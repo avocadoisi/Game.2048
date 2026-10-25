@@ -247,3 +247,18 @@ Reading the stderr:
 - Single-seed-range runs with 20 games (the previous protocol) can not show this: one range
   alone gives no stderr. Use `seed_ranges` ≥ 5 for policy comparisons.
 - Wall time: nn + spawn lookahead dominates (394 s for 100 games); 1-ply took 5 s.
+
+## Fair comparison (#38)
+
+Command: `zig build nn -Doptimize=ReleaseFast -- 0 20 1000 0.003 5` (eval only, committed weights, seeds 1000..1099 in 5 ranges of 20 games). Score per second = total score / CPU seconds for the 100 games.
+
+| policy | avg score (mean ± stderr) | avg moves | elapsed (100 games) | score/s |
+|---|---|---|---|---|
+| nn 1-ply | 18851 ± 503 | 1028 | 0.6 s | 2,957,818 |
+| nn + spawn lookahead | 38572 ± 1608 | 1917 | 42.2 s | 91,306 |
+| expectimax depth 2 | 24776 ± 1267 | 1320 | 18.2 s | 136,202 |
+
+- Per game, the lookahead is clearly stronger than expectimax depth 2 (about +13.8k).
+- Per CPU second, the lookahead is about 33% slower than expectimax (91k vs 136k score/s), so the gain does not hold at equal time.
+- nn 1-ply is far cheaper per second but much weaker per game. It is the cheapest option, not the strongest.
+- Caveat: one set of weights, one seed range, 100 games per policy. The timing is a single run on a loaded machine.

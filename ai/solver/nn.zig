@@ -467,6 +467,12 @@ pub fn meanStderr(xs: []const f64) MeanErr {
     return .{ .mean = mean, .stderr = @sqrt(ss / (n - 1) / n) };
 }
 
+/// Score per CPU second; 0 when no time elapsed (avoids division by zero).
+pub fn scorePerSecond(total_score: f64, elapsed_ns: i96) f64 {
+    if (elapsed_ns <= 0) return 0;
+    return total_score / (@as(f64, @floatFromInt(elapsed_ns)) / 1e9);
+}
+
 test "meanStderr gives mean and sample standard error" {
     const xs = [_]f64{ 2, 4, 4, 4, 5, 5, 7, 9 };
     const r = meanStderr(&xs);
@@ -479,6 +485,15 @@ test "meanStderr of one value has zero stderr" {
     const r = meanStderr(&[_]f64{3});
     try std.testing.expectApproxEqAbs(@as(f64, 3), r.mean, 1e-12);
     try std.testing.expectEqual(@as(f64, 0), r.stderr);
+}
+
+test "scorePerSecond divides total score by elapsed seconds" {
+    // 3000 points in 1.5 s is 2000 points per second
+    try std.testing.expectApproxEqAbs(@as(f64, 2000), scorePerSecond(3000, 1_500_000_000), 1e-9);
+}
+
+test "scorePerSecond of zero elapsed time is zero" {
+    try std.testing.expectEqual(@as(f64, 0), scorePerSecond(3000, 0));
 }
 
 test "weight file header round trips" {

@@ -26,6 +26,7 @@ const Eval = struct {
     range_scores: []f64 = &.{},
     avg_moves: f64 = 0,
     best_tile: core.Tile = 0,
+    total_score: u64 = 0,
     elapsed_ns: i96 = 0,
 };
 
@@ -119,6 +120,7 @@ pub fn main(init: std.process.Init) !void {
                     },
                 };
                 total_score += res.score;
+                r.total_score += res.score;
                 total_moves += res.moves;
                 r.best_tile = @max(r.best_tile, res.max_tile);
             }
@@ -132,7 +134,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("eval: games={d}/range ranges={d} seeds={d}..{d}\n", .{ eval_games, seed_ranges, eval_seed, last_seed });
     for (results) |r| {
         const st = nn.meanStderr(r.range_scores);
-        std.debug.print("{s}: avg score={d:.1} ± {d:.1} (stderr over {d} ranges) avg moves={d:.1} best tile={d} elapsed={d:.1} s\n", .{
+        std.debug.print("{s}: avg score={d:.1} ± {d:.1} (stderr over {d} ranges) avg moves={d:.1} best tile={d} elapsed={d:.1} s score/s={d:.1}\n", .{
             r.name,
             st.mean,
             st.stderr,
@@ -140,6 +142,7 @@ pub fn main(init: std.process.Init) !void {
             r.avg_moves,
             r.best_tile,
             @as(f64, @floatFromInt(r.elapsed_ns)) / 1e9,
+            nn.scorePerSecond(@floatFromInt(r.total_score), r.elapsed_ns),
         });
     }
 }
