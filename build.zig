@@ -27,6 +27,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "core", .module = core_mod },
+                .{ .name = "solver", .module = solver_mod },
             },
         }),
     });

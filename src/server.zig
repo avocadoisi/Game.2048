@@ -1,5 +1,6 @@
 const std = @import("std");
 const core = @import("core");
+const solver = @import("solver");
 
 const index_html = @embedFile("web/index.html");
 
@@ -64,6 +65,10 @@ pub fn route(
         session.newGame();
         return jsonResponse(gpa, .ok, stateJson(session, false, false));
     }
+    if (method == .GET and std.mem.eql(u8, path, "/api/solve")) {
+        const dir = solver.bestMove(session.state, depthFromQuery(query));
+        return jsonResponse(gpa, .ok, .{ .dir = dir });
+    }
     if (method == .POST and std.mem.eql(u8, path, "/api/move")) {
         const dir = directionFromQuery(query) orelse
             return .{ .status = .bad_request, .content_type = "text/plain", .body = "dir must be up|left|down|right\n" };
@@ -91,6 +96,17 @@ fn directionFromQuery(query: []const u8) ?core.Direction {
         if (std.mem.startsWith(u8, pair, "dir=")) return core.Direction.parse(pair["dir=".len..]);
     }
     return null;
+}
+
+/// Solver search depth from `depth=N`; defaults to 2 (the depth validated in ai/solver).
+fn depthFromQuery(query: []const u8) u8 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        if (std.mem.startsWith(u8, pair, "depth=")) {
+            return std.fmt.parseInt(u8, pair["depth=".len..], 10) catch 2;
+        }
+    }
+    return 2;
 }
 
 pub fn serve(io: std.Io, gpa: std.mem.Allocator, port: u16, seed: u64) !void {
@@ -174,4 +190,16 @@ fn countTiles(board: core.Board) usize {
         if (v != 0) n += 1;
     };
     return n;
+}
+
+test "route solve returns the solver's next move without changing the board" {
+    const gpa = std.testing.allocator;
+    var session = Session.init(1);
+    const before = session.state.board;
+
+    const res = try route(gpa, &session, .GET, "/api/solve?depth=2");
+    defer gpa.free(res.body);
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"dir\":") != null);
+    try std.testing.expectEqual(before, session.state.board);
 }
