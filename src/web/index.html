@@ -29,6 +29,12 @@
   <button id="new">New game</button>
   <button id="step">Solver: 1 step</button>
   <button id="auto">Solver: auto</button>
+  <label>speed <select id="speed">
+    <option value="600">slow (600 ms)</option>
+    <option value="300">normal (300 ms)</option>
+    <option value="150" selected>fast (150 ms)</option>
+    <option value="50">very fast (50 ms)</option>
+  </select></label>
 </p>
 <script>
 const KEYS = { ArrowUp: "up", w: "up", ArrowLeft: "left", a: "left", ArrowDown: "down", s: "down", ArrowRight: "right", d: "right" };
@@ -72,8 +78,14 @@ function stopAuto() { clearInterval(timer); timer = null; document.getElementByI
 document.getElementById("step").addEventListener("click", () => solveStep());
 document.getElementById("auto").addEventListener("click", () => {
   if (timer) return stopAuto();
+  startAuto();
+});
+function startAuto() {
   document.getElementById("auto").textContent = "Solver: stop";
-  timer = setInterval(solveStep, 150);
+  timer = setInterval(solveStep, Number(document.getElementById("speed").value));
+}
+document.getElementById("speed").addEventListener("change", () => {
+  if (timer) { clearInterval(timer); startAuto(); }
 });
 document.addEventListener("keydown", (e) => {
   const dir = KEYS[e.key] || KEYS[e.key.toLowerCase()];
