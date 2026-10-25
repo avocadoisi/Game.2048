@@ -21,9 +21,9 @@ const Entry = struct {
 /// One-line summary of each policy, shown next to its ranking row.
 fn describe(policy: solver.Policy) []const u8 {
     return switch (policy) {
-        .random => "legal move chosen uniformly at random (baseline)",
-        .greedy => "one move ahead: pick the move whose slid board scores best (no spawn, no search)",
-        .expectimax => "search 2 player moves ahead, averaging over random spawns (2 or 4); scores with the snake-order and merge heuristic",
+        .random => "合法手からランダムに1手選ぶ（比較の基準）",
+        .greedy => "1手先だけ見る。滑らせた盤面の評価が最も高い手を選ぶ（出現や探索はしない）",
+        .expectimax => "2手先まで探索し、ランダムな出現（2か4）を平均して評価する。評価は蛇行順と合体ペアの手作り関数",
     };
 }
 
