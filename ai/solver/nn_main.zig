@@ -2,6 +2,7 @@ const std = @import("std");
 const core = @import("core");
 const solver = @import("solver");
 const nn = @import("nn");
+const parallel = @import("parallel");
 
 const usage =
     \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate] [seed_ranges]
@@ -70,22 +71,31 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "nn + 1 spawn lookahead" },
         .{ .name = "expectimax depth 2" },
     };
+    const games = eval_games * seed_ranges;
+    const EvalCtx = struct { net: *const nn.Net, policy: usize, eval_seed: u64 };
+    // Game i uses seed eval_seed + i (= eval_seed + range*eval_games + g); games run in parallel.
+    const playGame = struct {
+        fn f(c: EvalCtx, i: usize) nn.PlayResult {
+            var prng = std.Random.DefaultPrng.init(c.eval_seed + i);
+            return switch (c.policy) {
+                0 => nn.play(c.net, prng.random(), .greedy),
+                1 => nn.play(c.net, prng.random(), .chance),
+                else => blk: {
+                    const b = solver.playPolicy(prng.random(), .expectimax, 2);
+                    break :blk nn.PlayResult{ .score = b.score, .max_tile = b.max_tile, .moves = b.moves };
+                },
+            };
+        }
+    }.f;
     for (&results, 0..) |*r, idx| {
         r.range_scores = try init.arena.allocator().alloc(f64, seed_ranges);
-        var total_moves: u64 = 0;
+        const res_all = try init.arena.allocator().alloc(nn.PlayResult, games);
         const start = std.Io.Clock.awake.now(init.io);
+        parallel.map(nn.PlayResult, res_all, EvalCtx{ .net = &net, .policy = idx, .eval_seed = eval_seed }, playGame);
+        var total_moves: u64 = 0;
         for (0..seed_ranges) |range| {
             var total_score: u64 = 0;
-            for (0..eval_games) |g| {
-                var prng = std.Random.DefaultPrng.init(eval_seed + range * eval_games + g);
-                const res = switch (idx) {
-                    0 => nn.play(&net, prng.random(), .greedy),
-                    1 => nn.play(&net, prng.random(), .chance),
-                    else => blk: {
-                        const b = solver.playPolicy(prng.random(), .expectimax, 2);
-                        break :blk nn.PlayResult{ .score = b.score, .max_tile = b.max_tile, .moves = b.moves };
-                    },
-                };
+            for (res_all[range * eval_games ..][0..eval_games]) |res| {
                 total_score += res.score;
                 r.total_score += res.score;
                 total_moves += res.moves;
@@ -94,7 +104,7 @@ pub fn main(init: std.process.Init) !void {
             r.range_scores[range] = @as(f64, @floatFromInt(total_score)) / @as(f64, @floatFromInt(eval_games));
         }
         r.elapsed_ns = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
-        const n: f64 = @floatFromInt(eval_games * seed_ranges);
+        const n: f64 = @floatFromInt(games);
         r.avg_moves = @as(f64, @floatFromInt(total_moves)) / n;
     }
     const last_seed = eval_seed + seed_ranges * eval_games - 1;
