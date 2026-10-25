@@ -36,13 +36,21 @@ pub const Ranking = struct {
 /// greedy: heuristic of the slid board, no spawn and no search (depth is ignored).
 pub fn rank(state: GameState, algo: Algorithm, depth: u8) Ranking {
     var r: Ranking = .{};
+    const packed_state = if (algo == .expectimax) packFor(state, depth) else null;
     for ([_]Direction{ .up, .left, .down, .right }) |d| {
         var next = state;
-        if (!next.slide(d).changed) continue;
-        const value = switch (algo) {
-            .expectimax => chanceValueW(next, depth, baseline),
-            .greedy => evaluateState(next),
-        };
+        var value: f64 = undefined;
+        if (packed_state) |p| {
+            const slid = p.slide(d);
+            if (!slid.changed) continue;
+            value = chanceValueP(slid.next, depth, baseline);
+        } else {
+            if (!next.slide(d).changed) continue;
+            value = switch (algo) {
+                .expectimax => chanceValueW(next, depth, baseline),
+                .greedy => evaluateState(next),
+            };
+        }
         // insertion sort: strict > keeps the earlier direction on ties
         var i = r.len;
         while (i > 0 and r.items[i - 1].value < value) : (i -= 1) r.items[i] = r.items[i - 1];
@@ -59,6 +67,23 @@ pub fn bestMove(state: GameState, depth: u8) ?Direction {
 
 /// Expectimax best move with custom evaluation weights; same tie rule as `rank` (earlier direction wins).
 pub fn bestMoveW(state: GameState, depth: u8, w: Weights) ?Direction {
+    const p = packFor(state, depth) orelse return bestMoveWBoard(state, depth, w);
+    var best: ?Direction = null;
+    var best_value: f64 = 0;
+    for ([_]Direction{ .up, .left, .down, .right }) |d| {
+        const slid = p.slide(d);
+        if (!slid.changed) continue;
+        const value = chanceValueP(slid.next, depth, w);
+        if (best == null or value > best_value) {
+            best = d;
+            best_value = value;
+        }
+    }
+    return best;
+}
+
+/// Reference expectimax on `GameState`; used when the board does not fit the packed form.
+fn bestMoveWBoard(state: GameState, depth: u8, w: Weights) ?Direction {
     var best: ?Direction = null;
     var best_value: f64 = 0;
     for ([_]Direction{ .up, .left, .down, .right }) |d| {
@@ -71,6 +96,13 @@ pub fn bestMoveW(state: GameState, depth: u8, w: Weights) ?Direction {
         }
     }
     return best;
+}
+
+/// Packed search is exact while the largest tile stays within the nibble range: each player move
+/// at most doubles the largest tile, so `depth` moves from this root add at most `depth` to its log2.
+fn packFor(state: GameState, depth: u8) ?core.Packed {
+    if (depth > 15) return null;
+    return core.Packed.fromBoard(state.board, @intCast(15 - depth));
 }
 
 /// Move-choosing policies compared in the ranking (`zig build ranking`).
@@ -454,6 +486,112 @@ fn chanceValueW(state: GameState, depth: u8, w: Weights) f64 {
     }
     if (empties == 0) return evaluateStateW(state, w);
     return total / empties;
+}
+
+/// Packed twins of `evaluateW`, `evaluateStateW`, `maxValueW`, `chanceValueW`: same order of
+/// floating-point operations, so results are bit-identical to the `GameState` versions.
+fn evaluateP(p: core.Packed, w: Weights) f64 {
+    // integer sums: levels are small integers, so these equal the f64 sums in `evaluateW` exactly
+    var empties: u32 = 0;
+    var penalty: u32 = 0;
+    var prev: ?u32 = null;
+    for (order) |cell| {
+        const e: u32 = p.exp(cell.row, cell.col);
+        if (e == 0) {
+            empties += 1;
+            continue;
+        }
+        if (prev) |before| penalty += e -| before;
+        prev = e;
+    }
+    return @as(f64, @floatFromInt(empties)) * w.empty - @as(f64, @floatFromInt(penalty)) * w.order_penalty + mergePairsP(p) * w.merge;
+}
+
+fn mergePairsP(p: core.Packed) f64 {
+    var n: f64 = 0;
+    for (0..core.BoardSize) |r| {
+        for (0..core.BoardSize) |c| {
+            const e = p.exp(r, c);
+            if (e == 0) continue;
+            if (c + 1 < core.BoardSize and p.exp(r, c + 1) == e) n += 1;
+            if (r + 1 < core.BoardSize and p.exp(r + 1, c) == e) n += 1;
+        }
+    }
+    return n;
+}
+
+fn evaluateStateP(p: core.Packed, w: Weights) f64 {
+    var score = evaluateP(p, w);
+    for ([_]Direction{ .up, .left, .right }) |d| {
+        if (p.canSlide(d)) return score;
+    }
+    if (p.canSlide(.down)) score -= w.forced_down;
+    return score;
+}
+
+fn maxValueP(p: core.Packed, depth: u8, w: Weights) f64 {
+    if (depth == 0) return evaluateStateP(p, w);
+    var best: f64 = lost_score;
+    var any_move = false;
+    for ([_]Direction{ .up, .left, .down, .right }) |d| {
+        const slid = p.slide(d);
+        if (!slid.changed) continue;
+        any_move = true;
+        best = @max(best, chanceValueP(slid.next, depth, w));
+    }
+    if (!any_move) return lost_score;
+    return best;
+}
+
+fn chanceValueP(p: core.Packed, depth: u8, w: Weights) f64 {
+    var total: f64 = 0;
+    var empties: f64 = 0;
+    for (0..core.BoardSize) |r| {
+        for (0..core.BoardSize) |c| {
+            if (p.exp(r, c) != 0) continue;
+            empties += 1;
+            for ([_]struct { exp: u4, p: f64 }{
+                .{ .exp = 1, .p = 0.9 },
+                .{ .exp = 2, .p = 0.1 },
+            }) |spawn| {
+                total += spawn.p * maxValueP(p.withExp(r, c, spawn.exp), depth - 1, w);
+            }
+        }
+    }
+    if (empties == 0) return evaluateStateP(p, w);
+    return total / empties;
+}
+
+test "packed search matches the GameState search on random positions" {
+    var prng = std.Random.DefaultPrng.init(31337);
+    const rng = prng.random();
+    for (0..200) |_| {
+        var state = GameState.gameStart(rng);
+        const steps = rng.uintLessThan(usize, 60);
+        for (0..steps) |_| {
+            const d = choose(.random, state, rng, 0) orelse break;
+            _ = state.move(d, rng);
+        }
+        for ([_]u8{ 1, 2 }) |depth| {
+            try std.testing.expectEqual(bestMoveWBoard(state, depth, baseline), bestMoveW(state, depth, baseline));
+            const r = rank(state, .expectimax, depth);
+            var r_ref: Ranking = .{};
+            for ([_]Direction{ .up, .left, .down, .right }) |d| {
+                var next = state;
+                if (!next.slide(d).changed) continue;
+                const value = chanceValueW(next, depth, baseline);
+                var i = r_ref.len;
+                while (i > 0 and r_ref.items[i - 1].value < value) : (i -= 1) r_ref.items[i] = r_ref.items[i - 1];
+                r_ref.items[i] = .{ .dir = d, .value = value };
+                r_ref.len += 1;
+            }
+            try std.testing.expectEqual(r_ref.len, r.len);
+            for (r.items[0..r.len], r_ref.items[0..r_ref.len]) |a, b| {
+                try std.testing.expectEqual(b.dir, a.dir);
+                try std.testing.expectEqual(b.value, a.value);
+            }
+        }
+    }
 }
 
 test "baseline weights reproduce evaluate on a hand-computed board" {

@@ -267,6 +267,110 @@ fn mergeLineSlow(line: [BoardSize]Tile) MergeResult {
     };
 }
 
+/// Search representation: each row is 4 nibbles, nibble c = log2 of the tile at column c
+/// (0 = empty). Slides are table lookups, so search avoids the per-cell work of `GameState`.
+/// Only boards whose tiles fit the nibble range are packable (see `fromBoard`).
+pub const Packed = struct {
+    rows: [BoardSize]u16,
+
+    pub const SlideResult = struct { next: Packed, changed: bool, score_delta: u32 };
+
+    /// Null when a tile is not a power of two >= 2, or its log2 exceeds `max_exp`.
+    pub fn fromBoard(board: Board, max_exp: u4) ?Packed {
+        var p = Packed{ .rows = @splat(0) };
+        for (board, 0..) |row, r| {
+            for (row, 0..) |value, c| {
+                if (value == 1 or value > 32768 or @popCount(value) > 1) return null;
+                const e: u16 = if (value == 0) 0 else @ctz(value);
+                if (e > max_exp) return null;
+                p.rows[r] |= e << @intCast(c * 4);
+            }
+        }
+        return p;
+    }
+
+    pub fn toBoard(self: Packed) Board {
+        var board: Board = undefined;
+        for (self.rows, 0..) |row, r| {
+            for (0..BoardSize) |c| {
+                const e: u16 = (row >> @intCast(c * 4)) & 0xF;
+                board[r][c] = if (e == 0) 0 else @as(Tile, 1) << @intCast(e);
+            }
+        }
+        return board;
+    }
+
+    /// log2 of the tile at (row, col); 0 for an empty cell.
+    pub fn exp(self: Packed, row: usize, col: usize) u4 {
+        return @truncate(self.rows[row] >> @intCast(col * 4));
+    }
+
+    pub fn withExp(self: Packed, row: usize, col: usize, e: u4) Packed {
+        var next = self;
+        const shift: u4 = @intCast(col * 4);
+        next.rows[row] = (next.rows[row] & ~(@as(u16, 0xF) << shift)) | (@as(u16, e) << shift);
+        return next;
+    }
+
+    /// Same result as `GameState.slide`, without the spawn and score bookkeeping.
+    /// Callers must keep every tile within the nibble range (see `fromBoard`).
+    pub fn slide(self: Packed, direction: Direction) SlideResult {
+        const vertical = direction == .up or direction == .down;
+        const far_first = direction == .right or direction == .down;
+        var next = self;
+        var changed = false;
+        var score_delta: u32 = 0;
+        for (0..BoardSize) |line| {
+            var key: u16 = 0;
+            for (0..BoardSize) |offset| {
+                const index = if (far_first) BoardSize - 1 - offset else offset;
+                const nibble = if (vertical) nibbleOf(self.rows[index], line) else nibbleOf(self.rows[line], index);
+                key |= nibble << @intCast(offset * 4);
+            }
+            const entry = row_table[key];
+            std.debug.assert(entry.ok);
+            if (entry.row == key) continue;
+            changed = true;
+            score_delta += entry.score;
+            for (0..BoardSize) |offset| {
+                const index = if (far_first) BoardSize - 1 - offset else offset;
+                const nibble = nibbleOf(entry.row, offset);
+                if (vertical) {
+                    next.rows[index] = setNibbleOf(next.rows[index], line, nibble);
+                } else {
+                    next.rows[line] = setNibbleOf(next.rows[line], index, nibble);
+                }
+            }
+        }
+        return .{ .next = next, .changed = changed, .score_delta = score_delta };
+    }
+
+    /// Stops at the first line that would change.
+    pub fn canSlide(self: Packed, direction: Direction) bool {
+        const vertical = direction == .up or direction == .down;
+        const far_first = direction == .right or direction == .down;
+        for (0..BoardSize) |line| {
+            var key: u16 = 0;
+            for (0..BoardSize) |offset| {
+                const index = if (far_first) BoardSize - 1 - offset else offset;
+                const nibble = if (vertical) nibbleOf(self.rows[index], line) else nibbleOf(self.rows[line], index);
+                key |= nibble << @intCast(offset * 4);
+            }
+            if (row_table[key].row != key) return true;
+        }
+        return false;
+    }
+};
+
+fn nibbleOf(row: u16, index: usize) u16 {
+    return (row >> @intCast(index * 4)) & 0xF;
+}
+
+fn setNibbleOf(row: u16, index: usize, nibble: u16) u16 {
+    const shift: u4 = @intCast(index * 4);
+    return (row & ~(@as(u16, 0xF) << shift)) | (nibble << shift);
+}
+
 /// Board cell for the `offset`-th cell of a line, where offset 0 is the cell
 /// the tiles slide toward (left column, right column, top row, bottom row).
 fn cellAt(direction: Direction, line_index: usize, offset: usize) Position {
@@ -619,4 +723,40 @@ test "canSlide matches slide(...).changed without changing the board" {
         }
         try std.testing.expectEqual(board, state.board);
     }
+}
+
+test "Packed.slide matches GameState.slide on random boards" {
+    var prng = std.Random.DefaultPrng.init(4096);
+    const rng = prng.random();
+    for (0..20_000) |_| {
+        var board: Board = undefined;
+        for (&board) |*row| {
+            for (row) |*cell| {
+                cell.* = if (rng.uintLessThan(u8, 3) == 0) 0 else @as(Tile, 1) << @intCast(1 + rng.uintLessThan(u8, 10));
+            }
+        }
+        const packed_state = Packed.fromBoard(board, 15) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(board, packed_state.toBoard());
+        for ([_]Direction{ .up, .left, .down, .right }) |d| {
+            var reference = GameState{ .board = board, .score = 0 };
+            const expected = reference.slide(d);
+            const got = packed_state.slide(d);
+            try std.testing.expectEqual(expected.changed, got.changed);
+            try std.testing.expectEqual(reference.board, got.next.toBoard());
+            try std.testing.expectEqual(expected.score_delta, got.score_delta);
+        }
+    }
+}
+
+test "Packed.fromBoard rejects tiles it cannot hold" {
+    var board: Board = @splat(@splat(0));
+    board[0][0] = 3;
+    try std.testing.expectEqual(@as(?Packed, null), Packed.fromBoard(board, 15));
+    board[0][0] = 1;
+    try std.testing.expectEqual(@as(?Packed, null), Packed.fromBoard(board, 15));
+    board[0][0] = 65536;
+    try std.testing.expectEqual(@as(?Packed, null), Packed.fromBoard(board, 15));
+    board[0][0] = 1024;
+    try std.testing.expectEqual(@as(?Packed, null), Packed.fromBoard(board, 9));
+    try std.testing.expect(Packed.fromBoard(board, 10) != null);
 }
