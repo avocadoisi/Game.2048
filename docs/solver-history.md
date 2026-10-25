@@ -139,7 +139,7 @@ Idea: search on rows packed as 4 nibbles (log2 of each tile), so a slide is one 
 - Conclusion: a real speedup needs `GameState` itself stored packed. That changes about 78 `.board` uses and
   makes tiles of 65536 and above need a separate path. Not done.
 
-## Training focus: near-loss states (proposal, not implemented)
+## Training focus: near-loss states (proposal)
 
 Problem: `nn.trainGame` runs TD(0) over every move of every self-play game with the same weight.
 Most moves are in the safe early and middle game, so the net sees few examples of boards close to
@@ -184,6 +184,8 @@ in forward order, one update per move, no replay, no weighting by position.
 - Add the diagnostic log (idea 1) to `nn_main.zig` or behind a flag in `nn.zig`.
 - If the error is concentrated near game over: implement idea 3 (cheapest) and measure.
   Then try idea 2 and idea 4 on the same seeds.
+- Status (#28): all three are done and measured (#32 diagnostic, #33 replay/backward, #34 priority).
+  Conclusion below: the error is spread out, so focusing on near-loss states does not pay off.
 
 ## Diagnostic run (#32)
 
@@ -281,6 +283,32 @@ Eval loops (`zig build nn` and `zig build ranking`) now run games on threads via
 - Identical results: nn output lines (avg score ± stderr, avg moves, best tile) match the serial run exactly: 18851.1 ± 503.4 / 1028.1 / 2048; 38572.0 ± 1607.6 / 1917.1 / 4096; 24775.9 ± 1266.8 / 1319.8 / 4096. The ranking JSON is byte-identical (`cmp`) to the serial output for `5 20 1000`.
 - Tests: `parallel.map` equals a serial loop (`parallel.zig`), nn games match the serial loop over 8 seeds (`nn.zig`), and `bench.run` matches a serial loop over 8 games (`bench.zig`).
 - Caveat: `score/s` in `zig build nn` is now total score per **wall** second, not per CPU second as in the fair-comparison table above. Use the serial numbers for per-CPU-second comparisons.
+
+## Near-loss focus: conclusion (#28)
+
+Closed after #32 (diagnostic), #33 (replay / backward sweep, PR #48) and #34 (priority replay, PR #50).
+
+- Measured: the last 10 moves before game over carry 3-4x the per-step TD error of the early game
+  (0.2966 vs 0.0702-0.1002 mean |err|) and the value drops by about -0.22 there. But those steps are
+  only about 8% of the total error; 53% sits in the 4..7 empty, earlier-move bucket (#32).
+- Measured at equal training budget (20000 games, training seed 1; eval on seed range 2000 and fresh
+  ranges 3000..6000, 20 games each): base 18,677 ± 717, replay K=30 14,973 ± 838,
+  priority (m=32, alpha 0.5, 50% uniform) 19,488 ± 1,490, backward 2,116 ± 80 (#33, #34).
+- So no candidate beats the uniform per-move TD(0) update. Priority comes closest: +811 against a
+  combined stderr of about 1,650 (0.5 sigma), and it processed 14.02M training moves vs base's 13.97M
+  (+0.3%), so that comparison is effectively at equal moves. Replay is about 3.4 sigma worse, and the
+  backward sweep collapses. The 8% error share explains it: oversampling near-loss states mostly
+  takes fit away from the mid-game states where half the error lives.
+- Candidate 5 (restart games from hard boards) is not implemented. The same 8% argument applies, with
+  an added risk: boards saved from earlier games may be unreachable under the current policy, so the
+  net would train on a state distribution it never plays. With every cheaper candidate at or below
+  baseline, restarting from hard boards is not worth the cost.
+- Kept: the diagnostic flag (`diag`) stays in `nn_main.zig` so the error split can be re-checked after
+  any future training change. The replay/backward/priority options stay off by default, with the
+  default path pinned by the CRC test.
+- Not done: no equal-moves sweep for replay (it reached 92% of base's moves), K/m/alpha not swept, and
+  one training seed only. A wider sweep would need several training seeds before it could overturn the
+  conclusion.
 
 ## Replay and backward sweep (#33)
 
