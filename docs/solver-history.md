@@ -184,3 +184,22 @@ in forward order, one update per move, no replay, no weighting by position.
 - Add the diagnostic log (idea 1) to `nn_main.zig` or behind a flag in `nn.zig`.
 - If the error is concentrated near game over: implement idea 3 (cheapest) and measure.
   Then try idea 2 and idea 4 on the same seeds.
+
+## Diagnostic run (#32)
+
+Command: `zig build nn -Doptimize=ReleaseFast -- 2000 1 2000 0.003 diag` (2000 training games, seed 1; weights restored afterwards).
+
+| empty | moves | steps | mean \|err\| | mean drop | share err |
+|---|---|---|---|---|---|
+| 0..3 | last 10 | 17979 | 0.2966 | -0.2193 | 7.9% |
+| 0..3 | 11..30 | 20110 | 0.1582 | -0.0045 | 4.7% |
+| 0..3 | earlier | 62048 | 0.1669 | 0.0224 | 15.3% |
+| 4..7 | last 10 | 2021 | 0.1632 | -0.1198 | 0.5% |
+| 4..7 | 11..30 | 19620 | 0.1165 | -0.0388 | 3.4% |
+| 4..7 | earlier | 355867 | 0.1002 | -0.0061 | 52.6% |
+| 8+ | earlier | 150594 | 0.0702 | -0.0136 | 15.6% |
+
+- Reading: the last 10 moves before game over have about 3-4x the mean TD error of the early game (0.30 vs 0.07-0.10), and the value drops by about -0.22 on average there.
+- But they are a small share of the total error (about 8%), because few steps are that close to game over. Most error sits in the 4..7 empty, earlier-move bucket (53%).
+- So the near-loss states are badly fit per step, but focusing only on them would cover little of the error. Mix them in (e.g. #33 K-move replay, #34 priority with a uniform share) instead of replacing the uniform training.
+- Caveat: one training run, one seed, 2000 games. Re-check with more games before deciding.

@@ -198,24 +198,85 @@ pub fn play(net: *const Net, rng: std.Random, mode: Mode) PlayResult {
     return .{ .score = state.score, .max_tile = max_tile, .moves = moves };
 }
 
+/// Buckets for the training diagnostic (issue #32): empty cells 0..3, 4..7, 8+; moves left 0..9, 10..29, 30+.
+pub fn emptyBucket(empties: usize) usize {
+    return if (empties <= 3) 0 else if (empties <= 7) 1 else 2;
+}
+
+pub fn distBucket(moves_left: usize) usize {
+    return if (moves_left < 10) 0 else if (moves_left < 30) 1 else 2;
+}
+
+/// Per-bucket sums over the training steps: TD error |target - V(s)| and value change V(s_{t+1}) - V(s_t).
+pub const Diag = struct {
+    pub const Stat = struct { count: u64 = 0, abs_err: f64 = 0, drop: f64 = 0 };
+    /// Steps still inside the last-30 window; their distance to game over is not known until the game ends.
+    const Pending = struct { empties: usize, err: f64, drop: f64 };
+    const window = 30;
+
+    stats: [3][3]Stat = @splat(@splat(.{})),
+    ring: [window]Pending = undefined,
+    pushed: usize = 0,
+
+    pub fn add(self: *Diag, empties: usize, moves_left: usize, err: f64, drop: f64) void {
+        const s = &self.stats[emptyBucket(empties)][distBucket(moves_left)];
+        s.count += 1;
+        s.abs_err += err;
+        s.drop += drop;
+    }
+
+    /// Record one training step of the current game. Steps older than the window are at least 30 moves from the end.
+    pub fn push(self: *Diag, empties: usize, err: f64, drop: f64) void {
+        if (self.pushed >= window) {
+            const old = self.ring[self.pushed % window];
+            self.add(old.empties, window, old.err, old.drop);
+        }
+        self.ring[self.pushed % window] = .{ .empties = empties, .err = err, .drop = drop };
+        self.pushed += 1;
+    }
+
+    /// Call at game end: flush the window with the known distances, then reset for the next game.
+    pub fn finish(self: *Diag) void {
+        const n = self.pushed;
+        for (n -| window..n) |i| {
+            const p = self.ring[i % window];
+            self.add(p.empties, n - 1 - i, p.err, p.drop);
+        }
+        self.pushed = 0;
+    }
+};
+
+pub fn countEmpty(board: Board) usize {
+    var n: usize = 0;
+    for (board) |row| for (row) |v| {
+        if (v == 0) n += 1;
+    };
+    return n;
+}
+
 /// TD(0) on afterstates over one self-play game (greedy 1-ply moves, fixed rng).
 /// Target for the previous afterstate = its scaled reward + V(next afterstate); 0 after game over.
-pub fn trainGame(net: *Net, rng: std.Random, lr: f64) u32 {
+/// `diag` (optional) records each step's TD error and value change; it does not touch the rng or the update.
+pub fn trainGame(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag) u32 {
     var state = GameState.gameStart(rng);
     var pending: ?Pick = null;
     var cache: Cache = .{};
     while (pickMove(net, state)) |pick| {
         if (pending) |p| {
             _ = forward(net, p.after, &cache);
-            train(net, &cache, p.reward + pick.value, lr);
+            const target = p.reward + pick.value;
+            if (diag) |d| d.push(countEmpty(p.after), @abs(target - p.value), pick.value - p.value);
+            train(net, &cache, target, lr);
         }
         pending = pick;
         _ = state.move(pick.dir, rng);
     }
     if (pending) |p| {
         _ = forward(net, p.after, &cache);
+        if (diag) |d| d.push(countEmpty(p.after), @abs(p.reward - p.value), -p.value);
         train(net, &cache, p.reward, lr);
     }
+    if (diag) |d| d.finish();
     return state.score;
 }
 
@@ -387,8 +448,8 @@ test "trainGame is deterministic for a fixed seed" {
     var b = a;
     var rng_a = std.Random.DefaultPrng.init(12);
     var rng_b = std.Random.DefaultPrng.init(12);
-    _ = trainGame(&a, rng_a.random(), 0.001);
-    _ = trainGame(&b, rng_b.random(), 0.001);
+    _ = trainGame(&a, rng_a.random(), 0.001, null);
+    _ = trainGame(&b, rng_b.random(), 0.001, null);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
 }
 
@@ -431,4 +492,63 @@ test "parse rejects wrong size" {
 
 test "embedded weights file parses" {
     _ = try parse(@embedFile("nn_weights.bin"));
+}
+
+test "emptyBucket splits empty-cell counts into 0..3, 4..7, 8+" {
+    try std.testing.expectEqual(@as(usize, 0), emptyBucket(0));
+    try std.testing.expectEqual(@as(usize, 0), emptyBucket(3));
+    try std.testing.expectEqual(@as(usize, 1), emptyBucket(4));
+    try std.testing.expectEqual(@as(usize, 1), emptyBucket(7));
+    try std.testing.expectEqual(@as(usize, 2), emptyBucket(8));
+    try std.testing.expectEqual(@as(usize, 2), emptyBucket(16));
+}
+
+test "distBucket splits moves left into last 10, 11..30, earlier" {
+    try std.testing.expectEqual(@as(usize, 0), distBucket(0));
+    try std.testing.expectEqual(@as(usize, 0), distBucket(9));
+    try std.testing.expectEqual(@as(usize, 1), distBucket(10));
+    try std.testing.expectEqual(@as(usize, 1), distBucket(29));
+    try std.testing.expectEqual(@as(usize, 2), distBucket(30));
+    try std.testing.expectEqual(@as(usize, 2), distBucket(500));
+}
+
+test "Diag.add accumulates count, abs error and signed drop per bucket" {
+    var diag: Diag = .{};
+    diag.add(2, 5, 0.5, -0.25);
+    diag.add(3, 7, 0.25, 0.25);
+    diag.add(9, 5, 1.0, 0);
+    const near = diag.stats[0][0];
+    try std.testing.expectEqual(@as(u64, 2), near.count);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), near.abs_err, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), near.drop, 1e-12);
+    try std.testing.expectEqual(@as(u64, 1), diag.stats[2][0].count);
+    try std.testing.expectEqual(@as(u64, 0), diag.stats[1][1].count);
+}
+
+test "Diag push and finish bucket each step by moves to game over" {
+    var diag: Diag = .{};
+    // 35 steps in one game: step i has 34 - i moves left
+    for (0..35) |_| diag.push(0, 1.0, 0);
+    diag.finish();
+    try std.testing.expectEqual(@as(u64, 10), diag.stats[0][0].count);
+    try std.testing.expectEqual(@as(u64, 20), diag.stats[0][1].count);
+    try std.testing.expectEqual(@as(u64, 5), diag.stats[0][2].count);
+    try std.testing.expectApproxEqAbs(@as(f64, 35), diag.stats[0][0].abs_err + diag.stats[0][1].abs_err + diag.stats[0][2].abs_err, 1e-12);
+}
+
+test "trainGame with diagnostic gives the same weights and records steps" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var a = Net.init(init_rng.random());
+    var b = a;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    var diag: Diag = .{};
+    _ = trainGame(&a, rng_a.random(), 0.001, null);
+    _ = trainGame(&b, rng_b.random(), 0.001, &diag);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+    var total: u64 = 0;
+    for (diag.stats) |row| for (row) |s| {
+        total += s.count;
+    };
+    try std.testing.expect(total > 0);
 }
