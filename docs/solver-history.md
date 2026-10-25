@@ -177,3 +177,34 @@ in forward order, one update per move, no replay, no weighting by position.
 - Add the diagnostic log (idea 1) to `nn_main.zig` or behind a flag in `nn.zig`.
 - If the error is concentrated near game over: implement idea 3 (cheapest) and measure.
   Then try idea 2 and idea 4 on the same seeds.
+
+## Eval variance (#37)
+
+Command (eval only, loads committed weights, writes nothing):
+
+```
+zig build nn -- 0 20 1000 0.003 5
+```
+
+Seeds 1000..1099 as 5 disjoint ranges of 20 games. Every policy plays the same seeds.
+Each range gives one average; the table reports mean ± stderr over the 5 range averages
+(stderr = sample sd / sqrt(5)).
+
+| policy | avg score (mean ± stderr) | avg moves | best tile |
+|---|---|---|---|
+| nn 1-ply | 18851 ± 503 | 1028.1 | 2048 |
+| nn + 1 spawn lookahead | 38572 ± 1608 | 1917.1 | 4096 |
+| expectimax depth 2 | 24776 ± 1267 | 1319.8 | 4096 |
+
+Reading the stderr:
+- nn 1-ply vs expectimax depth 2: difference 5925. Stderr of the difference is about
+  sqrt(503² + 1267²) ≈ 1363, so the gap is about 4.3 stderr (about 8 df). Significant at p < 0.01.
+  Treat the expectimax lead as real for these weights and this seed set.
+- nn + spawn lookahead vs expectimax: difference 13796, stderr about 2070 (≈ 6.7). Clearly significant.
+- These stderr values assume independent ranges. Policies share seeds, so the true paired
+  difference may be tighter; the independent estimate is conservative.
+- Only 100 games per policy in total. Stderr is from 5 range means, so it is itself noisy.
+  More ranges (e.g. 10+) or more games per range would tighten it.
+- Single-seed-range runs with 20 games (the previous protocol) can not show this: one range
+  alone gives no stderr. Use `seed_ranges` ≥ 5 for policy comparisons.
+- Wall time: nn + spawn lookahead dominates (394 s for 100 games); 1-ply took 5 s.
