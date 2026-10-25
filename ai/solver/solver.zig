@@ -31,7 +31,7 @@ const order: [core.BoardCellCount]core.Position = blk: {
     break :blk cells;
 };
 
-/// Heuristic: many empty cells, minus a penalty for each adjacent pair in the
+/// Heuristic: many empty cells, minus a heavier penalty (x30, tuned vs x10) for each adjacent pair in the
 /// reading order where the later cell holds a larger tile (log2 scale).
 /// shortcut: a hand-set order, not learned; replace with an n-tuple table later.
 pub fn evaluate(board: Board) f64 {
@@ -48,7 +48,7 @@ pub fn evaluate(board: Board) f64 {
         if (prev) |before| penalty += @max(0, level - before);
         prev = level;
     }
-    return empties * 10 - penalty * 10;
+    return empties * 10 - penalty * 30;
 }
 
 pub const GameResult = struct {
