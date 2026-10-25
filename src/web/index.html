@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>2048</title>
+<style>
+  body { font-family: system-ui, sans-serif; text-align: center; background: #faf8ef; color: #776e65; }
+  #grid { display: grid; grid-template-columns: repeat(4, 90px); gap: 10px; background: #bbada0; padding: 10px; width: max-content; margin: 16px auto; border-radius: 6px; }
+  .cell { width: 90px; height: 90px; line-height: 90px; font-size: 28px; font-weight: bold; border-radius: 4px; background: #cdc1b4; }
+  .v2 { background: #eee4da; } .v4 { background: #ede0c8; } .v8 { background: #f2b179; color: #fff; }
+  .v16 { background: #f59563; color: #fff; } .v32 { background: #f67c5f; color: #fff; } .v64 { background: #f65e3b; color: #fff; }
+  .big { background: #edc22e; color: #fff; font-size: 22px; }
+  button { font-size: 16px; padding: 6px 14px; margin: 4px; }
+  #msg { min-height: 1.5em; font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>2048</h1>
+<div>score: <span id="score">0</span></div>
+<div id="grid"></div>
+<div id="msg"></div>
+<p>
+  <button data-dir="up">↑ (W)</button><br>
+  <button data-dir="left">← (A)</button>
+  <button data-dir="down">↓ (S)</button>
+  <button data-dir="right">→ (D)</button>
+</p>
+<p><button id="new">New game</button></p>
+<script>
+const KEYS = { ArrowUp: "up", w: "up", ArrowLeft: "left", a: "left", ArrowDown: "down", s: "down", ArrowRight: "right", d: "right" };
+
+function render(s) {
+  const grid = document.getElementById("grid");
+  grid.innerHTML = "";
+  for (const row of s.board) for (const v of row) {
+    const c = document.createElement("div");
+    const cls = v === 0 ? "" : v > 64 ? "big" : "v" + v;
+    c.className = "cell " + cls;
+    c.textContent = v === 0 ? "" : v;
+    grid.appendChild(c);
+  }
+  document.getElementById("score").textContent = s.score;
+  document.getElementById("msg").textContent = s.game_over ? "Game over — press New game" : "";
+}
+
+async function call(method, url) {
+  const res = await fetch(url, { method });
+  const body = await res.json();
+  if (!res.ok) { document.getElementById("msg").textContent = "error: " + res.status; return; }
+  render(body);
+}
+
+for (const b of document.querySelectorAll("[data-dir]")) {
+  b.addEventListener("click", () => call("POST", "/api/move?dir=" + b.dataset.dir));
+}
+document.getElementById("new").addEventListener("click", () => call("POST", "/api/new"));
+document.addEventListener("keydown", (e) => {
+  const dir = KEYS[e.key] || KEYS[e.key.toLowerCase()];
+  if (dir) { e.preventDefault(); call("POST", "/api/move?dir=" + dir); }
+});
+call("GET", "/api/state");
+</script>
+</body>
+</html>
