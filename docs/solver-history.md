@@ -218,3 +218,23 @@ Per range, nn 1-ply avg score: base 19,110 / 16,668 / 19,592 / 17,423 / 20,589; 
 - Reading: neither candidate beats the baseline. Replay is about 20% lower than base (difference 3,704 vs combined stderr 1,103, about 3.4 sigma on the 1-ply policy). Backward collapses to about 2,100 (policy dies after about 200 moves). The collapse is not tuned: only lr 0.003 was tried, with the sweep updates applied to frozen-policy games.
 - Moves: backward played far fewer training moves because its policy is weak; replay reached 92% of base's moves. The comparison is at equal games (20000), and the moves are listed above. Equal-moves comparison was not run.
 - Caveats: one training seed (1, fixed in the code), K=30 and replay lr 0.5x not swept, backward not swept over lr. The near-loss error share (#32) is 8% of the total, so replaying it at this weight may just shift the fit away from the mid-game states. Next: if replay is kept, try a smaller replay share (K=10, lr x0.25) before deciding.
+
+## Priority replay (#34)
+
+Option `priority` in `ai/solver/nn.zig` (`Priority`, `Options.priority`; CLI variant `priority`). Default off; the default path is pinned by the CRC test.
+- Normal per-move TD(0) updates run for every move, as in base. Each update is also stored in a ring buffer (1024 entries: afterstate, reward, next afterstate, terminal flag, |TD error|). The buffer persists across games.
+- After each game, `m = 32` extra updates. Each draws an entry: uniform with probability 0.5, otherwise with probability proportional to `(|δ| + 1e-3)^0.5`. The target is recomputed with the current weights, and the drawn entry's |δ| is refreshed.
+- Tests: sampling share checked against the analytic mixture (fixed seed, tolerance 0.01); priority pass changes the weights.
+
+Command per variant: `zig build nn -Doptimize=ReleaseFast -- 20000 20 2000 0.003 - <variant> 30 /tmp/nnp/<variant>.bin`, then eval-only runs (`-- 0 20 <seed> 0.003 - base 30 /tmp/nnp/<variant>.bin`) on seed ranges 2000, 3000, 4000, 5000, 6000 (20 games each, 100 games per variant). Mean ± stderr over the 5 range averages (n=5), as in #33.
+
+| variant | train games | train moves | nn 1-ply avg score (mean ± stderr) |
+|---|---|---|---|
+| base | 20000 | 13,969,906 | 18,677 ± 717 |
+| priority (m=32, α=0.5, 50% uniform) | 20000 | 14,016,958 | 19,488 ± 1,490 |
+
+Per range, nn 1-ply avg score: base 19,110 / 16,668 / 19,592 / 17,423 / 20,589; priority 18,278 / 14,513 / 23,450 / 20,639 / 20,559.
+
+- Reading: no measurable gain. The difference is +811 against a combined stderr of about 1,650 (about 0.5 sigma). The priority spread is wider (seed range 3000 is the lowest of all runs, 14,513; seed 4000 the highest, 23,450). The base number reproduces #33 exactly (same moves and per-range scores), so the session is comparable.
+- Moves: priority played about 0.3% more training moves than base at equal games (14.02M vs 13.97M), so the extra updates did not change how games were played much.
+- Caveats: one training seed (1, fixed in the code), m=32 and α=0.5 not swept, 100 eval games per variant. Differences this size would need more training seeds to call either way. The issue's safety rules are met: the uniform share is kept at 50%, and the normal per-move update is unchanged.
