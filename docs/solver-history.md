@@ -105,6 +105,13 @@ Speed rule: no policy slower than depth 3 (about 6.8 to 15 s/game depending on m
 - Ranking, seed 1000 (5 runs x 20 games, avg score): expectimax_tt 41,216 / nn 36,885 / mcts 29,722 / expectimax 25,267 / ga 24,046 / beam 12,696 / greedy 3,424 / random 1,062.
 - The GA weights are lower than plain expectimax on seed 1000. The +4% above holds only on seeds 500–599. Not a clear win.
 
+## NN: longer training (200,000 games, lr 0.003 decaying to 10%)
+
+- `zig build nn -- 200000 100 3000 0.003`: 3,316 s training (same 64/32 MLP, 148 KB weights, checkpoint every 5,000 games). Linear lr decay added.
+- Eval seeds 3000..3099 (100 games): NN 1-ply 35,687 (best 4096); **NN + 1 spawn lookahead 66,600 (best 8192, 73.8 s)**; expectimax depth 2 24,839 (37.9 s). Before (20,000 games, seeds 2000..): 38,734.
+- Ranking seed 1000 (5x20): nn 64,113 (was 36,885), above expectimax_tt 41,216. Slower than expectimax depth 2 (~2x per game), so it breaks the "no policy slower than depth 3" rule only in time per game of about 0.7 s; still faster than depth 3.
+- Not measured: wider net (128/64, runs slower in training, see below), TD(lambda), n-tuple tables.
+
 ## Speed work (no change in play)
 
 Goal: faster self-play for AI training. Every row below gives identical moves for the same seed
