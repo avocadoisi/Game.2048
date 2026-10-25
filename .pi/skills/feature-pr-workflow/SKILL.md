@@ -40,7 +40,7 @@ Follow the `tdd-2048` skill (`.pi/skills/tdd-2048/SKILL.md`).
 - Red: write a failing test first, and see it fail for the expected reason.
 - Green: smallest change that passes.
 - Refactor: only with green tests.
-- Run `zig build test` with Zig **0.15.2** (see the Zig note in README). Zig 0.17 breaks `build.zig`.
+- Run `zig build test` with Zig **0.17** (`zig version` must print 0.17.x).
 - Bug fixes: first a test that reproduces the bug, then the fix.
 - Commit in small steps: one commit per Red/Green/Refactor cycle or per logical unit.
 
@@ -74,6 +74,6 @@ Report the PR URL to the user. Remove the worktree only after the PR is merged o
 
 - [ ] Prompt and acceptance criteria captured
 - [ ] Worktree created, branch named, nothing left on `main`
-- [ ] Tests written first; `zig build test` passes with 0.15.2
+- [ ] Tests written first; `zig build test` passes with Zig 0.17
 - [ ] Docs match the code; README commands verified
 - [ ] Pushed, PR opened with tests and checks in the body

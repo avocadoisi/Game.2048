@@ -76,16 +76,13 @@ Ghostty のように、**Nix で再現可能な開発環境** を前提にする
 
 ```bash
 nix develop
-zig version      # 0.15.2 を使う
+zig version      # 0.17.x を使う
 zig build test
 ```
 
 `flake.nix` は `devShell` を提供し、`zig` と (利用可能であれば) `zls` を使える。
 
-> **注意**: `build.zig` は Zig 0.15 系の API で書かれている。Zig 0.17 では
-> `b.args` などが無く `zig build` が失敗する。`zig` が 0.15.x でない場合は
-> 0.15.2 のバイナリを明示して実行する。
-> 例: `/nix/store/…-zig-0.15.2/bin/zig build test`
+> Zig **0.17** でビルドする。`build.zig` と `src/` は 0.17 の API (`std.Io`, `std.process.Init`) に合わせている。
 
 ## 起動方法
 

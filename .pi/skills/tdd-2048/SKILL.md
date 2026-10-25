@@ -12,7 +12,7 @@ Project: Zig 2048. Pure logic lives in `src/core.zig` (module `core`). `src/main
 - Test everything: `zig build test` (runs core tests and exe tests)
 - Run CLI: `zig build run` (play); `zig build run -- serve 8080` (HTTP server)
 - Files: `src/core.zig` (logic), `src/render.zig`, `src/cli.zig`, `src/server.zig` (+ `src/web/index.html`), `src/main.zig` (dispatch)
-- Zig version: project builds with **0.15.2** (`build.zig` uses 0.15 APIs). Zig 0.17 on PATH fails. Example: `zig build test --global-cache-dir /tmp/zgc` with the 0.15.2 binary
+- Zig version: **0.17** (`build.zig` uses `addPassthruArgs`; `std.Io` APIs). Check with `zig version` before building.
 - Enter toolchain: `nix develop` (if zig is not on PATH)
 
 Workflow for any change (worktree, branch, docs, PR): see `.pi/skills/feature-pr-workflow/SKILL.md`.

@@ -93,29 +93,29 @@ fn directionFromQuery(query: []const u8) ?core.Direction {
     return null;
 }
 
-pub fn serve(gpa: std.mem.Allocator, port: u16, seed: u64) !void {
-    const address = try std.net.Address.parseIp("127.0.0.1", port);
-    var listener = try address.listen(.{ .reuse_address = true });
-    defer listener.deinit();
+pub fn serve(io: std.Io, gpa: std.mem.Allocator, port: u16, seed: u64) !void {
+    const address: std.Io.net.IpAddress = try .parse("127.0.0.1", port);
+    var listener = try address.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
 
     var session = Session.init(seed);
     std.debug.print("2048 server: http://127.0.0.1:{d}/\n", .{port});
 
     while (true) {
-        const conn = try listener.accept();
-        defer conn.stream.close();
-        handleConnection(gpa, &session, conn.stream) catch |err| {
+        const stream = try listener.accept(io);
+        defer stream.close(io);
+        handleConnection(io, gpa, &session, stream) catch |err| {
             std.debug.print("connection error: {s}\n", .{@errorName(err)});
         };
     }
 }
 
-fn handleConnection(gpa: std.mem.Allocator, session: *Session, stream: std.net.Stream) !void {
+fn handleConnection(io: std.Io, gpa: std.mem.Allocator, session: *Session, stream: std.Io.net.Stream) !void {
     var read_buf: [8192]u8 = undefined;
     var write_buf: [8192]u8 = undefined;
-    var net_reader = stream.reader(&read_buf);
-    var net_writer = stream.writer(&write_buf);
-    var http_server = std.http.Server.init(net_reader.interface(), &net_writer.interface);
+    var net_reader = stream.reader(io, &read_buf);
+    var net_writer = stream.writer(io, &write_buf);
+    var http_server = std.http.Server.init(&net_reader.interface, &net_writer.interface);
 
     var req = try http_server.receiveHead();
     const res = try route(gpa, session, req.head.method, req.head.target);
