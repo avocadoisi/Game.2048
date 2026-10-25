@@ -79,7 +79,7 @@ Speed rule: no policy slower than depth 3 (about 6.8 to 15 s/game depending on m
 ## Deep learning: small MLP value net (`zig build nn`)
 
 - Model: `ai/solver/nn.zig`, one hidden layer MLP over afterstates, trained by TD(0) in pure Zig (no dependencies).
-- Training: 20,000 self-play games, learning rate 0.003 (default in `nn_main.zig`). Weights go to `ai/solver/nn_weights.bin` (git-ignored).
+- Training: 20,000 self-play games, learning rate 0.003 (default in `nn_main.zig`). Weights go to `ai/solver/nn_weights.bin` (tracked in git and embedded by `solver.zig`; format: 16-byte header + little-endian f64, see `nn.encode`/`nn.parse`).
 - Eval on seeds 2000..2099 (100 games, `zig build nn -- 20000 100 2000 0.003`):
 
 | Policy | avg score | avg moves | best tile | time (100 games) |
@@ -104,6 +104,13 @@ Speed rule: no policy slower than depth 3 (about 6.8 to 15 s/game depending on m
 - Both are selectable in `/api/solve?algo=ga|nn` and in the UI dropdown (ranking.json regenerated with `zig build ranking -Doptimize=ReleaseFast -- 5 20 1000`).
 - Ranking, seed 1000 (5 runs x 20 games, avg score): expectimax_tt 41,216 / nn 36,885 / mcts 29,722 / expectimax 25,267 / ga 24,046 / beam 12,696 / greedy 3,424 / random 1,062.
 - The GA weights are lower than plain expectimax on seed 1000. The +4% above holds only on seeds 500–599. Not a clear win.
+
+## NN: longer training (200,000 games, lr 0.003 decaying to 10%)
+
+- `zig build nn -- 200000 100 3000 0.003`: 3,316 s training (same 64/32 MLP, 148 KB weights, checkpoint every 5,000 games). Linear lr decay added.
+- Eval seeds 3000..3099 (100 games): NN 1-ply 35,687 (best 4096); **NN + 1 spawn lookahead 66,600 (best 8192, 73.8 s)**; expectimax depth 2 24,839 (37.9 s). Before (20,000 games, seeds 2000..): 38,734.
+- Ranking seed 1000 (5x20): nn 64,113 (was 36,885), above expectimax_tt 41,216. Slower than expectimax depth 2 (~2x per game), so it breaks the "no policy slower than depth 3" rule only in time per game of about 0.7 s; still faster than depth 3.
+- Not measured: wider net (128/64, runs slower in training, see below), TD(lambda), n-tuple tables.
 
 ## Speed work (no change in play)
 
@@ -177,6 +184,38 @@ in forward order, one update per move, no replay, no weighting by position.
 - Add the diagnostic log (idea 1) to `nn_main.zig` or behind a flag in `nn.zig`.
 - If the error is concentrated near game over: implement idea 3 (cheapest) and measure.
   Then try idea 2 and idea 4 on the same seeds.
+
+## Diagnostic run (#32)
+
+Command: `zig build nn -Doptimize=ReleaseFast -- 2000 1 2000 0.003 diag` (2000 training games, seed 1; weights restored afterwards).
+
+| empty | moves | steps | mean \|err\| | mean drop | share err |
+|---|---|---|---|---|---|
+| 0..3 | last 10 | 17979 | 0.2966 | -0.2193 | 7.9% |
+| 0..3 | 11..30 | 20110 | 0.1582 | -0.0045 | 4.7% |
+| 0..3 | earlier | 62048 | 0.1669 | 0.0224 | 15.3% |
+| 4..7 | last 10 | 2021 | 0.1632 | -0.1198 | 0.5% |
+| 4..7 | 11..30 | 19620 | 0.1165 | -0.0388 | 3.4% |
+| 4..7 | earlier | 355867 | 0.1002 | -0.0061 | 52.6% |
+| 8+ | earlier | 150594 | 0.0702 | -0.0136 | 15.6% |
+
+- Reading: the last 10 moves before game over have about 3-4x the mean TD error of the early game (0.30 vs 0.07-0.10), and the value drops by about -0.22 on average there.
+- But they are a small share of the total error (about 8%), because few steps are that close to game over. Most error sits in the 4..7 empty, earlier-move bucket (53%).
+- So the near-loss states are badly fit per step, but focusing only on them would cover little of the error. Mix them in (e.g. #33 K-move replay, #34 priority with a uniform share) instead of replacing the uniform training.
+- Caveat: one training run, one seed, 2000 games. Re-check with more games before deciding.
+
+## Bench run 2026-10-25 19:31:46 +0900
+
+- command: `zig build solve -- 1 2 2 1`
+- commit: 248c1a5
+- date: 2026-10-25 19:31:46 +0900
+- exit: 0
+
+```text
+runs=1 games/run=2 depth=2 seed=1 games=2
+avg score=20954.0 avg moves=1148.0 best tile=2048
+speed: 0.54 games/s, 621 moves/s, elapsed 3.7 s
+```
 
 ## Eval variance (#37)
 
