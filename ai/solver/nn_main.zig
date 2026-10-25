@@ -4,12 +4,13 @@ const solver = @import("solver");
 const nn = @import("nn");
 
 const usage =
-    \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate]
+    \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate] [diag]
     \\
     \\  train_games   TD(0) self-play games; 0 loads ai/solver/nn_weights.bin (default 2000)
     \\  eval_games    games per policy, same seeds for every policy (default 100)
     \\  eval_seed     first eval seed; game g uses eval_seed + g (default 1000)
     \\  learning_rate SGD step for TD training (default 0.003)
+    \\  diag          literal "diag": print the TD error / value drop table by empty cells and moves to game over
     \\
     \\Training seed is fixed (1). Trained weights are written to ai/solver/nn_weights.bin.
     \\
@@ -26,13 +27,36 @@ const Eval = struct {
     elapsed_ns: i96 = 0,
 };
 
+fn printDiag(diag: *const nn.Diag) void {
+    const empty_names = [_][]const u8{ "0..3", "4..7", "8+" };
+    const dist_names = [_][]const u8{ "last 10", "11..30", "earlier" };
+    std.debug.print("diag: |TD error| and value drop V(s')-V(s) (mean per step)\n", .{});
+    std.debug.print("{s:<10} {s:<9} {s:>10} {s:>12} {s:>12} {s:>12}\n", .{ "empty", "moves", "steps", "mean |err|", "mean drop", "share err" });
+    var total_err: f64 = 0;
+    for (diag.stats) |row| for (row) |s| {
+        total_err += s.abs_err;
+    };
+    for (diag.stats, 0..) |row, e| for (row, 0..) |s, d| {
+        const n: f64 = @floatFromInt(@max(s.count, 1));
+        std.debug.print("{s:<10} {s:<9} {d:>10} {d:>12.4} {d:>12.4} {d:>11.1}%\n", .{
+            empty_names[e],
+            dist_names[d],
+            s.count,
+            s.abs_err / n,
+            s.drop / n,
+            100 * s.abs_err / @max(total_err, 1e-300),
+        });
+    };
+}
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const train_games: u32 = if (args.len > 1) try std.fmt.parseInt(u32, args[1], 10) else 2000;
     const eval_games: u32 = if (args.len > 2) try std.fmt.parseInt(u32, args[2], 10) else 100;
     const eval_seed: u64 = if (args.len > 3) try std.fmt.parseInt(u64, args[3], 10) else 1000;
     const learning_rate: f64 = if (args.len > 4) try std.fmt.parseFloat(f64, args[4]) else 0.003;
-    if (args.len > 5 or eval_games == 0) {
+    const want_diag = args.len > 5 and std.mem.eql(u8, args[5], "diag");
+    if (args.len > 6 or (args.len > 5 and !want_diag) or eval_games == 0) {
         std.debug.print("{s}", .{usage});
         return;
     }
@@ -47,8 +71,9 @@ pub fn main(init: std.process.Init) !void {
         var rng = std.Random.DefaultPrng.init(train_seed);
         const start = std.Io.Clock.awake.now(init.io);
         var last_score: u64 = 0;
+        var diag: nn.Diag = .{};
         for (0..train_games) |g| {
-            last_score = nn.trainGame(&net, rng.random(), learning_rate);
+            last_score = nn.trainGame(&net, rng.random(), learning_rate, if (want_diag) &diag else null);
             if ((g + 1) % 500 == 0) std.debug.print("train {d}/{d} last game score {d}\n", .{ g + 1, train_games, last_score });
         }
         const elapsed = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
@@ -58,6 +83,7 @@ pub fn main(init: std.process.Init) !void {
             learning_rate,
             train_seed,
         });
+        if (want_diag) printDiag(&diag);
         try nn.save(&net, init.io, weights_path);
     }
 

@@ -256,22 +256,27 @@ pub fn countEmpty(board: Board) usize {
 
 /// TD(0) on afterstates over one self-play game (greedy 1-ply moves, fixed rng).
 /// Target for the previous afterstate = its scaled reward + V(next afterstate); 0 after game over.
-pub fn trainGame(net: *Net, rng: std.Random, lr: f64) u32 {
+/// `diag` (optional) records each step's TD error and value change; it does not touch the rng or the update.
+pub fn trainGame(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag) u32 {
     var state = GameState.gameStart(rng);
     var pending: ?Pick = null;
     var cache: Cache = .{};
     while (pickMove(net, state)) |pick| {
         if (pending) |p| {
             _ = forward(net, p.after, &cache);
-            train(net, &cache, p.reward + pick.value, lr);
+            const target = p.reward + pick.value;
+            if (diag) |d| d.push(countEmpty(p.after), @abs(target - p.value), pick.value - p.value);
+            train(net, &cache, target, lr);
         }
         pending = pick;
         _ = state.move(pick.dir, rng);
     }
     if (pending) |p| {
         _ = forward(net, p.after, &cache);
+        if (diag) |d| d.push(countEmpty(p.after), @abs(p.reward - p.value), -p.value);
         train(net, &cache, p.reward, lr);
     }
+    if (diag) |d| d.finish();
     return state.score;
 }
 
@@ -443,8 +448,8 @@ test "trainGame is deterministic for a fixed seed" {
     var b = a;
     var rng_a = std.Random.DefaultPrng.init(12);
     var rng_b = std.Random.DefaultPrng.init(12);
-    _ = trainGame(&a, rng_a.random(), 0.001);
-    _ = trainGame(&b, rng_b.random(), 0.001);
+    _ = trainGame(&a, rng_a.random(), 0.001, null);
+    _ = trainGame(&b, rng_b.random(), 0.001, null);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
 }
 
