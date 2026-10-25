@@ -375,3 +375,25 @@ Per range, nn 1-ply avg score: base 19,110 / 16,668 / 19,592 / 17,423 / 20,589; 
 - Reading: no measurable gain. The difference is +811 against a combined stderr of about 1,650 (about 0.5 sigma). The priority spread is wider (seed range 3000 is the lowest of all runs, 14,513; seed 4000 the highest, 23,450). The base number reproduces #33 exactly (same moves and per-range scores), so the session is comparable.
 - Moves: priority played about 0.3% more training moves than base at equal games (14.02M vs 13.97M), so the extra updates did not change how games were played much.
 - Caveats: one training seed (1, fixed in the code), m=32 and α=0.5 not swept, 100 eval games per variant. Differences this size would need more training seeds to call either way. The issue's safety rules are met: the uniform share is kept at 50%, and the normal per-move update is unchanged.
+
+## Priority replay across training seeds (#56)
+
+#34 left the only open question: one training seed cannot separate a +811 difference from noise. The training seed is now a CLI argument (positional 9, after `weights_path`, default 1), so the comparison can be repeated per training seed.
+
+Protocol: train `base` and `priority` for each training seed 1..5 (`zig build nn -Doptimize=ReleaseFast -- 20000 20 2000 0.003 - <variant> 30 /tmp/nnseed/<variant>_s<s>.bin <s>`), then evaluate every weights file on the fixed eval seed ranges 2000, 3000, 4000, 5000, 6000 (20 games each). Score is the nn 1-ply average score. Both variants stay on the serial per-game path: `par` trains the plain per-move variant only.
+
+Per training seed (mean of the 5 eval ranges):
+
+| training seed | base | priority | delta |
+|---|---|---|---|
+| 1 | 19,611 | 17,413 | -2,197 |
+| 2 | 18,011 | 17,107 | -905 |
+| 3 | 17,870 | 22,388 | +4,518 |
+| 4 | 20,431 | 19,528 | -903 |
+| 5 | 17,846 | 19,957 | +2,111 |
+| **mean ± stderr (n=5)** | **18,754 ± 534** | **19,279 ± 959** | **+525 ± 1,224** (t = 0.4) |
+
+- Reading: priority wins 2 of 5 training seeds and loses 3. The paired delta is +525 against a stderr of 1,224, so the earlier +811 was a single-seed artefact, not a gain. Verdict unchanged: `priority` stays opt-in and off by default.
+- The spread across training seeds (base 17.8k-20.4k, priority 17.1k-22.4k) is about 1.5x the difference between variants, which is why one seed could not decide it. Base seed 1 reproduces #34 (19,611 vs 18,677, both inside one stderr).
+- Cost: 10 training runs of 20,000 games, 300-410 s each on 8 cores (serial). `par` reaches 2,000 games in 1.5 s against 8.6 s serial, but it cannot run the variant path, so these runs are slow by construction. `par` now also accepts `weights_path`, so a parallel run no longer has to overwrite the committed `ai/solver/nn_weights.bin`.
+- Caveats: still 5 training seeds and 100 eval games per variant; m=32 and α=0.5 were not swept.

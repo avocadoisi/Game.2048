@@ -16,7 +16,9 @@ const usage =
     \\  variant       base (default), backward (sweep stored afterstates last to first), replay (re-train the last replay_k),
     \\              priority (#34: 32 extra updates per game sampled from a |TD error| buffer, 50% uniform)
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
-    \\                game i uses seed train_seed + i and the batch result is the mean of its games
+    \\                game i uses seed train_seed + i and the batch result is the mean of its games.
+    \\                par trains the plain per-move variant only: replay_k is ignored, but its
+    \\                slot must be filled to reach weights_path
     \\  replay_k      afterstates re-trained per game for variant replay (default 30)
     \\  weights_path  file to load (train_games 0) or write (default ai/solver/nn_weights.bin); use a temp path for variant runs
     \\  train_seed    seed for weight init and self-play games (default 1, omitted = same weights as before #56)
@@ -93,8 +95,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}", .{usage});
         return;
     };
-    // par trains the plain per-move variant only, so it takes no variant arguments
-    if (args.len > 10 or (use_par and args.len > 7) or eval_games == 0 or seed_ranges == 0) {
+    if (args.len > 10 or eval_games == 0 or seed_ranges == 0) {
         std.debug.print("{s}", .{usage});
         return;
     }
