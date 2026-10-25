@@ -24,15 +24,21 @@ pub fn bestMove(state: GameState, depth: u8) ?Direction {
     return best;
 }
 
-/// Cells in the reading order 1..16 (row by row, top-left to bottom-right); the top-left is the fixed anchor for the largest tile.
+/// Snake path 1..16: row 0 left to right, row 1 right to left, and so on.
+/// The largest tile is expected at the start (top-left).
 const order: [core.BoardCellCount]core.Position = blk: {
     var cells: [core.BoardCellCount]core.Position = undefined;
-    for (0..core.BoardCellCount) |i| cells[i] = .{ .row = i / core.BoardSize, .col = i % core.BoardSize };
+    for (0..core.BoardCellCount) |i| {
+        const row = i / core.BoardSize;
+        const offset = i % core.BoardSize;
+        const col = if (row % 2 == 0) offset else core.BoardSize - 1 - offset;
+        cells[i] = .{ .row = row, .col = col };
+    }
     break :blk cells;
 };
 
-/// Heuristic: many empty cells, minus a heavier penalty (x30, tuned vs x10) for each adjacent pair in the
-/// reading order where the later cell holds a larger tile (log2 scale).
+/// Heuristic: many empty cells, minus a penalty (x30) for each adjacent pair along the snake path
+/// where the later cell holds a larger tile (log2 scale).
 /// shortcut: a hand-set order, not learned; replace with an n-tuple table later.
 pub fn evaluate(board: Board) f64 {
     var empties: f64 = 0;
@@ -144,6 +150,14 @@ test "bestMove takes a merge over a move that does nothing" {
     } };
     const move = bestMove(state, 1).?;
     try std.testing.expect(move == .left or move == .right);
+}
+
+test "order follows the snake path 1..16" {
+    try std.testing.expectEqual(core.Position{ .row = 0, .col = 0 }, order[0]);
+    try std.testing.expectEqual(core.Position{ .row = 1, .col = 3 }, order[4]);
+    try std.testing.expectEqual(core.Position{ .row = 1, .col = 0 }, order[7]);
+    try std.testing.expectEqual(core.Position{ .row = 2, .col = 0 }, order[8]);
+    try std.testing.expectEqual(core.Position{ .row = 3, .col = 0 }, order[15]);
 }
 
 test "evaluateState penalizes a board where only down is legal" {
