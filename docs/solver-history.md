@@ -97,3 +97,10 @@ Speed rule: no policy slower than depth 3 (about 6.8 to 15 s/game depending on m
 - Holdout seeds 500..599 (100 games, depth 2): baseline 24,067, evolved 25,095 (+4%).
 - Evolved weights: empty 7.028, order_penalty 43.174, merge 0, forced_down 0.
 - Caveats: one GA run, one holdout range; merge and forced_down collapsed to 0, so the gain may be noise. Check on another seed range before adopting.
+
+## Policies wired into the solver (`ga`, `nn`)
+
+- `ga`: `solver.ga_weights` (3-decimal values from `zig build ga-rl`) with depth 2. `nn`: embedded `ai/solver/nn_weights.bin` (148 KB, committed), chance-mode net.
+- Both are selectable in `/api/solve?algo=ga|nn` and in the UI dropdown (ranking.json regenerated with `zig build ranking -Doptimize=ReleaseFast -- 5 20 1000`).
+- Ranking, seed 1000 (5 runs x 20 games, avg score): expectimax_tt 41,216 / nn 36,885 / mcts 29,722 / expectimax 25,267 / ga 24,046 / beam 12,696 / greedy 3,424 / random 1,062.
+- The GA weights are lower than plain expectimax on seed 1000. The +4% above holds only on seeds 500–599. Not a clear win.
