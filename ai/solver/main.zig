@@ -22,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const s = bench.run(init.io, runs, games_per_run, depth, seed);
+    const s = bench.run(init.io, .expectimax, runs, games_per_run, depth, seed);
     std.debug.print("runs={d} games/run={d} depth={d} seed={d} games={d}\n", .{ runs, games_per_run, depth, seed, s.games });
     std.debug.print("avg score={d:.1} avg moves={d:.1} best tile={d}\n", .{ s.avg_score, s.avg_moves, s.best_tile });
     std.debug.print("speed: {d:.2} games/s, {d:.0} moves/s, elapsed {d:.1} s\n", .{

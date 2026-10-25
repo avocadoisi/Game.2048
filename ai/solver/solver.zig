@@ -44,6 +44,47 @@ pub fn bestMove(state: GameState, depth: u8) ?Direction {
     return if (r.len == 0) null else r.items[0].dir;
 }
 
+/// Move-choosing policies compared in the ranking (`zig build ranking`).
+pub const Policy = enum { random, greedy, expectimax };
+
+/// Next move for a policy; null when no move changes the board.
+pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Direction {
+    switch (policy) {
+        .random => {
+            var legal: [4]Direction = undefined;
+            var n: usize = 0;
+            for ([_]Direction{ .up, .left, .down, .right }) |d| {
+                var next = state;
+                if (next.slide(d).changed) {
+                    legal[n] = d;
+                    n += 1;
+                }
+            }
+            if (n == 0) return null;
+            return legal[rng.uintLessThan(usize, n)];
+        },
+        .greedy => {
+            const r = rank(state, .greedy, 0);
+            return if (r.len == 0) null else r.items[0].dir;
+        },
+        .expectimax => return bestMove(state, depth),
+    }
+}
+
+pub fn playPolicy(rng: std.Random, policy: Policy, depth: u8) GameResult {
+    var state = GameState.gameStart(rng);
+    var moves: u32 = 0;
+    while (choose(policy, state, rng, depth)) |d| {
+        _ = state.move(d, rng);
+        moves += 1;
+    }
+    var max_tile: core.Tile = 0;
+    for (state.board) |row| {
+        for (row) |value| max_tile = @max(max_tile, value);
+    }
+    return .{ .score = state.score, .max_tile = max_tile, .moves = moves };
+}
+
 /// Snake path 1..16: row 0 left to right, row 1 right to left, and so on.
 /// The largest tile is expected at the start (top-left).
 const order: [core.BoardCellCount]core.Position = blk: {
@@ -99,18 +140,8 @@ pub const GameResult = struct {
 };
 
 /// Play one full game with the solver until no move changes the board.
-pub fn playGame(rng: anytype, depth: u8) GameResult {
-    var state = GameState.gameStart(rng);
-    var moves: u32 = 0;
-    while (bestMove(state, depth)) |d| {
-        _ = state.move(d, rng);
-        moves += 1;
-    }
-    var max_tile: core.Tile = 0;
-    for (state.board) |row| {
-        for (row) |value| max_tile = @max(max_tile, value);
-    }
-    return .{ .score = state.score, .max_tile = max_tile, .moves = moves };
+pub fn playGame(rng: std.Random, depth: u8) GameResult {
+    return playPolicy(rng, .expectimax, depth);
 }
 
 /// Extra penalty when only `down` is legal: with the top-left corner as the anchor,
@@ -173,6 +204,20 @@ test "bestMove returns null when no move changes the board" {
         .{ 4, 2, 4, 2 },
     } };
     try std.testing.expectEqual(@as(?Direction, null), bestMove(state, 1));
+}
+
+test "random policy only picks legal moves" {
+    const state: GameState = .{ .board = .{
+        .{ 2, 2, 4, 8 },
+        .{ 16, 32, 64, 128 },
+        .{ 256, 512, 1024, 2048 },
+        .{ 4096, 8192, 16384, 32768 },
+    } };
+    var prng = std.Random.DefaultPrng.init(7);
+    for (0..20) |_| {
+        const d = choose(.random, state, prng.random(), 0).?;
+        try std.testing.expect(d == .left or d == .right);
+    }
 }
 
 test "rank lists legal moves best first" {

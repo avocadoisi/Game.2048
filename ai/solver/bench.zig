@@ -18,7 +18,7 @@ pub const Summary = struct {
 };
 
 /// Play `runs * games_per_run` games, one PRNG seed per run (seed, seed+1, ...).
-pub fn run(io: std.Io, runs: u32, games_per_run: u32, depth: u8, seed: u64) Summary {
+pub fn run(io: std.Io, policy: solver.Policy, runs: u32, games_per_run: u32, depth: u8, seed: u64) Summary {
     var total_score: u64 = 0;
     var total_moves: u64 = 0;
     var best_tile: u32 = 0;
@@ -27,7 +27,7 @@ pub fn run(io: std.Io, runs: u32, games_per_run: u32, depth: u8, seed: u64) Summ
     for (0..runs) |r| {
         var prng = std.Random.DefaultPrng.init(seed + r);
         for (0..games_per_run) |_| {
-            const result = solver.playGame(prng.random(), depth);
+            const result = solver.playPolicy(prng.random(), policy, depth);
             total_score += result.score;
             total_moves += result.moves;
             best_tile = @max(best_tile, result.max_tile);
@@ -46,7 +46,7 @@ pub fn run(io: std.Io, runs: u32, games_per_run: u32, depth: u8, seed: u64) Summ
 }
 
 test "run plays the requested number of games and reports timing" {
-    const s = run(std.testing.io, 2, 2, 1, 1);
+    const s = run(std.testing.io, .expectimax, 2, 2, 1, 1);
     try std.testing.expectEqual(@as(u32, 4), s.games);
     try std.testing.expect(s.avg_moves > 0);
     try std.testing.expect(s.elapsed_ns > 0);
