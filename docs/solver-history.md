@@ -309,6 +309,29 @@ Closed after #32 (diagnostic), #33 (replay / backward sweep, PR #48) and #34 (pr
 - Not done: no equal-moves sweep for replay (it reached 92% of base's moves), K/m/alpha not swept, and
   one training seed only. A wider sweep would need several training seeds before it could overturn the
   conclusion.
+## Training parallelization (#35)
+
+Self-play training (`trainGame`) runs in parallel batches. With the opt-in `par` argument the CLI
+takes batches of `N = min(cpu count, 8)` games (clamped to the games left). Game `i` uses seed
+`train_seed + i` and trains its own copy of the batch-start net; the next net is
+`net_start + (1/N) * sum_i (net_after_i - net_start)`, summed in game index order. The sum order is
+fixed, so the weights do not depend on the thread count; the serial path (no `par`) is unchanged.
+`diag` works with `par` (per-game diagnostics are merged into one table).
+
+- Command: `zig build nn -Doptimize=ReleaseFast -- 2000 1 2000 0.003` (serial) vs
+  `zig build nn -Doptimize=ReleaseFast -- 2000 1 2000 0.003 1 par` (parallel), 8 logical CPUs,
+  batches of 8 games, 250 batches. Weights restored with `git checkout -- ai/solver/nn_weights.bin`.
+- Training time: 9.1 s serial, 1.6 s parallel (5.7x). The parallel run applies the lr of the batch
+  start to the whole batch, so it is a slightly different lr schedule from the serial loop.
+- Reproducibility: game `i` must match a serial run of the same games with the same seeds. The unit
+  test `parallel training batch matches a serial run of the same game seeds` (`ai/solver/nn.zig`)
+  runs a 4-game batch on threads and compares the resulting weights byte-for-byte with a serial
+  loop over seeds 77..80 that averages the same per-game nets. `zig build test` passes. Two
+  parallel CLI runs of the command above also write byte-identical weight files.
+- Caveat: the batch average is not the same update as applying the 8 games one after another to a
+  single net; it is the aggregation chosen for determinism. `par` is opt-in, so existing commands
+  and recorded results above keep the serial behaviour.
+
 
 ## Replay and backward sweep (#33)
 
