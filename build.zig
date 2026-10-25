@@ -147,6 +147,9 @@ pub fn build(b: *std.Build) void {
     nn_cmd.addPassthruArgs();
     nn_cmd.step.dependOn(b.getInstallStep());
 
+    const nn_main_tests = b.addTest(.{ .root_module = nn_exe.root_module });
+    const run_nn_main_tests = b.addRunArtifact(nn_main_tests);
+
     const nn_step = b.step("nn", "Train the value MLP (TD(0) self-play) and evaluate it against expectimax depth 2");
     nn_step.dependOn(&nn_cmd.step);
 
@@ -180,6 +183,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_solver_tests.step);
     test_step.dependOn(&run_bench_tests.step);
     test_step.dependOn(&run_nn_tests.step);
+    test_step.dependOn(&run_nn_main_tests.step);
     test_step.dependOn(&run_parallel_tests.step);
     test_step.dependOn(&run_ga_tests.step);
 }

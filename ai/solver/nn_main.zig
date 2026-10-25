@@ -5,7 +5,7 @@ const nn = @import("nn");
 const parallel = @import("parallel");
 
 const usage =
-    \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate] [seed_ranges|diag] [variant|par] [replay_k] [weights_path]
+    \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate] [seed_ranges|diag] [variant|par] [replay_k] [weights_path] [train_seed]
     \\
     \\  train_games   TD(0) self-play games; 0 loads ai/solver/nn_weights.bin (default 2000)
     \\  eval_games    games per seed range per policy, same seeds for every policy (default 100)
@@ -16,17 +16,24 @@ const usage =
     \\  variant       base (default), backward (sweep stored afterstates last to first), replay (re-train the last replay_k),
     \\              priority (#34: 32 extra updates per game sampled from a |TD error| buffer, 50% uniform)
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
-    \\                game i uses seed train_seed + i and the batch result is the mean of its games
+    \\                game i uses seed train_seed + i and the batch result is the mean of its games.
+    \\                par trains the plain per-move variant only: replay_k is ignored, but its
+    \\                slot must be filled to reach weights_path
     \\  replay_k      afterstates re-trained per game for variant replay (default 30)
     \\  weights_path  file to load (train_games 0) or write (default ai/solver/nn_weights.bin); use a temp path for variant runs
+    \\  train_seed    seed for weight init and self-play games (default 1, omitted = same weights as before #56)
     \\
-    \\Training seed is fixed (1). Weights are written to `weights_path` only when
-    \\train_games > 0; train_games = 0 (eval only) never writes.
+    \\Weights are written to `weights_path` only when train_games > 0;
+    \\train_games = 0 (eval only) never writes.
     \\
 ;
 
 const default_weights_path = "ai/solver/nn_weights.bin";
-const train_seed: u64 = 1;
+
+/// Positional arg 9, appended after `weights_path` so existing command lines keep their meaning.
+fn parseTrainSeed(args: []const []const u8) !u64 {
+    return if (args.len > 9) try std.fmt.parseInt(u64, args[9], 10) else 1;
+}
 
 const Eval = struct {
     name: []const u8,
@@ -74,6 +81,7 @@ pub fn main(init: std.process.Init) !void {
     const use_par = std.mem.eql(u8, variant, "par");
     const replay_k: usize = if (args.len > 7) try std.fmt.parseInt(usize, args[7], 10) else 30;
     const weights_path = if (args.len > 8) args[8] else default_weights_path;
+    const train_seed = try parseTrainSeed(args);
     var priority: nn.Priority = .{};
     const opts: nn.Options = if (use_par or std.mem.eql(u8, variant, "base"))
         .{}
@@ -87,8 +95,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}", .{usage});
         return;
     };
-    // par trains the plain per-move variant only, so it takes no variant arguments
-    if (args.len > 9 or (use_par and args.len > 7) or eval_games == 0 or seed_ranges == 0) {
+    if (args.len > 10 or eval_games == 0 or seed_ranges == 0) {
         std.debug.print("{s}", .{usage});
         return;
     }
@@ -199,4 +206,37 @@ pub fn main(init: std.process.Init) !void {
             nn.scorePerSecond(@floatFromInt(r.total_score), r.elapsed_ns),
         });
     }
+}
+
+test "train seed argument is optional and defaults to 1" {
+    const no_args = [_][]const u8{"nn"};
+    try std.testing.expectEqual(@as(u64, 1), try parseTrainSeed(&no_args));
+    const nine_args = [_][]const u8{ "nn", "0", "20", "2000", "0.003", "-", "base", "30", "x.bin" };
+    try std.testing.expectEqual(@as(u64, 1), try parseTrainSeed(&nine_args));
+    const with_seed = [_][]const u8{ "nn", "0", "20", "2000", "0.003", "-", "base", "30", "x.bin", "3" };
+    try std.testing.expectEqual(@as(u64, 3), try parseTrainSeed(&with_seed));
+    try std.testing.expectError(error.InvalidCharacter, parseTrainSeed(&[_][]const u8{ "nn", "0", "20", "2000", "0.003", "-", "base", "30", "x.bin", "x" }));
+}
+
+/// Test-only replica of the serial training setup in `main` (init + game RNG both from the seed).
+fn trainSeedWeights(seed: u64, games: usize) nn.Net {
+    var init_rng = std.Random.DefaultPrng.init(seed);
+    var net = nn.Net.init(init_rng.random());
+    var rng = std.Random.DefaultPrng.init(seed);
+    for (0..games) |_| _ = nn.trainGame(&net, rng.random(), 0.003, null);
+    return net;
+}
+
+test "omitted train seed trains seed 1 and matches the recorded checksum" {
+    const no_args = [_][]const u8{"nn"};
+    const net_default = trainSeedWeights(try parseTrainSeed(&no_args), 5);
+    const net_seed1 = trainSeedWeights(1, 5);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&net_seed1), std.mem.asBytes(&net_default));
+    try std.testing.expectEqual(@as(u32, 4199351724), std.hash.Crc32.hash(std.mem.asBytes(&net_default)));
+}
+
+test "different train seeds produce different weights" {
+    const net1 = trainSeedWeights(1, 5);
+    const net2 = trainSeedWeights(2, 5);
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&net1), std.mem.asBytes(&net2)));
 }
