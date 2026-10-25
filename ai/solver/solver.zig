@@ -24,7 +24,7 @@ pub fn bestMove(state: GameState, depth: u8) ?Direction {
     return best;
 }
 
-/// Cells in the reading order 1..16 (row by row, top-left to bottom-right).
+/// Cells in the reading order 1..16 (row by row, top-left to bottom-right); the top-left is the fixed anchor for the largest tile.
 const order: [core.BoardCellCount]core.Position = blk: {
     var cells: [core.BoardCellCount]core.Position = undefined;
     for (0..core.BoardCellCount) |i| cells[i] = .{ .row = i / core.BoardSize, .col = i % core.BoardSize };
@@ -32,12 +32,12 @@ const order: [core.BoardCellCount]core.Position = blk: {
 };
 
 /// Heuristic: many empty cells, minus a penalty for each adjacent pair in the
-/// reading order where the later cell holds a smaller tile (log2 scale).
+/// reading order where the later cell holds a larger tile (log2 scale).
 /// shortcut: a hand-set order, not learned; replace with an n-tuple table later.
 pub fn evaluate(board: Board) f64 {
     var empties: f64 = 0;
     var penalty: f64 = 0;
-    var prev: f64 = 0;
+    var prev: ?f64 = null;
     for (order) |p| {
         const value = board[p.row][p.col];
         if (value == 0) {
@@ -45,7 +45,7 @@ pub fn evaluate(board: Board) f64 {
             continue;
         }
         const level = @log2(@as(f64, @floatFromInt(value)));
-        penalty += @max(0, prev - level);
+        if (prev) |before| penalty += @max(0, level - before);
         prev = level;
     }
     return empties * 10 - penalty * 10;
@@ -156,7 +156,7 @@ test "evaluateState penalizes a board where only down is legal" {
     try std.testing.expect(evaluateState(forced_down) < evaluate(forced_down.board));
 }
 
-test "evaluate penalizes a smaller tile placed after a larger one in the order" {
+test "evaluate penalizes a larger tile placed after a smaller one in the order" {
     const sorted: Board = .{
         .{ 2, 4, 8, 16 },
         .{ 0, 0, 0, 0 },
@@ -169,10 +169,10 @@ test "evaluate penalizes a smaller tile placed after a larger one in the order" 
         .{ 0, 0, 0, 0 },
         .{ 0, 0, 0, 0 },
     };
-    try std.testing.expect(evaluate(sorted) > evaluate(reversed));
+    try std.testing.expect(evaluate(reversed) > evaluate(sorted));
 }
 
-test "evaluate rewards a large tile at a later position in the order" {
+test "evaluate rewards a large tile at an earlier position in the order" {
     const early: Board = .{
         .{ 64, 2, 0, 0 },
         .{ 0, 0, 0, 0 },
@@ -185,7 +185,7 @@ test "evaluate rewards a large tile at a later position in the order" {
         .{ 0, 0, 0, 0 },
         .{ 0, 0, 2, 64 },
     };
-    try std.testing.expect(evaluate(late) > evaluate(early));
+    try std.testing.expect(evaluate(early) > evaluate(late));
 }
 
 test "evaluate prefers boards with more empty cells" {
