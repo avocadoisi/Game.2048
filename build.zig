@@ -85,6 +85,24 @@ pub fn build(b: *std.Build) void {
     const solve_step = b.step("solve", "Run the solver and report game statistics");
     solve_step.dependOn(&solve_cmd.step);
 
+    const ranking_exe = b.addExecutable(.{
+        .name = "ranking",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("ai/solver/ranking.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "solver", .module = solver_mod },
+            },
+        }),
+    });
+    const ranking_cmd = b.addRunArtifact(ranking_exe);
+    ranking_cmd.addPassthruArgs();
+    ranking_cmd.step.dependOn(b.getInstallStep());
+
+    const ranking_step = b.step("ranking", "Compare policies and print JSON ranking");
+    ranking_step.dependOn(&ranking_cmd.step);
+
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_exe_tests.step);

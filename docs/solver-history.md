@@ -62,3 +62,8 @@ Speed differs run to run (runs were sequential on one machine); treat it as a ro
 - Try merge x10 with a deeper search (depth 3) and a time budget.
 - Try a smaller gap penalty (e.g. x2 or x5) and a down cost below x50 with the same benchmark.
 - Record every new variant in this file with its benchmark line.
+
+## Policy ranking (`zig build ranking`)
+Served at `/api/ranking` from `src/web/ranking.json`. Regenerate with:
+`zig build ranking -Doptimize=ReleaseFast -- 5 20 1000 > src/web/ranking.json`
+(seed 1000 is not used for tuning.) Current result: expectimax (depth 2) 25,267 > greedy 3,424 > random 1,062 (avg score).
