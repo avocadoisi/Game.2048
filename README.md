@@ -105,7 +105,7 @@ zig build run -- help         # 使い方
 `ai/solver/` に置き、`2048.core` の公開 API (`slide` / `move` / `isGameOver` など) だけを使う。core は solver を知らない。
 
 - `solver.bestMove(state, depth)`: expectimax で最良手を返す (`null` は合法手なし)
-- `solver.evaluate(board)`: 空きマス数 + 「左上から行順 (1..16) に並ぶ大小関係」の違反ペナルティ
+- `solver.evaluate(board)`: 空きマス数 + 「左上から行順 (1..16) に大きいタイルが並ぶ」大小関係の違反ペナルティ (左上が最大)
 - `solver.evaluateState(state)`: `evaluate` に「down しか合法手がない盤面」の大きなペナルティを加えた葉の評価
 - `solver.playGame(rng, depth)`: 1 ゲーム分プレイして結果を返す
 
@@ -123,6 +123,11 @@ zig build solve -Doptimize=ReleaseFast -- 100 2 1   # games depth seed
 | 行順 + forced-down 版 (seed 1) | 2 | 18,596 | 1,032 | 4096 | 最大 4096 2 / 100、2048 38 / 100 |
 | 角ボーナス版 (seed 2) | 2 | 7,866 | 524 | 1024 | — |
 | 行順 + forced-down 版 (seed 2) | 2 | 19,812 | 1,087 | 4096 | — |
+| 左上最大 + forced-down 版 (seed 1) | 1 | 3,343 | 265 | 1024 | — |
+| 左上最大 + forced-down 版 (seed 1) | 2 | 19,198 | 1,069 | 4096 | — |
+| 左上最大 + forced-down 版 (seed 2) | 2 | 19,352 | 1,067 | 4096 | — |
+
+左上最大版は、初版で「逆向きは弱い」と出た計測（5,421 / 5,106）が、先頭タイルを誤って罰する不具合によるものだったため、修正後に再計測した値です。
 
 行順評価では depth 1 が角ボーナス版より弱くなります (depth 2 以上で強い)。depth 3 は未計測 (角ボーナス版は 20 games で約 23 秒)。
 
