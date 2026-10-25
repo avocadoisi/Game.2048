@@ -54,7 +54,22 @@ pub fn evaluate(board: Board) f64 {
         if (prev) |before| penalty += @max(0, level - before);
         prev = level;
     }
-    return empties * 10 - penalty * 30;
+    return empties * 10 - penalty * 30 + mergePairs(board) * 10;
+}
+
+/// Count of horizontally or vertically adjacent equal non-empty tiles: more merges available.
+/// shortcut: hand-set weight (x10), tuned with `zig build solve` on fresh seeds.
+fn mergePairs(board: Board) f64 {
+    var n: f64 = 0;
+    for (0..core.BoardSize) |r| {
+        for (0..core.BoardSize) |c| {
+            const v = board[r][c];
+            if (v == 0) continue;
+            if (c + 1 < core.BoardSize and board[r][c + 1] == v) n += 1;
+            if (r + 1 < core.BoardSize and board[r + 1][c] == v) n += 1;
+        }
+    }
+    return n;
 }
 
 pub const GameResult = struct {
@@ -141,12 +156,13 @@ test "bestMove returns null when no move changes the board" {
 }
 
 test "bestMove takes a merge over a move that does nothing" {
-    // only left/right merge the pair; up/down leave the board unchanged
+    // full board: only the top row's 2,2 pair merges left/right; up/down change nothing
+    // (the old board let down move a tile and form a pair, which the merge bonus now rewards)
     const state: GameState = .{ .board = .{
-        .{ 2, 2, 0, 0 },
-        .{ 0, 0, 0, 0 },
-        .{ 0, 0, 0, 0 },
-        .{ 0, 0, 0, 0 },
+        .{ 2, 2, 4, 8 },
+        .{ 16, 32, 64, 128 },
+        .{ 256, 512, 1024, 2048 },
+        .{ 4096, 8192, 16384, 32768 },
     } };
     const move = bestMove(state, 1).?;
     try std.testing.expect(move == .left or move == .right);
@@ -158,6 +174,22 @@ test "order follows the snake path 1..16" {
     try std.testing.expectEqual(core.Position{ .row = 1, .col = 0 }, order[7]);
     try std.testing.expectEqual(core.Position{ .row = 2, .col = 0 }, order[8]);
     try std.testing.expectEqual(core.Position{ .row = 3, .col = 0 }, order[15]);
+}
+
+test "evaluate rewards adjacent equal tiles (merges available)" {
+    const merges: Board = .{
+        .{ 2, 2, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    const apart: Board = .{
+        .{ 2, 0, 2, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    try std.testing.expect(evaluate(merges) > evaluate(apart));
 }
 
 test "evaluateState penalizes a board where only down is legal" {

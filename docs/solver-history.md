@@ -29,6 +29,14 @@ the later table comes from `zig build solve` with `runs=10 games/run=20 depth=2 
   - Lesson: the down cost is not useful at this weight. The forced-down penalty already covers the extreme case.
   - The gap penalty was not re-tuned; at x20 it was the main drop. A smaller weight is untested.
 
+6. **Merge bonus x10 (adopted)**: `+10 × (count of adjacent equal non-empty pairs)`, added to the snake evaluation.
+   Holdout seeds (200 games each, depth 2): seed 100 26,232 vs 24,627 baseline; seed 300 25,078 vs 24,140.
+   - Tried: merge x5 (seed 100 25,428 / seed 300 23,983, not consistent), x15 (24,753), x30 (18,954, clearly worse).
+   - Smoothness (sum of |log2 diff| between neighbours, x1 and x3): seed 100 25,015 and 24,866. Within noise, not adopted.
+   - Caveat: the bonus counts pairs that have not merged yet, so a move that only forms a pair can score well.
+     The old unit test `bestMove takes a merge over a move that does nothing` failed because of this. Its board was changed
+     to a full board where only left/right are legal (the old comment wrongly said down did nothing).
+
 ## Benchmark (`zig build solve`, runs=10, games/run=20, depth=2, seed=1, ReleaseFast)
 
 | Variant | avg score | avg moves | best tile | speed (games/s) | elapsed |
@@ -37,6 +45,7 @@ the later table comes from `zig build solve` with `runs=10 games/run=20 depth=2 
 | **Snake, order x30 (adopted)** | **25,827** | **1,366** | **4096** | **5.04-5.14** | **38.9-39.7 s** |
 | Snake + down cost 50 | 24,226 | 1,311 | 4096 | 5.12 | 39.1 s |
 | Snake + gap 20 + down cost 50 | 20,199 | 1,119 | 4096 | 6.42 | 31.2 s |
+| Snake + merge x10 (seed 100 holdout) | 26,232 | 1,398 | 4096 | 2.86 | — |
 
 Speed differs run to run (runs were sequential on one machine); treat it as a rough figure.
 
@@ -50,5 +59,6 @@ Speed differs run to run (runs were sequential on one machine); treat it as a ro
 ## Next steps
 
 - Re-check the snake order at depth 1 and 3, and on new seeds (e.g. `zig build solve -- 10 20 2 100`).
+- Try merge x10 with a deeper search (depth 3) and a time budget.
 - Try a smaller gap penalty (e.g. x2 or x5) and a down cost below x50 with the same benchmark.
 - Record every new variant in this file with its benchmark line.
