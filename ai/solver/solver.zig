@@ -374,7 +374,7 @@ pub fn evaluateW(board: Board, w: Weights) f64 {
             empties += 1;
             continue;
         }
-        const level = @log2(@as(f64, @floatFromInt(value)));
+        const level: f64 = @floatFromInt(@ctz(value));
         if (prev) |before| penalty += @max(0, level - before);
         prev = level;
     }

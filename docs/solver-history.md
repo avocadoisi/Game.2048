@@ -104,3 +104,18 @@ Speed rule: no policy slower than depth 3 (about 6.8 to 15 s/game depending on m
 - Both are selectable in `/api/solve?algo=ga|nn` and in the UI dropdown (ranking.json regenerated with `zig build ranking -Doptimize=ReleaseFast -- 5 20 1000`).
 - Ranking, seed 1000 (5 runs x 20 games, avg score): expectimax_tt 41,216 / nn 36,885 / mcts 29,722 / expectimax 25,267 / ga 24,046 / beam 12,696 / greedy 3,424 / random 1,062.
 - The GA weights are lower than plain expectimax on seed 1000. The +4% above holds only on seeds 500–599. Not a clear win.
+
+## Speed work (no change in play)
+
+Goal: faster self-play for AI training. Every row below gives identical moves for the same seed
+(checked with `zig build solve -- 2 20 2 1`: avg score 22135.1, avg moves 1219.0).
+
+| Change | speed (games/s, depth 2, 40 games) |
+|---|---|
+| Baseline | 5.4 |
+| `evaluate`: `@log2(value)` -> `@ctz(value)` (tiles are powers of 2, so the result is the same) | 7.3 |
+| `core.mergeLine`: 65536-entry row table, fallback to the general path for non-powers-of-2 or >= 65536 | 8.3 |
+
+- Tried and dropped: precomputed slide index table (`slide_lines`) in `core.slide`. No measurable gain (about 27 ns per slide both ways).
+- Cost of the row table: about 512 KB in the binary, and about 15-20 s extra compile time in ReleaseFast.
+- Remaining cost is mostly the solver (`evaluateState` runs up to 4 slides per call). A bitboard core would be the next big step, but it changes `Board` everywhere.
