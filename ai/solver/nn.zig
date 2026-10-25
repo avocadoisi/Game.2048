@@ -560,3 +560,41 @@ test "default trainGame weights match the recorded checksum (5 games, seeds 11/1
     for (0..5) |_| _ = trainGame(&net, rng.random(), 0.003, null);
     try std.testing.expectEqual(@as(u32, 1621370333), std.hash.Crc32.hash(std.mem.asBytes(&net)));
 }
+
+test "trainGameOpts with default options equals trainGame" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var a = Net.init(init_rng.random());
+    var b = a;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    _ = trainGame(&a, rng_a.random(), 0.003, null);
+    _ = trainGameOpts(&b, rng_b.random(), 0.003, null, .{});
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+}
+
+test "backward sweep changes the weights and keeps the same game" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var base = Net.init(init_rng.random());
+    var back = base;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    const score_a = trainGame(&base, rng_a.random(), 0.003, null);
+    const score_b = trainGameOpts(&back, rng_b.random(), 0.003, null, .{ .backward = true });
+    try std.testing.expectEqual(score_a, score_b);
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&base), std.mem.asBytes(&back)));
+}
+
+test "replay tail changes the weights and K=0 is off" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var base = Net.init(init_rng.random());
+    var replay = base;
+    var off = base;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    var rng_c = std.Random.DefaultPrng.init(12);
+    _ = trainGame(&base, rng_a.random(), 0.003, null);
+    _ = trainGameOpts(&replay, rng_b.random(), 0.003, null, .{ .replay_k = 30 });
+    _ = trainGameOpts(&off, rng_c.random(), 0.003, null, .{ .replay_k = 0 });
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&base), std.mem.asBytes(&replay)));
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&base), std.mem.asBytes(&off));
+}
