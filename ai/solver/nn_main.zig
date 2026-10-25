@@ -4,15 +4,17 @@ const solver = @import("solver");
 const nn = @import("nn");
 
 const usage =
-    \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate] [diag]
+    \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate] [seed_ranges|diag]
     \\
     \\  train_games   TD(0) self-play games; 0 loads ai/solver/nn_weights.bin (default 2000)
-    \\  eval_games    games per policy, same seeds for every policy (default 100)
-    \\  eval_seed     first eval seed; game g uses eval_seed + g (default 1000)
+    \\  eval_games    games per seed range per policy, same seeds for every policy (default 100)
+    \\  eval_seed     first eval seed; range r, game g uses eval_seed + r*eval_games + g (default 1000)
     \\  learning_rate SGD step for TD training (default 0.003)
+    \\  seed_ranges   number of disjoint seed ranges; report mean ± stderr over them (default 1)
     \\  diag          literal "diag": print the TD error / value drop table by empty cells and moves to game over
     \\
-    \\Training seed is fixed (1). Trained weights are written to ai/solver/nn_weights.bin.
+    \\Training seed is fixed (1). Weights are written to ai/solver/nn_weights.bin only when
+    \\train_games > 0; train_games = 0 (eval only) never writes.
     \\
 ;
 
@@ -21,7 +23,7 @@ const train_seed: u64 = 1;
 
 const Eval = struct {
     name: []const u8,
-    avg_score: f64 = 0,
+    range_scores: []f64 = &.{},
     avg_moves: f64 = 0,
     best_tile: core.Tile = 0,
     elapsed_ns: i96 = 0,
@@ -55,8 +57,11 @@ pub fn main(init: std.process.Init) !void {
     const eval_games: u32 = if (args.len > 2) try std.fmt.parseInt(u32, args[2], 10) else 100;
     const eval_seed: u64 = if (args.len > 3) try std.fmt.parseInt(u64, args[3], 10) else 1000;
     const learning_rate: f64 = if (args.len > 4) try std.fmt.parseFloat(f64, args[4]) else 0.003;
-    const want_diag = args.len > 5 and std.mem.eql(u8, args[5], "diag");
-    if (args.len > 6 or (args.len > 5 and !want_diag) or eval_games == 0) {
+    // arg 5 is either the seed-range count or the literal "diag"
+    const arg5: ?[]const u8 = if (args.len > 5) args[5] else null;
+    const want_diag = arg5 != null and std.mem.eql(u8, arg5.?, "diag");
+    const seed_ranges: u32 = if (arg5) |a| (if (want_diag) 1 else try std.fmt.parseInt(u32, a, 10)) else 1;
+    if (args.len > 6 or eval_games == 0 or seed_ranges == 0) {
         std.debug.print("{s}", .{usage});
         return;
     }
@@ -98,32 +103,40 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "expectimax depth 2" },
     };
     for (&results, 0..) |*r, idx| {
-        var total_score: u64 = 0;
+        r.range_scores = try init.arena.allocator().alloc(f64, seed_ranges);
         var total_moves: u64 = 0;
         const start = std.Io.Clock.awake.now(init.io);
-        for (0..eval_games) |g| {
-            var prng = std.Random.DefaultPrng.init(eval_seed + g);
-            const res = switch (idx) {
-                0 => nn.play(&net, prng.random(), .greedy),
-                1 => nn.play(&net, prng.random(), .chance),
-                else => blk: {
-                    const b = solver.playPolicy(prng.random(), .expectimax, 2);
-                    break :blk nn.PlayResult{ .score = b.score, .max_tile = b.max_tile, .moves = b.moves };
-                },
-            };
-            total_score += res.score;
-            total_moves += res.moves;
-            r.best_tile = @max(r.best_tile, res.max_tile);
+        for (0..seed_ranges) |range| {
+            var total_score: u64 = 0;
+            for (0..eval_games) |g| {
+                var prng = std.Random.DefaultPrng.init(eval_seed + range * eval_games + g);
+                const res = switch (idx) {
+                    0 => nn.play(&net, prng.random(), .greedy),
+                    1 => nn.play(&net, prng.random(), .chance),
+                    else => blk: {
+                        const b = solver.playPolicy(prng.random(), .expectimax, 2);
+                        break :blk nn.PlayResult{ .score = b.score, .max_tile = b.max_tile, .moves = b.moves };
+                    },
+                };
+                total_score += res.score;
+                total_moves += res.moves;
+                r.best_tile = @max(r.best_tile, res.max_tile);
+            }
+            r.range_scores[range] = @as(f64, @floatFromInt(total_score)) / @as(f64, @floatFromInt(eval_games));
         }
         r.elapsed_ns = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
-        r.avg_score = @as(f64, @floatFromInt(total_score)) / @as(f64, @floatFromInt(eval_games));
-        r.avg_moves = @as(f64, @floatFromInt(total_moves)) / @as(f64, @floatFromInt(eval_games));
+        const n: f64 = @floatFromInt(eval_games * seed_ranges);
+        r.avg_moves = @as(f64, @floatFromInt(total_moves)) / n;
     }
-    std.debug.print("eval: games={d} seeds={d}..{d}\n", .{ eval_games, eval_seed, eval_seed + eval_games - 1 });
+    const last_seed = eval_seed + seed_ranges * eval_games - 1;
+    std.debug.print("eval: games={d}/range ranges={d} seeds={d}..{d}\n", .{ eval_games, seed_ranges, eval_seed, last_seed });
     for (results) |r| {
-        std.debug.print("{s}: avg score={d:.1} avg moves={d:.1} best tile={d} elapsed={d:.1} s\n", .{
+        const st = nn.meanStderr(r.range_scores);
+        std.debug.print("{s}: avg score={d:.1} ± {d:.1} (stderr over {d} ranges) avg moves={d:.1} best tile={d} elapsed={d:.1} s\n", .{
             r.name,
-            r.avg_score,
+            st.mean,
+            st.stderr,
+            seed_ranges,
             r.avg_moves,
             r.best_tile,
             @as(f64, @floatFromInt(r.elapsed_ns)) / 1e9,

@@ -453,6 +453,34 @@ test "trainGame is deterministic for a fixed seed" {
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
 }
 
+/// Mean and standard error (sample sd / sqrt(n)) of per-seed-range averages.
+pub const MeanErr = struct { mean: f64, stderr: f64 };
+
+pub fn meanStderr(xs: []const f64) MeanErr {
+    const n: f64 = @floatFromInt(xs.len);
+    var sum: f64 = 0;
+    for (xs) |x| sum += x;
+    const mean = sum / n;
+    if (xs.len < 2) return .{ .mean = mean, .stderr = 0 };
+    var ss: f64 = 0;
+    for (xs) |x| ss += (x - mean) * (x - mean);
+    return .{ .mean = mean, .stderr = @sqrt(ss / (n - 1) / n) };
+}
+
+test "meanStderr gives mean and sample standard error" {
+    const xs = [_]f64{ 2, 4, 4, 4, 5, 5, 7, 9 };
+    const r = meanStderr(&xs);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), r.mean, 1e-12);
+    // sample variance = 32 / 7, stderr = sqrt(32/7) / sqrt(8)
+    try std.testing.expectApproxEqAbs(@sqrt(32.0 / 7.0) / @sqrt(8.0), r.stderr, 1e-12);
+}
+
+test "meanStderr of one value has zero stderr" {
+    const r = meanStderr(&[_]f64{3});
+    try std.testing.expectApproxEqAbs(@as(f64, 3), r.mean, 1e-12);
+    try std.testing.expectEqual(@as(f64, 0), r.stderr);
+}
+
 test "weight file header round trips" {
     var prng = std.Random.DefaultPrng.init(21);
     const net = Net.init(prng.random());
