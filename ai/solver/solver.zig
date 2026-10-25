@@ -74,7 +74,7 @@ pub fn bestMoveW(state: GameState, depth: u8, w: Weights) ?Direction {
 }
 
 /// Move-choosing policies compared in the ranking (`zig build ranking`).
-pub const Policy = enum { random, greedy, expectimax, mcts, beam, expectimax_tt, ga, nn };
+pub const Policy = enum { random, greedy, expectimax, mcts, beam, expectimax_tt, ga, nn, nn2 };
 
 /// Weights evolved by `zig build ga-rl` (holdout +4%, see docs/solver-history.md). 3 decimals as printed.
 pub const ga_weights: Weights = .{ .empty = 7.028, .order_penalty = 43.174, .merge = 0, .forced_down = 0 };
@@ -110,6 +110,11 @@ pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Dir
         .nn => {
             const net = nn.parse(nn_weight_bytes) catch unreachable;
             return nn.bestMove(&net, state, .chance);
+        },
+        // shortcut: same per-move net copy as `nn`; the 2-ply search itself dominates the cost.
+        .nn2 => {
+            const net = nn.parse(nn_weight_bytes) catch unreachable;
+            return nn.bestMove(&net, state, .deep);
         },
     }
 }

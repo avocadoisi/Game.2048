@@ -118,13 +118,38 @@ pub const offsets = blk: {
     break :blk off;
 };
 
+/// Table set: `.light` drops the 2x3 6-tuple, which holds 16/17 of the raw table.
+pub const Set = enum { full, light };
+
+pub const light_count = pattern_count - 1;
+
+fn entriesOf(n: usize) usize {
+    var entries: usize = 0;
+    for (0..n) |p| entries += tableLen(p);
+    return entries;
+}
+
+pub fn entryCount(set: Set) usize {
+    return entriesOf(if (set == .light) light_count else pattern_count);
+}
+
 pub const TupleNet = struct {
     storage: []f32,
+    /// Number of active patterns (a prefix of `patterns`); `.light` stops before the 6-tuple.
+    count: usize,
 
     pub fn init(gpa: std.mem.Allocator) !TupleNet {
-        const storage = try gpa.alloc(f32, total_entries);
+        return initWith(gpa, .full);
+    }
+
+    pub fn initWith(gpa: std.mem.Allocator, set: Set) !TupleNet {
+        return initCount(gpa, if (set == .light) light_count else pattern_count);
+    }
+
+    fn initCount(gpa: std.mem.Allocator, n: usize) !TupleNet {
+        const storage = try gpa.alloc(f32, entriesOf(n));
         @memset(storage, 0);
-        return .{ .storage = storage };
+        return .{ .storage = storage, .count = n };
     }
 
     pub fn deinit(self: *TupleNet, gpa: std.mem.Allocator) void {
@@ -137,7 +162,7 @@ pub const TupleNet = struct {
 
     pub fn value(self: *const TupleNet, idx: Indices) f64 {
         var v: f64 = 0;
-        for (0..pattern_count) |p| v += self.storage[offsets[p] + idx[p]];
+        for (0..self.count) |p| v += self.storage[offsets[p] + idx[p]];
         return v;
     }
 
@@ -148,8 +173,8 @@ pub const TupleNet = struct {
     /// TD step: move every touched entry by `lr * (target - V) / n_tuples`; returns the TD error.
     pub fn train(self: *TupleNet, idx: Indices, target: f64, lr: f64) f64 {
         const delta = target - self.value(idx);
-        const step: f32 = @floatCast(lr * delta / @as(f64, pattern_count));
-        for (0..pattern_count) |p| self.storage[offsets[p] + idx[p]] += step;
+        const step: f32 = @floatCast(lr * delta / @as(f64, @floatFromInt(self.count)));
+        for (0..self.count) |p| self.storage[offsets[p] + idx[p]] += step;
         return delta;
     }
 };
@@ -158,17 +183,20 @@ pub const file_magic = "2048-NT\x00";
 pub const file_version: u32 = 1;
 const endian_marker: u32 = 0x01020304;
 const header_len: usize = 8 + 4 + 4 + 4;
-pub const file_len = header_len + pattern_count * 4 + total_entries * 4;
+/// File length for `n` tables; `.full` is `fileLen(pattern_count)`.
+pub fn fileLen(n: usize) usize {
+    return header_len + n * 4 + entriesOf(n) * 4;
+}
 
 /// File: magic, version, endianness marker, pattern count, per-table lengths (u32 LE), then f32 LE payload.
 pub fn encode(gpa: std.mem.Allocator, net: *const TupleNet) ![]u8 {
-    const bytes = try gpa.alloc(u8, file_len);
+    const bytes = try gpa.alloc(u8, fileLen(net.count));
     @memcpy(bytes[0..8], file_magic);
     std.mem.writeInt(u32, bytes[8..12], file_version, .little);
     std.mem.writeInt(u32, bytes[12..16], endian_marker, .little);
-    std.mem.writeInt(u32, bytes[16..20], pattern_count, .little);
+    std.mem.writeInt(u32, bytes[16..20], @intCast(net.count), .little);
     var pos = header_len;
-    for (patterns, 0..) |_, p| {
+    for (0..net.count) |p| {
         std.mem.writeInt(u32, bytes[pos..][0..4], @intCast(tableLen(p)), .little);
         pos += 4;
     }
@@ -180,17 +208,19 @@ pub fn encode(gpa: std.mem.Allocator, net: *const TupleNet) ![]u8 {
 }
 
 pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !TupleNet {
-    if (bytes.len != file_len) return error.WrongTableFileSize;
+    if (bytes.len < header_len) return error.WrongTableFileSize;
     if (!std.mem.eql(u8, bytes[0..8], file_magic)) return error.BadTableMagic;
     if (std.mem.readInt(u32, bytes[8..12], .little) != file_version) return error.UnsupportedTableVersion;
     if (std.mem.readInt(u32, bytes[12..16], .little) != endian_marker) return error.WrongTableEndianness;
-    if (std.mem.readInt(u32, bytes[16..20], .little) != pattern_count) return error.WrongPatternCount;
+    const n: usize = std.mem.readInt(u32, bytes[16..20], .little);
+    if (n == 0 or n > pattern_count) return error.WrongPatternCount;
+    if (bytes.len != fileLen(n)) return error.WrongTableFileSize;
     var pos = header_len;
-    for (patterns, 0..) |_, p| {
+    for (0..n) |p| {
         if (std.mem.readInt(u32, bytes[pos..][0..4], .little) != tableLen(p)) return error.WrongTableLength;
         pos += 4;
     }
-    var net = try TupleNet.init(gpa);
+    var net = try TupleNet.initCount(gpa, n);
     errdefer net.deinit(gpa);
     for (net.storage) |*w| {
         w.* = @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little));
@@ -206,16 +236,42 @@ pub fn save(net: *const TupleNet, io: std.Io, gpa: std.mem.Allocator, path: []co
 }
 
 pub fn load(net: *TupleNet, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(file_len + 1));
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(fileLen(pattern_count) + 1));
     defer gpa.free(bytes);
     var parsed = try parse(gpa, bytes);
     defer parsed.deinit(gpa);
     @memcpy(net.storage, parsed.storage);
 }
 
-pub const Mode = enum { greedy, chance };
+pub const Mode = enum {
+    /// 1-ply over afterstates: argmax of reward + V(afterstate).
+    greedy,
+    /// greedy plus one spawn of chance-node lookahead.
+    chance,
+    /// 2-ply: one more own move and spawn layer below `chance`.
+    deep,
+};
 
-pub const PlayResult = struct { score: u32, max_tile: core.Tile, moves: u32 };
+/// Runner variant: policy mode, table set, and whether to load `table_path` before training.
+pub const Variant = struct { mode: Mode = .greedy, set: Set = .full, resume_from_file: bool = false };
+
+pub fn parseVariant(name: []const u8) ?Variant {
+    if (std.mem.eql(u8, name, "base")) return .{};
+    if (std.mem.eql(u8, name, "chance")) return .{ .mode = .chance };
+    if (std.mem.eql(u8, name, "deep")) return .{ .mode = .deep };
+    if (std.mem.eql(u8, name, "light")) return .{ .set = .light };
+    if (std.mem.eql(u8, name, "lightdeep")) return .{ .mode = .deep, .set = .light };
+    if (std.mem.eql(u8, name, "resume")) return .{ .resume_from_file = true };
+    return null;
+}
+
+pub const PlayResult = struct {
+    score: u32,
+    max_tile: core.Tile,
+    moves: u32,
+    /// `net.eval` leaf calls summed over the game (0 for modes that do not search).
+    leaves: u64 = 0,
+};
 pub const GameResult = struct { score: u32, moves: u32 };
 
 /// Afterstate chosen by a policy, with its scaled reward, cached indices and value estimate.
@@ -288,22 +344,108 @@ fn chanceMove(net: *const TupleNet, state: core.GameState) ?Pick {
     return best;
 }
 
-fn chooseMove(net: *const TupleNet, state: core.GameState, mode: Mode) ?Pick {
+/// Search counters for one move: afterstate evaluations (`net.eval` calls).
+pub const Stats = struct { leaves: u64 = 0 };
+
+/// Depth-limited expectimax over the tables: our moves and every spawn (2 at 0.9, 4 at 0.1) exactly.
+const Search = struct {
+    net: *const TupleNet,
+    stats: Stats = .{},
+
+    /// Max over legal moves of reward + expected value after the spawn; 0 when no move changes the board.
+    fn value(self: *Search, state: core.GameState, depth: u8) f64 {
+        var best: f64 = -std.math.inf(f64);
+        for ([_]core.Direction{ .up, .left, .down, .right }) |d| {
+            var next = state;
+            const moved = next.slide(d);
+            if (!moved.changed) continue;
+            const v = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale + self.chance(next, depth - 1);
+            best = @max(best, v);
+        }
+        return if (best == -std.math.inf(f64)) 0 else best;
+    }
+
+    /// Expected value of a post-move board after spawning; depth 0 is the value leaf (the afterstate itself).
+    fn chance(self: *Search, state: core.GameState, depth: u8) f64 {
+        if (depth == 0) {
+            self.stats.leaves += 1;
+            return self.net.eval(state.board);
+        }
+        var total: f64 = 0;
+        var empties: f64 = 0;
+        for (0..core.BoardSize) |r| {
+            for (0..core.BoardSize) |c| {
+                if (state.board[r][c] != 0) continue;
+                empties += 1;
+                for ([_]struct { value: core.Tile, p: f64 }{ .{ .value = 2, .p = 0.9 }, .{ .value = 4, .p = 0.1 } }) |spawn| {
+                    var child = state;
+                    child.board[r][c] = spawn.value;
+                    total += spawn.p * self.value(child, depth);
+                }
+            }
+        }
+        return if (empties == 0) self.value(state, depth) else total / empties;
+    }
+};
+
+/// 2-ply: my move -> spawn -> my move -> spawn -> afterstate value + score_delta/reward_scale.
+fn deepMove(net: *const TupleNet, state: core.GameState, stats: *Stats) ?Pick {
+    var search: Search = .{ .net = net };
+    defer stats.* = search.stats;
+    var best: ?Pick = null;
+    var best_value: f64 = -std.math.inf(f64);
+    for ([_]core.Direction{ .up, .left, .down, .right }) |d| {
+        var next = state;
+        const moved = next.slide(d);
+        if (!moved.changed) continue;
+        const v = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale + search.chance(next, 2);
+        if (best == null or v > best_value) {
+            const idx = indices(next.board);
+            best = .{
+                .dir = d,
+                .idx = idx,
+                .reward = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale,
+                .value = net.value(idx),
+            };
+            best_value = v;
+        }
+    }
+    return best;
+}
+
+fn chooseMove(net: *const TupleNet, state: core.GameState, mode: Mode, stats: *Stats) ?Pick {
     return switch (mode) {
         .greedy => pickMove(net, state),
         .chance => chanceMove(net, state),
+        .deep => deepMove(net, state, stats),
     };
 }
 
 pub fn bestMove(net: *const TupleNet, state: core.GameState, mode: Mode) ?core.Direction {
-    return if (chooseMove(net, state, mode)) |p| p.dir else null;
+    var stats: Stats = .{};
+    return bestMoveWithStats(net, state, mode, &stats);
+}
+
+/// `bestMove` plus search counters (`leaves` is 0 for modes that do not search).
+pub fn bestMoveWithStats(net: *const TupleNet, state: core.GameState, mode: Mode, stats: *Stats) ?core.Direction {
+    stats.* = .{};
+    return if (chooseMove(net, state, mode, stats)) |p| p.dir else null;
 }
 
 /// Play one game to game over with the table policy.
 pub fn play(net: *const TupleNet, rng: std.Random, mode: Mode) PlayResult {
+    var stats: Stats = .{};
+    return playWithStats(net, rng, mode, &stats);
+}
+
+pub fn playWithStats(net: *const TupleNet, rng: std.Random, mode: Mode, stats: *Stats) PlayResult {
     var state = core.GameState.gameStart(rng);
     var moves: u32 = 0;
-    while (chooseMove(net, state, mode)) |pick| {
+    var move_stats: Stats = .{};
+    while (true) {
+        move_stats = .{};
+        const pick = chooseMove(net, state, mode, &move_stats) orelse break;
+        stats.leaves += move_stats.leaves;
         _ = state.move(pick.dir, rng);
         moves += 1;
     }
@@ -311,7 +453,7 @@ pub fn play(net: *const TupleNet, rng: std.Random, mode: Mode) PlayResult {
     for (state.board) |row| for (row) |value| {
         max_tile = @max(max_tile, value);
     };
-    return .{ .score = state.score, .max_tile = max_tile, .moves = moves };
+    return .{ .score = state.score, .max_tile = max_tile, .moves = moves, .leaves = stats.leaves };
 }
 
 /// TD(0) on afterstates over one self-play game.
@@ -319,7 +461,8 @@ pub fn trainGame(net: *TupleNet, rng: std.Random, lr: f64, mode: Mode) GameResul
     var state = core.GameState.gameStart(rng);
     var pending: ?Pick = null;
     var moves: u32 = 0;
-    while (chooseMove(net, state, mode)) |pick| {
+    var stats: Stats = .{};
+    while (chooseMove(net, state, mode, &stats)) |pick| {
         moves += 1;
         if (pending) |p| _ = net.train(p.idx, p.reward + pick.value, lr);
         pending = pick;
@@ -433,4 +576,111 @@ test "training is deterministic for a fixed seed" {
     _ = trainGame(&a, rng_a.random(), 0.01, .greedy);
     _ = trainGame(&b, rng_b.random(), 0.01, .greedy);
     try std.testing.expectEqualSlices(f32, a.storage, b.storage);
+}
+
+test "deep returns only legal moves and null on a dead board" {
+    var net = try testNet();
+    defer net.deinit(std.testing.allocator);
+    const dead: Board = .{
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+    };
+    try std.testing.expectEqual(@as(?core.Direction, null), bestMove(&net, .{ .board = dead }, .deep));
+    var state: core.GameState = .{ .board = sample_board };
+    try std.testing.expect(state.slide(bestMove(&net, state, .deep).?).changed);
+}
+
+test "deep is deterministic and counts leaf evaluations" {
+    var net = try testNet();
+    defer net.deinit(std.testing.allocator);
+    const state: core.GameState = .{ .board = sample_board };
+    var a: Stats = .{};
+    var b: Stats = .{};
+    const first = bestMoveWithStats(&net, state, .deep, &a);
+    const second = bestMoveWithStats(&net, state, .deep, &b);
+    try std.testing.expect(first != null);
+    try std.testing.expectEqual(first, second);
+    try std.testing.expect(a.leaves > 0);
+    try std.testing.expectEqual(a.leaves, b.leaves);
+}
+
+test "light tables keep the five base tuples and drop the 6-tuple" {
+    try std.testing.expectEqual(@as(usize, 5), light_count);
+    try std.testing.expectEqual(@as(usize, 5 * 65536), entryCount(.light));
+    try std.testing.expectEqual(total_entries, entryCount(.full));
+    try std.testing.expect(fileLen(light_count) * 17 <= fileLen(pattern_count) * 1);
+
+    var light = try TupleNet.initWith(std.testing.allocator, .light);
+    defer light.deinit(std.testing.allocator);
+    try std.testing.expectEqual(light_count, light.count);
+    try std.testing.expectEqual(entryCount(.light), light.storage.len);
+
+    const idx = indices(sample_board);
+    var expected: f64 = 0;
+    for (0..light_count) |p| {
+        light.storage[offsets[p] + idx[p]] = 0.5;
+        expected += 0.5;
+    }
+    try std.testing.expectEqual(expected, light.value(idx));
+}
+
+test "light table file round-trips with its own pattern count" {
+    var light = try TupleNet.initWith(std.testing.allocator, .light);
+    defer light.deinit(std.testing.allocator);
+    const idx = indices(sample_board);
+    for (0..light_count) |p| light.storage[offsets[p] + idx[p]] = @floatCast(@as(f64, @floatFromInt(p)) + 0.5);
+
+    const bytes = try encode(std.testing.allocator, &light);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqual(fileLen(light_count), bytes.len);
+    var back = try parse(std.testing.allocator, bytes);
+    defer back.deinit(std.testing.allocator);
+    try std.testing.expectEqual(light_count, back.count);
+    try std.testing.expectEqualSlices(f32, light.storage, back.storage);
+}
+
+test "resume keeps learned values instead of reinitialising the table" {
+    var net = try testNet();
+    defer net.deinit(std.testing.allocator);
+    var rng = std.Random.DefaultPrng.init(4);
+    _ = trainGame(&net, rng.random(), 0.05, .greedy);
+
+    var trained = false;
+    for (net.storage) |w| {
+        if (w != 0) trained = true;
+    }
+    try std.testing.expect(trained);
+
+    const bytes = try encode(std.testing.allocator, &net);
+    defer std.testing.allocator.free(bytes);
+
+    var fresh = try testNet();
+    defer fresh.deinit(std.testing.allocator);
+    var resumed = try testNet();
+    defer resumed.deinit(std.testing.allocator);
+    var parsed = try parse(std.testing.allocator, bytes);
+    defer parsed.deinit(std.testing.allocator);
+    @memcpy(resumed.storage, parsed.storage);
+    try std.testing.expectEqualSlices(f32, net.storage, resumed.storage);
+    try std.testing.expect(!std.mem.eql(f32, fresh.storage, resumed.storage));
+
+    const before = try std.testing.allocator.dupe(f32, resumed.storage);
+    defer std.testing.allocator.free(before);
+    const idx = indices(sample_board);
+    _ = resumed.train(idx, 1.0, 0.05);
+    try std.testing.expect(!std.mem.eql(f32, before, resumed.storage));
+}
+
+test "variant names select the mode, the table set and resume" {
+    try std.testing.expectEqual(Variant{}, parseVariant("base").?);
+    try std.testing.expectEqual(Mode.chance, parseVariant("chance").?.mode);
+    try std.testing.expectEqual(Mode.deep, parseVariant("deep").?.mode);
+    try std.testing.expectEqual(Set.light, parseVariant("light").?.set);
+    const lightdeep = parseVariant("lightdeep").?;
+    try std.testing.expectEqual(Mode.deep, lightdeep.mode);
+    try std.testing.expectEqual(Set.light, lightdeep.set);
+    try std.testing.expect(parseVariant("resume").?.resume_from_file);
+    try std.testing.expectEqual(@as(?Variant, null), parseVariant("lightresume"));
 }

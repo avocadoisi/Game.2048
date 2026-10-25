@@ -523,3 +523,24 @@ Serial training runs with the initial lr 0.01 (linear decay to 10%), training se
 - Reading: still climbing steeply at 1M games and about 60 games/s, but the level is far below the MLP (`nn` 72,205 with 2-ply). The classic n-tuple result needs tens of millions of games plus a much lower per-sample lr; at this scale the MLP is simply better per unit time.
 - Table size: 68.4 MB raw, 106 KB gzipped at 200 games and 183 KB at 2,000 games, so a sparse/gzip payload is fine for static hosting as long as the six-tuple stays (it dominates the raw size).
 - Verdict: not adopted as a policy yet. Follow-ups tracked in #73: 2-ply search on the n-tuple leaf, a `light` table set (5 four-tuples, 1/17 the raw size) and training resume so long sweeps are possible.
+
+## Deeper search: nn2 (2-ply) (#69)
+
+The `nn` policy is "1-ply + one spawn lookahead". Every extra ply is expensive (branching 4 moves x ~6 empty cells x 2 tile values), but the MLP's afterstate value is cheap enough to afford one more level, so the question was simply how much score one more ply buys.
+
+Mechanism: `nn.Mode.deep` — my move -> exact spawn over all empty cells x {2, 4} (4 with p = 0.1) -> my move -> spawn -> leaf = afterstate value + score_delta / reward_scale. Deterministic (no RNG), with a bounded value cache, exposed as `solver.Policy.nn2` (ranking depth 2) and therefore selectable via `/api/solve?algo=nn2`. `nn` is unchanged and remains the default; the recorded-checksum test is untouched.
+
+Comparison with the committed weights (200,000 + 40,000 games), eval ranges 2000, 3000, 4000, 5000, 6000 (20 games each), ReleaseFast:
+
+| range | nn (1-ply + spawn) | nn2 (2-ply) | ms/move nn | ms/move nn2 |
+|---|---|---|---|---|
+| 2000 | 64,052 | 72,220 | 0.10 | 0.97 |
+| 3000 | 64,231 | 73,277 | 0.10 | 1.07 |
+| 4000 | 62,665 | 72,320 | 0.10 | 0.81 |
+| 5000 | 63,276 | 73,410 | 0.04 | 0.47 |
+| 6000 | 67,640 | 69,797 | 0.05 | 0.48 |
+| **mean** | **64,373** | **72,205** | **0.08** | **0.76** |
+
+- Reading: +7,832 (+12.2%) for about 10x the time per move. Absolute cost is still under 1 ms per move and ~1,200 leaves per move, so it is affordable in the browser; expectimax depth 2, for comparison, needs 0.04-0.08 ms/move and scores ~22-25k.
+- Verdict: adopted as an extra policy (`nn2`); `nn` stays the default for speed, `nn2` is the quality option. `ranking.json` is regenerated separately once all pending policy changes land.
+- Cost: 5 x 20 games, 63 s per range for nn2.
