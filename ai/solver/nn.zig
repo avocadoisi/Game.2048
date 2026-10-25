@@ -530,3 +530,20 @@ test "Diag push and finish bucket each step by moves to game over" {
     try std.testing.expectEqual(@as(u64, 5), diag.stats[0][2].count);
     try std.testing.expectApproxEqAbs(@as(f64, 35), diag.stats[0][0].abs_err + diag.stats[0][1].abs_err + diag.stats[0][2].abs_err, 1e-12);
 }
+
+test "trainGame with diagnostic gives the same weights and records steps" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var a = Net.init(init_rng.random());
+    var b = a;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    var diag: Diag = .{};
+    _ = trainGame(&a, rng_a.random(), 0.001, null);
+    _ = trainGame(&b, rng_b.random(), 0.001, &diag);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+    var total: u64 = 0;
+    for (diag.stats) |row| for (row) |s| {
+        total += s.count;
+    };
+    try std.testing.expect(total > 0);
+}
