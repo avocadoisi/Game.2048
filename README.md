@@ -93,7 +93,7 @@ zig build run -- help         # 使い方
 ```
 
 - `play`: `w/a/s/d` または `up/left/down/right` で移動、`n` でリセット、`q` で終了
-- `serve`: `http://127.0.0.1:8080/` を開くと矢印キー/WASD で遊べる
+- `serve`: `http://127.0.0.1:8080/` を開くと矢印キー/WASD で遊べる (日本語 IME が有効なままでも操作できる)
   - `GET /api/state`, `POST /api/new`, `POST /api/move?dir=up|left|down|right`
   - `GET /api/ranking`: ポリシーの比較結果 (`src/web/ranking.json`) を返す
   - `GET /api/solve?depth=N&algo=<policy>`: solver の次の一手を返す (盤面は変えない)。`algo` は `random` / `greedy` / `expectimax` (既定) / `mcts` / `beam` / `expectimax_tt` / `ga` / `nn`。`depth` の既定は 2。レスポンスは `{"algo","depth","dir","ranking"}` で、`dir` は合法手なしのとき `null`、`ranking` は `expectimax` / `greedy` のときだけ各手の評価が入り、それ以外は空配列
