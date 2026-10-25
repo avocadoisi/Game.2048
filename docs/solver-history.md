@@ -397,3 +397,25 @@ Per training seed (mean of the 5 eval ranges):
 - The spread across training seeds (base 17.8k-20.4k, priority 17.1k-22.4k) is about 1.5x the difference between variants, which is why one seed could not decide it. Base seed 1 reproduces #34 (19,611 vs 18,677, both inside one stderr).
 - Cost: 10 training runs of 20,000 games, 300-410 s each on 8 cores (serial). `par` reaches 2,000 games in 1.5 s against 8.6 s serial, but it cannot run the variant path, so these runs are slow by construction. `par` now also accepts `weights_path`, so a parallel run no longer has to overwrite the committed `ai/solver/nn_weights.bin`.
 - Caveats: still 5 training seeds and 100 eval games per variant; m=32 and α=0.5 were not swept.
+
+## Mid-game focus (#59)
+
+#32 put 52.6% of the total TD error in the "4..7 empty cells, earlier move" bucket and only 7.9% in the last 10 moves before game over, so the next candidate was to sample the extra post-game updates from that mid-game bucket instead of the near-loss one.
+
+Mechanism: `Options.midgame` (CLI variant `midgame`). Same shape as `priority` — the per-move TD(0) update is untouched, the ring buffer (1024 entries) is reused, and after each game `m = 32` extra updates are drawn **uniformly from the entries with 4..7 empty cells** (falling back to the whole buffer while that bucket is empty), with the target recomputed from the current weights. Default off; the default path is pinned by the recorded-checksum test (base weights byte-identical, `md5 0a8e6bf01e256adf2fc481317c5072c9` at 2000 games before and after).
+
+Protocol identical to #56: train each variant for 20000 games at 5 training seeds, evaluate on the fixed seed ranges 2000, 3000, 4000, 5000, 6000 (20 games each), nn 1-ply average score. Base column is the #56 measurement re-evaluated with the same binary.
+
+| training seed | base | midgame | delta |
+|---|---|---|---|
+| 1 | 19,611 | 13,311 | -6,300 |
+| 2 | 18,011 | 21,087 | +3,076 |
+| 3 | 17,870 | 18,056 | +186 |
+| 4 | 20,431 | 15,700 | -4,731 |
+| 5 | 17,846 | 17,488 | -358 |
+| **mean ± stderr (n=5)** | **18,754 ± 534** | **17,128 ± 1,290** | **-1,625 ± 1,710** (t = -1.0) |
+
+- Reading: no gain, and the spread is much wider than base (13.3k-21.1k against 17.8k-20.4k). Two seeds lose 6.3k and 4.7k, which is the same failure mode as `replay` (#33): replacing the uniform sample with a narrow bucket takes fit away from the rest of the state distribution.
+- Verdict: `midgame` stays opt-in and off by default. The error-share argument (#32) says where the error is, not that concentrating updates there helps — the last three attempts (`replay`, `priority`, `midgame`) all point the same way.
+- Next candidates, in order of expected value: mix the mid-game bucket with a uniform share (the shape that came closest in #34), more training games at the same protocol, and an lr sweep.
+- Cost: 5 training runs, 145-358 s each (serial; `par` still cannot run variant paths).
