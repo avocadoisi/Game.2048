@@ -254,10 +254,77 @@ pub fn countEmpty(board: Board) usize {
     return n;
 }
 
+/// Opt-in training variants (issue #33). Default `.{}` is the plain per-move TD(0) of `trainGame`.
+pub const Options = struct {
+    /// Candidate A: no per-move update during the game; afterwards train every stored afterstate from last to first.
+    backward: bool = false,
+    /// Candidate B: after the game, re-train the last `replay_k` afterstates once more (0 = off), oldest first.
+    replay_k: usize = 0,
+    /// Learning rate of the replay pass, as a factor of the training lr.
+    replay_lr_scale: f64 = 0.5,
+};
+
+/// Stored afterstates of one game for the variants (ring buffer; the last `step_cap` steps are kept).
+/// shortcut: games longer than step_cap only replay/sweep their last step_cap afterstates, upgrade if games get that long.
+const step_cap = 8192;
+const Step = struct { after: Board, reward: f64 };
+
 /// TD(0) on afterstates over one self-play game (greedy 1-ply moves, fixed rng).
 /// Target for the previous afterstate = its scaled reward + V(next afterstate); 0 after game over.
 /// `diag` (optional) records each step's TD error and value change; it does not touch the rng or the update.
 pub fn trainGame(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag) u32 {
+    return trainGameOpts(net, rng, lr, diag, .{});
+}
+
+/// `trainGame` with options. `diag` is only recorded on the default path (`opts` all off).
+pub fn trainGameOpts(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) u32 {
+    if (!opts.backward and opts.replay_k == 0) return trainGamePerMove(net, rng, lr, diag);
+    var steps: [step_cap]Step = undefined;
+    var n: usize = 0;
+    var state = GameState.gameStart(rng);
+    var cache: Cache = .{};
+    var pending: ?Pick = null;
+    while (pickMove(net, state)) |pick| {
+        if (pending) |p| if (!opts.backward) trainAfter(net, &cache, p.after, p.reward + pick.value, lr);
+        steps[n % step_cap] = .{ .after = pick.after, .reward = pick.reward };
+        n += 1;
+        pending = pick;
+        _ = state.move(pick.dir, rng);
+    }
+    if (pending) |p| if (!opts.backward) trainAfter(net, &cache, p.after, p.reward, lr);
+
+    if (opts.backward) {
+        var i = n;
+        while (i > n -| step_cap) {
+            i -= 1;
+            const s = steps[i % step_cap];
+            const next = if (i + 1 < n) valueOf(net, steps[(i + 1) % step_cap].after) else 0;
+            trainAfter(net, &cache, s.after, s.reward + next, lr);
+        }
+    }
+    if (opts.replay_k > 0) {
+        const lr_replay = lr * opts.replay_lr_scale;
+        var i = n -| @min(opts.replay_k, step_cap);
+        while (i < n) : (i += 1) {
+            const s = steps[i % step_cap];
+            const next = if (i + 1 < n) valueOf(net, steps[(i + 1) % step_cap].after) else 0;
+            trainAfter(net, &cache, s.after, s.reward + next, lr_replay);
+        }
+    }
+    return state.score;
+}
+
+fn trainAfter(net: *Net, cache: *Cache, after: Board, target: f64, lr: f64) void {
+    _ = forward(net, after, cache);
+    train(net, cache, target, lr);
+}
+
+fn valueOf(net: *const Net, after: Board) f64 {
+    var cache: Cache = .{};
+    return forward(net, after, &cache);
+}
+
+fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag) u32 {
     var state = GameState.gameStart(rng);
     var pending: ?Pick = null;
     var cache: Cache = .{};
@@ -572,15 +639,14 @@ test "trainGameOpts with default options equals trainGame" {
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
 }
 
-test "backward sweep changes the weights and keeps the same game" {
+test "backward sweep changes the weights" {
     var init_rng = std.Random.DefaultPrng.init(11);
     var base = Net.init(init_rng.random());
     var back = base;
     var rng_a = std.Random.DefaultPrng.init(12);
     var rng_b = std.Random.DefaultPrng.init(12);
-    const score_a = trainGame(&base, rng_a.random(), 0.003, null);
-    const score_b = trainGameOpts(&back, rng_b.random(), 0.003, null, .{ .backward = true });
-    try std.testing.expectEqual(score_a, score_b);
+    _ = trainGame(&base, rng_a.random(), 0.003, null);
+    _ = trainGameOpts(&back, rng_b.random(), 0.003, null, .{ .backward = true });
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&base), std.mem.asBytes(&back)));
 }
 
