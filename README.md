@@ -98,6 +98,27 @@ zig build run -- help         # 使い方
   - 例: `curl -X POST "localhost:8080/api/move?dir=left"`
   - 127.0.0.1 のみで待ち受ける。1 リクエスト 1 接続 (ローカル試作用)
 
+## Solver (AI)
+
+`ai/solver/` に置き、`2048.core` の公開 API (`slide` / `move` / `isGameOver` など) だけを使う。core は solver を知らない。
+
+- `solver.bestMove(state, depth)`: expectimax で最良手を返す (`null` は合法手なし)
+- `solver.evaluate(board)`: 空きマス数 + 最大タイルの角ボーナスの手作り評価関数
+- `solver.playGame(rng, depth)`: 1 ゲーム分プレイして結果を返す
+
+検証 (ReleaseFast, seed 1, 100 games):
+
+```bash
+zig build solve -Doptimize=ReleaseFast -- 100 2 1   # games depth seed
+```
+
+| depth | avg score | avg moves | best tile | 1024 到達 |
+|---|---|---|---|---|
+| 1 | 3,673 | 292 | 512 | 0 / 100 |
+| 2 | 7,606 | 512 | 1024 | 13 / 100 |
+
+depth 3 は 20 games で約 23 秒 (平均 11,876 点、1024 到達 11 / 20)。
+
 ## ソース構成
 
 | ファイル | 役割 |
@@ -108,12 +129,14 @@ zig build run -- help         # 使い方
 | `src/server.zig` | HTTP サーバー、JSON API、埋め込み UI |
 | `src/web/index.html` | ブラウザ UI (サーバーに埋め込み) |
 | `src/main.zig` | サブコマンドの振り分け |
+| `ai/solver/solver.zig` | expectimax solver と評価関数 (core のみ依存) |
+| `ai/solver/main.zig` | `zig build solve` の検証用ランナー |
 
 ## マイルストーン
 
 1. ✅ `2048.core` の最小実装 + テスト基盤
 2. ✅ CLI でプレイ可能にする / ✅ ローカル HTTP サーバーで試せる
-3. solver AI の PoC (expectimax / monte-carlo など)
+3. ✅ solver AI の PoC (expectimax, 手作り評価関数) / ⬜ 軽量かつ高スコアの方式の検討 (n-tuple など)
 4. WASM ターゲット対応
 
 ## このプロジェクトで大事にすること

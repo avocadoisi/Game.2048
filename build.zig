@@ -10,6 +10,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const solver_mod = b.addModule("solver", .{
+        .root_source_file = b.path("ai/solver/solver.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core", .module = core_mod },
+        },
+    });
+
     const exe = b.addExecutable(.{
         .name = "game-2048",
         .root_module = b.createModule(.{
@@ -41,7 +50,31 @@ pub fn build(b: *std.Build) void {
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    const solver_tests = b.addTest(.{
+        .root_module = solver_mod,
+    });
+    const run_solver_tests = b.addRunArtifact(solver_tests);
+
+    const solve_exe = b.addExecutable(.{
+        .name = "solve",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("ai/solver/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "solver", .module = solver_mod },
+            },
+        }),
+    });
+    const solve_cmd = b.addRunArtifact(solve_exe);
+    solve_cmd.addPassthruArgs();
+    solve_cmd.step.dependOn(b.getInstallStep());
+
+    const solve_step = b.step("solve", "Run the solver and report game statistics");
+    solve_step.dependOn(&solve_cmd.step);
+
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_solver_tests.step);
 }

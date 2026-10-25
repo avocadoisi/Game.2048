@@ -57,6 +57,13 @@ pub const GameState = struct {
     }
 
     pub fn move(self: *GameState, direction: Direction, rng: anytype) MoveResult {
+        var result = self.slide(direction);
+        result.spawned = result.changed and self.spawnRandomTile(rng);
+        return result;
+    }
+
+    /// Slide and merge without spawning a tile (used by search).
+    pub fn slide(self: *GameState, direction: Direction) MoveResult {
         var changed = false;
         var score_delta: u32 = 0;
 
@@ -78,9 +85,7 @@ pub const GameState = struct {
         }
 
         self.score += score_delta;
-
-        const spawned = changed and self.spawnRandomTile(rng);
-        return .{ .changed = changed, .spawned = spawned, .score_delta = score_delta };
+        return .{ .changed = changed, .spawned = false, .score_delta = score_delta };
     }
 
     pub fn moveUp(self: *GameState, rng: anytype) MoveResult {
@@ -493,4 +498,20 @@ test "isGameOver is false while an empty cell remains" {
         .{ 4, 2, 4, 0 },
     } };
     try std.testing.expect(!state.isGameOver());
+}
+
+test "slide merges like move but never spawns" {
+    var game = GameState{ .board = .{
+        .{ 2, 0, 2, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    } };
+    const result = game.slide(.left);
+
+    try std.testing.expectEqual([BoardSize]Tile{ 4, 0, 0, 0 }, game.board[0]);
+    try std.testing.expect(result.changed);
+    try std.testing.expect(!result.spawned);
+    try std.testing.expectEqual(@as(u32, 4), result.score_delta);
+    try std.testing.expectEqual(@as(u32, 4), game.score);
 }
