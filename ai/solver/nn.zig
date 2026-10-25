@@ -610,3 +610,30 @@ test "trainGame with diagnostic gives the same weights and records steps" {
     };
     try std.testing.expect(total > 0);
 }
+
+test "parallel training batch matches a serial run of the same game seeds" {
+    const games = 4;
+    var init_rng = std.Random.DefaultPrng.init(77);
+    var base = Net.init(init_rng.random());
+
+    // Serial reference: game i uses seed (batch seed + i) from the same starting net,
+    // then the batch result is net_start + mean(net_after_i - net_start), summed in game order.
+    var units: [games]Net = undefined;
+    for (&units, 0..) |*u, i| {
+        u.* = base;
+        var rng = std.Random.DefaultPrng.init(77 + i);
+        _ = trainGame(u, rng.random(), 0.001, null);
+    }
+    const flat_len = @sizeOf(Net) / @sizeOf(f64);
+    var sums: [flat_len]f64 = @splat(0);
+    const start = flat(&base);
+    for (&units) |*u| {
+        for (flat(u), start, 0..) |v, s, k| sums[k] += v - s;
+    }
+    var serial = base;
+    for (flat(&serial), start, sums) |*w, s, sum| w.* = s + sum / games;
+
+    var par = base;
+    _ = trainBatch(&par, 77, 0, games, 0.001, null);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&serial), std.mem.asBytes(&par));
+}
