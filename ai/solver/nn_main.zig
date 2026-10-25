@@ -2,21 +2,24 @@ const std = @import("std");
 const core = @import("core");
 const solver = @import("solver");
 const nn = @import("nn");
+const parallel = @import("parallel");
 
 const usage =
-    \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate] [diag] [variant] [replay_k] [weights_path]
+    \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate] [seed_ranges|diag] [variant] [replay_k] [weights_path]
     \\
     \\  train_games   TD(0) self-play games; 0 loads ai/solver/nn_weights.bin (default 2000)
-    \\  eval_games    games per policy, same seeds for every policy (default 100)
-    \\  eval_seed     first eval seed; game g uses eval_seed + g (default 1000)
+    \\  eval_games    games per seed range per policy, same seeds for every policy (default 100)
+    \\  eval_seed     first eval seed; range r, game g uses eval_seed + r*eval_games + g (default 1000)
     \\  learning_rate SGD step for TD training (default 0.003)
+    \\  seed_ranges   number of disjoint seed ranges; report mean ± stderr over them (default 1)
     \\  diag          literal "diag": print the TD error / value drop table by empty cells and moves to game over; "-" for none
     \\  variant       base (default), backward (sweep stored afterstates last to first), replay (re-train the last replay_k),
     \\              priority (#34: 32 extra updates per game sampled from a |TD error| buffer, 50% uniform)
     \\  replay_k      afterstates re-trained per game for variant replay (default 30)
     \\  weights_path  file to load (train_games 0) or write (default ai/solver/nn_weights.bin); use a temp path for variant runs
     \\
-    \\Training seed is fixed (1).
+    \\Training seed is fixed (1). Weights are written to `weights_path` only when
+    \\train_games > 0; train_games = 0 (eval only) never writes.
     \\
 ;
 
@@ -25,9 +28,10 @@ const train_seed: u64 = 1;
 
 const Eval = struct {
     name: []const u8,
-    avg_score: f64 = 0,
+    range_scores: []f64 = &.{},
     avg_moves: f64 = 0,
     best_tile: core.Tile = 0,
+    total_score: u64 = 0,
     elapsed_ns: i96 = 0,
 };
 
@@ -59,7 +63,11 @@ pub fn main(init: std.process.Init) !void {
     const eval_games: u32 = if (args.len > 2) try std.fmt.parseInt(u32, args[2], 10) else 100;
     const eval_seed: u64 = if (args.len > 3) try std.fmt.parseInt(u64, args[3], 10) else 1000;
     const learning_rate: f64 = if (args.len > 4) try std.fmt.parseFloat(f64, args[4]) else 0.003;
-    const want_diag = args.len > 5 and std.mem.eql(u8, args[5], "diag");
+    // arg 5 is either the seed-range count or the literal "diag" ("-" = no diag, 1 range)
+    const arg5: ?[]const u8 = if (args.len > 5) args[5] else null;
+    const want_diag = arg5 != null and std.mem.eql(u8, arg5.?, "diag");
+    const no_diag = arg5 != null and std.mem.eql(u8, arg5.?, "-");
+    const seed_ranges: u32 = if (arg5) |a| (if (want_diag or no_diag) 1 else try std.fmt.parseInt(u32, a, 10)) else 1;
     const variant = if (args.len > 6) args[6] else "base";
     const replay_k: usize = if (args.len > 7) try std.fmt.parseInt(usize, args[7], 10) else 30;
     const weights_path = if (args.len > 8) args[8] else default_weights_path;
@@ -76,7 +84,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}", .{usage});
         return;
     };
-    if (args.len > 9 or (args.len > 5 and !want_diag and !std.mem.eql(u8, args[5], "-")) or eval_games == 0) {
+    if (args.len > 9 or eval_games == 0 or seed_ranges == 0) {
         std.debug.print("{s}", .{usage});
         return;
     }
@@ -94,10 +102,15 @@ pub fn main(init: std.process.Init) !void {
         var total_moves: u64 = 0;
         var diag: nn.Diag = .{};
         for (0..train_games) |g| {
-            const game = nn.trainGameOpts(&net, rng.random(), learning_rate, if (want_diag) &diag else null, opts);
+            // linear decay to 10% of the start rate: big steps early, fine tuning late
+            const frac = @as(f64, @floatFromInt(g)) / @as(f64, @floatFromInt(train_games));
+            const game = nn.trainGameOpts(&net, rng.random(), learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null, opts);
             last_score = game.score;
             total_moves += game.moves;
-            if ((g + 1) % 500 == 0) std.debug.print("train {d}/{d} last game score {d}\n", .{ g + 1, train_games, last_score });
+            if ((g + 1) % 5000 == 0) {
+                std.debug.print("train {d}/{d} last game score {d}\n", .{ g + 1, train_games, last_score });
+                try nn.save(&net, init.io, weights_path); // checkpoint
+            }
         }
         const elapsed = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
         std.debug.print("trained {d} games, {d} moves in {d:.1} s (lr={d}, seed={d}, variant={s})\n", .{
@@ -117,36 +130,55 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "nn + 1 spawn lookahead" },
         .{ .name = "expectimax depth 2" },
     };
-    for (&results, 0..) |*r, idx| {
-        var total_score: u64 = 0;
-        var total_moves: u64 = 0;
-        const start = std.Io.Clock.awake.now(init.io);
-        for (0..eval_games) |g| {
-            var prng = std.Random.DefaultPrng.init(eval_seed + g);
-            const res = switch (idx) {
-                0 => nn.play(&net, prng.random(), .greedy),
-                1 => nn.play(&net, prng.random(), .chance),
+    const games = eval_games * seed_ranges;
+    const EvalCtx = struct { net: *const nn.Net, policy: usize, eval_seed: u64 };
+    // Game i uses seed eval_seed + i (= eval_seed + range*eval_games + g); games run in parallel.
+    const playGame = struct {
+        fn f(c: EvalCtx, i: usize) nn.PlayResult {
+            var prng = std.Random.DefaultPrng.init(c.eval_seed + i);
+            return switch (c.policy) {
+                0 => nn.play(c.net, prng.random(), .greedy),
+                1 => nn.play(c.net, prng.random(), .chance),
                 else => blk: {
                     const b = solver.playPolicy(prng.random(), .expectimax, 2);
                     break :blk nn.PlayResult{ .score = b.score, .max_tile = b.max_tile, .moves = b.moves };
                 },
             };
-            total_score += res.score;
-            total_moves += res.moves;
-            r.best_tile = @max(r.best_tile, res.max_tile);
+        }
+    }.f;
+    for (&results, 0..) |*r, idx| {
+        r.range_scores = try init.arena.allocator().alloc(f64, seed_ranges);
+        const res_all = try init.arena.allocator().alloc(nn.PlayResult, games);
+        const start = std.Io.Clock.awake.now(init.io);
+        parallel.map(nn.PlayResult, res_all, EvalCtx{ .net = &net, .policy = idx, .eval_seed = eval_seed }, playGame);
+        var total_moves: u64 = 0;
+        for (0..seed_ranges) |range| {
+            var total_score: u64 = 0;
+            for (res_all[range * eval_games ..][0..eval_games]) |res| {
+                total_score += res.score;
+                r.total_score += res.score;
+                total_moves += res.moves;
+                r.best_tile = @max(r.best_tile, res.max_tile);
+            }
+            r.range_scores[range] = @as(f64, @floatFromInt(total_score)) / @as(f64, @floatFromInt(eval_games));
         }
         r.elapsed_ns = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
-        r.avg_score = @as(f64, @floatFromInt(total_score)) / @as(f64, @floatFromInt(eval_games));
-        r.avg_moves = @as(f64, @floatFromInt(total_moves)) / @as(f64, @floatFromInt(eval_games));
+        const n: f64 = @floatFromInt(games);
+        r.avg_moves = @as(f64, @floatFromInt(total_moves)) / n;
     }
-    std.debug.print("eval: games={d} seeds={d}..{d}\n", .{ eval_games, eval_seed, eval_seed + eval_games - 1 });
+    const last_seed = eval_seed + seed_ranges * eval_games - 1;
+    std.debug.print("eval: games={d}/range ranges={d} seeds={d}..{d}\n", .{ eval_games, seed_ranges, eval_seed, last_seed });
     for (results) |r| {
-        std.debug.print("{s}: avg score={d:.1} avg moves={d:.1} best tile={d} elapsed={d:.1} s\n", .{
+        const st = nn.meanStderr(r.range_scores);
+        std.debug.print("{s}: avg score={d:.1} ± {d:.1} (stderr over {d} ranges) avg moves={d:.1} best tile={d} elapsed={d:.1} s score/s={d:.1}\n", .{
             r.name,
-            r.avg_score,
+            st.mean,
+            st.stderr,
+            seed_ranges,
             r.avg_moves,
             r.best_tile,
             @as(f64, @floatFromInt(r.elapsed_ns)) / 1e9,
+            nn.scorePerSecond(@floatFromInt(r.total_score), r.elapsed_ns),
         });
     }
 }
