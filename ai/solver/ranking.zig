@@ -24,7 +24,9 @@ fn describe(policy: solver.Policy) []const u8 {
         .random => "合法手からランダムに1手選ぶ（比較の基準）",
         .greedy => "1手先だけ見る。滑らせた盤面の評価が最も高い手を選ぶ（出現や探索はしない）",
         .expectimax => "2手先まで探索し、ランダムな出現（2か4）を平均して評価する。評価は蛇行順と合体ペアの手作り関数",
-        .expectimax_tt => "3手先まで探索し、盤面の評価をキャッシュして高速化する。ランダムな出現（2か4）を平均し、蛇行順と合体ペアの手作り関数で評価する",
+        .mcts => "UCTで候補手を選び、ランダムな対局を繰り返して評価する",
+        .beam => "幅32で3手先まで探索し、各空きマスに2が出現すると仮定して評価する",
+        .expectimax_tt => "depth 3の期待値探索を置換表で高速化したもの（同じ手を選ぶ）",
     };
 }
 
@@ -46,6 +48,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .policy = .random, .depth = 0 },
         .{ .policy = .greedy, .depth = 0 },
         .{ .policy = .expectimax, .depth = 2 },
+        .{ .policy = .mcts, .depth = 0 },
+        .{ .policy = .beam, .depth = 0 },
         .{ .policy = .expectimax_tt, .depth = 0 },
     };
     var entries: [policies.len]Entry = undefined;

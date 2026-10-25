@@ -7,6 +7,9 @@ const GameState = core.GameState;
 
 /// Returned for a board where the player has no legal move.
 const lost_score: f64 = -1e9;
+/// shortcut: fixed width keeps branching cheap; tune against deeper searches if needed.
+const beam_width = 32;
+const beam_horizon = 3;
 
 pub const Algorithm = enum { expectimax, greedy };
 
@@ -45,7 +48,7 @@ pub fn bestMove(state: GameState, depth: u8) ?Direction {
 }
 
 /// Move-choosing policies compared in the ranking (`zig build ranking`).
-pub const Policy = enum { random, greedy, expectimax, expectimax_tt };
+pub const Policy = enum { random, greedy, expectimax, mcts, beam, expectimax_tt };
 
 /// Next move for a policy; null when no move changes the board.
 pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Direction {
@@ -68,8 +71,76 @@ pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Dir
             return if (r.len == 0) null else r.items[0].dir;
         },
         .expectimax => return bestMove(state, depth),
+        .mcts => return mctsMove(state, rng),
+        .beam => return beamMove(state),
         .expectimax_tt => return bestMoveTT(state, 3),
     }
+}
+
+/// shortcut: fixed 200 full random rollouts per move; raise only while the 6 s/game limit holds.
+const mcts_simulations: usize = 200;
+
+const MctsArm = struct {
+    dir: Direction,
+    visits: usize = 0,
+    reward: f64 = 0,
+};
+
+/// Root UCT selection with complete random games as rollouts.
+fn mctsMove(state: GameState, rng: std.Random) ?Direction {
+    var arms: [4]MctsArm = undefined;
+    var arm_count: usize = 0;
+    for ([_]Direction{ .up, .left, .down, .right }) |d| {
+        var next = state;
+        if (!next.slide(d).changed) continue;
+        arms[arm_count] = .{ .dir = d };
+        arm_count += 1;
+    }
+    if (arm_count == 0) return null;
+
+    for (0..mcts_simulations) |simulation| {
+        var selected: usize = 0;
+        var best_ucb: f64 = -std.math.inf(f64);
+        for (arms[0..arm_count], 0..) |arm, i| {
+            const ucb = if (arm.visits == 0)
+                std.math.inf(f64)
+            else
+                arm.reward / @as(f64, @floatFromInt(arm.visits)) +
+                    @sqrt(2 * @log(@as(f64, @floatFromInt(simulation + 1))) / @as(f64, @floatFromInt(arm.visits)));
+            if (ucb > best_ucb) {
+                best_ucb = ucb;
+                selected = i;
+            }
+        }
+
+        var rollout = state;
+        _ = rollout.move(arms[selected].dir, rng);
+        while (randomMove(&rollout, rng)) {}
+        arms[selected].visits += 1;
+        arms[selected].reward += @as(f64, @floatFromInt(rollout.score)) / 100000;
+    }
+
+    var best = arms[0];
+    for (arms[1..arm_count]) |arm| {
+        if (arm.reward / @as(f64, @floatFromInt(arm.visits)) > best.reward / @as(f64, @floatFromInt(best.visits))) best = arm;
+    }
+    return best.dir;
+}
+
+/// Apply one uniformly random legal move; false when the rollout is over.
+fn randomMove(state: *GameState, rng: std.Random) bool {
+    var legal: [4]Direction = undefined;
+    var count: usize = 0;
+    for ([_]Direction{ .up, .left, .down, .right }) |d| {
+        var next = state.*;
+        if (next.slide(d).changed) {
+            legal[count] = d;
+            count += 1;
+        }
+    }
+    if (count == 0) return false;
+    _ = state.move(legal[rng.uintLessThan(usize, count)], rng);
+    return true;
 }
 
 pub fn playPolicy(rng: std.Random, policy: Policy, depth: u8) GameResult {
@@ -86,79 +157,65 @@ pub fn playPolicy(rng: std.Random, policy: Policy, depth: u8) GameResult {
     return .{ .score = state.score, .max_tile = max_tile, .moves = moves };
 }
 
-/// Snake path 1..16: row 0 left to right, row 1 right to left, and so on.
-/// The largest tile is expected at the start (top-left).
-const order: [core.BoardCellCount]core.Position = blk: {
-    var cells: [core.BoardCellCount]core.Position = undefined;
-    for (0..core.BoardCellCount) |i| {
-        const row = i / core.BoardSize;
-        const offset = i % core.BoardSize;
-        const col = if (row % 2 == 0) offset else core.BoardSize - 1 - offset;
-        cells[i] = .{ .row = row, .col = col };
-    }
-    break :blk cells;
+const BeamNode = struct {
+    state: GameState,
+    first_move: Direction,
+    value: f64,
 };
 
-/// Heuristic: many empty cells, minus a penalty (x30) for each adjacent pair along the snake path
-/// where the later cell holds a larger tile (log2 scale).
-/// shortcut: a hand-set order, not learned; replace with an n-tuple table later.
-pub fn evaluate(board: Board) f64 {
-    var empties: f64 = 0;
-    var penalty: f64 = 0;
-    var prev: ?f64 = null;
-    for (order) |p| {
-        const value = board[p.row][p.col];
-        if (value == 0) {
-            empties += 1;
-            continue;
+/// Beam search over three player moves; each empty cell is considered as a 2 spawn.
+fn beamMove(state: GameState) ?Direction {
+    var beam: [beam_width]BeamNode = undefined;
+    beam[0] = .{ .state = state, .first_move = .up, .value = evaluateState(state) };
+    var beam_len: usize = 1;
+
+    for (0..beam_horizon) |ply| {
+        var next_beam: [beam_width]BeamNode = undefined;
+        var next_len: usize = 0;
+        for (beam[0..beam_len]) |node| {
+            for ([_]Direction{ .up, .left, .down, .right }) |direction| {
+                var moved = node.state;
+                if (!moved.slide(direction).changed) continue;
+                const first_move = if (ply == 0) direction else node.first_move;
+                var spawned = false;
+                for (0..core.BoardSize) |r| {
+                    for (0..core.BoardSize) |c| {
+                        if (moved.board[r][c] != 0) continue;
+                        var child = moved;
+                        child.board[r][c] = 2;
+                        insertBeam(&next_beam, &next_len, .{
+                            .state = child,
+                            .first_move = first_move,
+                            .value = evaluateState(child),
+                        });
+                        spawned = true;
+                    }
+                }
+                if (!spawned) insertBeam(&next_beam, &next_len, .{
+                    .state = moved,
+                    .first_move = first_move,
+                    .value = evaluateState(moved),
+                });
+            }
         }
-        const level = @log2(@as(f64, @floatFromInt(value)));
-        if (prev) |before| penalty += @max(0, level - before);
-        prev = level;
-    }
-    return empties * 10 - penalty * 30 + mergePairs(board) * 10;
-}
-
-/// Count of horizontally or vertically adjacent equal non-empty tiles: more merges available.
-/// shortcut: hand-set weight (x10), tuned with `zig build solve` on fresh seeds.
-fn mergePairs(board: Board) f64 {
-    var n: f64 = 0;
-    for (0..core.BoardSize) |r| {
-        for (0..core.BoardSize) |c| {
-            const v = board[r][c];
-            if (v == 0) continue;
-            if (c + 1 < core.BoardSize and board[r][c + 1] == v) n += 1;
-            if (r + 1 < core.BoardSize and board[r + 1][c] == v) n += 1;
+        if (next_len == 0) {
+            if (ply == 0) return null;
+            break;
         }
+        beam = next_beam;
+        beam_len = next_len;
     }
-    return n;
+    return beam[0].first_move;
 }
 
-pub const GameResult = struct {
-    score: u32,
-    max_tile: core.Tile,
-    moves: u32,
-};
-
-/// Play one full game with the solver until no move changes the board.
-pub fn playGame(rng: std.Random, depth: u8) GameResult {
-    return playPolicy(rng, .expectimax, depth);
-}
-
-/// Extra penalty when only `down` is legal: with the top-left corner as the anchor,
-/// a forced down move breaks the order.
-/// shortcut: fixed penalty, not tuned; tune with `zig build solve` later.
-const forced_down_penalty: f64 = 100;
-
-pub fn evaluateState(state: GameState) f64 {
-    var score = evaluate(state.board);
-    for ([_]Direction{ .up, .left, .right }) |d| {
-        var next = state;
-        if (next.slide(d).changed) return score;
+fn insertBeam(items: *[beam_width]BeamNode, len: *usize, candidate: BeamNode) void {
+    var i = len.*;
+    while (i > 0 and items[i - 1].value < candidate.value) : (i -= 1) {
+        if (i < beam_width) items[i] = items[i - 1];
     }
-    var down = state;
-    if (down.slide(.down).changed) score -= forced_down_penalty;
-    return score;
+    if (i == beam_width) return;
+    items[i] = candidate;
+    if (len.* < beam_width) len.* += 1;
 }
 
 // shortcut: 8192 direct-mapped entries; collisions only reduce cache hits, increase this if needed.
@@ -249,6 +306,82 @@ fn chanceValueTT(state: GameState, depth: u8, table: *[tt_entry_count]TTEntry) f
     return value;
 }
 
+
+/// Snake path 1..16: row 0 left to right, row 1 right to left, and so on.
+/// The largest tile is expected at the start (top-left).
+const order: [core.BoardCellCount]core.Position = blk: {
+    var cells: [core.BoardCellCount]core.Position = undefined;
+    for (0..core.BoardCellCount) |i| {
+        const row = i / core.BoardSize;
+        const offset = i % core.BoardSize;
+        const col = if (row % 2 == 0) offset else core.BoardSize - 1 - offset;
+        cells[i] = .{ .row = row, .col = col };
+    }
+    break :blk cells;
+};
+
+/// Heuristic: many empty cells, minus a penalty (x30) for each adjacent pair along the snake path
+/// where the later cell holds a larger tile (log2 scale).
+/// shortcut: a hand-set order, not learned; replace with an n-tuple table later.
+pub fn evaluate(board: Board) f64 {
+    var empties: f64 = 0;
+    var penalty: f64 = 0;
+    var prev: ?f64 = null;
+    for (order) |p| {
+        const value = board[p.row][p.col];
+        if (value == 0) {
+            empties += 1;
+            continue;
+        }
+        const level = @log2(@as(f64, @floatFromInt(value)));
+        if (prev) |before| penalty += @max(0, level - before);
+        prev = level;
+    }
+    return empties * 10 - penalty * 30 + mergePairs(board) * 10;
+}
+
+/// Count of horizontally or vertically adjacent equal non-empty tiles: more merges available.
+/// shortcut: hand-set weight (x10), tuned with `zig build solve` on fresh seeds.
+fn mergePairs(board: Board) f64 {
+    var n: f64 = 0;
+    for (0..core.BoardSize) |r| {
+        for (0..core.BoardSize) |c| {
+            const v = board[r][c];
+            if (v == 0) continue;
+            if (c + 1 < core.BoardSize and board[r][c + 1] == v) n += 1;
+            if (r + 1 < core.BoardSize and board[r + 1][c] == v) n += 1;
+        }
+    }
+    return n;
+}
+
+pub const GameResult = struct {
+    score: u32,
+    max_tile: core.Tile,
+    moves: u32,
+};
+
+/// Play one full game with the solver until no move changes the board.
+pub fn playGame(rng: std.Random, depth: u8) GameResult {
+    return playPolicy(rng, .expectimax, depth);
+}
+
+/// Extra penalty when only `down` is legal: with the top-left corner as the anchor,
+/// a forced down move breaks the order.
+/// shortcut: fixed penalty, not tuned; tune with `zig build solve` later.
+const forced_down_penalty: f64 = 100;
+
+pub fn evaluateState(state: GameState) f64 {
+    var score = evaluate(state.board);
+    for ([_]Direction{ .up, .left, .right }) |d| {
+        var next = state;
+        if (next.slide(d).changed) return score;
+    }
+    var down = state;
+    if (down.slide(.down).changed) score -= forced_down_penalty;
+    return score;
+}
+
 fn maxValue(state: GameState, depth: u8) f64 {
     if (depth == 0) return evaluateState(state);
     var best: f64 = lost_score;
@@ -285,6 +418,60 @@ fn chanceValue(state: GameState, depth: u8) f64 {
     return total / empties;
 }
 
+test "bestMove returns null when no move changes the board" {
+    const state: GameState = .{ .board = .{
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+    } };
+    try std.testing.expectEqual(@as(?Direction, null), bestMove(state, 1));
+}
+
+test "mcts returns only legal moves and null on a dead board" {
+    const state: GameState = .{ .board = .{
+        .{ 2, 2, 4, 8 },
+        .{ 16, 32, 64, 128 },
+        .{ 256, 512, 1024, 2048 },
+        .{ 4096, 8192, 16384, 32768 },
+    } };
+    var prng = std.Random.DefaultPrng.init(7);
+    const move = choose(.mcts, state, prng.random(), 0).?;
+    var repeat_prng = std.Random.DefaultPrng.init(7);
+    try std.testing.expectEqual(move, choose(.mcts, state, repeat_prng.random(), 0).?);
+    var next = state;
+    try std.testing.expect(next.slide(move).changed);
+
+    const dead: GameState = .{ .board = .{
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+    } };
+    try std.testing.expectEqual(@as(?Direction, null), choose(.mcts, dead, prng.random(), 0));
+}
+
+test "beam policy returns a legal move and null on a dead board" {
+    const state: GameState = .{ .board = .{
+        .{ 2, 2, 4, 8 },
+        .{ 16, 32, 64, 128 },
+        .{ 256, 512, 1024, 2048 },
+        .{ 4096, 8192, 16384, 32768 },
+    } };
+    var prng = std.Random.DefaultPrng.init(7);
+    const move = choose(.beam, state, prng.random(), 0).?;
+    var moved = state;
+    try std.testing.expect(moved.slide(move).changed);
+
+    const dead: GameState = .{ .board = .{
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+    } };
+    try std.testing.expectEqual(@as(?Direction, null), choose(.beam, dead, prng.random(), 0));
+}
+
 test "expectimax TT depth 3 matches bestMove on random-play boards" {
     var rng_state = std.Random.DefaultPrng.init(100);
     const rng = rng_state.random();
@@ -300,15 +487,6 @@ test "expectimax TT depth 3 matches bestMove on random-play boards" {
     }
 }
 
-test "bestMove returns null when no move changes the board" {
-    const state: GameState = .{ .board = .{
-        .{ 2, 4, 2, 4 },
-        .{ 4, 2, 4, 2 },
-        .{ 2, 4, 2, 4 },
-        .{ 4, 2, 4, 2 },
-    } };
-    try std.testing.expectEqual(@as(?Direction, null), bestMove(state, 1));
-}
 
 test "random policy only picks legal moves" {
     const state: GameState = .{ .board = .{
