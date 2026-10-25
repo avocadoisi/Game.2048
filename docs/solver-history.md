@@ -75,3 +75,10 @@ Served at `/api/ranking` from `src/web/ranking.json`. Regenerate with:
 - beam (width 32, 3 plies, spawn approximated as 2): 12,696 at about 0.07 s/game.
 - greedy 3,424; random 1,062.
 Speed rule: no policy slower than depth 3 (about 6.8 to 15 s/game depending on machine load).
+
+## GA over evaluation weights (`zig build ga-rl`)
+
+- Evolves the 4 snake-evaluation weights (empty, order_penalty, merge, forced_down_penalty) with tournament selection, uniform crossover, and clamped log-normal mutation. Args: `16 15 8 2 1 500 100` (population 16, 15 generations, games/fitness 8, depth 2, seed 1, holdout 500, 100 games).
+- Holdout seeds 500..599 (100 games, depth 2): baseline 24,067, evolved 25,095 (+4%).
+- Evolved weights: empty 7.028, order_penalty 43.174, merge 0, forced_down 0.
+- Caveats: one GA run, one holdout range; merge and forced_down collapsed to 0, so the gain may be noise. Check on another seed range before adopting.
