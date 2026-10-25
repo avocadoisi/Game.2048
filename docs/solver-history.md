@@ -79,7 +79,7 @@ Speed rule: no policy slower than depth 3 (about 6.8 to 15 s/game depending on m
 ## Deep learning: small MLP value net (`zig build nn`)
 
 - Model: `ai/solver/nn.zig`, one hidden layer MLP over afterstates, trained by TD(0) in pure Zig (no dependencies).
-- Training: 20,000 self-play games, learning rate 0.003 (default in `nn_main.zig`). Weights go to `ai/solver/nn_weights.bin` (git-ignored).
+- Training: 20,000 self-play games, learning rate 0.003 (default in `nn_main.zig`). Weights go to `ai/solver/nn_weights.bin` (tracked in git and embedded by `solver.zig`; format: 16-byte header + little-endian f64, see `nn.encode`/`nn.parse`).
 - Eval on seeds 2000..2099 (100 games, `zig build nn -- 20000 100 2000 0.003`):
 
 | Policy | avg score | avg moves | best tile | time (100 games) |
