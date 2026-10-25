@@ -95,6 +95,8 @@ zig build run -- help         # 使い方
 - `play`: `w/a/s/d` または `up/left/down/right` で移動、`n` でリセット、`q` で終了
 - `serve`: `http://127.0.0.1:8080/` を開くと矢印キー/WASD で遊べる
   - `GET /api/state`, `POST /api/new`, `POST /api/move?dir=up|left|down|right`
+  - `GET /api/solve?depth=N`: solver の次の一手を返す (盤面は変えない。`{"dir":"left"}`、合法手なしは `null`)
+  - ブラウザの「Solver: 1 step」「Solver: auto」で solver が手を打つ様子を確認できる
   - 例: `curl -X POST "localhost:8080/api/move?dir=left"`
   - 127.0.0.1 のみで待ち受ける。1 リクエスト 1 接続 (ローカル試作用)
 
