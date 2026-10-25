@@ -56,6 +56,7 @@ const Eval = struct {
     avg_moves: f64 = 0,
     best_tile: core.Tile = 0,
     total_score: u64 = 0,
+    leaves: u64 = 0,
     elapsed_ns: i96 = 0,
 };
 
@@ -170,6 +171,7 @@ pub fn main(init: std.process.Init) !void {
     var results = [_]Eval{
         .{ .name = "nn 1-ply" },
         .{ .name = "nn + 1 spawn lookahead" },
+        .{ .name = "nn 2-ply (deep)" },
         .{ .name = "expectimax depth 2" },
     };
     const games = eval_games * seed_ranges;
@@ -181,6 +183,7 @@ pub fn main(init: std.process.Init) !void {
             return switch (c.policy) {
                 0 => nn.play(c.net, prng.random(), .greedy),
                 1 => nn.play(c.net, prng.random(), .chance),
+                2 => nn.play(c.net, prng.random(), .deep),
                 else => blk: {
                     const b = solver.playPolicy(prng.random(), .expectimax, 2);
                     break :blk nn.PlayResult{ .score = b.score, .max_tile = b.max_tile, .moves = b.moves };
@@ -200,6 +203,7 @@ pub fn main(init: std.process.Init) !void {
                 total_score += res.score;
                 r.total_score += res.score;
                 total_moves += res.moves;
+                r.leaves += res.leaves;
                 r.best_tile = @max(r.best_tile, res.max_tile);
             }
             r.range_scores[range] = @as(f64, @floatFromInt(total_score)) / @as(f64, @floatFromInt(eval_games));
@@ -212,7 +216,10 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("eval: games={d}/range ranges={d} seeds={d}..{d}\n", .{ eval_games, seed_ranges, eval_seed, last_seed });
     for (results) |r| {
         const st = nn.meanStderr(r.range_scores);
-        std.debug.print("{s}: avg score={d:.1} ± {d:.1} (stderr over {d} ranges) avg moves={d:.1} best tile={d} elapsed={d:.1} s score/s={d:.1}\n", .{
+        const total_moves = r.avg_moves * @as(f64, @floatFromInt(games));
+        const ms_per_move = @as(f64, @floatFromInt(r.elapsed_ns)) / 1e6 / @max(total_moves, 1);
+        const leaves_per_move = @as(f64, @floatFromInt(r.leaves)) / @max(total_moves, 1);
+        std.debug.print("{s}: avg score={d:.1} ± {d:.1} (stderr over {d} ranges) avg moves={d:.1} best tile={d} elapsed={d:.1} s score/s={d:.1} leaves={d} leaves/move={d:.1} ms/move={d:.2}\n", .{
             r.name,
             st.mean,
             st.stderr,
@@ -221,6 +228,9 @@ pub fn main(init: std.process.Init) !void {
             r.best_tile,
             @as(f64, @floatFromInt(r.elapsed_ns)) / 1e9,
             nn.scorePerSecond(@floatFromInt(r.total_score), r.elapsed_ns),
+            r.leaves,
+            leaves_per_move,
+            ms_per_move,
         });
     }
 }
