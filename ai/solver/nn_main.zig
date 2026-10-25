@@ -11,7 +11,8 @@ const usage =
     \\  eval_seed     first eval seed; game g uses eval_seed + g (default 1000)
     \\  learning_rate SGD step for TD training (default 0.003)
     \\  diag          literal "diag": print the TD error / value drop table by empty cells and moves to game over; "-" for none
-    \\  variant       base (default), backward (sweep stored afterstates last to first), replay (re-train the last replay_k)
+    \\  variant       base (default), backward (sweep stored afterstates last to first), replay (re-train the last replay_k),
+    \\              priority (#34: 32 extra updates per game sampled from a |TD error| buffer, 50% uniform)
     \\  replay_k      afterstates re-trained per game for variant replay (default 30)
     \\  weights_path  file to load (train_games 0) or write (default ai/solver/nn_weights.bin); use a temp path for variant runs
     \\
@@ -62,12 +63,15 @@ pub fn main(init: std.process.Init) !void {
     const variant = if (args.len > 6) args[6] else "base";
     const replay_k: usize = if (args.len > 7) try std.fmt.parseInt(usize, args[7], 10) else 30;
     const weights_path = if (args.len > 8) args[8] else default_weights_path;
+    var priority: nn.Priority = .{};
     const opts: nn.Options = if (std.mem.eql(u8, variant, "base"))
         .{}
     else if (std.mem.eql(u8, variant, "backward"))
         .{ .backward = true }
     else if (std.mem.eql(u8, variant, "replay"))
         .{ .replay_k = replay_k }
+    else if (std.mem.eql(u8, variant, "priority"))
+        .{ .priority = &priority }
     else {
         std.debug.print("{s}", .{usage});
         return;
