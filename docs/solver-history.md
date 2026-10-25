@@ -67,3 +67,11 @@ Speed differs run to run (runs were sequential on one machine); treat it as a ro
 Served at `/api/ranking` from `src/web/ranking.json`. Regenerate with:
 `zig build ranking -Doptimize=ReleaseFast -- 5 20 1000 > src/web/ranking.json`
 (seed 1000 is not used for tuning.) Current result: expectimax (depth 2) 25,267 > greedy 3,424 > random 1,062 (avg score).
+
+## Parallel candidates (ranking seed 1000, 5 runs x 20 games, avg score)
+- expectimax_tt (depth 3 + transposition table): 41,216. Same moves as depth 3, about 4x faster (3.4 vs 15.2 s/game on a loaded machine).
+- mcts (200 rollouts/move): 29,722 at about 2.0 s/game.
+- expectimax (depth 2): 25,267.
+- beam (width 32, 3 plies, spawn approximated as 2): 12,696 at about 0.07 s/game.
+- greedy 3,424; random 1,062.
+Speed rule: no policy slower than depth 3 (about 6.8 to 15 s/game depending on machine load).
