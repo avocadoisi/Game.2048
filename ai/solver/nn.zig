@@ -255,14 +255,85 @@ pub fn countEmpty(board: Board) usize {
     return n;
 }
 
+/// Opt-in training variants (issue #33). Default `.{}` is the plain per-move TD(0) of `trainGame`.
+pub const Options = struct {
+    /// Candidate A: no per-move update during the game; afterwards train every stored afterstate from last to first.
+    backward: bool = false,
+    /// Candidate B: after the game, re-train the last `replay_k` afterstates once more (0 = off), oldest first.
+    replay_k: usize = 0,
+    /// Learning rate of the replay pass, as a factor of the training lr.
+    replay_lr_scale: f64 = 0.5,
+};
+
+/// Stored afterstates of one game for the variants (ring buffer; the last `step_cap` steps are kept).
+/// shortcut: games longer than step_cap only replay/sweep their last step_cap afterstates, upgrade if games get that long.
+const step_cap = 8192;
+const Step = struct { after: Board, reward: f64 };
+
 /// TD(0) on afterstates over one self-play game (greedy 1-ply moves, fixed rng).
 /// Target for the previous afterstate = its scaled reward + V(next afterstate); 0 after game over.
 /// `diag` (optional) records each step's TD error and value change; it does not touch the rng or the update.
 pub fn trainGame(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag) u32 {
+    return trainGameOpts(net, rng, lr, diag, .{}).score;
+}
+
+pub const GameResult = struct { score: u32, moves: u32 };
+
+/// `trainGame` with options. `diag` is only recorded on the default path (`opts` all off).
+pub fn trainGameOpts(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
+    if (!opts.backward and opts.replay_k == 0) return trainGamePerMove(net, rng, lr, diag);
+    var steps: [step_cap]Step = undefined;
+    var n: usize = 0;
+    var state = GameState.gameStart(rng);
+    var cache: Cache = .{};
+    var pending: ?Pick = null;
+    while (pickMove(net, state)) |pick| {
+        if (pending) |p| if (!opts.backward) trainAfter(net, &cache, p.after, p.reward + pick.value, lr);
+        steps[n % step_cap] = .{ .after = pick.after, .reward = pick.reward };
+        n += 1;
+        pending = pick;
+        _ = state.move(pick.dir, rng);
+    }
+    if (pending) |p| if (!opts.backward) trainAfter(net, &cache, p.after, p.reward, lr);
+
+    if (opts.backward) {
+        var i = n;
+        while (i > n -| step_cap) {
+            i -= 1;
+            const s = steps[i % step_cap];
+            const next = if (i + 1 < n) valueOf(net, steps[(i + 1) % step_cap].after) else 0;
+            trainAfter(net, &cache, s.after, s.reward + next, lr);
+        }
+    }
+    if (opts.replay_k > 0) {
+        const lr_replay = lr * opts.replay_lr_scale;
+        var i = n -| @min(opts.replay_k, step_cap);
+        while (i < n) : (i += 1) {
+            const s = steps[i % step_cap];
+            const next = if (i + 1 < n) valueOf(net, steps[(i + 1) % step_cap].after) else 0;
+            trainAfter(net, &cache, s.after, s.reward + next, lr_replay);
+        }
+    }
+    return .{ .score = state.score, .moves = @intCast(n) };
+}
+
+fn trainAfter(net: *Net, cache: *Cache, after: Board, target: f64, lr: f64) void {
+    _ = forward(net, after, cache);
+    train(net, cache, target, lr);
+}
+
+fn valueOf(net: *const Net, after: Board) f64 {
+    var cache: Cache = .{};
+    return forward(net, after, &cache);
+}
+
+fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag) GameResult {
     var state = GameState.gameStart(rng);
     var pending: ?Pick = null;
     var cache: Cache = .{};
+    var moves: u32 = 0;
     while (pickMove(net, state)) |pick| {
+        moves += 1;
         if (pending) |p| {
             _ = forward(net, p.after, &cache);
             const target = p.reward + pick.value;
@@ -278,7 +349,7 @@ pub fn trainGame(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag) u32 {
         train(net, &cache, p.reward, lr);
     }
     if (diag) |d| d.finish();
-    return state.score;
+    return .{ .score = state.score, .moves = moves };
 }
 
 /// Games per parallel training batch: min(cpu count, max_threads), at least 1.
@@ -672,6 +743,51 @@ test "trainGame with diagnostic gives the same weights and records steps" {
         total += s.count;
     };
     try std.testing.expect(total > 0);
+}
+
+test "default trainGame weights match the recorded checksum (5 games, seeds 11/12)" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var net = Net.init(init_rng.random());
+    var rng = std.Random.DefaultPrng.init(12);
+    for (0..5) |_| _ = trainGame(&net, rng.random(), 0.003, null);
+    try std.testing.expectEqual(@as(u32, 1621370333), std.hash.Crc32.hash(std.mem.asBytes(&net)));
+}
+
+test "trainGameOpts with default options equals trainGame" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var a = Net.init(init_rng.random());
+    var b = a;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    _ = trainGame(&a, rng_a.random(), 0.003, null);
+    _ = trainGameOpts(&b, rng_b.random(), 0.003, null, .{});
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+}
+
+test "backward sweep changes the weights" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var base = Net.init(init_rng.random());
+    var back = base;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    _ = trainGame(&base, rng_a.random(), 0.003, null);
+    _ = trainGameOpts(&back, rng_b.random(), 0.003, null, .{ .backward = true });
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&base), std.mem.asBytes(&back)));
+}
+
+test "replay tail changes the weights and K=0 is off" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var base = Net.init(init_rng.random());
+    var replay = base;
+    var off = base;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    var rng_c = std.Random.DefaultPrng.init(12);
+    _ = trainGame(&base, rng_a.random(), 0.003, null);
+    _ = trainGameOpts(&replay, rng_b.random(), 0.003, null, .{ .replay_k = 30 });
+    _ = trainGameOpts(&off, rng_c.random(), 0.003, null, .{ .replay_k = 0 });
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&base), std.mem.asBytes(&replay)));
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&base), std.mem.asBytes(&off));
 }
 
 test "parallel training batch matches a serial run of the same game seeds" {

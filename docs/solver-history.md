@@ -331,3 +331,26 @@ fixed, so the weights do not depend on the thread count; the serial path (no `pa
 - Caveat: the batch average is not the same update as applying the 8 games one after another to a
   single net; it is the aggregation chosen for determinism. `par` is opt-in, so existing commands
   and recorded results above keep the serial behaviour.
+
+
+## Replay and backward sweep (#33)
+
+Options in `ai/solver/nn.zig` (`trainGameOpts`, `Options`); default off, and the default path is pinned by a CRC test.
+- `backward`: no per-move update during the game (weights frozen while playing); afterwards every stored afterstate is trained from last to first, target = reward + V(next) with V recomputed.
+- `replay`: normal per-move updates, then the last K=30 afterstates are re-trained once, oldest first, at 0.5 x lr with fresh targets.
+- CLI: `zig build nn -- <train> <eval> <seed> <lr> <-|diag> <base|backward|replay> <K> <weights_path>`. Variant runs write to a temp path, so `ai/solver/nn_weights.bin` is not touched.
+
+Command per variant: `zig build nn -Doptimize=ReleaseFast -- 20000 20 2000 0.003 - <variant> 30 /tmp/nnb/<variant>.bin`, then eval-only runs (`-- 0 20 <seed> 0.003 - base 30 /tmp/nnb/<variant>.bin`) on seed ranges 2000, 3000, 4000, 5000, 6000 (20 games each, 100 games per variant).
+Mean ± stderr is over the 5 range averages (n=5). There is no seed-range helper in `main`, so the stderr is computed by hand.
+
+| variant | train games | train moves | nn 1-ply avg score (mean ± stderr) | nn + 1 spawn avg score (mean ± stderr) |
+|---|---|---|---|---|
+| base | 20000 | 13,969,906 | 18,677 ± 717 | 39,715 ± 1,103 |
+| backward | 20000 | 6,272,449 | 2,116 ± 80 | 2,116 ± 80 (same policy, no lookahead gain) |
+| replay K=30 | 20000 | 12,811,345 | 14,973 ± 838 | 33,241 ± 740 |
+
+Per range, nn 1-ply avg score: base 19,110 / 16,668 / 19,592 / 17,423 / 20,589; backward 2,288 / 2,101 / 1,821 / 2,196 / 2,176; replay 16,664 / 13,497 / 12,655 / 16,871 / 15,177 (seeds 2000, 3000, 4000, 5000, 6000 x 20 games). Expectimax depth 2 on seeds 2000..2019 was 21,840 in every run (same policy, reference only).
+
+- Reading: neither candidate beats the baseline. Replay is about 20% lower than base (difference 3,704 vs combined stderr 1,103, about 3.4 sigma on the 1-ply policy). Backward collapses to about 2,100 (policy dies after about 200 moves). The collapse is not tuned: only lr 0.003 was tried, with the sweep updates applied to frozen-policy games.
+- Moves: backward played far fewer training moves because its policy is weak; replay reached 92% of base's moves. The comparison is at equal games (20000), and the moves are listed above. Equal-moves comparison was not run.
+- Caveats: one training seed (1, fixed in the code), K=30 and replay lr 0.5x not swept, backward not swept over lr. The near-loss error share (#32) is 8% of the total, so replaying it at this weight may just shift the fit away from the mid-game states. Next: if replay is kept, try a smaller replay share (K=10, lr x0.25) before deciding.

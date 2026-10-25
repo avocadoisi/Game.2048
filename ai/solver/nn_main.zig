@@ -5,23 +5,26 @@ const nn = @import("nn");
 const parallel = @import("parallel");
 
 const usage =
-    \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate] [seed_ranges|diag] [par]
+    \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate] [seed_ranges|diag] [variant|par] [replay_k] [weights_path]
     \\
     \\  train_games   TD(0) self-play games; 0 loads ai/solver/nn_weights.bin (default 2000)
     \\  eval_games    games per seed range per policy, same seeds for every policy (default 100)
     \\  eval_seed     first eval seed; range r, game g uses eval_seed + r*eval_games + g (default 1000)
     \\  learning_rate SGD step for TD training (default 0.003)
     \\  seed_ranges   number of disjoint seed ranges; report mean ± stderr over them (default 1)
-    \\  diag          literal "diag": print the TD error / value drop table by empty cells and moves to game over
+    \\  diag          literal "diag": print the TD error / value drop table by empty cells and moves to game over; "-" for none
+    \\  variant       base (default), backward (sweep stored afterstates last to first), replay (re-train the last replay_k)
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
     \\                game i uses seed train_seed + i and the batch result is the mean of its games
+    \\  replay_k      afterstates re-trained per game for variant replay (default 30)
+    \\  weights_path  file to load (train_games 0) or write (default ai/solver/nn_weights.bin); use a temp path for variant runs
     \\
-    \\Training seed is fixed (1). Weights are written to ai/solver/nn_weights.bin only when
+    \\Training seed is fixed (1). Weights are written to `weights_path` only when
     \\train_games > 0; train_games = 0 (eval only) never writes.
     \\
 ;
 
-const weights_path = "ai/solver/nn_weights.bin";
+const default_weights_path = "ai/solver/nn_weights.bin";
 const train_seed: u64 = 1;
 
 const Eval = struct {
@@ -61,12 +64,27 @@ pub fn main(init: std.process.Init) !void {
     const eval_games: u32 = if (args.len > 2) try std.fmt.parseInt(u32, args[2], 10) else 100;
     const eval_seed: u64 = if (args.len > 3) try std.fmt.parseInt(u64, args[3], 10) else 1000;
     const learning_rate: f64 = if (args.len > 4) try std.fmt.parseFloat(f64, args[4]) else 0.003;
-    // arg 5 is either the seed-range count or the literal "diag"
+    // arg 5 is either the seed-range count or the literal "diag" ("-" = no diag, 1 range)
     const arg5: ?[]const u8 = if (args.len > 5) args[5] else null;
     const want_diag = arg5 != null and std.mem.eql(u8, arg5.?, "diag");
-    const seed_ranges: u32 = if (arg5) |a| (if (want_diag) 1 else try std.fmt.parseInt(u32, a, 10)) else 1;
-    const use_par = args.len > 6 and std.mem.eql(u8, args[6], "par");
-    if (args.len > 7 or (args.len > 6 and !use_par) or eval_games == 0 or seed_ranges == 0) {
+    const no_diag = arg5 != null and std.mem.eql(u8, arg5.?, "-");
+    const seed_ranges: u32 = if (arg5) |a| (if (want_diag or no_diag) 1 else try std.fmt.parseInt(u32, a, 10)) else 1;
+    const variant = if (args.len > 6) args[6] else "base";
+    const use_par = std.mem.eql(u8, variant, "par");
+    const replay_k: usize = if (args.len > 7) try std.fmt.parseInt(usize, args[7], 10) else 30;
+    const weights_path = if (args.len > 8) args[8] else default_weights_path;
+    const opts: nn.Options = if (use_par or std.mem.eql(u8, variant, "base"))
+        .{}
+    else if (std.mem.eql(u8, variant, "backward"))
+        .{ .backward = true }
+    else if (std.mem.eql(u8, variant, "replay"))
+        .{ .replay_k = replay_k }
+    else {
+        std.debug.print("{s}", .{usage});
+        return;
+    };
+    // par trains the plain per-move variant only, so it takes no variant arguments
+    if (args.len > 9 or (use_par and args.len > 7) or eval_games == 0 or seed_ranges == 0) {
         std.debug.print("{s}", .{usage});
         return;
     }
@@ -81,6 +99,7 @@ pub fn main(init: std.process.Init) !void {
         var rng = std.Random.DefaultPrng.init(train_seed);
         const start = std.Io.Clock.awake.now(init.io);
         var last_score: u64 = 0;
+        var total_moves: u64 = 0;
         var diag: nn.Diag = .{};
         if (use_par) {
             const batch_size = nn.trainBatchSize();
@@ -98,7 +117,9 @@ pub fn main(init: std.process.Init) !void {
             for (0..train_games) |g| {
                 // linear decay to 10% of the start rate: big steps early, fine tuning late
                 const frac = @as(f64, @floatFromInt(g)) / @as(f64, @floatFromInt(train_games));
-                last_score = nn.trainGame(&net, rng.random(), learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null);
+                const game = nn.trainGameOpts(&net, rng.random(), learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null, opts);
+                last_score = game.score;
+                total_moves += game.moves;
                 if ((g + 1) % 5000 == 0) {
                     std.debug.print("train {d}/{d} last game score {d}\n", .{ g + 1, train_games, last_score });
                     try nn.save(&net, init.io, weights_path); // checkpoint
@@ -106,11 +127,13 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         const elapsed = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
-        std.debug.print("trained {d} games in {d:.1} s (lr={d}, seed={d})\n", .{
+        std.debug.print("trained {d} games, {d} moves in {d:.1} s (lr={d}, seed={d}, variant={s})\n", .{
             train_games,
+            total_moves,
             @as(f64, @floatFromInt(elapsed)) / 1e9,
             learning_rate,
             train_seed,
+            variant,
         });
         if (want_diag) printDiag(&diag);
         try nn.save(&net, init.io, weights_path);
