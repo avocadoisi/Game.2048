@@ -103,6 +103,35 @@ pub fn build(b: *std.Build) void {
     const ranking_step = b.step("ranking", "Compare policies and print JSON ranking");
     ranking_step.dependOn(&ranking_cmd.step);
 
+    const nn_mod = b.addModule("nn", .{
+        .root_source_file = b.path("ai/solver/nn.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core_mod }},
+    });
+    const nn_tests = b.addTest(.{ .root_module = nn_mod });
+    const run_nn_tests = b.addRunArtifact(nn_tests);
+
+    const nn_exe = b.addExecutable(.{
+        .name = "nn",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("ai/solver/nn_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "solver", .module = solver_mod },
+                .{ .name = "nn", .module = nn_mod },
+            },
+        }),
+    });
+    const nn_cmd = b.addRunArtifact(nn_exe);
+    nn_cmd.addPassthruArgs();
+    nn_cmd.step.dependOn(b.getInstallStep());
+
+    const nn_step = b.step("nn", "Train the value MLP (TD(0) self-play) and evaluate it against expectimax depth 2");
+    nn_step.dependOn(&nn_cmd.step);
+
     const tt_bench_exe = b.addExecutable(.{
         .name = "tt-bench-scratch",
         .root_module = b.createModule(.{
@@ -121,4 +150,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_solver_tests.step);
     test_step.dependOn(&run_bench_tests.step);
+    test_step.dependOn(&run_nn_tests.step);
 }
