@@ -184,3 +184,16 @@ in forward order, one update per move, no replay, no weighting by position.
 - Add the diagnostic log (idea 1) to `nn_main.zig` or behind a flag in `nn.zig`.
 - If the error is concentrated near game over: implement idea 3 (cheapest) and measure.
   Then try idea 2 and idea 4 on the same seeds.
+
+## Bench run 2026-10-25 19:31:46 +0900
+
+- command: `zig build solve -- 1 2 2 1`
+- commit: 248c1a5
+- date: 2026-10-25 19:31:46 +0900
+- exit: 0
+
+```text
+runs=1 games/run=2 depth=2 seed=1 games=2
+avg score=20954.0 avg moves=1148.0 best tile=2048
+speed: 0.54 games/s, 621 moves/s, elapsed 3.7 s
+```
