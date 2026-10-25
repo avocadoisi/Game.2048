@@ -494,6 +494,36 @@ Same protocol, `train_games` 200,000, training seeds 1 and 2, compared against t
 - Seed 2 lands below it, so retraining from scratch across seeds does not improve the model. The win came from fine-tuning (#66) instead, at 40,000 games (about 1/5 of the cost).
 - Cost: 2 x 200,000 games, 4,118-4,254 s each.
 
+## n-tuple network runner (#70)
+
+The classic 2048 SOTA value function, as a standalone runner: `ai/solver/ntuple.zig` holds flat f32 pattern tables (`[16^k]f32`) indexed by the same `levelOf` cell encoding as the MLP, `ai/solver/ntuple_main.zig` trains them by TD(0) on afterstates and evaluates them.
+
+- Patterns (one table each, shared across the 8 dihedral transforms of the board): row 0, row 1, 2x2 top-left, 2x2 middle column, main diagonal (4-tuples), 2x3 top-left (6-tuple). The table index is the minimum over the 8 transforms, so a rotated or mirrored board gets the same weights (TDD test).
+- Index cost: a compile-time `cell -> (table, shift)` slot table, so one 16-cell scan yields all 48 transform accumulators; no table rescan per board.
+- Update: `table[p] += lr * (r + V(next) - V(after)) / n_tuples`, reward = score delta / 1000 (same scale as `nn`).
+- File: 8-byte magic + version + endianness + pattern count + per-table lengths + f32 LE payload.
+- CLI: `zig build ntuple -- <train_games> <eval_games> <eval_seed> <lr> <base|chance> <table_path> [train_seed]`; `train_games = 0` loads the table. Eval prints the same lines as `nn`, labelled `ntuple`. `chance` is spawn-lookahead self-play and is much slower than `base`.
+- Not wired into `solver.Policy` / `ranking` / `server` yet (adoption is a follow-up PR).
+
+Smoke (Zig 0.17, Debug, `zig build ntuple -- 200 20 2000 0.01 base /tmp/t.bin 1`): 200 games, 37,341 moves, 0.2 s training. Eval seeds 2000..2019: `ntuple 1-ply` 2,439, `ntuple + 1 spawn lookahead` 8,710, expectimax depth 2 21,840. 2,000 games (same command, 10 eval games) gives 3,118 / 10,213 on seeds 2000..2009, so the tables do learn.
+
+Table file: 68,419,628 bytes raw, 106,259 bytes with `gzip -9` after 200 games (182,822 bytes after 2,000). The dense 6-tuple table dominates the raw size; it is almost all zeros early, so the gzip target holds for the smoke file but grows as training fills it. If that breaks the < 1 MB static-hosting target later, drop the 6-tuple until a quantized or sparse payload is in place.
+
+### Scaling the n-tuple tables (training run, #70)
+
+Serial training runs with the initial lr 0.01 (linear decay to 10%), training seed 1, table size 68.4 MB raw (5 four-tuples + one 2x3 six-tuple):
+
+| train games | moves | time | 1-ply | + 1 spawn lookahead |
+|---|---|---|---|---|
+| 200 | 37,341 | 0.2 s | 2,439 | 8,710 |
+| 20,000 | 6,218,061 | 3.7 s | 4,426 | 11,385 |
+| 200,000 | 86,039,320 | 51.0 s | 7,783 | 15,100 |
+| 1,000,000 | 492,306,926 | 288.0 s | 8,832 | 17,093 |
+
+- Reading: still climbing steeply at 1M games and about 60 games/s, but the level is far below the MLP (`nn` 72,205 with 2-ply). The classic n-tuple result needs tens of millions of games plus a much lower per-sample lr; at this scale the MLP is simply better per unit time.
+- Table size: 68.4 MB raw, 106 KB gzipped at 200 games and 183 KB at 2,000 games, so a sparse/gzip payload is fine for static hosting as long as the six-tuple stays (it dominates the raw size).
+- Verdict: not adopted as a policy yet. Follow-ups tracked in #73: 2-ply search on the n-tuple leaf, a `light` table set (5 four-tuples, 1/17 the raw size) and training resume so long sweeps are possible.
+
 ## Deeper search: nn2 (2-ply) (#69)
 
 The `nn` policy is "1-ply + one spawn lookahead". Every extra ply is expensive (branching 4 moves x ~6 empty cells x 2 tile values), but the MLP's afterstate value is cheap enough to afford one more level, so the question was simply how much score one more ply buys.
