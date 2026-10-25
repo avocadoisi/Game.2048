@@ -12,34 +12,31 @@ const usage =
     \\
 ;
 
-pub fn main() !void {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
-
-    const args = try std.process.argsAlloc(gpa);
-    defer std.process.argsFree(gpa, args);
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     const command = if (args.len > 1) args[1] else "play";
 
     if (std.mem.eql(u8, command, "play")) {
-        var seed = std.Random.DefaultPrng.init(try seedFromOs());
+        var seed = std.Random.DefaultPrng.init(try seedFromOs(io));
         var in_buf: [4096]u8 = undefined;
         var out_buf: [4096]u8 = undefined;
-        var stdin_reader = std.fs.File.stdin().reader(&in_buf);
-        var stdout_writer = std.fs.File.stdout().writer(&out_buf);
+        var stdin_reader = std.Io.File.stdin().reader(io, &in_buf);
+        var stdout_writer = std.Io.File.stdout().writer(io, &out_buf);
         try cli.run(&stdin_reader.interface, &stdout_writer.interface, &seed);
     } else if (std.mem.eql(u8, command, "serve")) {
         const port: u16 = if (args.len > 2) try std.fmt.parseInt(u16, args[2], 10) else 8080;
-        try server.serve(gpa, port, try seedFromOs());
+        try server.serve(io, gpa, port, try seedFromOs(io));
     } else {
         std.debug.print("{s}", .{usage});
     }
 }
 
-fn seedFromOs() !u64 {
+fn seedFromOs(io: std.Io) !u64 {
     var buf: [8]u8 = undefined;
-    try std.posix.getrandom(&buf);
+    try io.randomSecure(&buf);
     return std.mem.readInt(u64, &buf, .little);
 }
 

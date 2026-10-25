@@ -24,7 +24,8 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
-    if (b.args) |args| run_cmd.addArgs(args);
+    // forwards `zig build run -- <args>` to the app (replaces removed `b.args`)
+    run_cmd.addPassthruArgs();
     run_cmd.step.dependOn(b.getInstallStep());
 
     const run_step = b.step("run", "Run the CLI app");

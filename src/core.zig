@@ -167,7 +167,7 @@ pub fn spawn(state: *GameState, rng: anytype) bool {
 
 /// Slide tiles toward index 0 and merge each equal pair once (left-to-right).
 pub fn mergeLine(line: [BoardSize]Tile) MergeResult {
-    var packed_tiles = [_]Tile{0} ** BoardSize;
+    var packed_tiles: [BoardSize]Tile = @splat(0);
     var count: usize = 0;
     for (line) |value| {
         if (value != 0) {
@@ -176,7 +176,7 @@ pub fn mergeLine(line: [BoardSize]Tile) MergeResult {
         }
     }
 
-    var merged = [_]Tile{0} ** BoardSize;
+    var merged: [BoardSize]Tile = @splat(0);
     var score_delta: u32 = 0;
     var read: usize = 0;
     var write: usize = 0;
