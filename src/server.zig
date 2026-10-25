@@ -66,8 +66,16 @@ pub fn route(
         return jsonResponse(gpa, .ok, stateJson(session, false, false));
     }
     if (method == .GET and std.mem.eql(u8, path, "/api/solve")) {
-        const dir = solver.bestMove(session.state, depthFromQuery(query));
-        return jsonResponse(gpa, .ok, .{ .dir = dir });
+        const algo = algoFromQuery(query) orelse
+            return .{ .status = .bad_request, .content_type = "text/plain", .body = "algo must be expectimax|greedy\n" };
+        const depth = depthFromQuery(query);
+        const r = solver.rank(session.state, algo, depth);
+        return jsonResponse(gpa, .ok, SolveJson{
+            .algo = @tagName(algo),
+            .depth = depth,
+            .dir = if (r.len == 0) null else r.items[0].dir,
+            .ranking = r.items[0..r.len],
+        });
     }
     if (method == .POST and std.mem.eql(u8, path, "/api/move")) {
         const dir = directionFromQuery(query) orelse
@@ -96,6 +104,22 @@ fn directionFromQuery(query: []const u8) ?core.Direction {
         if (std.mem.startsWith(u8, pair, "dir=")) return core.Direction.parse(pair["dir=".len..]);
     }
     return null;
+}
+
+const SolveJson = struct {
+    algo: []const u8,
+    depth: u8,
+    dir: ?core.Direction,
+    ranking: []const solver.Ranked,
+};
+
+/// Solver algorithm from `algo=NAME`; defaults to expectimax. Null for an unknown name.
+fn algoFromQuery(query: []const u8) ?solver.Algorithm {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        if (std.mem.startsWith(u8, pair, "algo=")) return std.meta.stringToEnum(solver.Algorithm, pair["algo=".len..]);
+    }
+    return .expectimax;
 }
 
 /// Solver search depth from `depth=N`; defaults to 2 (the depth validated in ai/solver).
@@ -190,6 +214,19 @@ fn countTiles(board: core.Board) usize {
         if (v != 0) n += 1;
     };
     return n;
+}
+
+test "route solve returns the algorithm, move and ranking" {
+    const gpa = std.testing.allocator;
+    var session = Session.init(1);
+    const res = try route(gpa, &session, .GET, "/api/solve?algo=greedy&depth=2");
+    defer gpa.free(res.body);
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"algo\":\"greedy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"ranking\":[{") != null);
+
+    const bad = try route(gpa, &session, .GET, "/api/solve?algo=magic");
+    try std.testing.expectEqual(std.http.Status.bad_request, bad.status);
 }
 
 test "route solve returns the solver's next move without changing the board" {

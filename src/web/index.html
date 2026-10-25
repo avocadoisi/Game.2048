@@ -29,6 +29,11 @@
   <button id="new">New game</button>
   <button id="step">Solver: 1 step</button>
   <button id="auto">Solver: auto</button>
+  <label>algorithm <select id="algo">
+    <option value="expectimax" selected>expectimax (depth 2)</option>
+    <option value="greedy">greedy (1 ply)</option>
+  </select></label>
+  <div id="ranking"></div>
   <label>speed <select id="speed">
     <option value="600">slow (600 ms)</option>
     <option value="300">normal (300 ms)</option>
@@ -69,8 +74,11 @@ document.getElementById("new").addEventListener("click", () => call("POST", "/ap
 // Solver preview: ask the server for the expectimax move, then apply it.
 let running = false;
 async function solveStep() {
-  const res = await fetch("/api/solve?depth=2");
-  const { dir } = await res.json();
+  const algo = document.getElementById("algo").value;
+  const res = await fetch("/api/solve?algo=" + algo + "&depth=2");
+  if (!res.ok) { document.getElementById("msg").textContent = "solver error: " + res.status; return false; }
+  const { dir, ranking } = await res.json();
+  document.getElementById("ranking").textContent = "ranking: " + ranking.map((r, i) => (i + 1) + ". " + r.dir + " (" + r.value.toFixed(1) + ")").join("  ");
   if (dir === null) { stopAuto(); document.getElementById("msg").textContent = "solver: no move (game over)"; return false; }
   await call("POST", "/api/move?dir=" + dir);
   return true;

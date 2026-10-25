@@ -8,20 +8,40 @@ const GameState = core.GameState;
 /// Returned for a board where the player has no legal move.
 const lost_score: f64 = -1e9;
 
-/// Pick the move with the best expectimax value; null when no move changes the board.
-pub fn bestMove(state: GameState, depth: u8) ?Direction {
-    var best: ?Direction = null;
-    var best_value: f64 = -std.math.inf(f64);
+pub const Algorithm = enum { expectimax, greedy };
+
+pub const Ranked = struct { dir: Direction, value: f64 };
+
+/// Legal moves sorted best first. Ties keep the up, left, down, right order.
+pub const Ranking = struct {
+    items: [4]Ranked = undefined,
+    len: usize = 0,
+};
+
+/// expectimax: value after the random spawn, searched `depth` player moves deep.
+/// greedy: heuristic of the slid board, no spawn and no search (depth is ignored).
+pub fn rank(state: GameState, algo: Algorithm, depth: u8) Ranking {
+    var r: Ranking = .{};
     for ([_]Direction{ .up, .left, .down, .right }) |d| {
         var next = state;
         if (!next.slide(d).changed) continue;
-        const value = chanceValue(next, depth);
-        if (best == null or value > best_value) {
-            best = d;
-            best_value = value;
-        }
+        const value = switch (algo) {
+            .expectimax => chanceValue(next, depth),
+            .greedy => evaluateState(next),
+        };
+        // insertion sort: strict > keeps the earlier direction on ties
+        var i = r.len;
+        while (i > 0 and r.items[i - 1].value < value) : (i -= 1) r.items[i] = r.items[i - 1];
+        r.items[i] = .{ .dir = d, .value = value };
+        r.len += 1;
     }
-    return best;
+    return r;
+}
+
+/// Pick the move with the best expectimax value; null when no move changes the board.
+pub fn bestMove(state: GameState, depth: u8) ?Direction {
+    const r = rank(state, .expectimax, depth);
+    return if (r.len == 0) null else r.items[0].dir;
 }
 
 /// Snake path 1..16: row 0 left to right, row 1 right to left, and so on.
@@ -153,6 +173,34 @@ test "bestMove returns null when no move changes the board" {
         .{ 4, 2, 4, 2 },
     } };
     try std.testing.expectEqual(@as(?Direction, null), bestMove(state, 1));
+}
+
+test "rank lists legal moves best first" {
+    const state: GameState = .{ .board = .{
+        .{ 2, 2, 4, 8 },
+        .{ 16, 32, 64, 128 },
+        .{ 256, 512, 1024, 2048 },
+        .{ 4096, 8192, 16384, 32768 },
+    } };
+    const r = rank(state, .greedy, 0);
+    // up/down are no-ops on this board, so only left and right are ranked
+    try std.testing.expectEqual(@as(usize, 2), r.len);
+    try std.testing.expect(r.items[0].value >= r.items[1].value);
+    try std.testing.expect(r.items[0].dir == .left or r.items[0].dir == .right);
+    try std.testing.expectEqual(bestMove(state, 2), r.items[0].dir);
+}
+
+test "greedy ranks by one-ply evaluation, not expectimax" {
+    const state: GameState = .{ .board = .{
+        .{ 2, 2, 4, 8 },
+        .{ 16, 32, 64, 128 },
+        .{ 256, 512, 1024, 2048 },
+        .{ 4096, 8192, 16384, 32768 },
+    } };
+    const greedy = rank(state, .greedy, 2);
+    const expect = rank(state, .expectimax, 2);
+    try std.testing.expectEqual(greedy.len, expect.len);
+    try std.testing.expect(greedy.items[0].value != expect.items[0].value);
 }
 
 test "bestMove takes a merge over a move that does nothing" {
