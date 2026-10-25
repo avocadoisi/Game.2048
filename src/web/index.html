@@ -29,6 +29,13 @@
   <button id="new">New game</button>
   <button id="step">Solver: 1 step</button>
   <button id="auto">Solver: auto</button>
+  <label>speed <select id="speed">
+    <option value="600">slow (600 ms)</option>
+    <option value="300">normal (300 ms)</option>
+    <option value="150" selected>fast (150 ms)</option>
+    <option value="50">very fast (50 ms)</option>
+    <option value="0">max (no delay)</option>
+  </select></label>
 </p>
 <script>
 const KEYS = { ArrowUp: "up", w: "up", ArrowLeft: "left", a: "left", ArrowDown: "down", s: "down", ArrowRight: "right", d: "right" };
@@ -60,7 +67,7 @@ for (const b of document.querySelectorAll("[data-dir]")) {
 document.getElementById("new").addEventListener("click", () => call("POST", "/api/new"));
 
 // Solver preview: ask the server for the expectimax move, then apply it.
-let timer = null;
+let running = false;
 async function solveStep() {
   const res = await fetch("/api/solve?depth=2");
   const { dir } = await res.json();
@@ -68,12 +75,21 @@ async function solveStep() {
   await call("POST", "/api/move?dir=" + dir);
   return true;
 }
-function stopAuto() { clearInterval(timer); timer = null; document.getElementById("auto").textContent = "Solver: auto"; }
+function stopAuto() { running = false; document.getElementById("auto").textContent = "Solver: auto"; }
+// One request at a time; the speed select is read on every step, so changes apply at once.
+async function autoLoop() {
+  while (running) {
+    if (!await solveStep()) break;
+    const delay = Number(document.getElementById("speed").value);
+    if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+  }
+}
 document.getElementById("step").addEventListener("click", () => solveStep());
 document.getElementById("auto").addEventListener("click", () => {
-  if (timer) return stopAuto();
+  if (running) return stopAuto();
+  running = true;
   document.getElementById("auto").textContent = "Solver: stop";
-  timer = setInterval(solveStep, 150);
+  autoLoop();
 });
 document.addEventListener("keydown", (e) => {
   const dir = KEYS[e.key] || KEYS[e.key.toLowerCase()];
