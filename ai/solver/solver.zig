@@ -45,7 +45,7 @@ pub fn bestMove(state: GameState, depth: u8) ?Direction {
 }
 
 /// Move-choosing policies compared in the ranking (`zig build ranking`).
-pub const Policy = enum { random, greedy, expectimax };
+pub const Policy = enum { random, greedy, expectimax, expectimax_tt };
 
 /// Next move for a policy; null when no move changes the board.
 pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Direction {
@@ -68,6 +68,7 @@ pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Dir
             return if (r.len == 0) null else r.items[0].dir;
         },
         .expectimax => return bestMove(state, depth),
+        .expectimax_tt => return bestMoveTT(state, 3),
     }
 }
 
@@ -160,6 +161,94 @@ pub fn evaluateState(state: GameState) f64 {
     return score;
 }
 
+// shortcut: 8192 direct-mapped entries; collisions only reduce cache hits, increase this if needed.
+const tt_entry_count = 8192;
+
+const TTKind = enum { max, chance };
+
+const TTEntry = struct {
+    board: Board,
+    value: f64,
+    depth: u8,
+    kind: TTKind,
+    valid: bool,
+};
+
+fn bestMoveTT(state: GameState, depth: u8) ?Direction {
+    var table: [tt_entry_count]TTEntry = undefined;
+    for (&table) |*entry| entry.valid = false;
+
+    var best: ?Direction = null;
+    var best_value = lost_score;
+    for ([_]Direction{ .up, .left, .down, .right }) |d| {
+        var next = state;
+        if (!next.slide(d).changed) continue;
+        const value = chanceValueTT(next, depth, &table);
+        if (best == null or value > best_value) {
+            best = d;
+            best_value = value;
+        }
+    }
+    return best;
+}
+
+fn ttSlot(board: Board, depth: u8, kind: TTKind) usize {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(std.mem.asBytes(&board));
+    hasher.update(std.mem.asBytes(&depth));
+    hasher.update(std.mem.asBytes(&kind));
+    return @as(usize, @truncate(hasher.final())) % tt_entry_count;
+}
+
+fn ttGet(board: Board, depth: u8, kind: TTKind, table: *[tt_entry_count]TTEntry) ?f64 {
+    const entry = table[ttSlot(board, depth, kind)];
+    if (entry.valid and entry.depth == depth and entry.kind == kind and std.meta.eql(entry.board, board)) return entry.value;
+    return null;
+}
+
+fn ttPut(board: Board, depth: u8, kind: TTKind, value: f64, table: *[tt_entry_count]TTEntry) void {
+    table[ttSlot(board, depth, kind)] = .{ .board = board, .value = value, .depth = depth, .kind = kind, .valid = true };
+}
+
+fn maxValueTT(state: GameState, depth: u8, table: *[tt_entry_count]TTEntry) f64 {
+    if (depth == 0) return evaluateState(state);
+    if (ttGet(state.board, depth, .max, table)) |value| return value;
+    var best: f64 = lost_score;
+    var any_move = false;
+    for ([_]Direction{ .up, .left, .down, .right }) |d| {
+        var next = state;
+        if (!next.slide(d).changed) continue;
+        any_move = true;
+        best = @max(best, chanceValueTT(next, depth, table));
+    }
+    if (!any_move) best = lost_score;
+    ttPut(state.board, depth, .max, best, table);
+    return best;
+}
+
+fn chanceValueTT(state: GameState, depth: u8, table: *[tt_entry_count]TTEntry) f64 {
+    if (ttGet(state.board, depth, .chance, table)) |value| return value;
+    var total: f64 = 0;
+    var empties: f64 = 0;
+    for (0..core.BoardSize) |r| {
+        for (0..core.BoardSize) |c| {
+            if (state.board[r][c] != 0) continue;
+            empties += 1;
+            for ([_]struct { value: core.Tile, p: f64 }{
+                .{ .value = 2, .p = 0.9 },
+                .{ .value = 4, .p = 0.1 },
+            }) |spawn| {
+                var next = state;
+                next.board[r][c] = spawn.value;
+                total += spawn.p * maxValueTT(next, depth - 1, table);
+            }
+        }
+    }
+    const value = if (empties == 0) evaluateState(state) else total / empties;
+    ttPut(state.board, depth, .chance, value, table);
+    return value;
+}
+
 fn maxValue(state: GameState, depth: u8) f64 {
     if (depth == 0) return evaluateState(state);
     var best: f64 = lost_score;
@@ -194,6 +283,21 @@ fn chanceValue(state: GameState, depth: u8) f64 {
     }
     if (empties == 0) return evaluateState(state);
     return total / empties;
+}
+
+test "expectimax TT depth 3 matches bestMove on random-play boards" {
+    var rng_state = std.Random.DefaultPrng.init(100);
+    const rng = rng_state.random();
+    var state = GameState.gameStart(rng);
+    const sample_after = [_]usize{ 8, 16, 24 };
+    var moves: usize = 0;
+    for (sample_after) |target| {
+        while (moves < target) : (moves += 1) {
+            const direction = choose(.random, state, rng, 0) orelse return error.UnexpectedGameOver;
+            _ = state.move(direction, rng);
+        }
+        try std.testing.expectEqual(bestMove(state, 3), choose(.expectimax_tt, state, rng, 0));
+    }
 }
 
 test "bestMove returns null when no move changes the board" {
