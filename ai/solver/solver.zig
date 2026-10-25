@@ -7,6 +7,9 @@ const GameState = core.GameState;
 
 /// Returned for a board where the player has no legal move.
 const lost_score: f64 = -1e9;
+/// shortcut: fixed width keeps branching cheap; tune against deeper searches if needed.
+const beam_width = 32;
+const beam_horizon = 3;
 
 pub const Algorithm = enum { expectimax, greedy };
 
@@ -45,7 +48,7 @@ pub fn bestMove(state: GameState, depth: u8) ?Direction {
 }
 
 /// Move-choosing policies compared in the ranking (`zig build ranking`).
-pub const Policy = enum { random, greedy, expectimax };
+pub const Policy = enum { random, greedy, expectimax, beam };
 
 /// Next move for a policy; null when no move changes the board.
 pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Direction {
@@ -68,6 +71,7 @@ pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Dir
             return if (r.len == 0) null else r.items[0].dir;
         },
         .expectimax => return bestMove(state, depth),
+        .beam => return beamMove(state),
     }
 }
 
@@ -83,6 +87,67 @@ pub fn playPolicy(rng: std.Random, policy: Policy, depth: u8) GameResult {
         for (row) |value| max_tile = @max(max_tile, value);
     }
     return .{ .score = state.score, .max_tile = max_tile, .moves = moves };
+}
+
+const BeamNode = struct {
+    state: GameState,
+    first_move: Direction,
+    value: f64,
+};
+
+/// Beam search over three player moves; each empty cell is considered as a 2 spawn.
+fn beamMove(state: GameState) ?Direction {
+    var beam: [beam_width]BeamNode = undefined;
+    beam[0] = .{ .state = state, .first_move = .up, .value = evaluateState(state) };
+    var beam_len: usize = 1;
+
+    for (0..beam_horizon) |ply| {
+        var next_beam: [beam_width]BeamNode = undefined;
+        var next_len: usize = 0;
+        for (beam[0..beam_len]) |node| {
+            for ([_]Direction{ .up, .left, .down, .right }) |direction| {
+                var moved = node.state;
+                if (!moved.slide(direction).changed) continue;
+                const first_move = if (ply == 0) direction else node.first_move;
+                var spawned = false;
+                for (0..core.BoardSize) |r| {
+                    for (0..core.BoardSize) |c| {
+                        if (moved.board[r][c] != 0) continue;
+                        var child = moved;
+                        child.board[r][c] = 2;
+                        insertBeam(&next_beam, &next_len, .{
+                            .state = child,
+                            .first_move = first_move,
+                            .value = evaluateState(child),
+                        });
+                        spawned = true;
+                    }
+                }
+                if (!spawned) insertBeam(&next_beam, &next_len, .{
+                    .state = moved,
+                    .first_move = first_move,
+                    .value = evaluateState(moved),
+                });
+            }
+        }
+        if (next_len == 0) {
+            if (ply == 0) return null;
+            break;
+        }
+        beam = next_beam;
+        beam_len = next_len;
+    }
+    return beam[0].first_move;
+}
+
+fn insertBeam(items: *[beam_width]BeamNode, len: *usize, candidate: BeamNode) void {
+    var i = len.*;
+    while (i > 0 and items[i - 1].value < candidate.value) : (i -= 1) {
+        if (i < beam_width) items[i] = items[i - 1];
+    }
+    if (i == beam_width) return;
+    items[i] = candidate;
+    if (len.* < beam_width) len.* += 1;
 }
 
 /// Snake path 1..16: row 0 left to right, row 1 right to left, and so on.
@@ -204,6 +269,27 @@ test "bestMove returns null when no move changes the board" {
         .{ 4, 2, 4, 2 },
     } };
     try std.testing.expectEqual(@as(?Direction, null), bestMove(state, 1));
+}
+
+test "beam policy returns a legal move and null on a dead board" {
+    const state: GameState = .{ .board = .{
+        .{ 2, 2, 4, 8 },
+        .{ 16, 32, 64, 128 },
+        .{ 256, 512, 1024, 2048 },
+        .{ 4096, 8192, 16384, 32768 },
+    } };
+    var prng = std.Random.DefaultPrng.init(7);
+    const move = choose(.beam, state, prng.random(), 0).?;
+    var moved = state;
+    try std.testing.expect(moved.slide(move).changed);
+
+    const dead: GameState = .{ .board = .{
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+    } };
+    try std.testing.expectEqual(@as(?Direction, null), choose(.beam, dead, prng.random(), 0));
 }
 
 test "random policy only picks legal moves" {
