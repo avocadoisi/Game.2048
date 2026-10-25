@@ -419,3 +419,20 @@ Protocol identical to #56: train each variant for 20000 games at 5 training seed
 - Verdict: `midgame` stays opt-in and off by default. The error-share argument (#32) says where the error is, not that concentrating updates there helps — the last three attempts (`replay`, `priority`, `midgame`) all point the same way.
 - Next candidates, in order of expected value: mix the mid-game bucket with a uniform share (the shape that came closest in #34), more training games at the same protocol, and an lr sweep.
 - Cost: 5 training runs, 145-358 s each (serial; `par` still cannot run variant paths).
+
+## Training games: 20,000 vs 40,000 (#61)
+
+Same protocol as #56 (5 training seeds, eval on seed ranges 2000, 3000, 4000, 5000, 6000 x 20 games, nn 1-ply average score), no code change: only `train_games` moved from 20,000 to 40,000. The linear lr decay is a function of the fraction trained, so the 40k runs also stretch the schedule to twice as many games.
+
+| training seed | 20k | 40k | delta |
+|---|---|---|---|
+| 1 | 19,611 | 30,770 | +11,160 |
+| 2 | 18,011 | 30,283 | +12,272 |
+| 3 | 17,870 | 33,257 | +15,387 |
+| 4 | 20,431 | 33,314 | +12,883 |
+| 5 | 17,846 | 25,906 | +8,060 |
+| **mean ± stderr (n=5)** | **18,754 ± 534** | **30,706 ± 1,352** | **+11,952 ± 1,195** (t = 10.0) |
+
+- Reading: doubling the games is worth about 12,000 points of nn 1-ply score at this stage of the curve, far above the seed noise. The curve has not flattened at 40,000 games.
+- **The committed weights were not replaced**: they were trained with 200,000 games (see "NN weights" above) and score 40,282 on these same five ranges (38,641 / 34,894 / 34,196 / 50,210 / 43,467), well above any 40k net. Comparing a 40k net against them is not a fair fight, which is the point of the table: the protocol in #33/#34/#56/#59 uses 20,000-game nets, so those variant comparisons are all made far down the curve.
+- Cost: 5 runs x 40,000 games, 514-559 s each (serial). Re-evaluating the 20k and committed weights with the same binary is free.
