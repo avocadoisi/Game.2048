@@ -16,6 +16,7 @@ const usage =
     \\  variant       base (default), backward (sweep stored afterstates last to first), replay (re-train the last replay_k),
     \\              priority (#34: 32 extra updates per game sampled from a |TD error| buffer, 50% uniform)
     \\              midgame (#59: 32 extra updates per game from buffer entries with 4..7 empty cells, uniform)
+    \\              midmix  (#63: same but 50% uniform over the whole buffer, 50% |TD error| in the 4..7 bucket)
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
     \\                game i uses seed train_seed + i and the batch result is the mean of its games.
     \\                par trains the plain per-move variant only: replay_k is ignored, but its
@@ -94,6 +95,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .priority = &priority }
     else if (std.mem.eql(u8, variant, "midgame"))
         .{ .priority = &priority, .midgame = true }
+    else if (std.mem.eql(u8, variant, "midmix"))
+        .{ .priority = &priority, .midmix = true }
     else {
         std.debug.print("{s}", .{usage});
         return;

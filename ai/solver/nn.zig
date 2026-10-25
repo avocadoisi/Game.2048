@@ -268,6 +268,9 @@ pub const Options = struct {
     /// Candidate E (#59): with `priority` set, the `m` extra updates draw uniformly from buffer entries
     /// with 4..7 empty cells (midgame) instead of by |TD error|.
     midgame: bool = false,
+    /// Candidate (#63): with `priority` set, the `m` extra updates keep the uniform share over the whole
+    /// buffer and draw the rest by |TD error| from the 4..7 empty-cell bucket only.
+    midmix: bool = false,
 };
 
 /// Prioritized replay (issue #34): ring buffer of recent TD updates. After each game, `m` extra updates
@@ -322,6 +325,28 @@ pub const Priority = struct {
         unreachable;
     }
 
+    /// Midgame branch of the midmix variant (#63): entries with 4..7 empty cells, by priority weight.
+    /// Whole buffer (uniform) when that bucket is empty.
+    pub fn sampleMidmix(self: *const Priority, rng: std.Random) usize {
+        if (rng.float(f64) < self.uniform_share) return rng.uintLessThan(usize, self.len);
+        var total: f64 = 0;
+        var eligible: usize = 0;
+        for (self.items[0..self.len]) |e| if (isMidgame(e.after)) {
+            total += self.weight(e.err);
+            eligible += 1;
+        };
+        if (eligible == 0) return rng.uintLessThan(usize, self.len);
+        var r = rng.float(f64) * total;
+        var last: usize = 0;
+        for (self.items[0..self.len], 0..) |e, i| {
+            if (!isMidgame(e.after)) continue;
+            last = i;
+            r -= self.weight(e.err);
+            if (r < 0) return i;
+        }
+        return last;
+    }
+
     fn isMidgame(board: Board) bool {
         const empty = countEmpty(board);
         return empty >= 4 and empty <= 7;
@@ -348,8 +373,8 @@ pub const GameResult = struct { score: u32, moves: u32 };
 
 /// `trainGame` with options. `diag` is only recorded on the default path (`opts` all off).
 pub fn trainGameOpts(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
-    if (opts.priority) |pr| return trainGamePerMove(net, rng, lr, diag, pr, opts.midgame);
-    if (!opts.backward and opts.replay_k == 0) return trainGamePerMove(net, rng, lr, diag, null, false);
+    if (opts.priority) |pr| return trainGamePerMove(net, rng, lr, diag, pr, opts.midgame, opts.midmix);
+    if (!opts.backward and opts.replay_k == 0) return trainGamePerMove(net, rng, lr, diag, null, false, false);
     var steps: [step_cap]Step = undefined;
     var n: usize = 0;
     var state = GameState.gameStart(rng);
@@ -395,7 +420,7 @@ fn valueOf(net: *const Net, after: Board) f64 {
     return forward(net, after, &cache);
 }
 
-fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, pr: ?*Priority, midgame: bool) GameResult {
+fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, pr: ?*Priority, midgame: bool, midmix: bool) GameResult {
     var state = GameState.gameStart(rng);
     var pending: ?Pick = null;
     var cache: Cache = .{};
@@ -419,7 +444,12 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, pr: ?*Pri
         train(net, &cache, p.reward, lr);
     }
     if (pr) |b| for (0..b.m) |_| {
-        const e = &b.items[if (midgame) b.sampleMidgame(rng) else b.sample(rng)];
+        const e = &b.items[if (midmix)
+            b.sampleMidmix(rng)
+        else if (midgame)
+            b.sampleMidgame(rng)
+        else
+            b.sample(rng)];
         const target = e.reward + if (e.terminal) 0 else valueOf(net, e.next);
         _ = forward(net, e.after, &cache);
         e.err = @abs(target - cache.out);
@@ -933,6 +963,53 @@ test "midgame sampling falls back to the whole buffer when no 4..7 entry exists"
     var rng = std.Random.DefaultPrng.init(7);
     var hits: [6]usize = @splat(0);
     for (0..6000) |_| hits[pr.sampleMidgame(rng.random())] += 1;
+    for (hits) |h| try std.testing.expect(h > 0);
+}
+
+test "midmix sampling mixes the uniform share with the weighted 4..7 share" {
+    var pr: Priority = .{};
+    // 0 and 1 are midgame entries (err 4 and 0), 2 and 3 are not: only the uniform share can hit those.
+    pr.items[0] = .{ .after = boardWithEmpties(5), .reward = 0, .next = undefined, .terminal = false, .err = 4 };
+    pr.items[1] = .{ .after = boardWithEmpties(5), .reward = 0, .next = undefined, .terminal = false, .err = 0 };
+    pr.items[2] = .{ .after = boardWithEmpties(2), .reward = 0, .next = undefined, .terminal = false, .err = 0 };
+    pr.items[3] = .{ .after = boardWithEmpties(12), .reward = 0, .next = undefined, .terminal = false, .err = 0 };
+    pr.len = 4;
+    var rng = std.Random.DefaultPrng.init(7);
+    const draws = 40000;
+    var hits: [4]usize = @splat(0);
+    for (0..draws) |_| hits[pr.sampleMidmix(rng.random())] += 1;
+    const w_small = @sqrt(Priority.err_floor);
+    // entry 0: 0.5 * 1/4 + 0.5 * 2 / (2 + w_small); entries 2..3: 0.5 * 1/4
+    const p0 = 0.5 * 0.25 + 0.5 * 2.0 / (2.0 + w_small);
+    const p_outside = 0.5 * 0.25;
+    try std.testing.expectApproxEqAbs(p0, @as(f64, @floatFromInt(hits[0])) / draws, 0.01);
+    try std.testing.expectApproxEqAbs(p_outside, @as(f64, @floatFromInt(hits[2])) / draws, 0.01);
+    try std.testing.expectApproxEqAbs(p_outside, @as(f64, @floatFromInt(hits[3])) / draws, 0.01);
+}
+
+test "midmix weighted branch only returns entries with 4..7 empty cells" {
+    var pr: Priority = .{ .uniform_share = 0 };
+    const empties = [_]usize{ 0, 4, 5, 6, 7, 8, 16 };
+    for (empties, 0..) |e, i| pr.items[i] = .{ .after = boardWithEmpties(e), .reward = 0, .next = undefined, .terminal = false, .err = @floatFromInt(i) };
+    pr.len = empties.len;
+    var rng = std.Random.DefaultPrng.init(7);
+    var seen: [4]bool = @splat(false);
+    for (0..1000) |_| {
+        const n = countEmpty(pr.items[pr.sampleMidmix(rng.random())].after);
+        try std.testing.expect(n >= 4 and n <= 7);
+        seen[n - 4] = true;
+    }
+    for (seen) |hit| try std.testing.expect(hit);
+}
+
+test "midmix sampling falls back to the whole buffer when no 4..7 entry exists" {
+    var pr: Priority = .{ .uniform_share = 0 };
+    const empties = [_]usize{ 0, 1, 2, 3, 8, 9 };
+    for (empties, 0..) |e, i| pr.items[i] = .{ .after = boardWithEmpties(e), .reward = 0, .next = undefined, .terminal = false, .err = 0 };
+    pr.len = empties.len;
+    var rng = std.Random.DefaultPrng.init(7);
+    var hits: [6]usize = @splat(0);
+    for (0..6000) |_| hits[pr.sampleMidmix(rng.random())] += 1;
     for (hits) |h| try std.testing.expect(h > 0);
 }
 
