@@ -48,7 +48,7 @@ pub fn bestMove(state: GameState, depth: u8) ?Direction {
 }
 
 /// Move-choosing policies compared in the ranking (`zig build ranking`).
-pub const Policy = enum { random, greedy, expectimax, beam };
+pub const Policy = enum { random, greedy, expectimax, mcts, beam };
 
 /// Next move for a policy; null when no move changes the board.
 pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Direction {
@@ -71,8 +71,75 @@ pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Dir
             return if (r.len == 0) null else r.items[0].dir;
         },
         .expectimax => return bestMove(state, depth),
+        .mcts => return mctsMove(state, rng),
         .beam => return beamMove(state),
     }
+}
+
+/// shortcut: fixed 200 full random rollouts per move; raise only while the 6 s/game limit holds.
+const mcts_simulations: usize = 200;
+
+const MctsArm = struct {
+    dir: Direction,
+    visits: usize = 0,
+    reward: f64 = 0,
+};
+
+/// Root UCT selection with complete random games as rollouts.
+fn mctsMove(state: GameState, rng: std.Random) ?Direction {
+    var arms: [4]MctsArm = undefined;
+    var arm_count: usize = 0;
+    for ([_]Direction{ .up, .left, .down, .right }) |d| {
+        var next = state;
+        if (!next.slide(d).changed) continue;
+        arms[arm_count] = .{ .dir = d };
+        arm_count += 1;
+    }
+    if (arm_count == 0) return null;
+
+    for (0..mcts_simulations) |simulation| {
+        var selected: usize = 0;
+        var best_ucb: f64 = -std.math.inf(f64);
+        for (arms[0..arm_count], 0..) |arm, i| {
+            const ucb = if (arm.visits == 0)
+                std.math.inf(f64)
+            else
+                arm.reward / @as(f64, @floatFromInt(arm.visits)) +
+                    @sqrt(2 * @log(@as(f64, @floatFromInt(simulation + 1))) / @as(f64, @floatFromInt(arm.visits)));
+            if (ucb > best_ucb) {
+                best_ucb = ucb;
+                selected = i;
+            }
+        }
+
+        var rollout = state;
+        _ = rollout.move(arms[selected].dir, rng);
+        while (randomMove(&rollout, rng)) {}
+        arms[selected].visits += 1;
+        arms[selected].reward += @as(f64, @floatFromInt(rollout.score)) / 100000;
+    }
+
+    var best = arms[0];
+    for (arms[1..arm_count]) |arm| {
+        if (arm.reward / @as(f64, @floatFromInt(arm.visits)) > best.reward / @as(f64, @floatFromInt(best.visits))) best = arm;
+    }
+    return best.dir;
+}
+
+/// Apply one uniformly random legal move; false when the rollout is over.
+fn randomMove(state: *GameState, rng: std.Random) bool {
+    var legal: [4]Direction = undefined;
+    var count: usize = 0;
+    for ([_]Direction{ .up, .left, .down, .right }) |d| {
+        var next = state.*;
+        if (next.slide(d).changed) {
+            legal[count] = d;
+            count += 1;
+        }
+    }
+    if (count == 0) return false;
+    _ = state.move(legal[rng.uintLessThan(usize, count)], rng);
+    return true;
 }
 
 pub fn playPolicy(rng: std.Random, policy: Policy, depth: u8) GameResult {
@@ -269,6 +336,29 @@ test "bestMove returns null when no move changes the board" {
         .{ 4, 2, 4, 2 },
     } };
     try std.testing.expectEqual(@as(?Direction, null), bestMove(state, 1));
+}
+
+test "mcts returns only legal moves and null on a dead board" {
+    const state: GameState = .{ .board = .{
+        .{ 2, 2, 4, 8 },
+        .{ 16, 32, 64, 128 },
+        .{ 256, 512, 1024, 2048 },
+        .{ 4096, 8192, 16384, 32768 },
+    } };
+    var prng = std.Random.DefaultPrng.init(7);
+    const move = choose(.mcts, state, prng.random(), 0).?;
+    var repeat_prng = std.Random.DefaultPrng.init(7);
+    try std.testing.expectEqual(move, choose(.mcts, state, repeat_prng.random(), 0).?);
+    var next = state;
+    try std.testing.expect(next.slide(move).changed);
+
+    const dead: GameState = .{ .board = .{
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+    } };
+    try std.testing.expectEqual(@as(?Direction, null), choose(.mcts, dead, prng.random(), 0));
 }
 
 test "beam policy returns a legal move and null on a dead board" {
