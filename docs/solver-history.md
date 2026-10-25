@@ -436,3 +436,24 @@ Same protocol as #56 (5 training seeds, eval on seed ranges 2000, 3000, 4000, 50
 - Reading: doubling the games is worth about 12,000 points of nn 1-ply score at this stage of the curve, far above the seed noise. The curve has not flattened at 40,000 games.
 - **The committed weights were not replaced**: they were trained with 200,000 games (see "NN weights" above) and score 40,282 on these same five ranges (38,641 / 34,894 / 34,196 / 50,210 / 43,467), well above any 40k net. Comparing a 40k net against them is not a fair fight, which is the point of the table: the protocol in #33/#34/#56/#59 uses 20,000-game nets, so those variant comparisons are all made far down the curve.
 - Cost: 5 runs x 40,000 games, 514-559 s each (serial). Re-evaluating the 20k and committed weights with the same binary is free.
+
+## Mid-game mixed replay (#63)
+
+#59 lost the uniform share entirely and dropped 1,625 points. #34's design ("50% uniform + 50% |TD error| weighted") came closest to base of all candidates so far, so the two were combined: keep the uniform share, and bias the other half towards the bucket that holds 52.6% of the error (4..7 empty cells, #32).
+
+Mechanism: `Options.midmix` (CLI variant `midmix`). Per-move TD(0) update untouched; after each game `m = 32` extra updates, each one either uniform over the whole ring buffer (probability 0.5) or `(|δ| + 1e-3)^0.5` weighted **among entries with 4..7 empty cells** (falling back to a uniform whole-buffer draw while that bucket is empty), target recomputed from the current weights. Default off; default path byte-identical (`md5 0a8e6bf01e256adf2fc481317c5072c9` at 2000 games).
+
+Protocol identical to #56/#59: 20000 games, 5 training seeds, eval on seed ranges 2000, 3000, 4000, 5000, 6000 (20 games each), nn 1-ply average score; base column from #61.
+
+| training seed | base | midmix | delta |
+|---|---|---|---|
+| 1 | 19,611 | 20,775 | +1,164 |
+| 2 | 18,011 | 21,868 | +3,857 |
+| 3 | 17,870 | 21,637 | +3,767 |
+| 4 | 20,431 | 14,644 | -5,787 |
+| 5 | 17,846 | 17,883 | +37 |
+| **mean ± stderr (n=5)** | **18,754 ± 534** | **19,362 ± 1,377** | **+608 ± 1,762** (t = 0.3) |
+
+- Reading: 4 of 5 seeds are positive and the mean is the best of all mid-game variants tried, but the spread (14.6k-21.9k against base's 17.8k-20.4k) is three times the effect, so this is not a gain either. It is however the first variant that is not worse on average, which fits the #32/#34 story: keep the uniform share and mix in the mid-game bucket rather than replacing it.
+- Verdict: stays opt-in and off by default; committed weights unchanged.
+- Cost: 5 runs x 20,000 games, 194-353 s each.
