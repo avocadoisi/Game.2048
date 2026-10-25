@@ -203,3 +203,16 @@ Command: `zig build nn -Doptimize=ReleaseFast -- 2000 1 2000 0.003 diag` (2000 t
 - But they are a small share of the total error (about 8%), because few steps are that close to game over. Most error sits in the 4..7 empty, earlier-move bucket (53%).
 - So the near-loss states are badly fit per step, but focusing only on them would cover little of the error. Mix them in (e.g. #33 K-move replay, #34 priority with a uniform share) instead of replacing the uniform training.
 - Caveat: one training run, one seed, 2000 games. Re-check with more games before deciding.
+
+## Bench run 2026-10-25 19:31:46 +0900
+
+- command: `zig build solve -- 1 2 2 1`
+- commit: 248c1a5
+- date: 2026-10-25 19:31:46 +0900
+- exit: 0
+
+```text
+runs=1 games/run=2 depth=2 seed=1 games=2
+avg score=20954.0 avg moves=1148.0 best tile=2048
+speed: 0.54 games/s, 621 moves/s, elapsed 3.7 s
+```
