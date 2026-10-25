@@ -111,3 +111,76 @@ Speed rule: no policy slower than depth 3 (about 6.8 to 15 s/game depending on m
 - Eval seeds 3000..3099 (100 games): NN 1-ply 35,687 (best 4096); **NN + 1 spawn lookahead 66,600 (best 8192, 73.8 s)**; expectimax depth 2 24,839 (37.9 s). Before (20,000 games, seeds 2000..): 38,734.
 - Ranking seed 1000 (5x20): nn 64,113 (was 36,885), above expectimax_tt 41,216. Slower than expectimax depth 2 (~2x per game), so it breaks the "no policy slower than depth 3" rule only in time per game of about 0.7 s; still faster than depth 3.
 - Not measured: wider net (128/64, runs slower in training, see below), TD(lambda), n-tuple tables.
+
+## Speed work (no change in play)
+
+Goal: faster self-play for AI training. Every row below gives identical moves for the same seed
+(checked with `zig build solve -- 2 20 2 1`: avg score 22135.1, avg moves 1219.0).
+
+| Change | speed (games/s, depth 2, 40 games) |
+|---|---|
+| Baseline | 5.4 |
+| `evaluate`: `@log2(value)` -> `@ctz(value)` (tiles are powers of 2, so the result is the same) | 7.3 |
+| `core.mergeLine`: 65536-entry row table, fallback to the general path for non-powers-of-2 or >= 65536 | 8.3 |
+
+- Tried and dropped: precomputed slide index table (`slide_lines`) in `core.slide`. No measurable gain (about 27 ns per slide both ways).
+- Cost of the row table: about 512 KB in the binary, and about 15-20 s extra compile time in ReleaseFast.
+- Remaining cost is mostly the solver (`evaluateState` runs up to 4 slides per call). A bitboard core would be the next big step, but it changes `Board` everywhere.
+
+## Tried and not merged: packed nibble search (branch `exp/packed-search`)
+
+Idea: search on rows packed as 4 nibbles (log2 of each tile), so a slide is one table lookup per row.
+- Micro benchmark (slide only, random rows): about 3 ns per slide, against about 28 ns for `GameState.slide`.
+- Full version (`core.Packed`, expectimax on packed boards, bit-identical results): `zig build solve -- 2 20 2 1`
+  gives the same avg score 22135.1, but speed is about 5.5-5.9 games/s, the same as the merged version.
+- Profile after the change: the heuristic (`evaluateStateP`, nibble extraction in the order loop) and
+  `Packed.slide` dominate. The board-based heuristic was already cheap enough that the slide cost was not the limit.
+- A pack-and-unpack wrapper around `GameState.slide` (no packed state kept) was slower: about 40 ns per slide.
+- Conclusion: a real speedup needs `GameState` itself stored packed. That changes about 78 `.board` uses and
+  makes tiles of 65536 and above need a separate path. Not done.
+
+## Training focus: near-loss states (proposal, not implemented)
+
+Problem: `nn.trainGame` runs TD(0) over every move of every self-play game with the same weight.
+Most moves are in the safe early and middle game, so the net sees few examples of boards close to
+game over. Those boards decide the score, and their values are the least accurate.
+
+Current behaviour (`ai/solver/nn.zig`, `trainGame`): each step calls `train(net, cache, reward + next_value, lr)`
+in forward order, one update per move, no replay, no weighting by position.
+
+### Candidate ideas (cheapest first)
+
+1. **Diagnose before changing anything.** Log the per-move TD error `|target - V(s)|` grouped by
+   empty-cell count (0..3, 4..7, 8+) and by distance to game over (last 10, 11..30, earlier).
+   If the error and the value drop (`V(s_{t+1}) - V(s_t)`) are concentrated near game over, the
+   focus idea is worth doing. If not, skip it. This needs only logging, no change in training.
+2. **Backward sweep after each game.** Store the (afterstate, reward) pairs of the game and train
+   from the last move back to the first. The terminal value propagates to earlier states in one
+   pass, so the near-loss boards learn the real outcome sooner. Cost: a small buffer per game.
+   Risk: changes the update order, so results differ from the current run; compare on the same seeds.
+3. **Replay the last K moves of each lost game.** Keep the final K (e.g. 30) afterstates of each game
+   and train on them again, in a separate pass with a smaller learning rate. This oversamples
+   the states just before a loss without changing how games are played.
+4. **Prioritized replay by TD error.** Keep a buffer of recent (state, target) pairs; sample with
+   probability proportional to `|δ|^α` (α about 0.5), and always keep a fraction (e.g. 50%) uniform.
+   Large `|δ|` is a good proxy for "the value just dropped". The uniform part keeps the training
+   distribution from drifting too far from the one the policy visits.
+5. **Restarts from hard boards.** Begin some games from saved boards with few empty cells and
+   high tiles (taken from earlier games). Gives direct coverage of late-game states. Riskier:
+   those boards may be unreachable under the policy, so keep the share small.
+
+### Safety rules for any of the above
+
+- Focusing on losing states is off-policy. Always mix in uniform samples (ideas 2–4 keep the
+  normal per-move update as well).
+- Compare with the same total number of moves processed, not the same number of games,
+  because replay makes each game cost more time.
+- Evaluate with the existing protocol: `zig build nn -- 20000 100 2000 0.003` on seeds 2000..2099,
+  then a fresh seed range (e.g. 3000..3099) before deciding. Record every run in this file.
+- Keep the diagnostic (idea 1) as a flag so it can be re-run after the training changes.
+
+### Next steps
+
+- Add the diagnostic log (idea 1) to `nn_main.zig` or behind a flag in `nn.zig`.
+- If the error is concentrated near game over: implement idea 3 (cheapest) and measure.
+  Then try idea 2 and idea 4 on the same seeds.
