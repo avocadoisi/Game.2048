@@ -5,7 +5,7 @@ const nn = @import("nn");
 const parallel = @import("parallel");
 
 const usage =
-    \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate] [seed_ranges|diag]
+    \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate] [seed_ranges|diag] [par]
     \\
     \\  train_games   TD(0) self-play games; 0 loads ai/solver/nn_weights.bin (default 2000)
     \\  eval_games    games per seed range per policy, same seeds for every policy (default 100)
@@ -13,6 +13,8 @@ const usage =
     \\  learning_rate SGD step for TD training (default 0.003)
     \\  seed_ranges   number of disjoint seed ranges; report mean ± stderr over them (default 1)
     \\  diag          literal "diag": print the TD error / value drop table by empty cells and moves to game over
+    \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
+    \\                game i uses seed train_seed + i and the batch result is the mean of its games
     \\
     \\Training seed is fixed (1). Weights are written to ai/solver/nn_weights.bin only when
     \\train_games > 0; train_games = 0 (eval only) never writes.
@@ -63,7 +65,8 @@ pub fn main(init: std.process.Init) !void {
     const arg5: ?[]const u8 = if (args.len > 5) args[5] else null;
     const want_diag = arg5 != null and std.mem.eql(u8, arg5.?, "diag");
     const seed_ranges: u32 = if (arg5) |a| (if (want_diag) 1 else try std.fmt.parseInt(u32, a, 10)) else 1;
-    if (args.len > 6 or eval_games == 0 or seed_ranges == 0) {
+    const use_par = args.len > 6 and std.mem.eql(u8, args[6], "par");
+    if (args.len > 7 or (args.len > 6 and !use_par) or eval_games == 0 or seed_ranges == 0) {
         std.debug.print("{s}", .{usage});
         return;
     }
@@ -79,13 +82,27 @@ pub fn main(init: std.process.Init) !void {
         const start = std.Io.Clock.awake.now(init.io);
         var last_score: u64 = 0;
         var diag: nn.Diag = .{};
-        for (0..train_games) |g| {
-            // linear decay to 10% of the start rate: big steps early, fine tuning late
-            const frac = @as(f64, @floatFromInt(g)) / @as(f64, @floatFromInt(train_games));
-            last_score = nn.trainGame(&net, rng.random(), learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null);
-            if ((g + 1) % 5000 == 0) {
-                std.debug.print("train {d}/{d} last game score {d}\n", .{ g + 1, train_games, last_score });
-                try nn.save(&net, init.io, weights_path); // checkpoint
+        if (use_par) {
+            const batch_size = nn.trainBatchSize();
+            var g: usize = 0;
+            while (g < train_games) : (g += @min(batch_size, train_games - g)) {
+                const games = @min(batch_size, train_games - g);
+                const frac = @as(f64, @floatFromInt(g)) / @as(f64, @floatFromInt(train_games));
+                last_score = nn.trainBatch(&net, train_seed, g, games, learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null);
+                if ((g + games) % 5000 == 0) {
+                    std.debug.print("train {d}/{d} last game score {d}\n", .{ g + games, train_games, last_score });
+                    try nn.save(&net, init.io, weights_path); // checkpoint
+                }
+            }
+        } else {
+            for (0..train_games) |g| {
+                // linear decay to 10% of the start rate: big steps early, fine tuning late
+                const frac = @as(f64, @floatFromInt(g)) / @as(f64, @floatFromInt(train_games));
+                last_score = nn.trainGame(&net, rng.random(), learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null);
+                if ((g + 1) % 5000 == 0) {
+                    std.debug.print("train {d}/{d} last game score {d}\n", .{ g + 1, train_games, last_score });
+                    try nn.save(&net, init.io, weights_path); // checkpoint
+                }
             }
         }
         const elapsed = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
