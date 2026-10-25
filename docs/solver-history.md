@@ -75,3 +75,32 @@ Served at `/api/ranking` from `src/web/ranking.json`. Regenerate with:
 - beam (width 32, 3 plies, spawn approximated as 2): 12,696 at about 0.07 s/game.
 - greedy 3,424; random 1,062.
 Speed rule: no policy slower than depth 3 (about 6.8 to 15 s/game depending on machine load).
+
+## Deep learning: small MLP value net (`zig build nn`)
+
+- Model: `ai/solver/nn.zig`, one hidden layer MLP over afterstates, trained by TD(0) in pure Zig (no dependencies).
+- Training: 20,000 self-play games, learning rate 0.003 (default in `nn_main.zig`). Weights go to `ai/solver/nn_weights.bin` (git-ignored).
+- Eval on seeds 2000..2099 (100 games, `zig build nn -- 20000 100 2000 0.003`):
+
+| Policy | avg score | avg moves | best tile | time (100 games) |
+|---|---|---|---|---|
+| NN 1-ply | 21,227 | 1,129 | 4096 | 0.6 s |
+| NN + 1 spawn lookahead | 38,734 | 1,919 | 4096 | 36.2 s |
+| expectimax depth 2 (baseline) | 25,004 | 1,328 | 4096 | 19.7 s |
+
+- Learning-rate sweep, 20 games on seed 1000 (short run, noisy): 0.0003 gave 5,571 / 14,493; 0.001 gave 11,452 / 20,286; 0.003 gave 18,234 / 34,645.
+- Caveats: one training run and one seed range only. The lookahead is not a like-for-like depth comparison with expectimax. It costs about 2x the baseline time. Re-check on more seeds before adopting.
+
+## GA over evaluation weights (`zig build ga-rl`)
+
+- Evolves the 4 snake-evaluation weights (empty, order_penalty, merge, forced_down_penalty) with tournament selection, uniform crossover, and clamped log-normal mutation. Args: `16 15 8 2 1 500 100` (population 16, 15 generations, games/fitness 8, depth 2, seed 1, holdout 500, 100 games).
+- Holdout seeds 500..599 (100 games, depth 2): baseline 24,067, evolved 25,095 (+4%).
+- Evolved weights: empty 7.028, order_penalty 43.174, merge 0, forced_down 0.
+- Caveats: one GA run, one holdout range; merge and forced_down collapsed to 0, so the gain may be noise. Check on another seed range before adopting.
+
+## Policies wired into the solver (`ga`, `nn`)
+
+- `ga`: `solver.ga_weights` (3-decimal values from `zig build ga-rl`) with depth 2. `nn`: embedded `ai/solver/nn_weights.bin` (148 KB, committed), chance-mode net.
+- Both are selectable in `/api/solve?algo=ga|nn` and in the UI dropdown (ranking.json regenerated with `zig build ranking -Doptimize=ReleaseFast -- 5 20 1000`).
+- Ranking, seed 1000 (5 runs x 20 games, avg score): expectimax_tt 41,216 / nn 36,885 / mcts 29,722 / expectimax 25,267 / ga 24,046 / beam 12,696 / greedy 3,424 / random 1,062.
+- The GA weights are lower than plain expectimax on seed 1000. The +4% above holds only on seeds 500–599. Not a clear win.

@@ -10,12 +10,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const nn_mod = b.addModule("nn", .{
+        .root_source_file = b.path("ai/solver/nn.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core_mod }},
+    });
+
     const solver_mod = b.addModule("solver", .{
         .root_source_file = b.path("ai/solver/solver.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core", .module = core_mod },
+            .{ .name = "nn", .module = nn_mod },
         },
     });
 
@@ -103,6 +111,29 @@ pub fn build(b: *std.Build) void {
     const ranking_step = b.step("ranking", "Compare policies and print JSON ranking");
     ranking_step.dependOn(&ranking_cmd.step);
 
+    const nn_tests = b.addTest(.{ .root_module = nn_mod });
+    const run_nn_tests = b.addRunArtifact(nn_tests);
+
+    const nn_exe = b.addExecutable(.{
+        .name = "nn",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("ai/solver/nn_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "solver", .module = solver_mod },
+                .{ .name = "nn", .module = nn_mod },
+            },
+        }),
+    });
+    const nn_cmd = b.addRunArtifact(nn_exe);
+    nn_cmd.addPassthruArgs();
+    nn_cmd.step.dependOn(b.getInstallStep());
+
+    const nn_step = b.step("nn", "Train the value MLP (TD(0) self-play) and evaluate it against expectimax depth 2");
+    nn_step.dependOn(&nn_cmd.step);
+
     const tt_bench_exe = b.addExecutable(.{
         .name = "tt-bench-scratch",
         .root_module = b.createModule(.{
@@ -116,9 +147,35 @@ pub fn build(b: *std.Build) void {
     const tt_bench_step = b.step("tt-bench-scratch", "Temporary TT timing run");
     tt_bench_step.dependOn(&tt_bench_run.step);
 
+    const ga_exe = b.addExecutable(.{
+        .name = "ga-rl",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("ai/solver/ga_rl.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "solver", .module = solver_mod },
+            },
+        }),
+    });
+    const ga_cmd = b.addRunArtifact(ga_exe);
+    ga_cmd.addPassthruArgs();
+    ga_cmd.step.dependOn(b.getInstallStep());
+
+    const ga_step = b.step("ga-rl", "Evolve evaluation weights with a GA and compare on holdout seeds");
+    ga_step.dependOn(&ga_cmd.step);
+
+    const ga_tests = b.addTest(.{
+        .root_module = ga_exe.root_module,
+    });
+    const run_ga_tests = b.addRunArtifact(ga_tests);
+
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_solver_tests.step);
     test_step.dependOn(&run_bench_tests.step);
+    test_step.dependOn(&run_nn_tests.step);
+    test_step.dependOn(&run_ga_tests.step);
 }
