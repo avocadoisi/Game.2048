@@ -96,7 +96,7 @@ zig build run -- help         # 使い方
 - `serve`: `http://127.0.0.1:8080/` を開くと矢印キー/WASD で遊べる (日本語 IME が有効なままでも操作できる)
   - `GET /api/state`, `POST /api/new`, `POST /api/move?dir=up|left|down|right`
   - `GET /api/ranking`: ポリシーの比較結果 (`src/web/ranking.json`) を返す
-  - `GET /api/solve?depth=N&algo=<policy>`: solver の次の一手を返す (盤面は変えない)。`algo` は `random` / `greedy` / `expectimax` (既定) / `mcts` / `beam` / `expectimax_tt` / `ga` / `nn`。`depth` の既定は 2。レスポンスは `{"algo","depth","dir","ranking"}` で、`dir` は合法手なしのとき `null`、`ranking` は `expectimax` / `greedy` のときだけ各手の評価が入り、それ以外は空配列
+  - `GET /api/solve?depth=N&algo=<policy>`: solver の次の一手を返す (盤面は変えない)。`algo` は `random` / `greedy` / `expectimax` (既定) / `mcts` / `beam` / `expectimax_tt` / `ga` / `nn` / `nn2`。`depth` の既定は 2。レスポンスは `{"algo","depth","dir","ranking"}` で、`dir` は合法手なしのとき `null`、`ranking` は `expectimax` / `greedy` のときだけ各手の評価が入り、それ以外は空配列
   - ブラウザの「Solver: 1 step」「Solver: auto」で solver が手を打つ様子を確認できる
   - 「speed」で auto の再生速度を選べる (600 / 300 / 150 / 50 ms / max = 待ち時間なし)。auto 中に変えると即座に反映される
   - 例: `curl -X POST "localhost:8080/api/move?dir=left"`
@@ -150,7 +150,7 @@ zig build nn -Doptimize=ReleaseFast -- 0 100 2000 0.003 # train_games eval_games
 zig build ga-rl -- 16 15 8 2 1 500 100                  # population generations games depth seed holdout_seed holdout_games
 ```
 
-`expectimax` 系に加えて、GA の重みを使う `ga` と TD 学習した MLP 価値関数の `nn` も選べる (`/api/solve?algo=ga` のように指定)。
+`expectimax` 系に加えて、GA の重みを使う `ga` と TD 学習した MLP 価値関数の `nn` (1-ply + 出現1回) / `nn2` (2-ply) も選べる (`/api/solve?algo=nn2` のように指定)。
 
 ## ソース構成
 
