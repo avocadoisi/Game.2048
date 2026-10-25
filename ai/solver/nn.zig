@@ -1,5 +1,6 @@
 const std = @import("std");
 const core = @import("core");
+const parallel = @import("parallel");
 
 const Board = core.Board;
 const Direction = core.Direction;
@@ -409,6 +410,20 @@ const sample_board: Board = .{
     .{ 0, 0, 0, 8 },
 };
 
+test "parallel nn games match the serial loop over 8 seeds" {
+    var prng = std.Random.DefaultPrng.init(5);
+    var net = Net.init(prng.random());
+    const playSeed = struct {
+        fn f(n: *const Net, i: usize) PlayResult {
+            var p = std.Random.DefaultPrng.init(1000 + i);
+            return play(n, p.random(), .chance);
+        }
+    }.f;
+    var out: [8]PlayResult = undefined;
+    parallel.map(PlayResult, &out, &net, playSeed);
+    for (out, 0..) |res, i| try std.testing.expectEqual(playSeed(&net, i), res);
+}
+
 test "forward gives one finite scalar and is deterministic" {
     var prng = std.Random.DefaultPrng.init(5);
     const net = Net.init(prng.random());
@@ -522,6 +537,49 @@ test "trainGame is deterministic for a fixed seed" {
     _ = trainGame(&a, rng_a.random(), 0.001, null);
     _ = trainGame(&b, rng_b.random(), 0.001, null);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+}
+
+/// Mean and standard error (sample sd / sqrt(n)) of per-seed-range averages.
+pub const MeanErr = struct { mean: f64, stderr: f64 };
+
+pub fn meanStderr(xs: []const f64) MeanErr {
+    const n: f64 = @floatFromInt(xs.len);
+    var sum: f64 = 0;
+    for (xs) |x| sum += x;
+    const mean = sum / n;
+    if (xs.len < 2) return .{ .mean = mean, .stderr = 0 };
+    var ss: f64 = 0;
+    for (xs) |x| ss += (x - mean) * (x - mean);
+    return .{ .mean = mean, .stderr = @sqrt(ss / (n - 1) / n) };
+}
+
+/// Score per CPU second; 0 when no time elapsed (avoids division by zero).
+pub fn scorePerSecond(total_score: f64, elapsed_ns: i96) f64 {
+    if (elapsed_ns <= 0) return 0;
+    return total_score / (@as(f64, @floatFromInt(elapsed_ns)) / 1e9);
+}
+
+test "meanStderr gives mean and sample standard error" {
+    const xs = [_]f64{ 2, 4, 4, 4, 5, 5, 7, 9 };
+    const r = meanStderr(&xs);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), r.mean, 1e-12);
+    // sample variance = 32 / 7, stderr = sqrt(32/7) / sqrt(8)
+    try std.testing.expectApproxEqAbs(@sqrt(32.0 / 7.0) / @sqrt(8.0), r.stderr, 1e-12);
+}
+
+test "meanStderr of one value has zero stderr" {
+    const r = meanStderr(&[_]f64{3});
+    try std.testing.expectApproxEqAbs(@as(f64, 3), r.mean, 1e-12);
+    try std.testing.expectEqual(@as(f64, 0), r.stderr);
+}
+
+test "scorePerSecond divides total score by elapsed seconds" {
+    // 3000 points in 1.5 s is 2000 points per second
+    try std.testing.expectApproxEqAbs(@as(f64, 2000), scorePerSecond(3000, 1_500_000_000), 1e-9);
+}
+
+test "scorePerSecond of zero elapsed time is zero" {
+    try std.testing.expectEqual(@as(f64, 0), scorePerSecond(3000, 0));
 }
 
 test "weight file header round trips" {

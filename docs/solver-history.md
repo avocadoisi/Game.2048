@@ -105,6 +105,13 @@ Speed rule: no policy slower than depth 3 (about 6.8 to 15 s/game depending on m
 - Ranking, seed 1000 (5 runs x 20 games, avg score): expectimax_tt 41,216 / nn 36,885 / mcts 29,722 / expectimax 25,267 / ga 24,046 / beam 12,696 / greedy 3,424 / random 1,062.
 - The GA weights are lower than plain expectimax on seed 1000. The +4% above holds only on seeds 500–599. Not a clear win.
 
+## NN: longer training (200,000 games, lr 0.003 decaying to 10%)
+
+- `zig build nn -- 200000 100 3000 0.003`: 3,316 s training (same 64/32 MLP, 148 KB weights, checkpoint every 5,000 games). Linear lr decay added.
+- Eval seeds 3000..3099 (100 games): NN 1-ply 35,687 (best 4096); **NN + 1 spawn lookahead 66,600 (best 8192, 73.8 s)**; expectimax depth 2 24,839 (37.9 s). Before (20,000 games, seeds 2000..): 38,734.
+- Ranking seed 1000 (5x20): nn 64,113 (was 36,885), above expectimax_tt 41,216. Slower than expectimax depth 2 (~2x per game), so it breaks the "no policy slower than depth 3" rule only in time per game of about 0.7 s; still faster than depth 3.
+- Not measured: wider net (128/64, runs slower in training, see below), TD(lambda), n-tuple tables.
+
 ## Speed work (no change in play)
 
 Goal: faster self-play for AI training. Every row below gives identical moves for the same seed
@@ -196,6 +203,84 @@ Command: `zig build nn -Doptimize=ReleaseFast -- 2000 1 2000 0.003 diag` (2000 t
 - But they are a small share of the total error (about 8%), because few steps are that close to game over. Most error sits in the 4..7 empty, earlier-move bucket (53%).
 - So the near-loss states are badly fit per step, but focusing only on them would cover little of the error. Mix them in (e.g. #33 K-move replay, #34 priority with a uniform share) instead of replacing the uniform training.
 - Caveat: one training run, one seed, 2000 games. Re-check with more games before deciding.
+
+## Bench run 2026-10-25 19:31:46 +0900
+
+- command: `zig build solve -- 1 2 2 1`
+- commit: 248c1a5
+- date: 2026-10-25 19:31:46 +0900
+- exit: 0
+
+```text
+runs=1 games/run=2 depth=2 seed=1 games=2
+avg score=20954.0 avg moves=1148.0 best tile=2048
+speed: 0.54 games/s, 621 moves/s, elapsed 3.7 s
+```
+
+## Eval variance (#37)
+
+Command (eval only, loads committed weights, writes nothing):
+
+```
+zig build nn -- 0 20 1000 0.003 5
+```
+
+Seeds 1000..1099 as 5 disjoint ranges of 20 games. Every policy plays the same seeds.
+Each range gives one average; the table reports mean ± stderr over the 5 range averages
+(stderr = sample sd / sqrt(5)).
+
+| policy | avg score (mean ± stderr) | avg moves | best tile |
+|---|---|---|---|
+| nn 1-ply | 18851 ± 503 | 1028.1 | 2048 |
+| nn + 1 spawn lookahead | 38572 ± 1608 | 1917.1 | 4096 |
+| expectimax depth 2 | 24776 ± 1267 | 1319.8 | 4096 |
+
+Reading the stderr:
+- nn 1-ply vs expectimax depth 2: difference 5925. Stderr of the difference is about
+  sqrt(503² + 1267²) ≈ 1363, so the gap is about 4.3 stderr (about 8 df). Significant at p < 0.01.
+  Treat the expectimax lead as real for these weights and this seed set.
+- nn + spawn lookahead vs expectimax: difference 13796, stderr about 2070 (≈ 6.7). Clearly significant.
+- These stderr values assume independent ranges. Policies share seeds, so the true paired
+  difference may be tighter; the independent estimate is conservative.
+- Only 100 games per policy in total. Stderr is from 5 range means, so it is itself noisy.
+  More ranges (e.g. 10+) or more games per range would tighten it.
+- Single-seed-range runs with 20 games (the previous protocol) can not show this: one range
+  alone gives no stderr. Use `seed_ranges` ≥ 5 for policy comparisons.
+- Wall time: nn + spawn lookahead dominates (394 s for 100 games); 1-ply took 5 s.
+
+## Fair comparison (#38)
+
+Command: `zig build nn -Doptimize=ReleaseFast -- 0 20 1000 0.003 5` (eval only, committed weights, seeds 1000..1099 in 5 ranges of 20 games). Score per second = total score / CPU seconds for the 100 games.
+
+| policy | avg score (mean ± stderr) | avg moves | elapsed (100 games) | score/s |
+|---|---|---|---|---|
+| nn 1-ply | 18851 ± 503 | 1028 | 0.6 s | 2,957,818 |
+| nn + spawn lookahead | 38572 ± 1608 | 1917 | 42.2 s | 91,306 |
+| expectimax depth 2 | 24776 ± 1267 | 1320 | 18.2 s | 136,202 |
+
+- Per game, the lookahead is clearly stronger than expectimax depth 2 (about +13.8k).
+- Per CPU second, the lookahead is about 33% slower than expectimax (91k vs 136k score/s), so the gain does not hold at equal time.
+- nn 1-ply is far cheaper per second but much weaker per game. It is the cheapest option, not the strongest.
+- Caveat: one set of weights, one seed range, 100 games per policy. The timing is a single run on a loaded machine.
+
+## Parallel eval (#40)
+
+Eval loops (`zig build nn` and `zig build ranking`) now run games on threads via `ai/solver/parallel.zig` (`std.Thread.spawn`, `min(cpu count, 8)` threads). Each game keeps its own PRNG seeded by its seed, so results do not depend on the thread count. `ranking` parallelizes per run (one PRNG per run, games in order inside a run, the same stream as before).
+
+- Machine: 8 logical CPUs (`hw.ncpu` 8), up to 8 threads (nn: 100 games in 8 chunks; ranking: 5 runs, so 5 threads).
+- Command: `zig build nn -Doptimize=ReleaseFast -- 0 20 1000 0.003 5` (eval only, committed weights).
+
+| policy | serial elapsed | parallel elapsed | speedup |
+|---|---|---|---|
+| nn 1-ply | 0.6 s | 0.1 s | 6x (too short to measure well) |
+| nn + spawn lookahead | 44.2 s | 9.9 s | 4.5x |
+| expectimax depth 2 | 13.1 s | 2.7 s | 4.9x |
+| sum of the three | 57.9 s | 12.7 s | 4.6x |
+
+- Whole command wall time (includes build): 58.1 s serial, 29.4 s parallel. `zig build ranking -Doptimize=ReleaseFast -- 5 20 1000`: 7m00s serial, 2m17s parallel.
+- Identical results: nn output lines (avg score ± stderr, avg moves, best tile) match the serial run exactly: 18851.1 ± 503.4 / 1028.1 / 2048; 38572.0 ± 1607.6 / 1917.1 / 4096; 24775.9 ± 1266.8 / 1319.8 / 4096. The ranking JSON is byte-identical (`cmp`) to the serial output for `5 20 1000`.
+- Tests: `parallel.map` equals a serial loop (`parallel.zig`), nn games match the serial loop over 8 seeds (`nn.zig`), and `bench.run` matches a serial loop over 8 games (`bench.zig`).
+- Caveat: `score/s` in `zig build nn` is now total score per **wall** second, not per CPU second as in the fair-comparison table above. Use the serial numbers for per-CPU-second comparisons.
 
 ## Replay and backward sweep (#33)
 
