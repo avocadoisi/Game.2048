@@ -1,11 +1,11 @@
 ---
 name: feature-pr-workflow
-description: Standard flow for every change in Game.2048. Use when starting any feature, fix, or refactor. Order is prompt -> git worktree -> new branch -> TDD -> fix docs -> PR.
+description: Standard flow for every change in Game.2048. Use when starting any feature, fix, or refactor, or when merging a PR. Order is prompt -> git worktree -> new branch -> TDD -> fix docs -> PR -> merge -> cleanup.
 ---
 
 # Feature PR workflow (Game.2048)
 
-Every change follows these six steps in order. Do not skip a step. Do not work on `main` directly.
+Every change follows these seven steps in order. Do not skip a step. Do not work on `main` directly.
 
 ## 1. Prompt (capture the request)
 
@@ -68,7 +68,33 @@ PR body must include:
 - Manual checks (e.g. `curl` / browser) if any
 - Known limits and what was skipped
 
-Report the PR URL to the user. Remove the worktree only after the PR is merged or the user asks: `git worktree remove ../Game.2048-<short-name>`.
+Report the PR URL to the user.
+
+## 7. Merge and cleanup
+
+Merge only when the user says so (for example "mergeして良い"). Merge is not automatic after PR creation.
+
+Before merging:
+- Re-run `zig build test` in the worktree. It must pass with Zig 0.17.
+- Confirm `gh pr view <n> --json mergeable` reports `MERGEABLE`.
+
+Stacked PRs (a PR whose base is another feature branch):
+- Merge the base PR first.
+- Retarget the child PR to `main` with `gh pr edit <n> --base main`. Then check it is still `MERGEABLE`.
+- Merge the child PR after the retarget.
+
+Merge and cleanup:
+
+```bash
+gh pr merge <n> --merge            # keep commit history (TDD steps stay visible)
+cd <repo> && git pull --ff-only origin main
+git worktree remove ../Game.2048-<short-name>
+git branch -d <branch>             # local branch; remote branch is deleted by gh if asked
+```
+
+- Use `--merge` by default. Use `--squash` only when the user asks or the commits are noise.
+- After merge, run `zig build test` on the updated `main` once.
+- Remove the worktree after merge, not before.
 
 ## Checklist
 
@@ -77,3 +103,5 @@ Report the PR URL to the user. Remove the worktree only after the PR is merged o
 - [ ] Tests written first; `zig build test` passes with Zig 0.17
 - [ ] Docs match the code; README commands verified
 - [ ] Pushed, PR opened with tests and checks in the body
+- [ ] Merged only after the user approved; stacked PRs retargeted to `main` first
+- [ ] `main` pulled, tests re-run, worktree and local branch removed
