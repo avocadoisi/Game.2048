@@ -119,3 +119,15 @@ Goal: faster self-play for AI training. Every row below gives identical moves fo
 - Tried and dropped: precomputed slide index table (`slide_lines`) in `core.slide`. No measurable gain (about 27 ns per slide both ways).
 - Cost of the row table: about 512 KB in the binary, and about 15-20 s extra compile time in ReleaseFast.
 - Remaining cost is mostly the solver (`evaluateState` runs up to 4 slides per call). A bitboard core would be the next big step, but it changes `Board` everywhere.
+
+## Tried and not merged: packed nibble search (branch `exp/packed-search`)
+
+Idea: search on rows packed as 4 nibbles (log2 of each tile), so a slide is one table lookup per row.
+- Micro benchmark (slide only, random rows): about 3 ns per slide, against about 28 ns for `GameState.slide`.
+- Full version (`core.Packed`, expectimax on packed boards, bit-identical results): `zig build solve -- 2 20 2 1`
+  gives the same avg score 22135.1, but speed is about 5.5-5.9 games/s, the same as the merged version.
+- Profile after the change: the heuristic (`evaluateStateP`, nibble extraction in the order loop) and
+  `Packed.slide` dominate. The board-based heuristic was already cheap enough that the slide cost was not the limit.
+- A pack-and-unpack wrapper around `GameState.slide` (no packed state kept) was slower: about 40 ns per slide.
+- Conclusion: a real speedup needs `GameState` itself stored packed. That changes about 78 `.board` uses and
+  makes tiles of 65536 and above need a separate path. Not done.
