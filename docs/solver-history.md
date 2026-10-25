@@ -457,3 +457,39 @@ Protocol identical to #56/#59: 20000 games, 5 training seeds, eval on seed range
 - Reading: 4 of 5 seeds are positive and the mean is the best of all mid-game variants tried, but the spread (14.6k-21.9k against base's 17.8k-20.4k) is three times the effect, so this is not a gain either. It is however the first variant that is not worse on average, which fits the #32/#34 story: keep the uniform share and mix in the mid-game bucket rather than replacing it.
 - Verdict: stays opt-in and off by default; committed weights unchanged.
 - Cost: 5 runs x 20,000 games, 194-353 s each.
+
+## Model update: fine-tuning the committed weights (#66)
+
+`train_games > 0` always started from a random init, so the only way to improve the committed net was 200,000 games from scratch (#62). New CLI variant literal `resume` (positional 6) loads `weights_path` first and then trains `train_games` more games on the plain per-move path: `zig build nn -Doptimize=ReleaseFast -- 20000 20 2000 0.001 - resume 30 /tmp/x.bin 1`. The default path is unchanged (recorded-checksum test, `md5 0a8e6bf01e256adf2fc481317c5072c9`).
+
+Protocol: start from `ai/solver/nn_weights.bin` (200,000 games, training seed 1), fine-tune, evaluate on the #56 in-protocol ranges (2000..6000) and on held-out ranges (7000..10000) that are never used to choose a candidate. All scores are nn 1-ply average score, 20 games per range unless noted.
+
+| candidate (from committed) | in-protocol | held-out | vs committed (held-out) |
+|---|---|---|---|
+| committed (200k, seed 1) | 40,282 | 37,233 | — |
+| +20k, lr 1e-3, seed 1 | 42,856 | 43,224 | +5,990 |
+| +20k, lr 3e-4, seed 1 | 42,544 | 42,577 | +5,344 |
+| +20k lr 1e-3 then +20k lr 3e-4, seed 1 | 43,187 | 45,342 | +8,109 |
+| +20k lr 1e-3 then +50k lr 3e-4, seed 1 | 45,118 | 42,089 | +4,856 |
+| +50k, lr 1e-3, seed 1 | 37,894 | 40,611 | +3,378 |
+| +20k, lr 1e-3, training seed 2 | 33,847 | 38,663 | +1,430 |
+| +20k, lr 3e-4, training seed 2 | 41,157 | 37,576 | +343 |
+
+- Chosen: **+20k lr 1e-3 then +20k lr 3e-4** (40,000 extra games, 1,028 s + 628 s serial). It wins in-protocol and held-out, and the pattern "high lr first, low lr to settle" beats the same budget at a single lr.
+- Final check on fresh ranges **11000..15000 with 40 games each** (never used before): committed 38,402, candidate 42,609 (+4,207, about +11%), candidate ahead on 4 of 5 ranges and tied on the fifth.
+- Canonical bench `zig build ranking -Doptimize=ReleaseFast -- 5 20 1000`: nn 64,112.9 -> **65,409.9** (+1,297, best tile 4096 -> 8192); every other policy unchanged, so the delta is the weights alone. `src/web/ranking.json` regenerated.
+- New committed weights: `ai/solver/nn_weights.bin`, `md5 e501bae176f5cf2ff11a25c6f99e75a0` (old `6c9a164b5e05519ca2298c26e30431c4`).
+- Caveat: fine-tuning cannot pass the point the 200k run already reached, so the gain is bounded. The single-lr and longer schedules were only tried at training seed 1 (seed 2 fine-tunes were clearly worse), so a small seed effect cannot be excluded.
+
+## 200,000 games from scratch across seeds (#62)
+
+Same protocol, `train_games` 200,000, training seeds 1 and 2, compared against the committed net.
+
+| training seed | in-protocol (2000..6000) | vs committed (40,282) |
+|---|---|---|
+| 1 | 40,282 | 0 (byte-identical weights, `md5 6c9a164b...`) |
+| 2 | 38,116 | -2,166 |
+
+- Seed 1 reproducing the committed file byte-for-byte confirms the committed weights are exactly `200000 games, lr 0.003, seed 1`, and that the pipeline is deterministic (this is the check #62 asked for).
+- Seed 2 lands below it, so retraining from scratch across seeds does not improve the model. The win came from fine-tuning (#66) instead, at 40,000 games (about 1/5 of the cost).
+- Cost: 2 x 200,000 games, 4,118-4,254 s each.

@@ -17,6 +17,7 @@ const usage =
     \\              priority (#34: 32 extra updates per game sampled from a |TD error| buffer, 50% uniform)
     \\              midgame (#59: 32 extra updates per game from buffer entries with 4..7 empty cells, uniform)
     \\              midmix  (#63: same but 50% uniform over the whole buffer, 50% |TD error| in the 4..7 bucket)
+    \\              resume  (#66: load weights_path and train train_games more games from those weights, plain per-move path)
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
     \\                game i uses seed train_seed + i and the batch result is the mean of its games.
     \\                par trains the plain per-move variant only: replay_k is ignored, but its
@@ -35,6 +36,18 @@ const default_weights_path = "ai/solver/nn_weights.bin";
 /// Positional arg 9, appended after `weights_path` so existing command lines keep their meaning.
 fn parseTrainSeed(args: []const []const u8) !u64 {
     return if (args.len > 9) try std.fmt.parseInt(u64, args[9], 10) else 1;
+}
+
+/// Starting net for `main`: `weights_path` when resuming (or eval-only), otherwise a random init
+/// from `train_seed`. Returns whether the file was loaded.
+fn startNet(net: *nn.Net, io: std.Io, gpa: std.mem.Allocator, train_games: u32, from_file: bool, train_seed: u64, weights_path: []const u8) !bool {
+    if (train_games == 0 or from_file) {
+        try nn.load(net, io, gpa, weights_path);
+        return true;
+    }
+    var init_rng = std.Random.DefaultPrng.init(train_seed);
+    net.* = nn.Net.init(init_rng.random());
+    return false;
 }
 
 const Eval = struct {
@@ -81,11 +94,12 @@ pub fn main(init: std.process.Init) !void {
     const seed_ranges: u32 = if (arg5) |a| (if (want_diag or no_diag) 1 else try std.fmt.parseInt(u32, a, 10)) else 1;
     const variant = if (args.len > 6) args[6] else "base";
     const use_par = std.mem.eql(u8, variant, "par");
+    const use_resume = std.mem.eql(u8, variant, "resume");
     const replay_k: usize = if (args.len > 7) try std.fmt.parseInt(usize, args[7], 10) else 30;
     const weights_path = if (args.len > 8) args[8] else default_weights_path;
     const train_seed = try parseTrainSeed(args);
     var priority: nn.Priority = .{};
-    const opts: nn.Options = if (use_par or std.mem.eql(u8, variant, "base"))
+    const opts: nn.Options = if (use_par or use_resume or std.mem.eql(u8, variant, "base"))
         .{}
     else if (std.mem.eql(u8, variant, "backward"))
         .{ .backward = true }
@@ -107,12 +121,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var net: nn.Net = undefined;
-    if (train_games == 0) {
-        try nn.load(&net, init.io, init.gpa, weights_path);
+    if (try startNet(&net, init.io, init.gpa, train_games, use_resume, train_seed, weights_path))
         std.debug.print("loaded {s}\n", .{weights_path});
-    } else {
-        var init_rng = std.Random.DefaultPrng.init(train_seed);
-        net = nn.Net.init(init_rng.random());
+    if (train_games > 0) {
         var rng = std.Random.DefaultPrng.init(train_seed);
         const start = std.Io.Clock.awake.now(init.io);
         var last_score: u64 = 0;
@@ -245,4 +256,29 @@ test "different train seeds produce different weights" {
     const net1 = trainSeedWeights(1, 5);
     const net2 = trainSeedWeights(2, 5);
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&net1), std.mem.asBytes(&net2)));
+}
+
+test "resume starts from the saved weights file instead of a random init" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const path = "/tmp/nn_resume_test.bin";
+
+    var init_rng = std.Random.DefaultPrng.init(7);
+    const saved = nn.Net.init(init_rng.random());
+    try nn.save(&saved, io, path);
+
+    // resume: the net comes out of weights_path byte-for-byte, before any update
+    var resumed: nn.Net = undefined;
+    try std.testing.expect(try startNet(&resumed, io, std.testing.allocator, 5, true, 7, path));
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&saved), std.mem.asBytes(&resumed));
+
+    // default: train_games > 0 without resume still starts from a random init (seed 99, so it must differ)
+    var fresh: nn.Net = undefined;
+    try std.testing.expect(!try startNet(&fresh, io, std.testing.allocator, 5, false, 99, path));
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&saved), std.mem.asBytes(&fresh)));
+}
+
+test "usage text lists the resume variant" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "resume  (#66") != null);
 }
