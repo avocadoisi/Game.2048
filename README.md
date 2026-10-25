@@ -95,7 +95,8 @@ zig build run -- help         # 使い方
 - `play`: `w/a/s/d` または `up/left/down/right` で移動、`n` でリセット、`q` で終了
 - `serve`: `http://127.0.0.1:8080/` を開くと矢印キー/WASD で遊べる
   - `GET /api/state`, `POST /api/new`, `POST /api/move?dir=up|left|down|right`
-  - `GET /api/solve?depth=N`: solver の次の一手を返す (盤面は変えない。`{"dir":"left"}`、合法手なしは `null`)
+  - `GET /api/ranking`: ポリシーの比較結果 (`src/web/ranking.json`) を返す
+  - `GET /api/solve?depth=N&algo=<policy>`: solver の次の一手を返す (盤面は変えない)。`algo` は `random` / `greedy` / `expectimax` (既定) / `mcts` / `beam` / `expectimax_tt` / `ga` / `nn`。`depth` の既定は 2。レスポンスは `{"algo","depth","dir","ranking"}` で、`dir` は合法手なしのとき `null`、`ranking` は `expectimax` / `greedy` のときだけ各手の評価が入り、それ以外は空配列
   - ブラウザの「Solver: 1 step」「Solver: auto」で solver が手を打つ様子を確認できる
   - 「speed」で auto の再生速度を選べる (600 / 300 / 150 / 50 ms / max = 待ち時間なし)。auto 中に変えると即座に反映される
   - 例: `curl -X POST "localhost:8080/api/move?dir=left"`
@@ -106,14 +107,14 @@ zig build run -- help         # 使い方
 `ai/solver/` に置き、`2048.core` の公開 API (`slide` / `move` / `isGameOver` など) だけを使う。core は solver を知らない。
 
 - `solver.bestMove(state, depth)`: expectimax で最良手を返す (`null` は合法手なし)
-- `solver.evaluate(board)`: 空きマス数 + 蛇行順 (1..16、行ごとに左→右、右→左、左上が最大) に沿った大小関係の違反ペナルティ
+- `solver.evaluate(board)`: 空きマス数 + 蛇行順 (1..16、行ごとに左→右、右→左、左上が最大) に沿った大小関係の違反ペナルティ + 隣接同値ペア数 × merge bonus (既定 10)
 - `solver.evaluateState(state)`: `evaluate` に「down しか合法手がない盤面」の大きなペナルティを加えた葉の評価
 - `solver.playGame(rng, depth)`: 1 ゲーム分プレイして結果を返す
 
 検証 (ReleaseFast, seed 1, 100 games):
 
 ```bash
-zig build solve -Doptimize=ReleaseFast -- 100 2 1   # games depth seed
+zig build solve -Doptimize=ReleaseFast -- 1 100 2 1   # runs games/run depth seed = 100 games, depth 2, seed 1
 ```
 
 | 版 | depth | avg score | avg moves | best tile | 1024 到達 |
@@ -141,6 +142,16 @@ x3 は約 10,500、x10 は 19,275、x30 は 22,522 (採用)、x50 は 20,308、x
 
 行順評価では depth 1 が角ボーナス版より弱くなります (depth 2 以上で強い)。depth 3 は未計測 (角ボーナス版は 20 games で約 23 秒)。
 
+ポリシー比較・NN・GA のランナー:
+
+```bash
+zig build ranking -Doptimize=ReleaseFast -- 5 20 1000   # runs games/run seed (全ポリシーを同じ seed で比較、JSON 出力)
+zig build nn -Doptimize=ReleaseFast -- 0 100 2000 0.003 # train_games eval_games seed lr (train_games=0 は保存済み重みを読み込む)
+zig build ga-rl -- 16 15 8 2 1 500 100                  # population generations games depth seed holdout_seed holdout_games
+```
+
+`expectimax` 系に加えて、GA の重みを使う `ga` と TD 学習した MLP 価値関数の `nn` も選べる (`/api/solve?algo=ga` のように指定)。
+
 ## ソース構成
 
 | ファイル | 役割 |
@@ -153,12 +164,20 @@ x3 は約 10,500、x10 は 19,275、x30 は 22,522 (採用)、x50 は 20,308、x
 | `src/main.zig` | サブコマンドの振り分け |
 | `ai/solver/solver.zig` | expectimax solver と評価関数 (core のみ依存) |
 | `ai/solver/main.zig` | `zig build solve` の検証用ランナー |
+| `ai/solver/bench.zig` | solver のベンチマーク実行と集計 |
+| `ai/solver/parallel.zig` | ゲーム単位の並列実行 (決定性は seed ごとに保持) |
+| `ai/solver/ranking.zig` | `zig build ranking` (全ポリシー比較、JSON 出力) |
+| `ai/solver/nn.zig` | TD(0) で学習する小さな MLP 価値関数 |
+| `ai/solver/nn_main.zig` | `zig build nn` の学習・評価ランナー |
+| `ai/solver/ga_rl.zig` | `zig build ga-rl` (GA による評価重みの進化) |
+| `docs/solver-history.md` | solver の試行錯誤・計測・却下した案の記録 |
+| `scripts/record-bench.sh` | ベンチマーク出力を `docs/solver-history.md` に追記するスクリプト |
 
 ## マイルストーン
 
 1. ✅ `2048.core` の最小実装 + テスト基盤
 2. ✅ CLI でプレイ可能にする / ✅ ローカル HTTP サーバーで試せる
-3. ✅ solver AI の PoC (expectimax, 手作り評価関数) / ⬜ 軽量かつ高スコアの方式の検討 (n-tuple など)
+3. ✅ solver AI の PoC (expectimax, 手作り評価関数) / ✅ 軽量かつ高スコアの方式 (TD 学習の MLP を `nn` ポリシーとして採用。ranking seed 1000 で 64,113 と 1 位) / ⬜ n-tuple などの検討
 4. WASM ターゲット対応
 
 ## このプロジェクトで大事にすること
