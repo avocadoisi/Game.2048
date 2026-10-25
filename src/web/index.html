@@ -29,18 +29,20 @@
   <button id="new">New game</button>
   <button id="step">Solver: 1 step</button>
   <button id="auto">Solver: auto</button>
-  <label>algorithm <select id="algo">
-    <option value="expectimax" selected>expectimax (depth 2)</option>
-    <option value="greedy">greedy (1 ply)</option>
-  </select></label>
-  <div id="ranking"></div>
-  <table id="policies" style="margin:8px auto;border-collapse:collapse"></table>
   <label>speed <select id="speed">
     <option value="600">slow (600 ms)</option>
     <option value="300">normal (300 ms)</option>
     <option value="150" selected>fast (150 ms)</option>
     <option value="50">very fast (50 ms)</option>
     <option value="0">max (no delay)</option>
+  </select></label>
+</p>
+<div id="ranking"></div>
+<table id="policies" style="margin:8px auto;border-collapse:collapse"></table>
+<p>
+  <label>algorithm <select id="algo">
+    <option value="expectimax" selected>expectimax (depth 2)</option>
+    <option value="greedy">greedy (1 ply)</option>
   </select></label>
 </p>
 <script>
