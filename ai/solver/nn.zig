@@ -362,3 +362,44 @@ test "trainGame is deterministic for a fixed seed" {
     _ = trainGame(&b, rng_b.random(), 0.001);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
 }
+
+test "weight file header round trips" {
+    var prng = std.Random.DefaultPrng.init(21);
+    const net = Net.init(prng.random());
+    const bytes = encode(&net);
+    try std.testing.expectEqualStrings("2048-NN\x00", bytes[0..8]);
+    const back = try parse(&bytes);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&net), std.mem.asBytes(&back));
+}
+
+test "parse rejects bad magic" {
+    var prng = std.Random.DefaultPrng.init(21);
+    var bytes = encode(&Net.init(prng.random()));
+    bytes[0] ^= 0xff;
+    try std.testing.expectError(error.BadWeightMagic, parse(&bytes));
+}
+
+test "parse rejects wrong version" {
+    var prng = std.Random.DefaultPrng.init(21);
+    var bytes = encode(&Net.init(prng.random()));
+    std.mem.writeInt(u32, bytes[8..12], 2, .little);
+    try std.testing.expectError(error.UnsupportedWeightVersion, parse(&bytes));
+}
+
+test "parse rejects wrong endianness marker" {
+    var prng = std.Random.DefaultPrng.init(21);
+    var bytes = encode(&Net.init(prng.random()));
+    std.mem.writeInt(u32, bytes[12..16], 0x04030201, .little);
+    try std.testing.expectError(error.WrongWeightEndianness, parse(&bytes));
+}
+
+test "parse rejects wrong size" {
+    var prng = std.Random.DefaultPrng.init(21);
+    const bytes = encode(&Net.init(prng.random()));
+    try std.testing.expectError(error.WrongWeightFileSize, parse(bytes[0 .. bytes.len - 1]));
+    try std.testing.expectError(error.WrongWeightFileSize, parse(&bytes ++ [_]u8{0}));
+}
+
+test "embedded weights file parses" {
+    _ = try parse(@embedFile("nn_weights.bin"));
+}
