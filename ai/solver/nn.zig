@@ -432,3 +432,45 @@ test "parse rejects wrong size" {
 test "embedded weights file parses" {
     _ = try parse(@embedFile("nn_weights.bin"));
 }
+
+test "emptyBucket splits empty-cell counts into 0..3, 4..7, 8+" {
+    try std.testing.expectEqual(@as(usize, 0), emptyBucket(0));
+    try std.testing.expectEqual(@as(usize, 0), emptyBucket(3));
+    try std.testing.expectEqual(@as(usize, 1), emptyBucket(4));
+    try std.testing.expectEqual(@as(usize, 1), emptyBucket(7));
+    try std.testing.expectEqual(@as(usize, 2), emptyBucket(8));
+    try std.testing.expectEqual(@as(usize, 2), emptyBucket(16));
+}
+
+test "distBucket splits moves left into last 10, 11..30, earlier" {
+    try std.testing.expectEqual(@as(usize, 0), distBucket(0));
+    try std.testing.expectEqual(@as(usize, 0), distBucket(9));
+    try std.testing.expectEqual(@as(usize, 1), distBucket(10));
+    try std.testing.expectEqual(@as(usize, 1), distBucket(29));
+    try std.testing.expectEqual(@as(usize, 2), distBucket(30));
+    try std.testing.expectEqual(@as(usize, 2), distBucket(500));
+}
+
+test "Diag.add accumulates count, abs error and signed drop per bucket" {
+    var diag: Diag = .{};
+    diag.add(2, 5, 0.5, -0.25);
+    diag.add(3, 7, 0.25, 0.25);
+    diag.add(9, 5, 1.0, 0);
+    const near = diag.stats[0][0];
+    try std.testing.expectEqual(@as(u64, 2), near.count);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), near.abs_err, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), near.drop, 1e-12);
+    try std.testing.expectEqual(@as(u64, 1), diag.stats[2][0].count);
+    try std.testing.expectEqual(@as(u64, 0), diag.stats[1][1].count);
+}
+
+test "Diag push and finish bucket each step by moves to game over" {
+    var diag: Diag = .{};
+    // 35 steps in one game: step i has 34 - i moves left
+    for (0..35) |_| diag.push(0, 1.0, 0);
+    diag.finish();
+    try std.testing.expectEqual(@as(u64, 10), diag.stats[0][0].count);
+    try std.testing.expectEqual(@as(u64, 20), diag.stats[0][1].count);
+    try std.testing.expectEqual(@as(u64, 5), diag.stats[0][2].count);
+    try std.testing.expectApproxEqAbs(@as(f64, 35), diag.stats[0][0].abs_err + diag.stats[0][1].abs_err + diag.stats[0][2].abs_err, 1e-12);
+}
