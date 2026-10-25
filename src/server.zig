@@ -141,6 +141,15 @@ test "route serves the page and rejects unknown paths" {
     try std.testing.expectEqual(std.http.Status.not_found, missing.status);
 }
 
+test "page maps keys by physical code and reports no-change moves" {
+    const gpa = std.testing.allocator;
+    var session = Session.init(1);
+    const page = try route(gpa, &session, .GET, "/");
+    // e.code keeps working under a Japanese IME, where e.key is "Process"
+    try std.testing.expect(std.mem.indexOf(u8, page.body, "KeyD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page.body, "no change") != null);
+}
+
 test "route move validates direction and returns JSON state" {
     const gpa = std.testing.allocator;
     var session = Session.init(1);

@@ -27,7 +27,8 @@
 </p>
 <p><button id="new">New game</button></p>
 <script>
-const KEYS = { ArrowUp: "up", w: "up", ArrowLeft: "left", a: "left", ArrowDown: "down", s: "down", ArrowRight: "right", d: "right" };
+// Keyed by physical key (e.code) so it works under a Japanese IME, where e.key is "Process".
+const CODES = { ArrowUp: "up", KeyW: "up", ArrowLeft: "left", KeyA: "left", ArrowDown: "down", KeyS: "down", ArrowRight: "right", KeyD: "right" };
 
 function render(s) {
   const grid = document.getElementById("grid");
@@ -40,13 +41,14 @@ function render(s) {
     grid.appendChild(c);
   }
   document.getElementById("score").textContent = s.score;
-  document.getElementById("msg").textContent = s.game_over ? "Game over — press New game" : "";
+  document.getElementById("msg").textContent = s.game_over ? "Game over — press New game" : (s.changed === false && s.moved ? "no change" : "");
 }
 
 async function call(method, url) {
   const res = await fetch(url, { method });
   const body = await res.json();
   if (!res.ok) { document.getElementById("msg").textContent = "error: " + res.status; return; }
+  body.moved = url.includes("/api/move");
   render(body);
 }
 
@@ -55,7 +57,8 @@ for (const b of document.querySelectorAll("[data-dir]")) {
 }
 document.getElementById("new").addEventListener("click", () => call("POST", "/api/new"));
 document.addEventListener("keydown", (e) => {
-  const dir = KEYS[e.key] || KEYS[e.key.toLowerCase()];
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const dir = CODES[e.code];
   if (dir) { e.preventDefault(); call("POST", "/api/move?dir=" + dir); }
 });
 call("GET", "/api/state");
