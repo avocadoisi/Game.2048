@@ -404,6 +404,69 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, pr: ?*Pri
     return .{ .score = state.score, .moves = moves };
 }
 
+/// Games per parallel training batch: min(cpu count, max_threads), at least 1.
+pub fn trainBatchSize() usize {
+    const cpus = std.Thread.getCpuCount() catch 1;
+    return @max(1, @min(cpus, parallel.max_threads));
+}
+
+/// Seed for training game `index`; depends only on the game index, not on thread count or batch layout.
+pub fn trainingSeed(seed: u64, index: usize) u64 {
+    return seed +% @as(u64, @intCast(index));
+}
+
+const BatchGameCtx = struct { net: Net, seed: u64, first_game: usize, lr: f64, want_diag: bool };
+
+const BatchGame = struct {
+    net: Net,
+    score: u32,
+    diag: Diag = .{},
+};
+
+fn runBatchGame(ctx: BatchGameCtx, i: usize) BatchGame {
+    const game = ctx.first_game + i;
+    var result: BatchGame = .{ .net = ctx.net, .score = 0 };
+    var rng = std.Random.DefaultPrng.init(trainingSeed(ctx.seed, game));
+    result.score = trainGame(&result.net, rng.random(), ctx.lr, if (ctx.want_diag) &result.diag else null);
+    return result;
+}
+
+fn mergeDiag(dst: *Diag, src: *const Diag) void {
+    for (0..3) |e| for (0..3) |k| {
+        dst.stats[e][k].count += src.stats[e][k].count;
+        dst.stats[e][k].abs_err += src.stats[e][k].abs_err;
+        dst.stats[e][k].drop += src.stats[e][k].drop;
+    };
+}
+
+/// Runs `games` (<= max_threads) self-play games in parallel from the same starting net, then sets
+/// `net` to net_start + (1/games) * sum_i (net_after_i - net_start), summed in game order.
+/// Each game i uses `trainingSeed(seed, first_game + i)`, so the result is the same for any thread count.
+pub fn trainBatch(net: *Net, seed: u64, first_game: usize, games: usize, lr: f64, diag: ?*Diag) u32 {
+    std.debug.assert(games >= 1 and games <= parallel.max_threads);
+    var units: [parallel.max_threads]BatchGame = undefined;
+    parallel.map(BatchGame, units[0..games], BatchGameCtx{
+        .net = net.*,
+        .seed = seed,
+        .first_game = first_game,
+        .lr = lr,
+        .want_diag = diag != null,
+    }, runBatchGame);
+
+    const start = net.*;
+    const start_w = std.mem.bytesAsSlice(f64, std.mem.asBytes(&start));
+    const out_w = std.mem.bytesAsSlice(f64, std.mem.asBytes(net));
+    for (out_w) |*w| w.* = 0;
+    for (units[0..games]) |*u| {
+        const after = std.mem.bytesAsSlice(f64, std.mem.asBytes(&u.net));
+        for (out_w, after, start_w) |*o, v, s| o.* += v - s;
+    }
+    const n: f64 = @floatFromInt(games);
+    for (out_w, start_w) |*o, s| o.* = s + o.* / n;
+    if (diag) |d| for (units[0..games]) |u| mergeDiag(d, &u.diag);
+    return units[games - 1].score;
+}
+
 /// Weight file: 8-byte magic, u32 version, u32 endianness marker (all little-endian), then the f64 weights as little-endian.
 pub const file_magic = "2048-NN\x00";
 pub const file_version: u32 = 1;
@@ -809,4 +872,31 @@ test "priority pass changes the weights" {
     _ = trainGameOpts(&prio, rng_b.random(), 0.003, null, .{ .priority = &pr });
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&base), std.mem.asBytes(&prio)));
     try std.testing.expect(pr.len > 0);
+}
+
+test "parallel training batch matches a serial run of the same game seeds" {
+    const games = 4;
+    var init_rng = std.Random.DefaultPrng.init(77);
+    var base = Net.init(init_rng.random());
+
+    // Serial reference: game i uses seed (batch seed + i) from the same starting net,
+    // then the batch result is net_start + mean(net_after_i - net_start), summed in game order.
+    var units: [games]Net = undefined;
+    for (&units, 0..) |*u, i| {
+        u.* = base;
+        var rng = std.Random.DefaultPrng.init(77 + i);
+        _ = trainGame(u, rng.random(), 0.001, null);
+    }
+    const flat_len = @sizeOf(Net) / @sizeOf(f64);
+    var sums: [flat_len]f64 = @splat(0);
+    const start = flat(&base);
+    for (&units) |*u| {
+        for (flat(u), start, 0..) |v, s, k| sums[k] += v - s;
+    }
+    var serial = base;
+    for (flat(&serial), start, sums) |*w, s, sum| w.* = s + sum / games;
+
+    var par = base;
+    _ = trainBatch(&par, 77, 0, games, 0.001, null);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&serial), std.mem.asBytes(&par));
 }
