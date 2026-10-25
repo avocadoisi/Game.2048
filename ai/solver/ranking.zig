@@ -26,6 +26,7 @@ fn describe(policy: solver.Policy) []const u8 {
         .expectimax => "2手先まで探索し、ランダムな出現（2か4）を平均して評価する。評価は蛇行順と合体ペアの手作り関数",
         .mcts => "UCTで候補手を選び、ランダムな対局を繰り返して評価する",
         .beam => "幅32で3手先まで探索し、各空きマスに2が出現すると仮定して評価する",
+        .expectimax_tt => "depth 3の期待値探索を置換表で高速化したもの（同じ手を選ぶ）",
     };
 }
 
@@ -49,6 +50,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .policy = .expectimax, .depth = 2 },
         .{ .policy = .mcts, .depth = 0 },
         .{ .policy = .beam, .depth = 0 },
+        .{ .policy = .expectimax_tt, .depth = 0 },
     };
     var entries: [policies.len]Entry = undefined;
     for (policies, 0..) |p, i| {
