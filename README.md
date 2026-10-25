@@ -106,7 +106,7 @@ zig build run -- help         # 使い方
 `ai/solver/` に置き、`2048.core` の公開 API (`slide` / `move` / `isGameOver` など) だけを使う。core は solver を知らない。
 
 - `solver.bestMove(state, depth)`: expectimax で最良手を返す (`null` は合法手なし)
-- `solver.evaluate(board)`: 空きマス数 + 「左上から行順 (1..16) に大きいタイルが並ぶ」大小関係の違反ペナルティ (左上が最大)
+- `solver.evaluate(board)`: 空きマス数 + 蛇行順 (1..16、行ごとに左→右、右→左、左上が最大) に沿った大小関係の違反ペナルティ
 - `solver.evaluateState(state)`: `evaluate` に「down しか合法手がない盤面」の大きなペナルティを加えた葉の評価
 - `solver.playGame(rng, depth)`: 1 ゲーム分プレイして結果を返す
 
@@ -129,6 +129,10 @@ zig build solve -Doptimize=ReleaseFast -- 100 2 1   # games depth seed
 | 左上最大 + forced-down 版 (seed 2) | 2 | 19,352 | 1,067 | 4096 | — |
 | 左上最大 + 順序ペナルティ x30 (seed 1) | 2 | 23,204 | 1,247 | 4096 | — |
 | 左上最大 + 順序ペナルティ x30 (seed 2) | 2 | 21,840 | 1,177 | 4096 | — |
+| 蛇行順 + 順序ペナルティ x30 (seed 1) | 2 | 26,716 | 1,408 | 4096 | — |
+| 蛇行順 + 順序ペナルティ x30 (seed 2) | 2 | 24,935 | 1,334 | 4096 | — |
+
+蛇行順は行順と同じ重み (x30、空きマス 10) のまま変更したもの。重みは行順向けに調整した値で、蛇行順向けの再調整はしていない。
 
 順序ペナルティの重み (空きマス 10 固定、100 games、depth 2、seed 1 / seed 2 の平均):
 x3 は約 10,500、x10 は 19,275、x30 は 22,522 (採用)、x50 は 20,308、x100 は 21,051。空きマス重みを 5 / 30 に変えると 20,897 / 19,980 で、10 が最良。
