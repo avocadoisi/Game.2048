@@ -198,6 +198,62 @@ pub fn play(net: *const Net, rng: std.Random, mode: Mode) PlayResult {
     return .{ .score = state.score, .max_tile = max_tile, .moves = moves };
 }
 
+/// Buckets for the training diagnostic (issue #32): empty cells 0..3, 4..7, 8+; moves left 0..9, 10..29, 30+.
+pub fn emptyBucket(empties: usize) usize {
+    return if (empties <= 3) 0 else if (empties <= 7) 1 else 2;
+}
+
+pub fn distBucket(moves_left: usize) usize {
+    return if (moves_left < 10) 0 else if (moves_left < 30) 1 else 2;
+}
+
+/// Per-bucket sums over the training steps: TD error |target - V(s)| and value change V(s_{t+1}) - V(s_t).
+pub const Diag = struct {
+    pub const Stat = struct { count: u64 = 0, abs_err: f64 = 0, drop: f64 = 0 };
+    /// Steps still inside the last-30 window; their distance to game over is not known until the game ends.
+    const Pending = struct { empties: usize, err: f64, drop: f64 };
+    const window = 30;
+
+    stats: [3][3]Stat = @splat(@splat(.{})),
+    ring: [window]Pending = undefined,
+    pushed: usize = 0,
+
+    pub fn add(self: *Diag, empties: usize, moves_left: usize, err: f64, drop: f64) void {
+        const s = &self.stats[emptyBucket(empties)][distBucket(moves_left)];
+        s.count += 1;
+        s.abs_err += err;
+        s.drop += drop;
+    }
+
+    /// Record one training step of the current game. Steps older than the window are at least 30 moves from the end.
+    pub fn push(self: *Diag, empties: usize, err: f64, drop: f64) void {
+        if (self.pushed >= window) {
+            const old = self.ring[self.pushed % window];
+            self.add(old.empties, window, old.err, old.drop);
+        }
+        self.ring[self.pushed % window] = .{ .empties = empties, .err = err, .drop = drop };
+        self.pushed += 1;
+    }
+
+    /// Call at game end: flush the window with the known distances, then reset for the next game.
+    pub fn finish(self: *Diag) void {
+        const n = self.pushed;
+        for (n -| window..n) |i| {
+            const p = self.ring[i % window];
+            self.add(p.empties, n - 1 - i, p.err, p.drop);
+        }
+        self.pushed = 0;
+    }
+};
+
+pub fn countEmpty(board: Board) usize {
+    var n: usize = 0;
+    for (board) |row| for (row) |v| {
+        if (v == 0) n += 1;
+    };
+    return n;
+}
+
 /// TD(0) on afterstates over one self-play game (greedy 1-ply moves, fixed rng).
 /// Target for the previous afterstate = its scaled reward + V(next afterstate); 0 after game over.
 pub fn trainGame(net: *Net, rng: std.Random, lr: f64) u32 {
