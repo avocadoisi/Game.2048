@@ -1,17 +1,25 @@
 ---
 name: feature-pr-workflow
-description: Standard flow for every change in Game.2048. Use when starting any feature, fix, or refactor, or when merging a PR. Order is prompt -> git worktree -> new branch -> TDD -> fix docs -> PR -> merge -> cleanup.
+description: Standard flow for every change in Game.2048. Use when starting any feature, fix, or refactor, or when merging a PR. Order is prompt -> GitHub issue -> git worktree -> new branch -> TDD -> fix docs -> PR (linked to the issue) -> merge -> cleanup.
 ---
 
 # Feature PR workflow (Game.2048)
 
-Every change follows these seven steps in order. Do not skip a step. Do not work on `main` directly.
+Every change follows these steps in order (the issue step comes first). Do not skip a step. Do not work on `main` directly.
 
 ## 1. Prompt (capture the request)
 
 - Restate the goal in one or two lines and list acceptance criteria.
 - If the request is ambiguous, ask before creating anything.
 - Write the list of steps with the todo tool.
+
+## 1b. GitHub issue (before any work starts)
+
+- Create an issue before touching code: `gh issue create --title "<title>" --body-file <file>`.
+- Body: Goal, Background, Candidates or scope, and Acceptance criteria as a checklist.
+- Report the issue URL to the user. Work starts only after the issue exists.
+- The PR body must contain `Refs #<n>`, or `Closes #<n>` when the PR completes the issue.
+- Draft PRs are allowed while work is partial. Mark the PR ready (`gh pr ready <n>`) when done.
 
 ## 2. Git worktree (isolated checkout)
 
@@ -99,9 +107,10 @@ git branch -d <branch>             # local branch; remote branch is deleted by g
 ## Checklist
 
 - [ ] Prompt and acceptance criteria captured
+- [ ] GitHub issue created and its URL reported before work starts
 - [ ] Worktree created, branch named, nothing left on `main`
 - [ ] Tests written first; `zig build test` passes with Zig 0.17
 - [ ] Docs match the code; README commands verified
-- [ ] Pushed, PR opened with tests and checks in the body
+- [ ] Pushed, PR opened with `Refs #<n>` / `Closes #<n>` and tests in the body
 - [ ] Merged only after the user approved; stacked PRs retargeted to `main` first
 - [ ] `main` pulled, tests re-run, worktree and local branch removed
