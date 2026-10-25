@@ -13,7 +13,8 @@ const usage =
     \\  learning_rate SGD step for TD training (default 0.003)
     \\  seed_ranges   number of disjoint seed ranges; report mean ± stderr over them (default 1)
     \\  diag          literal "diag": print the TD error / value drop table by empty cells and moves to game over; "-" for none
-    \\  variant       base (default), backward (sweep stored afterstates last to first), replay (re-train the last replay_k)
+    \\  variant       base (default), backward (sweep stored afterstates last to first), replay (re-train the last replay_k),
+    \\              priority (#34: 32 extra updates per game sampled from a |TD error| buffer, 50% uniform)
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
     \\                game i uses seed train_seed + i and the batch result is the mean of its games
     \\  replay_k      afterstates re-trained per game for variant replay (default 30)
@@ -73,12 +74,15 @@ pub fn main(init: std.process.Init) !void {
     const use_par = std.mem.eql(u8, variant, "par");
     const replay_k: usize = if (args.len > 7) try std.fmt.parseInt(usize, args[7], 10) else 30;
     const weights_path = if (args.len > 8) args[8] else default_weights_path;
+    var priority: nn.Priority = .{};
     const opts: nn.Options = if (use_par or std.mem.eql(u8, variant, "base"))
         .{}
     else if (std.mem.eql(u8, variant, "backward"))
         .{ .backward = true }
     else if (std.mem.eql(u8, variant, "replay"))
         .{ .replay_k = replay_k }
+    else if (std.mem.eql(u8, variant, "priority"))
+        .{ .priority = &priority }
     else {
         std.debug.print("{s}", .{usage});
         return;

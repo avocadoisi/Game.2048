@@ -263,6 +263,48 @@ pub const Options = struct {
     replay_k: usize = 0,
     /// Learning rate of the replay pass, as a factor of the training lr.
     replay_lr_scale: f64 = 0.5,
+    /// Candidate D (#34): prioritized replay buffer; null = off. Normal per-move updates run as well.
+    priority: ?*Priority = null,
+};
+
+/// Prioritized replay (issue #34): ring buffer of recent TD updates. After each game, `m` extra updates
+/// are drawn from the buffer: with probability `uniform_share` uniformly, otherwise with probability
+/// proportional to (|TD error| + err_floor)^alpha. The drawn entry's error is refreshed after its update.
+pub const Priority = struct {
+    pub const cap = 1024;
+    pub const err_floor = 1e-3;
+    m: usize = 32,
+    alpha: f64 = 0.5,
+    uniform_share: f64 = 0.5,
+    len: usize = 0,
+    head: usize = 0,
+    items: [cap]Entry = undefined,
+
+    /// One TD update: afterstate, scaled reward, next afterstate (ignored when terminal), last |error|.
+    pub const Entry = struct { after: Board, reward: f64, next: Board, terminal: bool, err: f64 };
+
+    pub fn push(self: *Priority, e: Entry) void {
+        self.items[self.head] = e;
+        self.head = (self.head + 1) % cap;
+        self.len = @min(self.len + 1, cap);
+    }
+
+    /// Index into items[0..len]: uniform with prob uniform_share, else proportional to priority weight.
+    pub fn sample(self: *const Priority, rng: std.Random) usize {
+        if (rng.float(f64) < self.uniform_share) return rng.uintLessThan(usize, self.len);
+        var total: f64 = 0;
+        for (self.items[0..self.len]) |e| total += self.weight(e.err);
+        var r = rng.float(f64) * total;
+        for (self.items[0..self.len], 0..) |e, i| {
+            r -= self.weight(e.err);
+            if (r < 0) return i;
+        }
+        return self.len - 1;
+    }
+
+    fn weight(self: *const Priority, err: f64) f64 {
+        return std.math.pow(f64, @abs(err) + err_floor, self.alpha);
+    }
 };
 
 /// Stored afterstates of one game for the variants (ring buffer; the last `step_cap` steps are kept).
@@ -281,7 +323,8 @@ pub const GameResult = struct { score: u32, moves: u32 };
 
 /// `trainGame` with options. `diag` is only recorded on the default path (`opts` all off).
 pub fn trainGameOpts(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
-    if (!opts.backward and opts.replay_k == 0) return trainGamePerMove(net, rng, lr, diag);
+    if (opts.priority) |pr| return trainGamePerMove(net, rng, lr, diag, pr);
+    if (!opts.backward and opts.replay_k == 0) return trainGamePerMove(net, rng, lr, diag, null);
     var steps: [step_cap]Step = undefined;
     var n: usize = 0;
     var state = GameState.gameStart(rng);
@@ -327,7 +370,7 @@ fn valueOf(net: *const Net, after: Board) f64 {
     return forward(net, after, &cache);
 }
 
-fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag) GameResult {
+fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, pr: ?*Priority) GameResult {
     var state = GameState.gameStart(rng);
     var pending: ?Pick = null;
     var cache: Cache = .{};
@@ -338,6 +381,7 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag) GameResul
             _ = forward(net, p.after, &cache);
             const target = p.reward + pick.value;
             if (diag) |d| d.push(countEmpty(p.after), @abs(target - p.value), pick.value - p.value);
+            if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = pick.after, .terminal = false, .err = @abs(target - p.value) });
             train(net, &cache, target, lr);
         }
         pending = pick;
@@ -346,8 +390,16 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag) GameResul
     if (pending) |p| {
         _ = forward(net, p.after, &cache);
         if (diag) |d| d.push(countEmpty(p.after), @abs(p.reward - p.value), -p.value);
+        if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = p.after, .terminal = true, .err = @abs(p.reward - p.value) });
         train(net, &cache, p.reward, lr);
     }
+    if (pr) |b| for (0..b.m) |_| {
+        const e = &b.items[b.sample(rng)];
+        const target = e.reward + if (e.terminal) 0 else valueOf(net, e.next);
+        _ = forward(net, e.after, &cache);
+        e.err = @abs(target - cache.out);
+        train(net, &cache, target, lr);
+    };
     if (diag) |d| d.finish();
     return .{ .score = state.score, .moves = moves };
 }
@@ -788,6 +840,38 @@ test "replay tail changes the weights and K=0 is off" {
     _ = trainGameOpts(&off, rng_c.random(), 0.003, null, .{ .replay_k = 0 });
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&base), std.mem.asBytes(&replay)));
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&base), std.mem.asBytes(&off));
+}
+
+test "priority sampling gives the uniform share plus the |err|^alpha share" {
+    var pr: Priority = .{};
+    // entry 0 has a large error, entries 1..3 have none: weights 4^0.5 = 2 vs (1e-3)^0.5 each
+    pr.len = 4;
+    pr.items[0].err = 4;
+    for (pr.items[1..4]) |*e| e.err = 0;
+    var rng = std.Random.DefaultPrng.init(7);
+    const draws = 40000;
+    var hits: usize = 0;
+    for (0..draws) |_| {
+        if (pr.sample(rng.random()) == 0) hits += 1;
+    }
+    // expected: 0.5 * 1/4 + 0.5 * w0 / (w0 + 3 * w_small), w0 = 2, w_small = sqrt(eps)
+    const w_small = @sqrt(Priority.err_floor);
+    const expected = 0.5 * 0.25 + 0.5 * 2.0 / (2.0 + 3 * w_small);
+    const share = @as(f64, @floatFromInt(hits)) / draws;
+    try std.testing.expectApproxEqAbs(expected, share, 0.01);
+}
+
+test "priority pass changes the weights" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var base = Net.init(init_rng.random());
+    var prio = base;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    var pr: Priority = .{};
+    _ = trainGame(&base, rng_a.random(), 0.003, null);
+    _ = trainGameOpts(&prio, rng_b.random(), 0.003, null, .{ .priority = &pr });
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&base), std.mem.asBytes(&prio)));
+    try std.testing.expect(pr.len > 0);
 }
 
 test "parallel training batch matches a serial run of the same game seeds" {
