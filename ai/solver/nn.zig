@@ -219,16 +219,45 @@ pub fn trainGame(net: *Net, rng: std.Random, lr: f64) u32 {
     return state.score;
 }
 
-/// Write the raw weight bytes (platform-endian f64; not portable across architectures).
+/// Weight file: 8-byte magic, u32 version, u32 endianness marker (all little-endian), then the f64 weights as little-endian.
+pub const file_magic = "2048-NN\x00";
+pub const file_version: u32 = 1;
+const endian_marker: u32 = 0x01020304;
+const header_len = 16;
+pub const file_len = header_len + @sizeOf(Net);
+
+pub fn encode(net: *const Net) [file_len]u8 {
+    var out: [file_len]u8 = undefined;
+    @memcpy(out[0..8], file_magic);
+    std.mem.writeInt(u32, out[8..12], file_version, .little);
+    std.mem.writeInt(u32, out[12..16], endian_marker, .little);
+    for (std.mem.bytesAsSlice(f64, std.mem.asBytes(net)), 0..) |w, i| {
+        std.mem.writeInt(u64, out[header_len + i * 8 ..][0..8], @bitCast(w), .little);
+    }
+    return out;
+}
+
+pub fn parse(bytes: []const u8) !Net {
+    if (bytes.len != file_len) return error.WrongWeightFileSize;
+    if (!std.mem.eql(u8, bytes[0..8], file_magic)) return error.BadWeightMagic;
+    if (std.mem.readInt(u32, bytes[8..12], .little) != file_version) return error.UnsupportedWeightVersion;
+    if (std.mem.readInt(u32, bytes[12..16], .little) != endian_marker) return error.WrongWeightEndianness;
+    var net: Net = undefined;
+    for (std.mem.bytesAsSlice(f64, std.mem.asBytes(&net)), 0..) |*w, i| {
+        w.* = @bitCast(std.mem.readInt(u64, bytes[header_len + i * 8 ..][0..8], .little));
+    }
+    return net;
+}
+
 pub fn save(net: *const Net, io: std.Io, path: []const u8) !void {
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = std.mem.asBytes(net) });
+    const bytes = encode(net);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = &bytes });
 }
 
 pub fn load(net: *Net, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(@sizeOf(Net) + 1));
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(file_len + 1));
     defer gpa.free(bytes);
-    if (bytes.len != @sizeOf(Net)) return error.WrongWeightFileSize;
-    @memcpy(std.mem.asBytes(net), bytes);
+    net.* = try parse(bytes);
 }
 
 fn flat(net: *Net) []f64 {
