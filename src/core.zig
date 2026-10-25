@@ -171,7 +171,57 @@ pub fn spawn(state: *GameState, rng: anytype) bool {
 }
 
 /// Slide tiles toward index 0 and merge each equal pair once (left-to-right).
+/// Uses a precomputed table when every tile is a power of two below 65536; otherwise the
+/// general path (`mergeLineSlow`) runs, so odd tile values still behave the same.
 pub fn mergeLine(line: [BoardSize]Tile) MergeResult {
+    var key: u16 = 0;
+    for (line, 0..) |value, i| {
+        if (value > 32768 or @popCount(value) > 1) return mergeLineSlow(line);
+        const exp: u16 = if (value == 0) 0 else @ctz(value);
+        key |= exp << @intCast(i * 4);
+    }
+    const entry = row_table[key];
+    if (!entry.ok) return mergeLineSlow(line);
+    var merged: [BoardSize]Tile = undefined;
+    for (&merged, 0..) |*cell, i| {
+        const exp: u4 = @truncate(entry.row >> @intCast(i * 4));
+        cell.* = if (exp == 0) 0 else @as(Tile, 1) << exp;
+    }
+    return .{ .line = merged, .changed = entry.row != key, .score_delta = entry.score };
+}
+
+const RowEntry = struct {
+    /// Merged line as 4 nibbles of log2 tile values (0 = empty).
+    row: u16,
+    score: u32,
+    /// false when a merge would produce a tile above 32768 (nibble overflow).
+    ok: bool,
+};
+
+/// row_table[key]: key packs 4 nibbles of log2 tile values, offset 0 in the low nibble.
+const row_table: [65536]RowEntry = blk: {
+    @setEvalBranchQuota(1_000_000_000);
+    var t: [65536]RowEntry = undefined;
+    for (0..65536) |key| {
+        var line: [BoardSize]Tile = undefined;
+        for (&line, 0..) |*cell, i| {
+            const exp: u4 = @truncate(key >> @intCast(i * 4));
+            cell.* = if (exp == 0) 0 else @as(Tile, 1) << exp;
+        }
+        const merged = mergeLineSlow(line);
+        var row: u16 = 0;
+        var ok = true;
+        for (merged.line, 0..) |value, i| {
+            const exp: u16 = if (value == 0) 0 else @ctz(value);
+            if (exp > 15) ok = false;
+            row |= exp << @intCast(i * 4);
+        }
+        t[key] = .{ .row = row, .score = merged.score_delta, .ok = ok };
+    }
+    break :blk t;
+};
+
+fn mergeLineSlow(line: [BoardSize]Tile) MergeResult {
     var packed_tiles: [BoardSize]Tile = @splat(0);
     var count: usize = 0;
     for (line) |value| {
@@ -514,4 +564,27 @@ test "slide merges like move but never spawns" {
     try std.testing.expect(!result.spawned);
     try std.testing.expectEqual(@as(u32, 4), result.score_delta);
     try std.testing.expectEqual(@as(u32, 4), game.score);
+}
+
+test "mergeLine table matches the general path for every power-of-two row" {
+    for (0..65536) |key| {
+        var line: [BoardSize]Tile = undefined;
+        for (&line, 0..) |*cell, i| {
+            const exp: u4 = @truncate(key >> @intCast(i * 4));
+            cell.* = if (exp == 0) 0 else @as(Tile, 1) << exp;
+        }
+        const fast = mergeLine(line);
+        const slow = mergeLineSlow(line);
+        try std.testing.expectEqual(slow.line, fast.line);
+        try std.testing.expectEqual(slow.changed, fast.changed);
+        try std.testing.expectEqual(slow.score_delta, fast.score_delta);
+    }
+}
+
+test "mergeLine falls back for tiles the table cannot hold" {
+    const big = mergeLine(.{ 65536, 65536, 3, 0 });
+    try std.testing.expectEqual([BoardSize]Tile{ 131072, 3, 0, 0 }, big.line);
+    try std.testing.expectEqual(@as(u32, 131072), big.score_delta);
+    const odd = mergeLine(.{ 3, 3, 0, 0 });
+    try std.testing.expectEqual([BoardSize]Tile{ 6, 0, 0, 0 }, odd.line);
 }
