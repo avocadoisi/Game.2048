@@ -133,6 +133,19 @@ pub const GameState = struct {
         self.board[pos.row][pos.col] = value;
     }
 
+    /// True when `slide(direction)` would change the board. Does not modify the state.
+    pub fn canSlide(self: GameState, direction: Direction) bool {
+        for (0..BoardSize) |line_index| {
+            var line: [BoardSize]Tile = undefined;
+            for (&line, 0..) |*cell, offset| {
+                const p = cellAt(direction, line_index, offset);
+                cell.* = self.board[p.row][p.col];
+            }
+            if (mergeLine(line).changed) return true;
+        }
+        return false;
+    }
+
     pub fn isGameOver(self: GameState) bool {
         for (0..BoardSize) |row| {
             for (0..BoardSize) |col| {
@@ -587,4 +600,23 @@ test "mergeLine falls back for tiles the table cannot hold" {
     try std.testing.expectEqual(@as(u32, 131072), big.score_delta);
     const odd = mergeLine(.{ 3, 3, 0, 0 });
     try std.testing.expectEqual([BoardSize]Tile{ 6, 0, 0, 0 }, odd.line);
+}
+
+test "canSlide matches slide(...).changed without changing the board" {
+    var prng = std.Random.DefaultPrng.init(99);
+    const rng = prng.random();
+    for (0..20_000) |_| {
+        var board: Board = undefined;
+        for (&board) |*row| {
+            for (row) |*cell| {
+                cell.* = if (rng.uintLessThan(u8, 3) == 0) 0 else @as(Tile, 1) << @intCast(1 + rng.uintLessThan(u8, 10));
+            }
+        }
+        const state = GameState{ .board = board, .score = 5 };
+        for ([_]Direction{ .up, .left, .down, .right }) |d| {
+            var copy = state;
+            try std.testing.expectEqual(copy.slide(d).changed, state.canSlide(d));
+        }
+        try std.testing.expectEqual(board, state.board);
+    }
 }

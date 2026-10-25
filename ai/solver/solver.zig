@@ -414,11 +414,9 @@ pub fn evaluateState(state: GameState) f64 {
 pub fn evaluateStateW(state: GameState, w: Weights) f64 {
     var score = evaluateW(state.board, w);
     for ([_]Direction{ .up, .left, .right }) |d| {
-        var next = state;
-        if (next.slide(d).changed) return score;
+        if (state.canSlide(d)) return score;
     }
-    var down = state;
-    if (down.slide(.down).changed) score -= w.forced_down;
+    if (state.canSlide(.down)) score -= w.forced_down;
     return score;
 }
 
