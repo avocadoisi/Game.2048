@@ -48,8 +48,13 @@ pub fn main(init: std.process.Init) !void {
         const start = std.Io.Clock.awake.now(init.io);
         var last_score: u64 = 0;
         for (0..train_games) |g| {
-            last_score = nn.trainGame(&net, rng.random(), learning_rate);
-            if ((g + 1) % 500 == 0) std.debug.print("train {d}/{d} last game score {d}\n", .{ g + 1, train_games, last_score });
+            // linear decay to 10% of the start rate: big steps early, fine tuning late
+            const frac = @as(f64, @floatFromInt(g)) / @as(f64, @floatFromInt(train_games));
+            last_score = nn.trainGame(&net, rng.random(), learning_rate * (1 - 0.9 * frac));
+            if ((g + 1) % 5000 == 0) {
+                std.debug.print("train {d}/{d} last game score {d}\n", .{ g + 1, train_games, last_score });
+                try nn.save(&net, init.io, weights_path); // checkpoint
+            }
         }
         const elapsed = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
         std.debug.print("trained {d} games in {d:.1} s (lr={d}, seed={d})\n", .{
