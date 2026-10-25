@@ -108,7 +108,7 @@ pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Dir
         .ga => return bestMoveW(state, depth, ga_weights),
         // shortcut: copies the 148 KB net per move; keep a static copy if this shows up in profiles
         .nn => {
-            const net = std.mem.bytesToValue(nn.Net, nn_weight_bytes);
+            const net = nn.parse(nn_weight_bytes) catch unreachable;
             return nn.bestMove(&net, state, .chance);
         },
     }
