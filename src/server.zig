@@ -71,15 +71,23 @@ pub fn route(
         return jsonResponse(gpa, .ok, stateJson(session, false, false));
     }
     if (method == .GET and std.mem.eql(u8, path, "/api/solve")) {
-        const algo = algoFromQuery(query) orelse
-            return .{ .status = .bad_request, .content_type = "text/plain", .body = "algo must be expectimax|greedy\n" };
+        const policy = policyFromQuery(query) orelse
+            return .{ .status = .bad_request, .content_type = "text/plain", .body = "algo must be a solver policy name (see /api/ranking)\n" };
         const depth = depthFromQuery(query);
-        const r = solver.rank(session.state, algo, depth);
+        const dir = solver.choose(policy, session.state, session.prng.random(), depth);
+        // per-move ranking exists only for the expectimax and greedy scorers
+        const ranked: []const solver.Ranked = switch (policy) {
+            .expectimax, .greedy => blk: {
+                const r = solver.rank(session.state, if (policy == .greedy) .greedy else .expectimax, depth);
+                break :blk r.items[0..r.len];
+            },
+            else => &.{},
+        };
         return jsonResponse(gpa, .ok, SolveJson{
-            .algo = @tagName(algo),
+            .algo = @tagName(policy),
             .depth = depth,
-            .dir = if (r.len == 0) null else r.items[0].dir,
-            .ranking = r.items[0..r.len],
+            .dir = dir,
+            .ranking = ranked,
         });
     }
     if (method == .POST and std.mem.eql(u8, path, "/api/move")) {
@@ -118,11 +126,11 @@ const SolveJson = struct {
     ranking: []const solver.Ranked,
 };
 
-/// Solver algorithm from `algo=NAME`; defaults to expectimax. Null for an unknown name.
-fn algoFromQuery(query: []const u8) ?solver.Algorithm {
+/// Solver policy from `algo=NAME` (any solver.Policy); defaults to expectimax. Null for an unknown name.
+fn policyFromQuery(query: []const u8) ?solver.Policy {
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
-        if (std.mem.startsWith(u8, pair, "algo=")) return std.meta.stringToEnum(solver.Algorithm, pair["algo=".len..]);
+        if (std.mem.startsWith(u8, pair, "algo=")) return std.meta.stringToEnum(solver.Policy, pair["algo=".len..]);
     }
     return .expectimax;
 }
@@ -240,6 +248,12 @@ test "route solve returns the algorithm, move and ranking" {
 
     const bad = try route(gpa, &session, .GET, "/api/solve?algo=magic");
     try std.testing.expectEqual(std.http.Status.bad_request, bad.status);
+
+    const mcts = try route(gpa, &session, .GET, "/api/solve?algo=mcts&depth=2");
+    defer gpa.free(mcts.body);
+    try std.testing.expectEqual(std.http.Status.ok, mcts.status);
+    try std.testing.expect(std.mem.indexOf(u8, mcts.body, "\"algo\":\"mcts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mcts.body, "\"ranking\":[]") != null);
 }
 
 test "route solve returns the solver's next move without changing the board" {
