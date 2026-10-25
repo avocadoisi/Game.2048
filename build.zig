@@ -54,6 +54,17 @@ pub fn build(b: *std.Build) void {
     const solver_tests = b.addTest(.{
         .root_module = solver_mod,
     });
+    const bench_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("ai/solver/bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "solver", .module = solver_mod },
+            },
+        }),
+    });
+    const run_bench_tests = b.addRunArtifact(bench_tests);
     const run_solver_tests = b.addRunArtifact(solver_tests);
 
     const solve_exe = b.addExecutable(.{
@@ -78,4 +89,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_solver_tests.step);
+    test_step.dependOn(&run_bench_tests.step);
 }
