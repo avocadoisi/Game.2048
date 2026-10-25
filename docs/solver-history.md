@@ -508,3 +508,18 @@ The classic 2048 SOTA value function, as a standalone runner: `ai/solver/ntuple.
 Smoke (Zig 0.17, Debug, `zig build ntuple -- 200 20 2000 0.01 base /tmp/t.bin 1`): 200 games, 37,341 moves, 0.2 s training. Eval seeds 2000..2019: `ntuple 1-ply` 2,439, `ntuple + 1 spawn lookahead` 8,710, expectimax depth 2 21,840. 2,000 games (same command, 10 eval games) gives 3,118 / 10,213 on seeds 2000..2009, so the tables do learn.
 
 Table file: 68,419,628 bytes raw, 106,259 bytes with `gzip -9` after 200 games (182,822 bytes after 2,000). The dense 6-tuple table dominates the raw size; it is almost all zeros early, so the gzip target holds for the smoke file but grows as training fills it. If that breaks the < 1 MB static-hosting target later, drop the 6-tuple until a quantized or sparse payload is in place.
+
+### Scaling the n-tuple tables (training run, #70)
+
+Serial training runs with the initial lr 0.01 (linear decay to 10%), training seed 1, table size 68.4 MB raw (5 four-tuples + one 2x3 six-tuple):
+
+| train games | moves | time | 1-ply | + 1 spawn lookahead |
+|---|---|---|---|---|
+| 200 | 37,341 | 0.2 s | 2,439 | 8,710 |
+| 20,000 | 6,218,061 | 3.7 s | 4,426 | 11,385 |
+| 200,000 | 86,039,320 | 51.0 s | 7,783 | 15,100 |
+| 1,000,000 | 492,306,926 | 288.0 s | 8,832 | 17,093 |
+
+- Reading: still climbing steeply at 1M games and about 60 games/s, but the level is far below the MLP (`nn` 72,205 with 2-ply). The classic n-tuple result needs tens of millions of games plus a much lower per-sample lr; at this scale the MLP is simply better per unit time.
+- Table size: 68.4 MB raw, 106 KB gzipped at 200 games and 183 KB at 2,000 games, so a sparse/gzip payload is fine for static hosting as long as the six-tuple stays (it dominates the raw size).
+- Verdict: not adopted as a policy yet. Follow-ups tracked in #73: 2-ply search on the n-tuple leaf, a `light` table set (5 four-tuples, 1/17 the raw size) and training resume so long sweeps are possible.
