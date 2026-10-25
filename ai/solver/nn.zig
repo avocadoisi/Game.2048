@@ -1,5 +1,6 @@
 const std = @import("std");
 const core = @import("core");
+const parallel = @import("parallel");
 
 const Board = core.Board;
 const Direction = core.Direction;
@@ -337,6 +338,20 @@ const sample_board: Board = .{
     .{ 0, 0, 0, 0 },
     .{ 0, 0, 0, 8 },
 };
+
+test "parallel nn games match the serial loop over 8 seeds" {
+    var prng = std.Random.DefaultPrng.init(5);
+    var net = Net.init(prng.random());
+    const playSeed = struct {
+        fn f(n: *const Net, i: usize) PlayResult {
+            var p = std.Random.DefaultPrng.init(1000 + i);
+            return play(n, p.random(), .chance);
+        }
+    }.f;
+    var out: [8]PlayResult = undefined;
+    parallel.map(PlayResult, &out, &net, playSeed);
+    for (out, 0..) |res, i| try std.testing.expectEqual(playSeed(&net, i), res);
+}
 
 test "forward gives one finite scalar and is deterministic" {
     var prng = std.Random.DefaultPrng.init(5);

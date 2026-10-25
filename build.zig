@@ -10,11 +10,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const parallel_mod = b.addModule("parallel", .{
+        .root_source_file = b.path("ai/solver/parallel.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const nn_mod = b.addModule("nn", .{
         .root_source_file = b.path("ai/solver/nn.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "core", .module = core_mod }},
+        .imports = &.{
+            .{ .name = "core", .module = core_mod },
+            .{ .name = "parallel", .module = parallel_mod },
+        },
     });
 
     const solver_mod = b.addModule("solver", .{
@@ -69,6 +78,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "solver", .module = solver_mod },
+                .{ .name = "parallel", .module = parallel_mod },
             },
         }),
     });
@@ -83,6 +93,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "solver", .module = solver_mod },
+                .{ .name = "parallel", .module = parallel_mod },
             },
         }),
     });
@@ -101,6 +112,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "solver", .module = solver_mod },
+                .{ .name = "parallel", .module = parallel_mod },
             },
         }),
     });
@@ -110,6 +122,9 @@ pub fn build(b: *std.Build) void {
 
     const ranking_step = b.step("ranking", "Compare policies and print JSON ranking");
     ranking_step.dependOn(&ranking_cmd.step);
+
+    const parallel_tests = b.addTest(.{ .root_module = parallel_mod });
+    const run_parallel_tests = b.addRunArtifact(parallel_tests);
 
     const nn_tests = b.addTest(.{ .root_module = nn_mod });
     const run_nn_tests = b.addRunArtifact(nn_tests);
@@ -124,6 +139,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "core", .module = core_mod },
                 .{ .name = "solver", .module = solver_mod },
                 .{ .name = "nn", .module = nn_mod },
+                .{ .name = "parallel", .module = parallel_mod },
             },
         }),
     });
@@ -164,5 +180,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_solver_tests.step);
     test_step.dependOn(&run_bench_tests.step);
     test_step.dependOn(&run_nn_tests.step);
+    test_step.dependOn(&run_parallel_tests.step);
     test_step.dependOn(&run_ga_tests.step);
 }

@@ -58,7 +58,7 @@ pub fn main(init: std.process.Init) !void {
     };
     var entries: [policies.len]Entry = undefined;
     for (policies, 0..) |p, i| {
-        entries[i] = .{ .policy = p.policy, .depth = p.depth, .summary = bench.run(init.io, p.policy, runs, games_per_run, p.depth, seed) };
+        entries[i] = .{ .policy = p.policy, .depth = p.depth, .summary = try bench.run(init.io, init.arena.allocator(), p.policy, runs, games_per_run, p.depth, seed) };
     }
     std.mem.sort(Entry, &entries, {}, byScoreDesc);
 
