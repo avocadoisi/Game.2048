@@ -134,19 +134,6 @@ pub fn build(b: *std.Build) void {
     const nn_step = b.step("nn", "Train the value MLP (TD(0) self-play) and evaluate it against expectimax depth 2");
     nn_step.dependOn(&nn_cmd.step);
 
-    const tt_bench_exe = b.addExecutable(.{
-        .name = "tt-bench-scratch",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("ai/solver/tt_bench_scratch.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "solver", .module = solver_mod }},
-        }),
-    });
-    const tt_bench_run = b.addRunArtifact(tt_bench_exe);
-    const tt_bench_step = b.step("tt-bench-scratch", "Temporary TT timing run");
-    tt_bench_step.dependOn(&tt_bench_run.step);
-
     const ga_exe = b.addExecutable(.{
         .name = "ga-rl",
         .root_module = b.createModule(.{
