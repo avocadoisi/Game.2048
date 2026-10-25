@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>2048</title>
+<style>
+  body { font-family: system-ui, sans-serif; text-align: center; background: #faf8ef; color: #776e65; }
+  #grid { display: grid; grid-template-columns: repeat(4, 90px); gap: 10px; background: #bbada0; padding: 10px; width: max-content; margin: 16px auto; border-radius: 6px; }
+  .cell { width: 90px; height: 90px; line-height: 90px; font-size: 28px; font-weight: bold; border-radius: 4px; background: #cdc1b4; }
+  .v2 { background: #eee4da; } .v4 { background: #ede0c8; } .v8 { background: #f2b179; color: #fff; }
+  .v16 { background: #f59563; color: #fff; } .v32 { background: #f67c5f; color: #fff; } .v64 { background: #f65e3b; color: #fff; }
+  .big { background: #edc22e; color: #fff; font-size: 22px; }
+  button { font-size: 16px; padding: 6px 14px; margin: 4px; }
+  #msg { min-height: 1.5em; font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>2048</h1>
+<div>score: <span id="score">0</span> — best tile: <span id="best">0</span></div>
+<div id="grid"></div>
+<div id="msg"></div>
+<p>
+  <button data-dir="0">↑ (W)</button><br>
+  <button data-dir="1">← (A)</button>
+  <button data-dir="2">↓ (S)</button>
+  <button data-dir="3">→ (D)</button>
+</p>
+<p>
+  <button id="new">New game</button>
+  <button id="step">Solver: 1 step</button>
+  <button id="auto">Solver: auto</button>
+  <label>speed <select id="speed">
+    <option value="600">slow (600 ms)</option>
+    <option value="300">normal (300 ms)</option>
+    <option value="150" selected>fast (150 ms)</option>
+    <option value="50">very fast (50 ms)</option>
+    <option value="0">max (no delay)</option>
+  </select></label>
+</p>
+<p><label>algorithm <select id="algo"></select></label></p>
+<script>
+// Static build: everything runs in WebAssembly, there is no server.
+// Exports follow src/wasm.zig: move returns 0 no change, 1 moved, 2 game over.
+const CODES = { ArrowUp: 0, KeyW: 0, ArrowLeft: 1, KeyA: 1, ArrowDown: 2, KeyS: 2, ArrowRight: 3, KeyD: 3 };
+const NO_CHANGE = 0, MOVED = 1, GAME_OVER = 2;
+
+let w; // wasm exports
+let gameOver = false;
+
+function render() {
+  const board = new Uint32Array(w.memory.buffer, w.board_ptr(), 16);
+  const grid = document.getElementById("grid");
+  grid.innerHTML = "";
+  for (const v of board) {
+    const c = document.createElement("div");
+    c.className = "cell " + (v === 0 ? "" : v > 64 ? "big" : "v" + v);
+    c.textContent = v === 0 ? "" : v;
+    grid.appendChild(c);
+  }
+  document.getElementById("score").textContent = w.score();
+  document.getElementById("best").textContent = w.best_tile();
+  document.getElementById("msg").textContent = gameOver ? "Game over — press New game" : "";
+}
+
+function move(dir) {
+  if (gameOver) return false;
+  const result = w.move(dir);
+  gameOver = result === GAME_OVER;
+  if (result === NO_CHANGE) document.getElementById("msg").textContent = "no change";
+  render();
+  return result !== NO_CHANGE;
+}
+
+function newGame() {
+  // crypto seed when available, fixed mix otherwise
+  const seed = crypto.getRandomValues(new Uint32Array(2));
+  w.init(seed[0], seed[1]);
+  gameOver = false;
+  render();
+}
+
+// Solver preview: ask the wasm solver for the move, then apply it.
+let running = false;
+function solveStep() {
+  const algo = Number(document.getElementById("algo").value);
+  const dir = w.solve(algo, 2);
+  if (dir < 0) { stopAuto(); document.getElementById("msg").textContent = "solver: no move (game over)"; return false; }
+  return move(dir);
+}
+function stopAuto() { running = false; document.getElementById("auto").textContent = "Solver: auto"; }
+function autoLoop() {
+  while (running) {
+    if (!solveStep()) break;
+    const delay = Number(document.getElementById("speed").value);
+    if (delay > 0) { setTimeout(autoLoop, delay); return; }
+  }
+}
+
+(async () => {
+  const bytes = await (await fetch("game2048.wasm")).arrayBuffer();
+  const { instance } = await WebAssembly.instantiate(bytes, {});
+  w = instance.exports;
+
+  const names = [];
+  for (let i = 0; i < w.algo_count(); i++) {
+    names.push(new TextDecoder().decode(new Uint8Array(w.memory.buffer, w.algo_name(i), w.algo_name_len(i))));
+  }
+  document.getElementById("algo").innerHTML = names
+    .map((name, i) => `<option value="${i}"${name === "expectimax" ? " selected" : ""}>${name}</option>`)
+    .join("");
+
+  for (const b of document.querySelectorAll("[data-dir]")) {
+    b.addEventListener("click", () => move(Number(b.dataset.dir)));
+  }
+  document.getElementById("new").addEventListener("click", newGame);
+  document.getElementById("step").addEventListener("click", () => solveStep());
+  document.getElementById("auto").addEventListener("click", () => {
+    if (running) return stopAuto();
+    running = true;
+    document.getElementById("auto").textContent = "Solver: stop";
+    autoLoop();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const dir = CODES[e.code];
+    if (dir !== undefined) { e.preventDefault(); move(dir); }
+  });
+
+  newGame();
+})();
+</script>
+</body>
+</html>

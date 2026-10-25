@@ -9,7 +9,7 @@ UI や実行環境に依存しない `2048.core` を中心に据えることで�
 
 - ネイティブ実行 (まずは CLI/terminal)
 - AI solver (探索・評価関数・方策比較)
-- 将来的な WASM 版 (Web UI への接続)
+- WASM 版 (ブラウザで遊ぶ・静的配信)
 
 ## 目標アーキテクチャ
 
@@ -24,7 +24,7 @@ UI や実行環境に依存しない `2048.core` を中心に据えることで�
 
 - `app/cli`: 入出力と描画のみ
 - `ai/solver`: `2048.core` を読むだけで行動を決定
-- `wasm` (future): JS バインディングで `2048.core` を呼ぶ
+- `src/wasm.zig`: JS バインディング (`zig build wasm`) で `2048.core` を呼ぶ
 
 ## Core API
 
@@ -102,6 +102,26 @@ zig build run -- help         # 使い方
   - 例: `curl -X POST "localhost:8080/api/move?dir=left"`
   - 127.0.0.1 のみで待ち受ける。1 リクエスト 1 接続 (ローカル試作用)
 
+## 静的配信 (WASM)
+
+`zig build wasm -Doptimize=ReleaseFast` で、ゲームと solver を WebAssembly にまとめ、サーバー無しで遊べる静的サイトを `zig-out/web/` に出力する。HTTP サーバー (`zig build run -- serve`) は従来どおり動く。
+
+- `zig-out/web/index.html`: 静的 UI (`src/web/index.static.html` をコピー)。`/api/*` を一切使わず、`game2048.wasm` を直接呼ぶ
+- `zig-out/web/game2048.wasm`: ゲーム + solver。`nn` の重みは `@embedFile` で埋め込み済み
+- ABI は `src/wasm.zig` 冒頭のコメント参照: `init(seed_lo, seed_hi)` / `move(dir)` / `solve(algo, depth)` / `board_ptr()` / `score()` / `best_tile()` / `algo_count()` / `algo_name(i)`
+
+サイズ (ReleaseFast): raw 718,704 B (702 KiB)、`gzip -9` 後 282,207 B (276 KiB)。
+
+```bash
+zig build wasm -Doptimize=ReleaseFast
+node scripts/wasm-smoke.mjs                      # init/move/solve のスモークテスト (失敗時は非 0)
+python3 -m http.server 8000 -d zig-out/web       # http://localhost:8000/ で遊ぶ
+```
+
+`game2048.wasm` は `application/wasm` で配信される必要がある (python の `http.server` と GitHub Pages は対応済み)。GitHub Pages などに公開する場合は `zig-out/web/` の中身 (`index.html` と `game2048.wasm`) をそのまま置く。
+
+静的版 UI は埋め込み UI (`src/web/index.html`) とは別ファイルにしてある。サーバー版は `/api/ranking` の表を出すため、同じファイルで wasm と `/api/` を切り替えるより単純なため。
+
 ## Solver (AI)
 
 `ai/solver/` に置き、`2048.core` の公開 API (`slide` / `move` / `isGameOver` など) だけを使う。core は solver を知らない。
@@ -160,7 +180,9 @@ zig build ga-rl -- 16 15 8 2 1 500 100                  # population generations
 | `src/render.zig` | 盤面のテキスト描画 |
 | `src/cli.zig` | 端末プレイのコマンド解析とループ |
 | `src/server.zig` | HTTP サーバー、JSON API、埋め込み UI |
+| `src/wasm.zig` | WASM 版の C ABI (ゲーム + solver を JS から呼ぶ) |
 | `src/web/index.html` | ブラウザ UI (サーバーに埋め込み) |
+| `src/web/index.static.html` | 静的配信用のブラウザ UI (wasm のみ、`zig build wasm` が `zig-out/web/index.html` にコピー) |
 | `src/main.zig` | サブコマンドの振り分け |
 | `ai/solver/solver.zig` | expectimax solver と評価関数 (core のみ依存) |
 | `ai/solver/main.zig` | `zig build solve` の検証用ランナー |
@@ -172,13 +194,14 @@ zig build ga-rl -- 16 15 8 2 1 500 100                  # population generations
 | `ai/solver/ga_rl.zig` | `zig build ga-rl` (GA による評価重みの進化) |
 | `docs/solver-history.md` | solver の試行錯誤・計測・却下した案の記録 |
 | `scripts/record-bench.sh` | ベンチマーク出力を `docs/solver-history.md` に追記するスクリプト |
+| `scripts/wasm-smoke.mjs` | WASM ビルドのスモークテスト (node、依存なし) |
 
 ## マイルストーン
 
 1. ✅ `2048.core` の最小実装 + テスト基盤
 2. ✅ CLI でプレイ可能にする / ✅ ローカル HTTP サーバーで試せる
 3. ✅ solver AI の PoC (expectimax, 手作り評価関数) / ✅ 軽量かつ高スコアの方式 (TD 学習の MLP を `nn` ポリシーとして採用。ranking seed 1000 で 64,113 と 1 位) / ⬜ n-tuple などの検討
-4. WASM ターゲット対応
+4. ✅ WASM ターゲット対応 (静的配信)
 
 ## このプロジェクトで大事にすること
 
