@@ -11,6 +11,16 @@ const lost_score: f64 = -1e9;
 const beam_width = 32;
 const beam_horizon = 3;
 
+/// Weights of the snake heuristic (`evaluateW`, `evaluateStateW`). `baseline` is the hand-set version.
+pub const Weights = struct {
+    empty: f64 = 10,
+    order_penalty: f64 = 30,
+    merge: f64 = 10,
+    /// extra penalty when only `down` is legal (the top-left anchor breaks)
+    forced_down: f64 = 100,
+};
+pub const baseline: Weights = .{};
+
 pub const Algorithm = enum { expectimax, greedy };
 
 pub const Ranked = struct { dir: Direction, value: f64 };
@@ -29,7 +39,7 @@ pub fn rank(state: GameState, algo: Algorithm, depth: u8) Ranking {
         var next = state;
         if (!next.slide(d).changed) continue;
         const value = switch (algo) {
-            .expectimax => chanceValue(next, depth),
+            .expectimax => chanceValueW(next, depth, baseline),
             .greedy => evaluateState(next),
         };
         // insertion sort: strict > keeps the earlier direction on ties
@@ -43,8 +53,23 @@ pub fn rank(state: GameState, algo: Algorithm, depth: u8) Ranking {
 
 /// Pick the move with the best expectimax value; null when no move changes the board.
 pub fn bestMove(state: GameState, depth: u8) ?Direction {
-    const r = rank(state, .expectimax, depth);
-    return if (r.len == 0) null else r.items[0].dir;
+    return bestMoveW(state, depth, baseline);
+}
+
+/// Expectimax best move with custom evaluation weights; same tie rule as `rank` (earlier direction wins).
+pub fn bestMoveW(state: GameState, depth: u8, w: Weights) ?Direction {
+    var best: ?Direction = null;
+    var best_value: f64 = 0;
+    for ([_]Direction{ .up, .left, .down, .right }) |d| {
+        var next = state;
+        if (!next.slide(d).changed) continue;
+        const value = chanceValueW(next, depth, w);
+        if (best == null or value > best_value) {
+            best = d;
+            best_value = value;
+        }
+    }
+    return best;
 }
 
 /// Move-choosing policies compared in the ranking (`zig build ranking`).
@@ -324,6 +349,10 @@ const order: [core.BoardCellCount]core.Position = blk: {
 /// where the later cell holds a larger tile (log2 scale).
 /// shortcut: a hand-set order, not learned; replace with an n-tuple table later.
 pub fn evaluate(board: Board) f64 {
+    return evaluateW(board, baseline);
+}
+
+pub fn evaluateW(board: Board, w: Weights) f64 {
     var empties: f64 = 0;
     var penalty: f64 = 0;
     var prev: ?f64 = null;
@@ -337,7 +366,7 @@ pub fn evaluate(board: Board) f64 {
         if (prev) |before| penalty += @max(0, level - before);
         prev = level;
     }
-    return empties * 10 - penalty * 30 + mergePairs(board) * 10;
+    return empties * w.empty - penalty * w.order_penalty + mergePairs(board) * w.merge;
 }
 
 /// Count of horizontally or vertically adjacent equal non-empty tiles: more merges available.
@@ -366,38 +395,37 @@ pub fn playGame(rng: std.Random, depth: u8) GameResult {
     return playPolicy(rng, .expectimax, depth);
 }
 
-/// Extra penalty when only `down` is legal: with the top-left corner as the anchor,
-/// a forced down move breaks the order.
-/// shortcut: fixed penalty, not tuned; tune with `zig build solve` later.
-const forced_down_penalty: f64 = 100;
-
 pub fn evaluateState(state: GameState) f64 {
-    var score = evaluate(state.board);
+    return evaluateStateW(state, baseline);
+}
+
+pub fn evaluateStateW(state: GameState, w: Weights) f64 {
+    var score = evaluateW(state.board, w);
     for ([_]Direction{ .up, .left, .right }) |d| {
         var next = state;
         if (next.slide(d).changed) return score;
     }
     var down = state;
-    if (down.slide(.down).changed) score -= forced_down_penalty;
+    if (down.slide(.down).changed) score -= w.forced_down;
     return score;
 }
 
-fn maxValue(state: GameState, depth: u8) f64 {
-    if (depth == 0) return evaluateState(state);
+fn maxValueW(state: GameState, depth: u8, w: Weights) f64 {
+    if (depth == 0) return evaluateStateW(state, w);
     var best: f64 = lost_score;
     var any_move = false;
     for ([_]Direction{ .up, .left, .down, .right }) |d| {
         var next = state;
         if (!next.slide(d).changed) continue;
         any_move = true;
-        best = @max(best, chanceValue(next, depth));
+        best = @max(best, chanceValueW(next, depth, w));
     }
     if (!any_move) return lost_score;
     return best;
 }
 
 /// Average over the random spawn: each empty cell gets 2 (p=0.9) or 4 (p=0.1).
-fn chanceValue(state: GameState, depth: u8) f64 {
+fn chanceValueW(state: GameState, depth: u8, w: Weights) f64 {
     var total: f64 = 0;
     var empties: f64 = 0;
     for (0..core.BoardSize) |r| {
@@ -410,12 +438,24 @@ fn chanceValue(state: GameState, depth: u8) f64 {
             }) |spawn| {
                 var next = state;
                 next.board[r][c] = spawn.value;
-                total += spawn.p * maxValue(next, depth - 1);
+                total += spawn.p * maxValueW(next, depth - 1, w);
             }
         }
     }
-    if (empties == 0) return evaluateState(state);
+    if (empties == 0) return evaluateStateW(state, w);
     return total / empties;
+}
+
+test "baseline weights reproduce evaluate on a hand-computed board" {
+    // 12 empty cells x10, level steps 1->2->3->4 (three x30 penalties), no equal neighbours
+    const sorted: Board = .{
+        .{ 2, 4, 8, 16 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    try std.testing.expectEqual(@as(f64, 30), evaluate(sorted));
+    try std.testing.expectEqual(evaluate(sorted), evaluateW(sorted, baseline));
 }
 
 test "bestMove returns null when no move changes the board" {
