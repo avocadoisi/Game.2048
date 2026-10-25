@@ -27,6 +27,8 @@ fn describe(policy: solver.Policy) []const u8 {
         .mcts => "UCTで候補手を選び、ランダムな対局を繰り返して評価する",
         .beam => "幅32で3手先まで探索し、各空きマスに2が出現すると仮定して評価する",
         .expectimax_tt => "depth 3の期待値探索を置換表で高速化したもの（同じ手を選ぶ）",
+        .ga => "GAで評価の重みを進化させた期待値探索（depth 2）。holdoutでベースラインより約4%高い",
+        .nn => "TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）",
     };
 }
 
@@ -51,6 +53,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .policy = .mcts, .depth = 0 },
         .{ .policy = .beam, .depth = 0 },
         .{ .policy = .expectimax_tt, .depth = 0 },
+        .{ .policy = .ga, .depth = 2 },
+        .{ .policy = .nn, .depth = 0 },
     };
     var entries: [policies.len]Entry = undefined;
     for (policies, 0..) |p, i| {

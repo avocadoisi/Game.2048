@@ -4,4 +4,3 @@ zig-out/
 result
 .direnv/
 .playwright-mcp/
-ai/solver/nn_weights.bin
