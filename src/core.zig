@@ -2,13 +2,20 @@ const std = @import("std");
 
 pub const BoardSize: usize = 4;
 pub const BoardCellCount: usize = BoardSize * BoardSize;
-pub const Board = [BoardSize][BoardSize]u16;
+
+/// u32 (not u16): a merge of two 32768 tiles produces 65536, which overflowed u16.
+pub const Tile = u32;
+pub const Board = [BoardSize][BoardSize]Tile;
 
 pub const Direction = enum {
     up,
     left,
     down,
     right,
+
+    pub fn parse(name: []const u8) ?Direction {
+        return std.meta.stringToEnum(Direction, name);
+    }
 };
 
 pub const MoveResult = struct {
@@ -18,7 +25,7 @@ pub const MoveResult = struct {
 };
 
 pub const MergeResult = struct {
-    line: [BoardSize]u16,
+    line: [BoardSize]Tile,
     changed: bool,
     score_delta: u32,
 };
@@ -51,29 +58,29 @@ pub const GameState = struct {
 
     pub fn move(self: *GameState, direction: Direction, rng: anytype) MoveResult {
         var changed = false;
-        var total_score_delta: u32 = 0;
+        var score_delta: u32 = 0;
 
         for (0..BoardSize) |line_index| {
-            const extracted = extractLine(self.board, direction, line_index);
-            const merged = mergeLineLeft(extracted);
-            injectLine(&self.board, direction, line_index, merged.line);
+            var line: [BoardSize]Tile = undefined;
+            for (&line, 0..) |*cell, offset| {
+                const p = cellAt(direction, line_index, offset);
+                cell.* = self.board[p.row][p.col];
+            }
+
+            const merged = mergeLine(line);
+            for (merged.line, 0..) |value, offset| {
+                const p = cellAt(direction, line_index, offset);
+                self.board[p.row][p.col] = value;
+            }
 
             changed = changed or merged.changed;
-            total_score_delta += merged.score_delta;
+            score_delta += merged.score_delta;
         }
 
-        self.score += total_score_delta;
+        self.score += score_delta;
 
-        var spawned = false;
-        if (changed) {
-            spawned = self.spawnRandomTile(rng);
-        }
-
-        return .{
-            .changed = changed,
-            .spawned = spawned,
-            .score_delta = total_score_delta,
-        };
+        const spawned = changed and self.spawnRandomTile(rng);
+        return .{ .changed = changed, .spawned = spawned, .score_delta = score_delta };
     }
 
     pub fn moveUp(self: *GameState, rng: anytype) MoveResult {
@@ -107,25 +114,16 @@ pub const GameState = struct {
 
         if (empty_count == 0) return false;
 
-        const empty_pick = rng.uintLessThan(usize, empty_count);
-        const value_pick = rng.uintLessThan(u8, 10);
-        const value: u16 = if (value_pick == 0) 4 else 2;
-
-        const pos = empties[empty_pick];
+        const pos = empties[rng.uintLessThan(usize, empty_count)];
+        const value: Tile = if (rng.uintLessThan(u8, 10) == 0) 4 else 2;
         self.board[pos.row][pos.col] = value;
         return true;
     }
 
-    pub fn spawnAt(self: *GameState, pos: Position, value: u16) SpawnError!void {
-        if (pos.row >= BoardSize or pos.col >= BoardSize) {
-            return error.OutOfBounds;
-        }
-        if (self.board[pos.row][pos.col] != 0) {
-            return error.Occupied;
-        }
-        if (value != 2 and value != 4) {
-            return error.InvalidValue;
-        }
+    pub fn spawnAt(self: *GameState, pos: Position, value: Tile) SpawnError!void {
+        if (pos.row >= BoardSize or pos.col >= BoardSize) return error.OutOfBounds;
+        if (self.board[pos.row][pos.col] != 0) return error.Occupied;
+        if (value != 2 and value != 4) return error.InvalidValue;
 
         self.board[pos.row][pos.col] = value;
     }
@@ -135,16 +133,10 @@ pub const GameState = struct {
             for (0..BoardSize) |col| {
                 const value = self.board[row][col];
                 if (value == 0) return false;
-
-                if (row + 1 < BoardSize and self.board[row + 1][col] == value) {
-                    return false;
-                }
-                if (col + 1 < BoardSize and self.board[row][col + 1] == value) {
-                    return false;
-                }
+                if (row + 1 < BoardSize and self.board[row + 1][col] == value) return false;
+                if (col + 1 < BoardSize and self.board[row][col + 1] == value) return false;
             }
         }
-
         return true;
     }
 };
@@ -169,87 +161,54 @@ pub fn moveRight(state: *GameState, rng: anytype) MoveResult {
     return state.moveRight(rng);
 }
 
-pub fn mergeLine(line: [BoardSize]u16) MergeResult {
-    return mergeLineLeft(line);
-}
-
 pub fn spawn(state: *GameState, rng: anytype) bool {
     return state.spawnRandomTile(rng);
 }
 
-pub fn mergeLineLeft(line: [BoardSize]u16) MergeResult {
-    var compacted: [BoardSize]u16 = undefined;
-    var compact_len: usize = 0;
-
+/// Slide tiles toward index 0 and merge each equal pair once (left-to-right).
+pub fn mergeLine(line: [BoardSize]Tile) MergeResult {
+    var packed_tiles = [_]Tile{0} ** BoardSize;
+    var count: usize = 0;
     for (line) |value| {
-        if (value == 0) continue;
-        compacted[compact_len] = value;
-        compact_len += 1;
-    }
-
-    var merged = [_]u16{0} ** BoardSize;
-    var merged_index: usize = 0;
-    var read_index: usize = 0;
-    var score_delta: u32 = 0;
-
-    while (read_index < compact_len) {
-        const current = compacted[read_index];
-        if (read_index + 1 < compact_len and compacted[read_index + 1] == current) {
-            merged[merged_index] = current * 2;
-            score_delta += @as(u32, current) * 2;
-            read_index += 2;
-        } else {
-            merged[merged_index] = current;
-            read_index += 1;
+        if (value != 0) {
+            packed_tiles[count] = value;
+            count += 1;
         }
-
-        merged_index += 1;
     }
 
-    const changed = !std.mem.eql(u16, line[0..], merged[0..]);
+    var merged = [_]Tile{0} ** BoardSize;
+    var score_delta: u32 = 0;
+    var read: usize = 0;
+    var write: usize = 0;
+    while (read < count) : (write += 1) {
+        const value = packed_tiles[read];
+        if (read + 1 < count and packed_tiles[read + 1] == value) {
+            merged[write] = value * 2;
+            score_delta += value * 2;
+            read += 2;
+        } else {
+            merged[write] = value;
+            read += 1;
+        }
+    }
+
     return .{
         .line = merged,
-        .changed = changed,
+        .changed = !std.mem.eql(Tile, &line, &merged),
         .score_delta = score_delta,
     };
 }
 
-fn extractLine(board: Board, direction: Direction, line_index: usize) [BoardSize]u16 {
-    var line: [BoardSize]u16 = undefined;
-
-    switch (direction) {
-        .left => for (0..BoardSize) |offset| {
-            line[offset] = board[line_index][offset];
-        },
-        .right => for (0..BoardSize) |offset| {
-            line[offset] = board[line_index][BoardSize - 1 - offset];
-        },
-        .up => for (0..BoardSize) |offset| {
-            line[offset] = board[offset][line_index];
-        },
-        .down => for (0..BoardSize) |offset| {
-            line[offset] = board[BoardSize - 1 - offset][line_index];
-        },
-    }
-
-    return line;
-}
-
-fn injectLine(board: *Board, direction: Direction, line_index: usize, line: [BoardSize]u16) void {
-    switch (direction) {
-        .left => for (0..BoardSize) |offset| {
-            board[line_index][offset] = line[offset];
-        },
-        .right => for (0..BoardSize) |offset| {
-            board[line_index][BoardSize - 1 - offset] = line[offset];
-        },
-        .up => for (0..BoardSize) |offset| {
-            board[offset][line_index] = line[offset];
-        },
-        .down => for (0..BoardSize) |offset| {
-            board[BoardSize - 1 - offset][line_index] = line[offset];
-        },
-    }
+/// Board cell for the `offset`-th cell of a line, where offset 0 is the cell
+/// the tiles slide toward (left column, right column, top row, bottom row).
+fn cellAt(direction: Direction, line_index: usize, offset: usize) Position {
+    const far = BoardSize - 1 - offset;
+    return switch (direction) {
+        .left => .{ .row = line_index, .col = offset },
+        .right => .{ .row = line_index, .col = far },
+        .up => .{ .row = offset, .col = line_index },
+        .down => .{ .row = far, .col = line_index },
+    };
 }
 
 const SequenceRng = struct {
@@ -257,15 +216,10 @@ const SequenceRng = struct {
     index: usize = 0,
 
     pub fn uintLessThan(self: *SequenceRng, comptime T: type, upper: T) T {
-        std.debug.assert(upper > 0);
         std.debug.assert(self.index < self.values.len);
-
         const raw = self.values[self.index];
         self.index += 1;
-
-        const upper_usize: usize = @intCast(upper);
-        const picked = raw % upper_usize;
-        return @as(T, @intCast(picked));
+        return @intCast(raw % @as(usize, upper));
     }
 };
 
@@ -277,20 +231,50 @@ const NoCallRng = struct {
 
 fn countTiles(board: Board) usize {
     var count: usize = 0;
-    for (0..BoardSize) |row| {
-        for (0..BoardSize) |col| {
-            if (board[row][col] != 0) count += 1;
+    for (board) |row| {
+        for (row) |value| {
+            if (value != 0) count += 1;
         }
     }
     return count;
 }
 
-test "mergeLineLeft merges each pair once" {
-    const merged = mergeLineLeft(.{ 2, 2, 2, 2 });
-
-    try std.testing.expectEqual([BoardSize]u16{ 4, 4, 0, 0 }, merged.line);
+test "mergeLine merges each pair once" {
+    const merged = mergeLine(.{ 2, 2, 2, 2 });
+    try std.testing.expectEqual([BoardSize]Tile{ 4, 4, 0, 0 }, merged.line);
     try std.testing.expect(merged.changed);
     try std.testing.expectEqual(@as(u32, 8), merged.score_delta);
+}
+
+test "mergeLine does not chain a new merge onto an existing one" {
+    const merged = mergeLine(.{ 2, 2, 4, 0 });
+    try std.testing.expectEqual([BoardSize]Tile{ 4, 4, 0, 0 }, merged.line);
+    try std.testing.expectEqual(@as(u32, 4), merged.score_delta);
+}
+
+test "mergeLine compacts gaps without merging" {
+    const merged = mergeLine(.{ 0, 2, 0, 4 });
+    try std.testing.expectEqual([BoardSize]Tile{ 2, 4, 0, 0 }, merged.line);
+    try std.testing.expect(merged.changed);
+    try std.testing.expectEqual(@as(u32, 0), merged.score_delta);
+}
+
+test "mergeLine reports unchanged for packed non-mergeable line" {
+    const merged = mergeLine(.{ 2, 4, 8, 0 });
+    try std.testing.expect(!merged.changed);
+    try std.testing.expectEqual(@as(u32, 0), merged.score_delta);
+}
+
+test "mergeLine of empty line is unchanged" {
+    const merged = mergeLine(.{ 0, 0, 0, 0 });
+    try std.testing.expectEqual([BoardSize]Tile{ 0, 0, 0, 0 }, merged.line);
+    try std.testing.expect(!merged.changed);
+}
+
+test "mergeLine does not overflow when tile reaches 65536" {
+    const merged = mergeLine(.{ 32768, 32768, 0, 0 });
+    try std.testing.expectEqual([BoardSize]Tile{ 65536, 0, 0, 0 }, merged.line);
+    try std.testing.expectEqual(@as(u32, 65536), merged.score_delta);
 }
 
 test "moveLeft merges line vectors and then spawns" {
@@ -329,11 +313,7 @@ test "moveLeft does not spawn on unchanged board" {
         .{ 8, 16, 32, 64 },
     };
 
-    var game = GameState{
-        .board = board_before,
-        .score = 100,
-    };
-
+    var game = GameState{ .board = board_before, .score = 100 };
     var rng = NoCallRng{};
     const result = game.moveLeft(&rng);
 
@@ -342,6 +322,119 @@ test "moveLeft does not spawn on unchanged board" {
     try std.testing.expectEqual(@as(u32, 0), result.score_delta);
     try std.testing.expectEqual(@as(u32, 100), game.score);
     try std.testing.expectEqual(board_before, game.board);
+}
+
+test "moveUp slides and merges toward the top row" {
+    var game = GameState{ .board = .{
+        .{ 2, 0, 0, 0 },
+        .{ 2, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 4, 0, 0, 0 },
+    } };
+    var rng = SequenceRng{ .values = &[_]usize{ 0, 0 } };
+    _ = game.moveUp(&rng);
+
+    try std.testing.expectEqual(@as(Tile, 4), game.board[0][0]);
+    try std.testing.expectEqual(@as(Tile, 4), game.board[1][0]);
+    try std.testing.expectEqual(@as(Tile, 0), game.board[2][0]);
+    try std.testing.expectEqual(@as(Tile, 0), game.board[3][0]);
+}
+
+test "moveDown slides and merges toward the bottom row" {
+    var game = GameState{ .board = .{
+        .{ 2, 0, 0, 0 },
+        .{ 2, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 4, 0, 0, 0 },
+    } };
+    // after the move column 0 is {0,0,4,4}; the spawn lands in the first empty cell (0,0)
+    var rng = SequenceRng{ .values = &[_]usize{ 0, 1 } };
+    _ = game.moveDown(&rng);
+
+    try std.testing.expectEqual(@as(Tile, 2), game.board[0][0]);
+    try std.testing.expectEqual(@as(Tile, 0), game.board[1][0]);
+    try std.testing.expectEqual(@as(Tile, 4), game.board[2][0]);
+    try std.testing.expectEqual(@as(Tile, 4), game.board[3][0]);
+}
+
+test "moveRight slides and merges toward the right column" {
+    var game = GameState{ .board = .{
+        .{ 2, 2, 0, 4 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    } };
+    // after the move row 0 is {0,0,4,4}; spawn of 2 lands in first empty cell (0,0)
+    var rng = SequenceRng{ .values = &[_]usize{ 0, 1 } };
+    const result = game.moveRight(&rng);
+
+    try std.testing.expectEqual([BoardSize]Tile{ 2, 0, 4, 4 }, game.board[0]);
+    try std.testing.expect(result.changed);
+    try std.testing.expectEqual(@as(u32, 4), result.score_delta);
+}
+
+test "move spawns into a cell freed by a merge" {
+    var game = GameState{ .board = .{
+        .{ 2, 4, 8, 16 },
+        .{ 2, 4, 8, 16 },
+        .{ 32, 64, 128, 256 },
+        .{ 32, 64, 128, 256 },
+    } };
+    // moveUp merges every column pair: 8 tiles remain, rows 2-3 are empty.
+    // rng index 0 -> first empty (2,0); value roll 1 -> 2.
+    var rng = SequenceRng{ .values = &[_]usize{ 0, 1 } };
+    const result = game.moveUp(&rng);
+
+    try std.testing.expect(result.changed);
+    try std.testing.expect(result.spawned);
+    try std.testing.expectEqual(@as(Tile, 2), game.board[2][0]);
+    try std.testing.expectEqual(@as(usize, 9), countTiles(game.board));
+}
+
+test "spawnRandomTile returns false on full board" {
+    var game = GameState{ .board = .{
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+    } };
+    var rng = NoCallRng{};
+    try std.testing.expect(!game.spawnRandomTile(&rng));
+}
+
+test "spawnRandomTile picks the rng-chosen empty cell and spawns 4 on a 1-in-10 roll" {
+    var game = GameState{ .board = .{
+        .{ 2, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    } };
+    // empties in row-major order: (0,1)(0,2)(0,3)(1,0)...; index 1 -> (0,2)
+    // value roll 0 -> 4
+    var rng = SequenceRng{ .values = &[_]usize{ 1, 0 } };
+    try std.testing.expect(game.spawnRandomTile(&rng));
+    try std.testing.expectEqual(@as(Tile, 4), game.board[0][2]);
+}
+
+test "spawnAt rejects out of bounds, occupied, and invalid values" {
+    var game = GameState{ .board = .{
+        .{ 2, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    } };
+    try std.testing.expectError(error.OutOfBounds, game.spawnAt(.{ .row = 4, .col = 0 }, 2));
+    try std.testing.expectError(error.Occupied, game.spawnAt(.{ .row = 0, .col = 0 }, 2));
+    try std.testing.expectError(error.InvalidValue, game.spawnAt(.{ .row = 1, .col = 1 }, 8));
+    try game.spawnAt(.{ .row = 1, .col = 1 }, 4);
+    try std.testing.expectEqual(@as(Tile, 4), game.board[1][1]);
+}
+
+test "Direction.parse accepts only the four direction names" {
+    try std.testing.expectEqual(Direction.up, Direction.parse("up").?);
+    try std.testing.expectEqual(Direction.right, Direction.parse("right").?);
+    try std.testing.expectEqual(@as(?Direction, null), Direction.parse("w"));
+    try std.testing.expectEqual(@as(?Direction, null), Direction.parse(""));
 }
 
 test "gameStart spawns two deterministic tiles" {
@@ -360,27 +453,44 @@ test "gameStart spawns two deterministic tiles" {
     try std.testing.expectEqual(@as(u32, 0), game.score);
 }
 
-test "isGameOver detects playable and terminal boards" {
-    const terminal: GameState = .{
-        .board = .{
-            .{ 2, 4, 2, 4 },
-            .{ 4, 2, 4, 2 },
-            .{ 2, 4, 2, 4 },
-            .{ 4, 2, 4, 2 },
-        },
-        .score = 0,
-    };
+test "same seed reproduces the same game" {
+    var a = std.Random.DefaultPrng.init(12345);
+    var b = std.Random.DefaultPrng.init(12345);
+    var ga = GameState.gameStart(a.random());
+    var gb = GameState.gameStart(b.random());
+    for ([_]Direction{ .left, .up, .right, .down, .left }) |d| {
+        _ = ga.move(d, a.random());
+        _ = gb.move(d, b.random());
+    }
+    try std.testing.expectEqual(ga.board, gb.board);
+    try std.testing.expectEqual(ga.score, gb.score);
+}
 
-    const playable: GameState = .{
-        .board = .{
-            .{ 2, 4, 2, 4 },
-            .{ 4, 2, 4, 2 },
-            .{ 2, 2, 4, 8 },
-            .{ 16, 32, 64, 128 },
-        },
-        .score = 0,
-    };
+test "isGameOver detects playable and terminal boards" {
+    const terminal: GameState = .{ .board = .{
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+    } };
+
+    const playable: GameState = .{ .board = .{
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+        .{ 2, 2, 4, 8 },
+        .{ 16, 32, 64, 128 },
+    } };
 
     try std.testing.expect(terminal.isGameOver());
     try std.testing.expect(!playable.isGameOver());
+}
+
+test "isGameOver is false while an empty cell remains" {
+    const state: GameState = .{ .board = .{
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 0 },
+    } };
+    try std.testing.expect(!state.isGameOver());
 }
