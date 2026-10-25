@@ -131,3 +131,49 @@ Idea: search on rows packed as 4 nibbles (log2 of each tile), so a slide is one 
 - A pack-and-unpack wrapper around `GameState.slide` (no packed state kept) was slower: about 40 ns per slide.
 - Conclusion: a real speedup needs `GameState` itself stored packed. That changes about 78 `.board` uses and
   makes tiles of 65536 and above need a separate path. Not done.
+
+## Training focus: near-loss states (proposal, not implemented)
+
+Problem: `nn.trainGame` runs TD(0) over every move of every self-play game with the same weight.
+Most moves are in the safe early and middle game, so the net sees few examples of boards close to
+game over. Those boards decide the score, and their values are the least accurate.
+
+Current behaviour (`ai/solver/nn.zig`, `trainGame`): each step calls `train(net, cache, reward + next_value, lr)`
+in forward order, one update per move, no replay, no weighting by position.
+
+### Candidate ideas (cheapest first)
+
+1. **Diagnose before changing anything.** Log the per-move TD error `|target - V(s)|` grouped by
+   empty-cell count (0..3, 4..7, 8+) and by distance to game over (last 10, 11..30, earlier).
+   If the error and the value drop (`V(s_{t+1}) - V(s_t)`) are concentrated near game over, the
+   focus idea is worth doing. If not, skip it. This needs only logging, no change in training.
+2. **Backward sweep after each game.** Store the (afterstate, reward) pairs of the game and train
+   from the last move back to the first. The terminal value propagates to earlier states in one
+   pass, so the near-loss boards learn the real outcome sooner. Cost: a small buffer per game.
+   Risk: changes the update order, so results differ from the current run; compare on the same seeds.
+3. **Replay the last K moves of each lost game.** Keep the final K (e.g. 30) afterstates of each game
+   and train on them again, in a separate pass with a smaller learning rate. This oversamples
+   the states just before a loss without changing how games are played.
+4. **Prioritized replay by TD error.** Keep a buffer of recent (state, target) pairs; sample with
+   probability proportional to `|δ|^α` (α about 0.5), and always keep a fraction (e.g. 50%) uniform.
+   Large `|δ|` is a good proxy for "the value just dropped". The uniform part keeps the training
+   distribution from drifting too far from the one the policy visits.
+5. **Restarts from hard boards.** Begin some games from saved boards with few empty cells and
+   high tiles (taken from earlier games). Gives direct coverage of late-game states. Riskier:
+   those boards may be unreachable under the policy, so keep the share small.
+
+### Safety rules for any of the above
+
+- Focusing on losing states is off-policy. Always mix in uniform samples (ideas 2–4 keep the
+  normal per-move update as well).
+- Compare with the same total number of moves processed, not the same number of games,
+  because replay makes each game cost more time.
+- Evaluate with the existing protocol: `zig build nn -- 20000 100 2000 0.003` on seeds 2000..2099,
+  then a fresh seed range (e.g. 3000..3099) before deciding. Record every run in this file.
+- Keep the diagnostic (idea 1) as a flag so it can be re-run after the training changes.
+
+### Next steps
+
+- Add the diagnostic log (idea 1) to `nn_main.zig` or behind a flag in `nn.zig`.
+- If the error is concentrated near game over: implement idea 3 (cheapest) and measure.
+  Then try idea 2 and idea 4 on the same seeds.
