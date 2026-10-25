@@ -26,27 +26,25 @@ UI や実行環境に依存しない `2048.core` を中心に据えることで�
 - `ai/solver`: `2048.core` を読むだけで行動を決定
 - `wasm` (future): JS バインディングで `2048.core` を呼ぶ
 
-## Core API (Draft)
+## Core API
 
-`2048.core` の操作 API は、まず次のシンプルな形を基準にする。
+`src/core.zig` の公開 API。
 
-- `game-start`
-- `move-up`
-- `move-left`
-- `move-down`
-- `move-right`
+- `core.GameState.gameStart(rng)` / `core.gameStart(rng)`: 初期盤面 (タイル 2 つ)
+- `GameState.move(direction, rng)` と `moveUp/Left/Down/Right`: 移動・マージ・生成
+- `core.mergeLine(line)`: 1 行のスライド + マージ (1 ターン 1 回マージ)
+- `GameState.spawnRandomTile(rng)` / `spawnAt(pos, value)`: タイル生成
+- `GameState.isGameOver()`: 終局判定
+- `core.Direction.parse("up")`: 文字列から方向へ変換
 
-move 操作の内部は、方向ごとに以下の手順で統一する。
+`move` の内部は方向ごとに以下で統一している。
 
-1. ボードから 1 行 (ベクトル) を抽出する
-2. 行単位の結合関数でスライド + マージする
-3. これを 4 行ぶん繰り返して盤面へ戻す
-4. 盤面が変化した場合のみ生成操作 (spawn) を行う
+1. ボードから 1 行 (ベクトル) を取り出す (`cellAt` で向きを吸収)
+2. `mergeLine` でスライド + マージする
+3. 結果を盤面へ書き戻す
+4. 盤面が変化した場合のみ生成 (spawn) を行う
 
-これにより、テスト対象を次の 2 つに分けられる。
-
-- 行単位の結合操作 (`mergeLine`)
-- 生成操作 (`spawn`)
+タイル値は `core.Tile = u32`。`u16` だと 65536 のマージで溢れるため。
 
 ## 開発方針 (TDD)
 
@@ -56,13 +54,15 @@ TDD を基本サイクルにする。
 2. Green: 最小実装で通す
 3. Refactor: 構造を整える
 
-特に以下をユニットテストで固定する。
+特に以下をユニットテストで固定する (現在 `zig build test` で全件通過)。
 
-- 各方向のスライドとマージ規則
-- 1 ターン 1 回マージ制約
-- 盤面変化がないときの挙動
+- 各方向のスライドとマージ規則 (`moveUp/Down/Left/Right`)
+- 1 ターン 1 回マージ制約、連鎖マージの禁止
+- 盤面変化がないときの挙動 (生成しない・RNG を呼ばない)
 - 乱数シード固定時の再現性
 - 終局判定
+- `spawnAt` の境界・占有・値の検証
+- CLI のコマンド解析・描画、サーバーのルーティング
 
 ## Nix ベースの開発環境
 
@@ -76,16 +76,46 @@ Ghostty のように、**Nix で再現可能な開発環境** を前提にする
 
 ```bash
 nix develop
-zig version
+zig version      # 0.15.2 を使う
 zig build test
 ```
 
 `flake.nix` は `devShell` を提供し、`zig` と (利用可能であれば) `zls` を使える。
 
+> **注意**: `build.zig` は Zig 0.15 系の API で書かれている。Zig 0.17 では
+> `b.args` などが無く `zig build` が失敗する。`zig` が 0.15.x でない場合は
+> 0.15.2 のバイナリを明示して実行する。
+> 例: `/nix/store/…-zig-0.15.2/bin/zig build test`
+
+## 起動方法
+
+```bash
+zig build run                 # 端末で遊ぶ (play, 既定)
+zig build run -- serve 8080   # HTTP サーバー + ブラウザ UI (既定ポート 8080)
+zig build run -- help         # 使い方
+```
+
+- `play`: `w/a/s/d` または `up/left/down/right` で移動、`n` でリセット、`q` で終了
+- `serve`: `http://127.0.0.1:8080/` を開くと矢印キー/WASD で遊べる
+  - `GET /api/state`, `POST /api/new`, `POST /api/move?dir=up|left|down|right`
+  - 例: `curl -X POST "localhost:8080/api/move?dir=left"`
+  - 127.0.0.1 のみで待ち受ける。1 リクエスト 1 接続 (ローカル試作用)
+
+## ソース構成
+
+| ファイル | 役割 |
+|---|---|
+| `src/core.zig` | ゲームロジック (純粋・RNG 注入) |
+| `src/render.zig` | 盤面のテキスト描画 |
+| `src/cli.zig` | 端末プレイのコマンド解析とループ |
+| `src/server.zig` | HTTP サーバー、JSON API、埋め込み UI |
+| `src/web/index.html` | ブラウザ UI (サーバーに埋め込み) |
+| `src/main.zig` | サブコマンドの振り分け |
+
 ## マイルストーン
 
-1. `2048.core` の最小実装 + テスト基盤
-2. CLI でプレイ可能にする
+1. ✅ `2048.core` の最小実装 + テスト基盤
+2. ✅ CLI でプレイ可能にする / ✅ ローカル HTTP サーバーで試せる
 3. solver AI の PoC (expectimax / monte-carlo など)
 4. WASM ターゲット対応
 
