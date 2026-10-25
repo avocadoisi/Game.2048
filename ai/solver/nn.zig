@@ -265,6 +265,9 @@ pub const Options = struct {
     replay_lr_scale: f64 = 0.5,
     /// Candidate D (#34): prioritized replay buffer; null = off. Normal per-move updates run as well.
     priority: ?*Priority = null,
+    /// Candidate E (#59): with `priority` set, the `m` extra updates draw uniformly from buffer entries
+    /// with 4..7 empty cells (midgame) instead of by |TD error|.
+    midgame: bool = false,
 };
 
 /// Prioritized replay (issue #34): ring buffer of recent TD updates. After each game, `m` extra updates
@@ -302,6 +305,28 @@ pub const Priority = struct {
         return self.len - 1;
     }
 
+    /// `m` extra updates, midgame variant (#59): uniform over entries with 4..7 empty cells,
+    /// whole buffer when none exist.
+    pub fn sampleMidgame(self: *const Priority, rng: std.Random) usize {
+        var eligible: usize = 0;
+        for (self.items[0..self.len]) |e| if (isMidgame(e.after)) {
+            eligible += 1;
+        };
+        if (eligible == 0) return rng.uintLessThan(usize, self.len);
+        var k = rng.uintLessThan(usize, eligible);
+        for (self.items[0..self.len], 0..) |e, i| {
+            if (!isMidgame(e.after)) continue;
+            if (k == 0) return i;
+            k -= 1;
+        }
+        unreachable;
+    }
+
+    fn isMidgame(board: Board) bool {
+        const empty = countEmpty(board);
+        return empty >= 4 and empty <= 7;
+    }
+
     fn weight(self: *const Priority, err: f64) f64 {
         return std.math.pow(f64, @abs(err) + err_floor, self.alpha);
     }
@@ -323,8 +348,8 @@ pub const GameResult = struct { score: u32, moves: u32 };
 
 /// `trainGame` with options. `diag` is only recorded on the default path (`opts` all off).
 pub fn trainGameOpts(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
-    if (opts.priority) |pr| return trainGamePerMove(net, rng, lr, diag, pr);
-    if (!opts.backward and opts.replay_k == 0) return trainGamePerMove(net, rng, lr, diag, null);
+    if (opts.priority) |pr| return trainGamePerMove(net, rng, lr, diag, pr, opts.midgame);
+    if (!opts.backward and opts.replay_k == 0) return trainGamePerMove(net, rng, lr, diag, null, false);
     var steps: [step_cap]Step = undefined;
     var n: usize = 0;
     var state = GameState.gameStart(rng);
@@ -370,7 +395,7 @@ fn valueOf(net: *const Net, after: Board) f64 {
     return forward(net, after, &cache);
 }
 
-fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, pr: ?*Priority) GameResult {
+fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, pr: ?*Priority, midgame: bool) GameResult {
     var state = GameState.gameStart(rng);
     var pending: ?Pick = null;
     var cache: Cache = .{};
@@ -394,7 +419,7 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, pr: ?*Pri
         train(net, &cache, p.reward, lr);
     }
     if (pr) |b| for (0..b.m) |_| {
-        const e = &b.items[b.sample(rng)];
+        const e = &b.items[if (midgame) b.sampleMidgame(rng) else b.sample(rng)];
         const target = e.reward + if (e.terminal) 0 else valueOf(net, e.next);
         _ = forward(net, e.after, &cache);
         e.err = @abs(target - cache.out);
@@ -872,6 +897,43 @@ test "priority pass changes the weights" {
     _ = trainGameOpts(&prio, rng_b.random(), 0.003, null, .{ .priority = &pr });
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&base), std.mem.asBytes(&prio)));
     try std.testing.expect(pr.len > 0);
+}
+
+/// Board with exactly `empties` empty cells (zeros first), for the midgame sampler tests.
+fn boardWithEmpties(empties: usize) Board {
+    var b: Board = undefined;
+    var i: usize = 0;
+    for (&b) |*row| for (row) |*v| {
+        v.* = if (i < empties) 0 else 2;
+        i += 1;
+    };
+    return b;
+}
+
+test "midgame sampling only returns entries with 4..7 empty cells" {
+    var pr: Priority = .{};
+    const empties = [_]usize{ 0, 2, 3, 4, 5, 6, 7, 8, 12, 16 };
+    for (empties, 0..) |e, i| pr.items[i].after = boardWithEmpties(e);
+    pr.len = empties.len;
+    var rng = std.Random.DefaultPrng.init(7);
+    var seen: [4]bool = @splat(false);
+    for (0..1000) |_| {
+        const n = countEmpty(pr.items[pr.sampleMidgame(rng.random())].after);
+        try std.testing.expect(n >= 4 and n <= 7);
+        seen[n - 4] = true;
+    }
+    for (seen) |hit| try std.testing.expect(hit);
+}
+
+test "midgame sampling falls back to the whole buffer when no 4..7 entry exists" {
+    var pr: Priority = .{};
+    const empties = [_]usize{ 0, 1, 2, 3, 8, 9 };
+    for (empties, 0..) |e, i| pr.items[i].after = boardWithEmpties(e);
+    pr.len = empties.len;
+    var rng = std.Random.DefaultPrng.init(7);
+    var hits: [6]usize = @splat(0);
+    for (0..6000) |_| hits[pr.sampleMidgame(rng.random())] += 1;
+    for (hits) |h| try std.testing.expect(h > 0);
 }
 
 test "parallel training batch matches a serial run of the same game seeds" {
