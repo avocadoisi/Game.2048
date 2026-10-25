@@ -105,7 +105,8 @@ zig build run -- help         # 使い方
 `ai/solver/` に置き、`2048.core` の公開 API (`slide` / `move` / `isGameOver` など) だけを使う。core は solver を知らない。
 
 - `solver.bestMove(state, depth)`: expectimax で最良手を返す (`null` は合法手なし)
-- `solver.evaluate(board)`: 空きマス数 + 最大タイルの角ボーナスの手作り評価関数
+- `solver.evaluate(board)`: 空きマス数 + 「左上から行順 (1..16) に並ぶ大小関係」の違反ペナルティ
+- `solver.evaluateState(state)`: `evaluate` に「down しか合法手がない盤面」の大きなペナルティを加えた葉の評価
 - `solver.playGame(rng, depth)`: 1 ゲーム分プレイして結果を返す
 
 検証 (ReleaseFast, seed 1, 100 games):
@@ -114,12 +115,16 @@ zig build run -- help         # 使い方
 zig build solve -Doptimize=ReleaseFast -- 100 2 1   # games depth seed
 ```
 
-| depth | avg score | avg moves | best tile | 1024 到達 |
-|---|---|---|---|---|
-| 1 | 3,673 | 292 | 512 | 0 / 100 |
-| 2 | 7,606 | 512 | 1024 | 13 / 100 |
+| 版 | depth | avg score | avg moves | best tile | 1024 到達 |
+|---|---|---|---|---|---|
+| 角ボーナス版 (seed 1) | 1 | 3,673 | 292 | 512 | 0 / 100 |
+| 角ボーナス版 (seed 1) | 2 | 7,606 | 512 | 1024 | 13 / 100 |
+| 行順 + forced-down 版 (seed 1) | 1 | 2,843 | 236 | 512 | — |
+| 行順 + forced-down 版 (seed 1) | 2 | 18,596 | 1,032 | 4096 | 最大 4096 2 / 100、2048 38 / 100 |
+| 角ボーナス版 (seed 2) | 2 | 7,866 | 524 | 1024 | — |
+| 行順 + forced-down 版 (seed 2) | 2 | 19,812 | 1,087 | 4096 | — |
 
-depth 3 は 20 games で約 23 秒 (平均 11,876 点、1024 到達 11 / 20)。
+行順評価では depth 1 が角ボーナス版より弱くなります (depth 2 以上で強い)。depth 3 は未計測 (角ボーナス版は 20 games で約 23 秒)。
 
 ## ソース構成
 

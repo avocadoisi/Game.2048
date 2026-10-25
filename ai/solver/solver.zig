@@ -24,24 +24,31 @@ pub fn bestMove(state: GameState, depth: u8) ?Direction {
     return best;
 }
 
-/// Heuristic: many empty cells, plus a bonus when the largest tile sits in a corner.
-/// shortcut: a hand-tuned score, not learned; replace with an n-tuple table later.
+/// Cells in the reading order 1..16 (row by row, top-left to bottom-right).
+const order: [core.BoardCellCount]core.Position = blk: {
+    var cells: [core.BoardCellCount]core.Position = undefined;
+    for (0..core.BoardCellCount) |i| cells[i] = .{ .row = i / core.BoardSize, .col = i % core.BoardSize };
+    break :blk cells;
+};
+
+/// Heuristic: many empty cells, minus a penalty for each adjacent pair in the
+/// reading order where the later cell holds a smaller tile (log2 scale).
+/// shortcut: a hand-set order, not learned; replace with an n-tuple table later.
 pub fn evaluate(board: Board) f64 {
-    const last = core.BoardSize - 1;
     var empties: f64 = 0;
-    var max_tile: core.Tile = 0;
-    for (board) |row| {
-        for (row) |value| {
-            if (value == 0) empties += 1;
-            max_tile = @max(max_tile, value);
+    var penalty: f64 = 0;
+    var prev: f64 = 0;
+    for (order) |p| {
+        const value = board[p.row][p.col];
+        if (value == 0) {
+            empties += 1;
+            continue;
         }
+        const level = @log2(@as(f64, @floatFromInt(value)));
+        penalty += @max(0, prev - level);
+        prev = level;
     }
-    const corners = [_]core.Tile{ board[0][0], board[0][last], board[last][0], board[last][last] };
-    var corner_bonus: f64 = 0;
-    for (corners) |value| {
-        if (value != 0 and value == max_tile) corner_bonus = @log2(@as(f64, @floatFromInt(max_tile)));
-    }
-    return empties * 10 + corner_bonus * 5;
+    return empties * 10 - penalty * 10;
 }
 
 pub const GameResult = struct {
@@ -65,8 +72,24 @@ pub fn playGame(rng: anytype, depth: u8) GameResult {
     return .{ .score = state.score, .max_tile = max_tile, .moves = moves };
 }
 
+/// Extra penalty when only `down` is legal: with the top-left corner as the anchor,
+/// a forced down move breaks the order.
+/// shortcut: fixed penalty, not tuned; tune with `zig build solve` later.
+const forced_down_penalty: f64 = 100;
+
+pub fn evaluateState(state: GameState) f64 {
+    var score = evaluate(state.board);
+    for ([_]Direction{ .up, .left, .right }) |d| {
+        var next = state;
+        if (next.slide(d).changed) return score;
+    }
+    var down = state;
+    if (down.slide(.down).changed) score -= forced_down_penalty;
+    return score;
+}
+
 fn maxValue(state: GameState, depth: u8) f64 {
-    if (depth == 0) return evaluate(state.board);
+    if (depth == 0) return evaluateState(state);
     var best: f64 = lost_score;
     var any_move = false;
     for ([_]Direction{ .up, .left, .down, .right }) |d| {
@@ -97,7 +120,7 @@ fn chanceValue(state: GameState, depth: u8) f64 {
             }
         }
     }
-    if (empties == 0) return evaluate(state.board);
+    if (empties == 0) return evaluateState(state);
     return total / empties;
 }
 
@@ -123,20 +146,46 @@ test "bestMove takes a merge over a move that does nothing" {
     try std.testing.expect(move == .left or move == .right);
 }
 
-test "evaluate gives a bonus when the largest tile is in a corner" {
-    const corner: Board = .{
+test "evaluateState penalizes a board where only down is legal" {
+    const forced_down: GameState = .{ .board = .{
+        .{ 2, 4, 8, 16 },
+        .{ 4, 8, 16, 32 },
+        .{ 8, 16, 32, 64 },
+        .{ 0, 0, 0, 0 },
+    } };
+    try std.testing.expect(evaluateState(forced_down) < evaluate(forced_down.board));
+}
+
+test "evaluate penalizes a smaller tile placed after a larger one in the order" {
+    const sorted: Board = .{
+        .{ 2, 4, 8, 16 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    const reversed: Board = .{
+        .{ 16, 8, 4, 2 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    try std.testing.expect(evaluate(sorted) > evaluate(reversed));
+}
+
+test "evaluate rewards a large tile at a later position in the order" {
+    const early: Board = .{
         .{ 64, 2, 0, 0 },
         .{ 0, 0, 0, 0 },
         .{ 0, 0, 0, 0 },
         .{ 0, 0, 0, 0 },
     };
-    const middle: Board = .{
+    const late: Board = .{
         .{ 2, 0, 0, 0 },
-        .{ 0, 64, 0, 0 },
         .{ 0, 0, 0, 0 },
         .{ 0, 0, 0, 0 },
+        .{ 0, 0, 2, 64 },
     };
-    try std.testing.expect(evaluate(corner) > evaluate(middle));
+    try std.testing.expect(evaluate(late) > evaluate(early));
 }
 
 test "evaluate prefers boards with more empty cells" {
