@@ -273,11 +273,13 @@ const Step = struct { after: Board, reward: f64 };
 /// Target for the previous afterstate = its scaled reward + V(next afterstate); 0 after game over.
 /// `diag` (optional) records each step's TD error and value change; it does not touch the rng or the update.
 pub fn trainGame(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag) u32 {
-    return trainGameOpts(net, rng, lr, diag, .{});
+    return trainGameOpts(net, rng, lr, diag, .{}).score;
 }
 
+pub const GameResult = struct { score: u32, moves: u32 };
+
 /// `trainGame` with options. `diag` is only recorded on the default path (`opts` all off).
-pub fn trainGameOpts(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) u32 {
+pub fn trainGameOpts(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
     if (!opts.backward and opts.replay_k == 0) return trainGamePerMove(net, rng, lr, diag);
     var steps: [step_cap]Step = undefined;
     var n: usize = 0;
@@ -311,7 +313,7 @@ pub fn trainGameOpts(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Op
             trainAfter(net, &cache, s.after, s.reward + next, lr_replay);
         }
     }
-    return state.score;
+    return .{ .score = state.score, .moves = @intCast(n) };
 }
 
 fn trainAfter(net: *Net, cache: *Cache, after: Board, target: f64, lr: f64) void {
@@ -324,11 +326,13 @@ fn valueOf(net: *const Net, after: Board) f64 {
     return forward(net, after, &cache);
 }
 
-fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag) u32 {
+fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag) GameResult {
     var state = GameState.gameStart(rng);
     var pending: ?Pick = null;
     var cache: Cache = .{};
+    var moves: u32 = 0;
     while (pickMove(net, state)) |pick| {
+        moves += 1;
         if (pending) |p| {
             _ = forward(net, p.after, &cache);
             const target = p.reward + pick.value;
@@ -344,7 +348,7 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag) u32 {
         train(net, &cache, p.reward, lr);
     }
     if (diag) |d| d.finish();
-    return state.score;
+    return .{ .score = state.score, .moves = moves };
 }
 
 /// Weight file: 8-byte magic, u32 version, u32 endianness marker (all little-endian), then the f64 weights as little-endian.
