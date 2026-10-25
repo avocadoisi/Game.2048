@@ -223,3 +223,22 @@ Command: `zig build nn -Doptimize=ReleaseFast -- 0 20 1000 0.003 5` (eval only, 
 - Per CPU second, the lookahead is about 33% slower than expectimax (91k vs 136k score/s), so the gain does not hold at equal time.
 - nn 1-ply is far cheaper per second but much weaker per game. It is the cheapest option, not the strongest.
 - Caveat: one set of weights, one seed range, 100 games per policy. The timing is a single run on a loaded machine.
+
+## Parallel eval (#40)
+
+Eval loops (`zig build nn` and `zig build ranking`) now run games on threads via `ai/solver/parallel.zig` (`std.Thread.spawn`, `min(cpu count, 8)` threads). Each game keeps its own PRNG seeded by its seed, so results do not depend on the thread count. `ranking` parallelizes per run (one PRNG per run, games in order inside a run, the same stream as before).
+
+- Machine: 8 logical CPUs (`hw.ncpu` 8), up to 8 threads (nn: 100 games in 8 chunks; ranking: 5 runs, so 5 threads).
+- Command: `zig build nn -Doptimize=ReleaseFast -- 0 20 1000 0.003 5` (eval only, committed weights).
+
+| policy | serial elapsed | parallel elapsed | speedup |
+|---|---|---|---|
+| nn 1-ply | 0.6 s | 0.1 s | 6x (too short to measure well) |
+| nn + spawn lookahead | 44.2 s | 9.9 s | 4.5x |
+| expectimax depth 2 | 13.1 s | 2.7 s | 4.9x |
+| sum of the three | 57.9 s | 12.7 s | 4.6x |
+
+- Whole command wall time (includes build): 58.1 s serial, 29.4 s parallel. `zig build ranking -Doptimize=ReleaseFast -- 5 20 1000`: 7m00s serial, 2m17s parallel.
+- Identical results: nn output lines (avg score ± stderr, avg moves, best tile) match the serial run exactly: 18851.1 ± 503.4 / 1028.1 / 2048; 38572.0 ± 1607.6 / 1917.1 / 4096; 24775.9 ± 1266.8 / 1319.8 / 4096. The ranking JSON is byte-identical (`cmp`) to the serial output for `5 20 1000`.
+- Tests: `parallel.map` equals a serial loop (`parallel.zig`), nn games match the serial loop over 8 seeds (`nn.zig`), and `bench.run` matches a serial loop over 8 games (`bench.zig`).
+- Caveat: `score/s` in `zig build nn` is now total score per **wall** second, not per CPU second as in the fair-comparison table above. Use the serial numbers for per-CPU-second comparisons.
