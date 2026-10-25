@@ -552,3 +552,11 @@ test "trainGame with diagnostic gives the same weights and records steps" {
     };
     try std.testing.expect(total > 0);
 }
+
+test "default trainGame weights match the recorded checksum (5 games, seeds 11/12)" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var net = Net.init(init_rng.random());
+    var rng = std.Random.DefaultPrng.init(12);
+    for (0..5) |_| _ = trainGame(&net, rng.random(), 0.003, null);
+    try std.testing.expectEqual(@as(u32, 1621370333), std.hash.Crc32.hash(std.mem.asBytes(&net)));
+}
