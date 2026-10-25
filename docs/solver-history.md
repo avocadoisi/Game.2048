@@ -305,7 +305,8 @@ Closed after #32 (diagnostic), #33 (replay / backward sweep, PR #48) and #34 (pr
   baseline, restarting from hard boards is not worth the cost.
 - Kept: the diagnostic flag (`diag`) stays in `nn_main.zig` so the error split can be re-checked after
   any future training change. The replay/backward/priority options stay off by default, with the
-  default path pinned by the CRC test.
+  default path pinned by the recorded-checksum test in `ai/solver/nn.zig` ("default trainGame weights
+  match the recorded checksum (5 games, seeds 11/12)").
 - Not done: no equal-moves sweep for replay (it reached 92% of base's moves), K/m/alpha not swept, and
   one training seed only. A wider sweep would need several training seeds before it could overturn the
   conclusion.
@@ -335,13 +336,13 @@ fixed, so the weights do not depend on the thread count; the serial path (no `pa
 
 ## Replay and backward sweep (#33)
 
-Options in `ai/solver/nn.zig` (`trainGameOpts`, `Options`); default off, and the default path is pinned by a CRC test.
+Options in `ai/solver/nn.zig` (`trainGameOpts`, `Options`); default off, and the default path is pinned by the recorded-checksum test above.
 - `backward`: no per-move update during the game (weights frozen while playing); afterwards every stored afterstate is trained from last to first, target = reward + V(next) with V recomputed.
 - `replay`: normal per-move updates, then the last K=30 afterstates are re-trained once, oldest first, at 0.5 x lr with fresh targets.
 - CLI: `zig build nn -- <train> <eval> <seed> <lr> <-|diag> <base|backward|replay> <K> <weights_path>`. Variant runs write to a temp path, so `ai/solver/nn_weights.bin` is not touched.
 
 Command per variant: `zig build nn -Doptimize=ReleaseFast -- 20000 20 2000 0.003 - <variant> 30 /tmp/nnb/<variant>.bin`, then eval-only runs (`-- 0 20 <seed> 0.003 - base 30 /tmp/nnb/<variant>.bin`) on seed ranges 2000, 3000, 4000, 5000, 6000 (20 games each, 100 games per variant).
-Mean ± stderr is over the 5 range averages (n=5). There is no seed-range helper in `main`, so the stderr is computed by hand.
+Mean ± stderr is over the 5 range averages (n=5). The built-in `seed_ranges` argument only covers contiguous ranges (`eval_seed + r*eval_games + g`), so the 1000-apart ranges were run individually and the stderr was computed by hand.
 
 | variant | train games | train moves | nn 1-ply avg score (mean ± stderr) | nn + 1 spawn avg score (mean ± stderr) |
 |---|---|---|---|---|
@@ -357,7 +358,7 @@ Per range, nn 1-ply avg score: base 19,110 / 16,668 / 19,592 / 17,423 / 20,589; 
 
 ## Priority replay (#34)
 
-Option `priority` in `ai/solver/nn.zig` (`Priority`, `Options.priority`; CLI variant `priority`). Default off; the default path is pinned by the CRC test.
+Option `priority` in `ai/solver/nn.zig` (`Priority`, `Options.priority`; CLI variant `priority`). Default off; the default path is pinned by that recorded-checksum test.
 - Normal per-move TD(0) updates run for every move, as in base. Each update is also stored in a ring buffer (1024 entries: afterstate, reward, next afterstate, terminal flag, |TD error|). The buffer persists across games.
 - After each game, `m = 32` extra updates. Each draws an entry: uniform with probability 0.5, otherwise with probability proportional to `(|δ| + 1e-3)^0.5`. The target is recomputed with the current weights, and the drawn entry's |δ| is refreshed.
 - Tests: sampling share checked against the analytic mixture (fixed seed, tolerance 0.01); priority pass changes the weights.
