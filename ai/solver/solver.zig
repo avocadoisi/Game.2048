@@ -984,3 +984,57 @@ test "playGame finishes a game and reports its result" {
     try std.testing.expect(result.moves > 0);
     try std.testing.expect(result.max_tile >= 2);
 }
+
+/// Golden fingerprint of a full game's move sequence and outcome (issue #87 regression guard).
+const Golden = struct { score: u32, max_tile: core.Tile, moves: u32, checksum: u64 };
+
+/// Play one full game with `policy` on `seed`, returning its outcome plus an FNV-1a checksum of
+/// the move sequence so any change to the picked moves shows up in the result.
+fn goldenPlay(policy: Policy, seed: u64, depth: u8) Golden {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+    var state = GameState.gameStart(rng);
+    var checksum: u64 = 0xcbf29ce484222325;
+    var moves: u32 = 0;
+    while (choose(policy, state, rng, depth)) |d| {
+        checksum = (checksum ^ @intFromEnum(d)) *% 0x100000001b3;
+        _ = state.move(d, rng);
+        moves += 1;
+    }
+    var max_tile: core.Tile = 0;
+    for (state.board) |row| for (row) |value| {
+        max_tile = @max(max_tile, value);
+    };
+    return .{ .score = state.score, .max_tile = max_tile, .moves = moves, .checksum = checksum };
+}
+
+test "nn policy reproduces the same move sequence and score on a fixed seed" {
+    const g = goldenPlay(.nn, 20240601, 0);
+    try std.testing.expectEqual(@as(u32, 70364), g.score);
+    try std.testing.expectEqual(@as(core.Tile, 4096), g.max_tile);
+    try std.testing.expectEqual(@as(u32, 3176), g.moves);
+    try std.testing.expectEqual(@as(u64, 16210708713020604363), g.checksum);
+}
+
+test "nn2 policy reproduces the same move sequence and score on a fixed seed" {
+    const g = goldenPlay(.nn2, 20240601, 0);
+    try std.testing.expectEqual(@as(u32, 73964), g.score);
+    try std.testing.expectEqual(@as(core.Tile, 4096), g.max_tile);
+    try std.testing.expectEqual(@as(u32, 3320), g.moves);
+    try std.testing.expectEqual(@as(u64, 14931741200977583578), g.checksum);
+}
+
+test "nn policy parses the weights once per thread, not once per move" {
+    var prng = std.Random.DefaultPrng.init(7);
+    const rng = prng.random();
+    var state = GameState.gameStart(rng);
+    const before = nn.parse_count;
+    var moves: usize = 0;
+    while (moves < 32) : (moves += 1) {
+        const d = choose(.nn, state, rng, 0) orelse break;
+        _ = state.move(d, rng);
+    }
+    try std.testing.expectEqual(@as(usize, 32), moves);
+    // the ~148 KB net is parsed at most once for the whole game, then reused by reference
+    try std.testing.expect(nn.parse_count - before <= 1);
+}
