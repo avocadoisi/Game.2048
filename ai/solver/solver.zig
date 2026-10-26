@@ -81,6 +81,17 @@ pub const ga_weights: Weights = .{ .empty = 7.028, .order_penalty = 43.174, .mer
 /// Trained value net (`zig build nn`), embedded at build time.
 const nn_weight_bytes = @embedFile("nn_weights.bin");
 
+/// The embedded net parsed once per thread (issue #87). Every move passes this `*const Net` by
+/// reference instead of re-parsing the ~148 KB weight block, so parallel ranking / HTTP / WASM each
+/// keep their own copy with no shared mutable state.
+threadlocal var cached_net: ?nn.Net = null;
+
+/// Per-thread net, parsed from the embedded weights on first use and reused for every later move.
+fn nnNet() *const nn.Net {
+    if (cached_net == null) cached_net = nn.parse(nn_weight_bytes) catch unreachable;
+    return &cached_net.?;
+}
+
 /// Next move for a policy; null when no move changes the board.
 pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Direction {
     switch (policy) {
@@ -106,17 +117,16 @@ pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Dir
         .beam => return beamMove(state),
         .expectimax_tt => return bestMoveTT(state, 3),
         .ga => return bestMoveW(state, depth, ga_weights),
-        // shortcut: one 148 KB net copy per move for all four NN policies; keep a static copy if
-        // this shows up in profiles. Separate copies per arm overflowed the wasm stack.
+        // The net is parsed once per thread and reused by reference (issue #87), never copied per move.
         .nn, .nn2, .nnmcts, .nnbeam => {
-            const net = nn.parse(nn_weight_bytes) catch unreachable;
+            const net = nnNet();
             return switch (policy) {
-                .nn => nn.bestMove(&net, state, .chance),
+                .nn => nn.bestMove(net, state, .chance),
                 // the 2-ply search itself dominates the cost.
-                .nn2 => nn.bestMove(&net, state, .deep),
-                .nnmcts => nnmctsMove(&net, state, rng),
+                .nn2 => nn.bestMove(net, state, .deep),
+                .nnmcts => nnmctsMove(net, state, rng),
                 // the sampled beam stays below nn2's leaf count.
-                .nnbeam => if (nnBeamBest(&net, state, rng)) |best| best.first_move else null,
+                .nnbeam => if (nnBeamBest(net, state, rng)) |best| best.first_move else null,
                 else => unreachable,
             };
         },
