@@ -30,6 +30,7 @@ fn describe(policy: solver.Policy) []const u8 {
         .ga => "GAで評価の重みを進化させた期待値探索（depth 2）。GA内のholdout(seed 500〜)では+4%だが、ranking seed 1000では素の expectimax より低い",
         .nn => "TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）",
         .nn2 => "TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）",
+        .nnmcts => "UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）",
     };
 }
 
@@ -57,6 +58,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .policy = .ga, .depth = 2 },
         .{ .policy = .nn, .depth = 0 },
         .{ .policy = .nn2, .depth = 2 },
+        .{ .policy = .nnmcts, .depth = 0 },
     };
     var entries: [policies.len]Entry = undefined;
     for (policies, 0..) |p, i| {
