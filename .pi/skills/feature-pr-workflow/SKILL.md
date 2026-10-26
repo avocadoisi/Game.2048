@@ -104,6 +104,12 @@ git branch -d <branch>             # local branch; remote branch is deleted by g
 - After merge, run `zig build test` on the updated `main` once.
 - Remove the worktree after merge, not before.
 
+## Parallel work (subagents, applies throughout)
+
+- When the user says to do things in parallel (「並行して」), split the items across subagents and run them concurrently; each writing subagent gets its own worktree (see §2).
+- Even without the word "parallel", use subagents proactively whenever there are multiple independent items.
+- Only one heavy run at a time (`zig build test`, benchmarks, training); everything else may run in parallel with it.
+
 ## Checklist
 
 - [ ] Prompt and acceptance criteria captured
