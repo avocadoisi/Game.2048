@@ -110,7 +110,7 @@ zig build run -- help         # 使い方
 - `zig-out/web/game2048.wasm`: ゲーム + solver。`nn` の重みは `@embedFile` で埋め込み済み
 - ABI は `src/wasm.zig` 冒頭のコメント参照: `init(seed_lo, seed_hi)` / `move(dir)` / `solve(algo, depth)` / `board_ptr()` / `score()` / `best_tile()` / `algo_count()` / `algo_name(i)`
 
-サイズ (ReleaseFast): raw 753,911 B (736 KiB)、`gzip -9` 後 286,245 B (280 KiB)。
+サイズ (ReleaseFast): raw 757,140 B (739 KiB)、`gzip -9` 後 286,881 B (280 KiB)。
 
 ```bash
 zig build wasm -Doptimize=ReleaseFast
