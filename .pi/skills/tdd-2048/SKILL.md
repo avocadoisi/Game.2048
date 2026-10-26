@@ -44,6 +44,7 @@ One behavior per cycle. Commit or report after each green step when useful.
 - Test names describe behavior. A bug fix starts with a test that reproduces it.
 - Each non-trivial helper (merge, spawn, route, parse) gets its own test; prefer `std.testing` `expectEqual` / `expectEqualStrings` / `expectError`.
 - Tests that need randomness use `SequenceRng` (scripted) or a fixed-seed `DefaultPrng`.
+- Only one heavy run (`zig build test`, benchmarks, training) at a time, even with parallel subagents (see feature-pr-workflow "Parallel work").
 
 ## Done checklist
 
