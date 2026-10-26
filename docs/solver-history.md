@@ -529,6 +529,18 @@ Correctness: one `sym` step equals eight explicit `forward(transformBoard(k, boa
 - Reading: eight updates per visited position is not eight times the data, it is eight correlated steps against a target computed from the pre-step net, and TD(0) with function approximation cannot absorb that — at the normal lr the weights blow up to NaN within 20,000 games, at lr/8 they collapse to a near-constant value function (dead ReLUs), and λ = 0.7 makes it worse because traces multiply the same over-update. Dividing the lr keeps the total step size but not the optimisation dynamics: the game schedule (lr decay per game, freshest games last) is compressed 8x.
 - Verdict: not adopted, both options stay off by default (no default-path change, checksum test unchanged). A version that could work would accumulate the 8 transformed gradients from one net snapshot and apply a single averaged step (true batch augmentation) instead of eight sequential steps, and clip the gradient norm; that is a different, larger change, not a knob.
 - Cost: 2 settings x 5 seeds and 1 setting x 3 seeds x 20,000 games, ~150-800 s per run.
+
+## Batched symmetry update: symbatch (#98)
+
+Follow-up of #72: reuse each position in all 8 dihedral orientations without the eight correlated steps that made `sym` diverge.
+
+Mechanism (opt-in `nn.Options.sym_batch`, CLI variant `symbatch`): for one afterstate and its target `t` (computed exactly as the `sym` path does: its scaled reward plus V of the next afterstate, 0 after game over) it runs `forward` + `gradOf` on the 8 transformed boards **while `net` is untouched**, so all eight gradients describe the same pre-step net, averages them elementwise (`mean_k (V_k - t) * grad V_k`), clips the averaged gradient's global L2 norm to `nn.sym_batch_clip = 1.0`, and applies one SGD step `net -= lr * clip(mean_k ...)`. Deterministic, no RNG. `base` and every earlier variant stay byte-identical; the recorded-checksum tests are untouched.
+
+Why the clip value: measured averaged-gradient norms over one self-play game are 0.04..0.26 on a freshly initialised net but 4..300 late in training on the committed net (TD errors grow with the value scale, ~36..40 there). A unit-norm clip is therefore a no-op at the start (where lr is largest) and only binds late, where it caps one update's total weight displacement at `lr = 0.003` against a committed net mean |w| of 0.44 — the blow-up path of #72 (weights moving by their own magnitude per move, 8 times per position) is cut off instead of pre-empted by a smaller lr.
+
+Correctness: one `symbatch` step equals the averaged gradient applied once (tested to 1e-15), differs from the eight sequential `sym` steps, and on a large TD error (t = 100) the applied step's norm is exactly `lr * sym_batch_clip` while the unclipped averaged gradient is more than 10x the clip, so the clipping branch is exercised.
+
+Measurement: pending. The protocol is the one from #72 — 20,000 training games per seed, eval ranges 2000/3000/4000/5000/6000 x 20 games, `nn` 1-ply, against the `base` reference (18,754 ± 534) and the `sym` rows above; the numbers go in this section when the sweep has run.
 ## n-tuple network runner (#70)
 
 The classic 2048 SOTA value function, as a standalone runner: `ai/solver/ntuple.zig` holds flat f32 pattern tables (`[16^k]f32`) indexed by the same `levelOf` cell encoding as the MLP, `ai/solver/ntuple_main.zig` trains them by TD(0) on afterstates and evaluates them.
