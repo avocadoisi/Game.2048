@@ -346,14 +346,19 @@ const NnBeamNode = struct {
     value: f64,
 };
 
-/// Beam search with the learned NN leaf and `nnbeam_spawn_samples` sampled spawns per node.
+/// Beam search with the learned NN leaf and `nnbeam_spawn_samples` sampled spawns between plies;
+/// the last ply ends on the afterstate, the leaf rule `nn2` uses (`chance(..., 0)`).
 /// Spawns are drawn from `rng`, so a fixed seed reproduces the same move. Null when no move changes the board.
 fn nnBeamBest(net: *const nn.Net, state: GameState, rng: std.Random) ?NnBeamNode {
+    return nnBeamSearch(net, state, rng, nnbeam_horizon);
+}
+
+fn nnBeamSearch(net: *const nn.Net, state: GameState, rng: std.Random, horizon: u8) ?NnBeamNode {
     var beam: [nnbeam_width]NnBeamNode = undefined;
     beam[0] = .{ .state = state, .first_move = .up, .reward = 0, .value = 0 };
     var beam_len: usize = 1;
 
-    for (0..nnbeam_horizon) |ply| {
+    for (0..horizon) |ply| {
         var next_beam: [nnbeam_width]NnBeamNode = undefined;
         var next_len: usize = 0;
         for (beam[0..beam_len]) |node| {
@@ -363,6 +368,15 @@ fn nnBeamBest(net: *const nn.Net, state: GameState, rng: std.Random) ?NnBeamNode
                 if (!result.changed) continue;
                 const first_move = if (ply == 0) direction else node.first_move;
                 const reward = node.reward + @as(f64, @floatFromInt(result.score_delta)) / nn.reward_scale;
+                if (ply + 1 == @as(usize, horizon)) {
+                    insertNnBeam(&next_beam, &next_len, .{
+                        .state = moved,
+                        .first_move = first_move,
+                        .reward = reward,
+                        .value = reward + nnLeafValue(net, moved.board),
+                    });
+                    continue;
+                }
                 var spawned = false;
                 for (0..nnbeam_spawn_samples) |_| {
                     var child = moved;
@@ -794,6 +808,22 @@ test "nnbeam returns the root move of the best leaf, not a deeper direction" {
         const direction = choose(.random, state, rng, 0) orelse break;
         _ = state.move(direction, rng);
     }
+}
+
+test "nnbeam evaluates the afterstate before spawn at the final ply" {
+    const net = nn.parse(nn_weight_bytes) catch unreachable;
+    const state: GameState = .{ .board = .{
+        .{ 2, 4, 8, 16 },
+        .{ 32, 64, 128, 256 },
+        .{ 512, 1024, 2048, 0 },
+        .{ 0, 0, 0, 0 },
+    } };
+    // horizon 1: the leaf must be the afterstate of the returned move, like `nn2` ends on `chance(..., 0)`
+    var prng = std.Random.DefaultPrng.init(7);
+    const best = nnBeamSearch(&net, state, prng.random(), 1).?;
+    var afterstate = state;
+    try std.testing.expect(afterstate.slide(best.first_move).changed);
+    try std.testing.expectEqual(afterstate.board, best.state.board);
 }
 
 test "expectimax TT depth 3 matches bestMove on random-play boards" {
