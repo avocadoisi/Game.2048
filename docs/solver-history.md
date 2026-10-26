@@ -648,3 +648,33 @@ References on the same seed: `mcts` 29,722 (committed `ranking.json`, 5 x 20 gam
 - Verdict: not adopted for `ranking.json` or as the default policy; kept as an experimental policy (`Policy.nnmcts`, `algo=nnmcts`, wasm) because it documents the limit of pairing random rollouts with this value net.
 - The canonical 5 x 20 same-seed `zig build ranking` run for `nnmcts` was started but skipped — it did not finish within the working timeout — so the decision rests on the 10-game table above, which carries a few thousand points of noise per row. Existing `mcts` and `nn`/`nn2` behaviour is unchanged: the UCT and best-arm rules were extracted verbatim with the same RNG call order, and both NN policies still call the same `nn.bestMove`.
 - Wasm: three separate 148 KB per-move net copies (one per NN arm) overflowed the wasm stack — `solve` failed with `RuntimeError: memory access out of bounds` even for `algo=0`, since the copies live in `choose`'s frame. The three NN arms now share one copy; the module grew from 745,167 to 753,911 bytes (286,245 gzipped) and the smoke test passes for all ten policies and ten applied moves.
+## NN-value beam with sampled spawns (#83)
+
+Idea: `beam` uses the hand-written snake/merge evaluation and assumes a 2 on every empty cell; `nn`/`nn2` use the learned MLP but only walk one or two own moves. `nnbeam` puts the learned value under a small beam: fixed width 8, horizon 3 own moves, and 2 sampled spawns between plies instead of an exact spawn expectation.
+
+Mechanism (`ai/solver/solver.zig`):
+- `nnBeamSearch(net, state, rng, horizon)` keeps two `[8]NnBeamNode` arrays (`state`, `first_move`, `reward`, `value`) and reuses the existing `insertBeam`-style insertion. Rewards are `score_delta / nn.reward_scale`; leaves are `nn.forward` on the afterstate, i.e. the same leaf rule as `nn`. `nnBeamBest` is the `nnbeam_horizon` wrapper the policy calls.
+- Spawns are sampled only *between* plies: `sampleSpawn` picks a uniformly random empty cell and places 2 (90%) or 4 (10%). The last ply inserts the afterstate itself, without a spawn, matching `nn2`, which ends on `chance(..., 0)` — the net was trained on afterstates before spawn, so a post-spawn leaf asks it about a board it never saw. A full board keeps the afterstate as the leaf; no legal root move returns `null`, so the dead-board semantics match the other policies.
+- `first_move` is copied from the ply-0 direction, so the returned move is always legal on the root board (a test asserts `canSlide` and that the deeper direction never leaks out).
+- Randomness comes only from the caller's `std.Random`, so the same seed replays the same move; a test plays 12 random-move boards and compares two identically seeded calls.
+- `depth` is ignored (the horizon is fixed); `Policy.nnbeam` is registered in `choose`, in `ranking`'s policy list/description, and therefore in the server, the wasm `algo_count`/`algo_name` export, and the static UI dropdown.
+
+WASM: routing `nnbeam` through its own `nn.parse` arm pushed `choose`'s stack frame over the wasm stack — `random` failed too, because a function's frame is allocated on entry. The three NN policies now share one `nn.parse` per call (behavior unchanged: same net, one policy executes), and all ten policies pass the smoke test.
+
+Measured, ReleaseFast, one run per policy, same seed and policy order (`zig build ranking -Doptimize=ReleaseFast -- 1 20 2000`, 3m47s):
+
+| seed 2000 / 20 games | avg score | avg moves | ms/move |
+|---|---|---|---|
+| nn2 | 72,960.0 | 3,318.7 | 1.947 |
+| nn | 63,486.0 | 2,911.5 | 0.200 |
+| expectimax_tt | 46,744.8 | 2,267.9 | 0.695 |
+| mcts | 29,310.6 | 1,523.3 | 1.001 |
+| expectimax | 26,153.6 | 1,373.8 | 0.081 |
+| **nnbeam** | **25,480.2** | **1,327.9** | **0.124** |
+| ga | 22,189.8 | 1,205.3 | 0.078 |
+| beam | 12,584.6 | 760.1 | 0.067 |
+
+- Reading: `nnbeam` scores exactly 2.03x `beam` (25,480 vs 12,585) at 0.124 ms/move, i.e. still cheap, so the sampled beam plus the learned leaf does lift the shallow `beam` baseline. It stays slightly below `expectimax` depth 2 (26,154) and far below `nn` (63,486): three plies of width 8 with 2 spawns each evaluate ~64 leaves per move, but every leaf is an afterstate the beam reached through one sampled spawn per gap, so the search commits to one spawn outcome instead of averaging it. That is the structural reason a sampled beam trails the 1-ply-plus-expectation `nn`.
+- Verdict: kept as an experimental policy (`algo=nnbeam`), not a default; `nn` stays the fast option and `nn2` the strong one. Either widening the beam or averaging the spawns would recover strength, but at `nn2`-class cost, so it stays a bounded experiment.
+- Correction: the first version of this section reported seed-1000 10-game numbers (23,875 / 28,493 / 16,513) from an implementation whose *last* ply also inserted a post-spawn child, so it asked the net about spawn boards at the leaf. Those numbers describe a different leaf rule and were dropped rather than mixed with the table above; the code now ends the last ply on the afterstate, and the focused test (`nnbeam evaluates the afterstate before spawn at the final ply`) pins the rule at horizon 1: the returned leaf board must equal the afterstate of the returned move.
+- `src/web/ranking.json` is not regenerated here (the canonical 5 x 20 run costs ~5 min and the policy is experimental); the file still lists the nine earlier policies.

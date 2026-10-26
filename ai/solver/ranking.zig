@@ -31,6 +31,7 @@ fn describe(policy: solver.Policy) []const u8 {
         .nn => "TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）",
         .nn2 => "TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）",
         .nnmcts => "UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）",
+        .nnbeam => "NNの盤面価値を葉にしたビーム探索。幅8・3手先で、ply間のspawnを2回サンプリングする（固定seedで再現）",
     };
 }
 
@@ -59,6 +60,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .policy = .nn, .depth = 0 },
         .{ .policy = .nn2, .depth = 2 },
         .{ .policy = .nnmcts, .depth = 0 },
+        .{ .policy = .nnbeam, .depth = 0 },
     };
     var entries: [policies.len]Entry = undefined;
     for (policies, 0..) |p, i| {
@@ -72,8 +74,8 @@ pub fn main(init: std.process.Init) !void {
     try w.print("{{\"seed\":{d},\"runs\":{d},\"games_per_run\":{d},\"entries\":[", .{ seed, runs, games_per_run });
     for (entries, 0..) |e, i| {
         if (i > 0) try w.writeAll(",");
-        try w.print("{{\"policy\":\"{s}\",\"depth\":{d},\"games\":{d},\"avg_score\":{d:.1},\"avg_moves\":{d:.1},\"best_tile\":{d},\"description\":\"{s}\"}}", .{
-            @tagName(e.policy), e.depth, e.summary.games, e.summary.avg_score, e.summary.avg_moves, e.summary.best_tile, describe(e.policy),
+        try w.print("{{\"policy\":\"{s}\",\"depth\":{d},\"games\":{d},\"avg_score\":{d:.1},\"avg_moves\":{d:.1},\"best_tile\":{d},\"ms_per_move\":{d:.3},\"description\":\"{s}\"}}", .{
+            @tagName(e.policy), e.depth, e.summary.games, e.summary.avg_score, e.summary.avg_moves, e.summary.best_tile, e.summary.msPerMove(), describe(e.policy),
         });
     }
     try w.writeAll("]}\n");
