@@ -8,9 +8,18 @@ pub const Summary = struct {
     avg_moves: f64,
     best_tile: u32,
     elapsed_ns: i96,
+    /// Sum of the per-run serial times (each run plays its games on one thread).
+    serial_elapsed_ns: i96,
+    total_moves: u64,
 
     pub fn gamesPerSec(self: Summary) f64 {
         return @as(f64, @floatFromInt(self.games)) * 1e9 / @as(f64, @floatFromInt(self.elapsed_ns));
+    }
+
+    /// Serial latency: ms per move for one game played alone on its thread (not the parallel wall time).
+    pub fn latencyMsPerMove(self: Summary) f64 {
+        const moves: f64 = @floatFromInt(@max(self.total_moves, 1));
+        return @as(f64, @floatFromInt(self.serial_elapsed_ns)) / 1e6 / moves;
     }
 
     pub fn movesPerSec(self: Summary) f64 {
@@ -23,12 +32,13 @@ pub const Summary = struct {
     }
 };
 
-const RunResult = struct { score: u64 = 0, moves: u64 = 0, best_tile: u32 = 0 };
+const RunResult = struct { score: u64 = 0, moves: u64 = 0, best_tile: u32 = 0, elapsed_ns: i96 = 0 };
 
-const RunCtx = struct { policy: solver.Policy, depth: u8, games_per_run: u32, seed: u64 };
+const RunCtx = struct { policy: solver.Policy, depth: u8, games_per_run: u32, seed: u64, io: std.Io };
 
 /// One run: one PRNG seeded `seed + r`, games played in order (same stream as the serial loop).
 fn playRun(c: RunCtx, r: usize) RunResult {
+    const start = std.Io.Clock.awake.now(c.io);
     var prng = std.Random.DefaultPrng.init(c.seed + r);
     var res: RunResult = .{};
     for (0..c.games_per_run) |_| {
@@ -37,6 +47,7 @@ fn playRun(c: RunCtx, r: usize) RunResult {
         res.moves += result.moves;
         res.best_tile = @max(res.best_tile, result.max_tile);
     }
+    res.elapsed_ns = start.durationTo(std.Io.Clock.awake.now(c.io)).toNanoseconds();
     return res;
 }
 
@@ -45,14 +56,16 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, policy: solver.Policy, runs: u32,
     const start = std.Io.Clock.awake.now(io);
     const per_run = try gpa.alloc(RunResult, runs);
     defer gpa.free(per_run);
-    parallel.map(RunResult, per_run, RunCtx{ .policy = policy, .depth = depth, .games_per_run = games_per_run, .seed = seed }, playRun);
+    parallel.map(RunResult, per_run, RunCtx{ .policy = policy, .depth = depth, .games_per_run = games_per_run, .seed = seed, .io = io }, playRun);
     var total_score: u64 = 0;
     var total_moves: u64 = 0;
     var best_tile: u32 = 0;
+    var serial_elapsed: i96 = 0;
     for (per_run) |r| {
         total_score += r.score;
         total_moves += r.moves;
         best_tile = @max(best_tile, r.best_tile);
+        serial_elapsed += r.elapsed_ns;
     }
     const games: u32 = runs * games_per_run;
     const elapsed = start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
@@ -63,7 +76,16 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, policy: solver.Policy, runs: u32,
         .avg_moves = @as(f64, @floatFromInt(total_moves)) / n,
         .best_tile = best_tile,
         .elapsed_ns = elapsed,
+        .serial_elapsed_ns = serial_elapsed,
+        .total_moves = total_moves,
     };
+}
+
+test "summary separates serial latency from parallel throughput" {
+    const s = try run(std.testing.io, std.testing.allocator, .expectimax, 2, 2, 1, 1);
+    // latency is per-move serial cost (ms), throughput is games/sec of the parallel batch
+    try std.testing.expect(s.latencyMsPerMove() > 0);
+    try std.testing.expect(s.gamesPerSec() > 0);
 }
 
 test "run plays the requested number of games and reports timing" {
