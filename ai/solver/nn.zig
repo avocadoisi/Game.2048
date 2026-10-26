@@ -687,6 +687,11 @@ fn valueOf(net: *const Net, after: Board) f64 {
     return forward(net, after, &cache);
 }
 
+/// Global L2 norm the averaged symmetry gradient is clipped to (#98). Measured averaged-gradient norms are
+/// 0.04..0.26 on a fresh net but 4..300 late in training, so a unit-norm step is a no-op early and, with lr,
+/// caps a late-game update at lr = 0.003 against a mean |w| of 0.44.
+pub const sym_batch_clip: f64 = 1.0;
+
 /// Batch symmetry (#98): 8 gradients from one snapshot, averaged elementwise, one SGD step.
 fn trainSymBatch(net: *Net, after: Board, target: f64, lr: f64) void {
     var grad = std.mem.zeroes(Net);
@@ -697,7 +702,11 @@ fn trainSymBatch(net: *Net, after: Board, target: f64, lr: f64) void {
         for (flat(&grad), flat(@constCast(&step))) |*acc, x| acc.* += (v - target) * x;
     }
     for (flat(&grad)) |*acc| acc.* /= @as(f64, @floatFromInt(symmetry_count));
-    for (flat(net), flat(&grad)) |*w, x| w.* -= lr * x;
+    var norm2: f64 = 0;
+    for (flat(&grad)) |x| norm2 += x * x;
+    const norm = @sqrt(norm2);
+    const scale: f64 = if (norm > sym_batch_clip) sym_batch_clip / norm else 1;
+    for (flat(net), flat(&grad)) |*w, x| w.* -= lr * scale * x;
 }
 
 /// One per-move TD update on `after` with `target`: all 8 dihedral transforms when `opts.symmetry`,
@@ -1853,4 +1862,26 @@ test "one symbatch step differs from the eight sequential symmetry steps" {
     trainStep(&sequential, &cache, sample_board, 0.4, 0.01, .{ .symmetry = true }, &trace);
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&batched), std.mem.asBytes(&sequential)));
     for (flat(&batched)) |w| try std.testing.expect(std.math.isFinite(w));
+}
+
+test "a large averaged gradient is clipped to the module norm" {
+    var init_rng = std.Random.DefaultPrng.init(18);
+    var start = Net.init(init_rng.random());
+    var batched = start;
+    var cache: Cache = .{};
+    var trace: Net = std.mem.zeroes(Net);
+    const target: f64 = 100;
+    trainStep(&batched, &cache, sample_board, target, 0.001, .{ .sym_batch = true }, &trace);
+
+    var g = avgSymGrad(&start, sample_board, target);
+    var g2: f64 = 0;
+    for (flat(&g)) |x| g2 += x * x;
+    try std.testing.expect(@sqrt(g2) > 10 * sym_batch_clip);
+
+    var d2: f64 = 0;
+    for (flat(&start), flat(&batched)) |w0, w| {
+        const delta = w - w0;
+        d2 += delta * delta;
+    }
+    try std.testing.expectApproxEqRel(0.001 * sym_batch_clip, @sqrt(d2), 1e-12);
 }
