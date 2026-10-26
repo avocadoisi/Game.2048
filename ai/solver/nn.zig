@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const core = @import("core");
 const parallel = @import("parallel");
 
@@ -191,17 +192,126 @@ fn chanceMove(net: *const Net, state: GameState) ?Direction {
     return best;
 }
 
+/// Search statistics for one move (issue #69): afterstate evaluations and value-cache hits.
+pub const Stats = struct { leaves: u64 = 0, hits: u64 = 0 };
+
+/// Bounded transposition table for afterstate values, direct-mapped and deterministic.
+/// shortcut: 2^13 slots (128 KiB) keyed by the full 64-bit board hash; a collision drops the
+/// entry (a miss, never a wrong value), so the table only changes speed, not the chosen move.
+pub const ValueCache = struct {
+    /// The cache lives on the stack: wasm gets a smaller one (the 8K-entry version overflowed it).
+    pub const capacity = if (builtin.target.cpu.arch.isWasm()) 1 << 10 else 1 << 13;
+    const empty_key = std.math.maxInt(u64);
+    const Entry = struct { key: u64 = empty_key, value: f64 = 0 };
+    entries: [capacity]Entry = @splat(.{}),
+
+    fn keyOf(board: Board) u64 {
+        var h: u64 = 0xcbf29ce484222325;
+        for (board) |row| for (row) |value| {
+            h = (h ^ @as(u64, value)) *% 0x100000001b3;
+        };
+        return h;
+    }
+
+    /// `forward(net, board)` with memoization; `stats` counts leaf evaluations and hits.
+    pub fn get(self: *ValueCache, net: *const Net, board: Board, stats: *Stats) f64 {
+        const key = keyOf(board);
+        if (key == empty_key) return leafValue(net, board, stats);
+        const slot: usize = @intCast(key & (capacity - 1));
+        if (self.entries[slot].key == key) {
+            stats.hits += 1;
+            return self.entries[slot].value;
+        }
+        const value_ = leafValue(net, board, stats);
+        self.entries[slot] = .{ .key = key, .value = value_ };
+        return value_;
+    }
+};
+
+fn leafValue(net: *const Net, board: Board, stats: *Stats) f64 {
+    var cache: Cache = .{};
+    stats.leaves += 1;
+    return forward(net, board, &cache);
+}
+
+/// Depth-limited expectimax: our moves and every spawn (2 at 0.9, 4 at 0.1) exactly, no RNG.
+const Search = struct {
+    net: *const Net,
+    cache: ValueCache = .{},
+    stats: Stats = .{},
+
+    /// Max over legal moves of reward + expected value after the spawn; 0 when no move changes the board.
+    fn value(self: *Search, state: GameState, depth: u8) f64 {
+        var best: f64 = -std.math.inf(f64);
+        for ([_]Direction{ .up, .left, .down, .right }) |d| {
+            var next = state;
+            const moved = next.slide(d);
+            if (!moved.changed) continue;
+            const v = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale + self.chance(next, depth - 1);
+            best = @max(best, v);
+        }
+        return if (best == -std.math.inf(f64)) 0 else best;
+    }
+
+    /// Expected value of a post-move board after spawning; depth 0 is the value leaf (the afterstate itself).
+    fn chance(self: *Search, state: GameState, depth: u8) f64 {
+        if (depth == 0) return self.cache.get(self.net, state.board, &self.stats);
+        var total: f64 = 0;
+        var empties: f64 = 0;
+        for (0..core.BoardSize) |r| {
+            for (0..core.BoardSize) |c| {
+                if (state.board[r][c] != 0) continue;
+                empties += 1;
+                for ([_]struct { value: core.Tile, p: f64 }{ .{ .value = 2, .p = 0.9 }, .{ .value = 4, .p = 0.1 } }) |spawn| {
+                    var child = state;
+                    child.board[r][c] = spawn.value;
+                    total += spawn.p * self.value(child, depth);
+                }
+            }
+        }
+        return if (empties == 0) self.value(state, depth) else total / empties;
+    }
+};
+
+/// 2-ply: my move -> spawn -> my move -> spawn -> afterstate value + score_delta/reward_scale.
+fn deepMove(net: *const Net, state: GameState, stats: *Stats) ?Direction {
+    var search: Search = .{ .net = net };
+    defer stats.* = search.stats;
+    var best: ?Direction = null;
+    var best_value: f64 = -std.math.inf(f64);
+    for ([_]Direction{ .up, .left, .down, .right }) |d| {
+        var next = state;
+        const moved = next.slide(d);
+        if (!moved.changed) continue;
+        const v = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale + search.chance(next, 2);
+        if (best == null or v > best_value) {
+            best = d;
+            best_value = v;
+        }
+    }
+    return best;
+}
+
 pub const Mode = enum {
     /// 1-ply over afterstates: argmax of reward + V(afterstate).
     greedy,
     /// greedy plus one spawn of chance-node lookahead (see `chanceMove`).
     chance,
+    /// 2-ply: one more own move and spawn layer below `chance` (see `deepMove`).
+    deep,
 };
 
 pub fn bestMove(net: *const Net, state: GameState, mode: Mode) ?Direction {
+    var stats: Stats = .{};
+    return bestMoveWithStats(net, state, mode, &stats);
+}
+
+/// `bestMove` plus search counters (leaves = `forward` evaluations, hits = value-cache reuse).
+pub fn bestMoveWithStats(net: *const Net, state: GameState, mode: Mode, stats: *Stats) ?Direction {
     return switch (mode) {
         .greedy => if (pickMove(net, state)) |p| p.dir else null,
         .chance => chanceMove(net, state),
+        .deep => deepMove(net, state, stats),
     };
 }
 
@@ -209,21 +319,33 @@ pub const PlayResult = struct {
     score: u32,
     max_tile: core.Tile,
     moves: u32,
+    /// `forward` leaf evaluations summed over the game (0 for modes that do not search).
+    leaves: u64 = 0,
 };
 
 /// Play one game to game over with the network policy.
 pub fn play(net: *const Net, rng: std.Random, mode: Mode) PlayResult {
+    var stats: Stats = .{};
+    return playWithStats(net, rng, mode, &stats);
+}
+
+pub fn playWithStats(net: *const Net, rng: std.Random, mode: Mode, stats: *Stats) PlayResult {
     var state = GameState.gameStart(rng);
     var moves: u32 = 0;
-    while (bestMove(net, state, mode)) |d| {
-        _ = state.move(d, rng);
+    var move_stats: Stats = .{};
+    while (true) {
+        move_stats = .{};
+        const dir = bestMoveWithStats(net, state, mode, &move_stats) orelse break;
+        stats.leaves += move_stats.leaves;
+        stats.hits += move_stats.hits;
+        _ = state.move(dir, rng);
         moves += 1;
     }
     var max_tile: core.Tile = 0;
     for (state.board) |row| for (row) |value| {
         max_tile = @max(max_tile, value);
     };
-    return .{ .score = state.score, .max_tile = max_tile, .moves = moves };
+    return .{ .score = state.score, .max_tile = max_tile, .moves = moves, .leaves = stats.leaves };
 }
 
 /// Buckets for the training diagnostic (issue #32): empty cells 0..3, 4..7, 8+; moves left 0..9, 10..29, 30+.
@@ -771,6 +893,67 @@ test "bestMove returns null on a dead board and a legal move otherwise" {
     var moved = state;
     try std.testing.expect(moved.slide(bestMove(&net, state, .greedy).?).changed);
     try std.testing.expect(moved.slide(bestMove(&net, state, .chance).?).changed);
+}
+
+/// Board with a few empties: enough spawns for a 2-ply search to have work to do.
+const mid_board: GameState = .{ .board = .{
+    .{ 2, 4, 8, 16 },
+    .{ 0, 2, 0, 4 },
+    .{ 8, 0, 2, 0 },
+    .{ 0, 16, 0, 32 },
+} };
+
+test "deep returns only legal moves and null on a dead board" {
+    var prng = std.Random.DefaultPrng.init(6);
+    const net = Net.init(prng.random());
+    const dead: GameState = .{ .board = .{
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+    } };
+    try std.testing.expectEqual(@as(?Direction, null), bestMove(&net, dead, .deep));
+    var moved = mid_board;
+    try std.testing.expect(moved.slide(bestMove(&net, mid_board, .deep).?).changed);
+}
+
+test "deep is deterministic and searches more leaves than chance" {
+    var prng = std.Random.DefaultPrng.init(6);
+    const net = Net.init(prng.random());
+    var chance_stats: Stats = .{};
+    var a: Stats = .{};
+    var b: Stats = .{};
+    _ = bestMoveWithStats(&net, mid_board, .chance, &chance_stats);
+    const first = bestMoveWithStats(&net, mid_board, .deep, &a);
+    const second = bestMoveWithStats(&net, mid_board, .deep, &b);
+    try std.testing.expect(first != null);
+    try std.testing.expectEqual(first, second);
+    try std.testing.expectEqual(a.leaves, b.leaves);
+    try std.testing.expectEqual(a.hits, b.hits);
+    try std.testing.expect(a.leaves > chance_stats.leaves);
+}
+
+test "greedy and chance moves are unchanged by the deep mode" {
+    var prng = std.Random.DefaultPrng.init(6);
+    const net = Net.init(prng.random());
+    // recorded on the pre-#69 code: both modes still route to pickMove / chanceMove
+    try std.testing.expectEqual(@as(?Direction, .left), bestMove(&net, mid_board, .greedy));
+    try std.testing.expectEqual(@as(?Direction, .left), bestMove(&net, mid_board, .chance));
+}
+
+test "value cache returns the forward value and counts leaf evaluations" {
+    var prng = std.Random.DefaultPrng.init(8);
+    const net = Net.init(prng.random());
+    var cache: ValueCache = .{};
+    var stats: Stats = .{};
+    var scratch: Cache = .{};
+    const plain = forward(&net, sample_board, &scratch);
+    try std.testing.expectEqual(plain, cache.get(&net, sample_board, &stats));
+    try std.testing.expectEqual(@as(u64, 1), stats.leaves);
+    try std.testing.expectEqual(@as(u64, 0), stats.hits);
+    try std.testing.expectEqual(plain, cache.get(&net, sample_board, &stats));
+    try std.testing.expectEqual(@as(u64, 1), stats.leaves);
+    try std.testing.expectEqual(@as(u64, 1), stats.hits);
 }
 
 test "trainGame is deterministic for a fixed seed" {

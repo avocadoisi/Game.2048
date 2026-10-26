@@ -26,6 +26,15 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const ntuple_mod = b.addModule("ntuple", .{
+        .root_source_file = b.path("ai/solver/ntuple.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core", .module = core_mod },
+        },
+    });
+
     const solver_mod = b.addModule("solver", .{
         .root_source_file = b.path("ai/solver/solver.zig"),
         .target = target,
@@ -153,6 +162,33 @@ pub fn build(b: *std.Build) void {
     const nn_step = b.step("nn", "Train the value MLP (TD(0) self-play) and evaluate it against expectimax depth 2");
     nn_step.dependOn(&nn_cmd.step);
 
+    const ntuple_tests = b.addTest(.{ .root_module = ntuple_mod });
+    const run_ntuple_tests = b.addRunArtifact(ntuple_tests);
+
+    const ntuple_exe = b.addExecutable(.{
+        .name = "ntuple",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("ai/solver/ntuple_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "solver", .module = solver_mod },
+                .{ .name = "ntuple", .module = ntuple_mod },
+                .{ .name = "parallel", .module = parallel_mod },
+            },
+        }),
+    });
+    const ntuple_cmd = b.addRunArtifact(ntuple_exe);
+    ntuple_cmd.addPassthruArgs();
+    ntuple_cmd.step.dependOn(b.getInstallStep());
+
+    const ntuple_main_tests = b.addTest(.{ .root_module = ntuple_exe.root_module });
+    const run_ntuple_main_tests = b.addRunArtifact(ntuple_main_tests);
+
+    const ntuple_step = b.step("ntuple", "Train the n-tuple TD value function and evaluate it against expectimax depth 2");
+    ntuple_step.dependOn(&ntuple_cmd.step);
+
     const ga_exe = b.addExecutable(.{
         .name = "ga-rl",
         .root_module = b.createModule(.{
@@ -177,6 +213,62 @@ pub fn build(b: *std.Build) void {
     });
     const run_ga_tests = b.addRunArtifact(ga_tests);
 
+    // WASM build for static hosting: `zig build wasm -Doptimize=ReleaseFast`
+    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const wasm_core_mod = b.addModule("core-wasm", .{
+        .root_source_file = b.path("src/core.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const wasm_parallel_mod = b.addModule("parallel-wasm", .{
+        .root_source_file = b.path("ai/solver/parallel.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const wasm_nn_mod = b.addModule("nn-wasm", .{
+        .root_source_file = b.path("ai/solver/nn.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core", .module = wasm_core_mod },
+            .{ .name = "parallel", .module = wasm_parallel_mod },
+        },
+    });
+    const wasm_solver_mod = b.addModule("solver-wasm", .{
+        .root_source_file = b.path("ai/solver/solver.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core", .module = wasm_core_mod },
+            .{ .name = "nn", .module = wasm_nn_mod },
+        },
+    });
+    const wasm_exe = b.addExecutable(.{
+        .name = "game2048",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm.zig"),
+            .target = wasm_target,
+            .optimize = optimize,
+            .strip = true,
+            .imports = &.{
+                .{ .name = "core", .module = wasm_core_mod },
+                .{ .name = "solver", .module = wasm_solver_mod },
+            },
+        }),
+    });
+    // No `_start`: JS instantiates and calls the exports directly; memory is exported.
+    wasm_exe.entry = .disabled;
+    wasm_exe.import_memory = false;
+    wasm_exe.rdynamic = true;
+    wasm_exe.export_memory = true;
+
+    const install_wasm = b.addInstallFileWithDir(wasm_exe.getEmittedBin(), .{ .custom = "web" }, "game2048.wasm");
+    const install_static_html = b.addInstallFileWithDir(b.path("src/web/index.static.html"), .{ .custom = "web" }, "index.html");
+
+    const wasm_step = b.step("wasm", "Build the WebAssembly module and static site into zig-out/web");
+    wasm_step.dependOn(&install_wasm.step);
+    wasm_step.dependOn(&install_static_html.step);
+
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_exe_tests.step);
@@ -184,6 +276,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_bench_tests.step);
     test_step.dependOn(&run_nn_tests.step);
     test_step.dependOn(&run_nn_main_tests.step);
+    test_step.dependOn(&run_ntuple_tests.step);
+    test_step.dependOn(&run_ntuple_main_tests.step);
     test_step.dependOn(&run_parallel_tests.step);
     test_step.dependOn(&run_ga_tests.step);
 }
