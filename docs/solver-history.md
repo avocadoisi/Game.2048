@@ -494,6 +494,26 @@ Same protocol, `train_games` 200,000, training seeds 1 and 2, compared against t
 - Seed 2 lands below it, so retraining from scratch across seeds does not improve the model. The win came from fine-tuning (#66) instead, at 40,000 games (about 1/5 of the cost).
 - Cost: 2 x 200,000 games, 4,118-4,254 s each.
 
+## Symmetry augmentation + TD(lambda): diverges (#72)
+
+Two ways to get more out of each self-play game: reuse every position in all 8 dihedral orientations (rotation/reflection of the 4x4 board), and propagate TD errors backwards along the whole game with eligibility traces instead of one step.
+
+Mechanism (opt-in, `nn.Options`): `symmetry` applies each per-move TD(0) update to all 8 dihedral transforms of the afterstate with the same target (deterministic, no RNG); `lambda` switches the update to TD(λ) with accumulating traces (`trace = λ * trace + grad V`, `net -= lr * (out - target) * trace`, λ = 0 reduces to today's TD(0)). CLI variants `sym` and `symlam` (symmetry + λ = 0.7). `base` and every earlier variant stay byte-identical; the recorded-checksum test is untouched.
+
+Correctness: one `sym` step equals eight explicit `forward(transformBoard(k, board))` + `train` steps (tested to 1e-15), λ = 0 matches the plain TD(0) step, the 8 transforms are distinct and closed under composition, and `forward` on a transformed board equals `forward` with transformed weights. So the implementation does what it says; the outcome is what fails.
+
+20,000 training games per seed, eval ranges 2000/3000/4000/5000/6000 x 20 games, committed `nn` 1-ply protocol:
+
+| variant | lr | per-seed mean score | mean ± stderr | weights |
+|---|---|---|---|---|
+| base (reference, #56) | 0.003 | — | 18,754 ± 534 | fine |
+| `sym` | 0.003 | 2,116 / 3,472 / 2,116 / 2,772 / 3,035 | 2,702 ± 264 | 2 of 5 nets contain NaN/Inf |
+| `sym` | 0.000375 (lr/8) | 4,274 / 6,828 / 2,762 | 4,621 ± 1,187 | finite but collapsed (V ≈ -51 for every board) |
+| `symlam` | 0.000375 | 2,116 / 4,958 / 2,116 | 3,064 ± 947 | 2 of 3 nets are entirely NaN |
+
+- Reading: eight updates per visited position is not eight times the data, it is eight correlated steps against a target computed from the pre-step net, and TD(0) with function approximation cannot absorb that — at the normal lr the weights blow up to NaN within 20,000 games, at lr/8 they collapse to a near-constant value function (dead ReLUs), and λ = 0.7 makes it worse because traces multiply the same over-update. Dividing the lr keeps the total step size but not the optimisation dynamics: the game schedule (lr decay per game, freshest games last) is compressed 8x.
+- Verdict: not adopted, both options stay off by default (no default-path change, checksum test unchanged). A version that could work would accumulate the 8 transformed gradients from one net snapshot and apply a single averaged step (true batch augmentation) instead of eight sequential steps, and clip the gradient norm; that is a different, larger change, not a knob.
+- Cost: 2 settings x 5 seeds and 1 setting x 3 seeds x 20,000 games, ~150-800 s per run.
 ## n-tuple network runner (#70)
 
 The classic 2048 SOTA value function, as a standalone runner: `ai/solver/ntuple.zig` holds flat f32 pattern tables (`[16^k]f32`) indexed by the same `levelOf` cell encoding as the MLP, `ai/solver/ntuple_main.zig` trains them by TD(0) on afterstates and evaluates them.

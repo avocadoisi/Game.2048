@@ -105,6 +105,33 @@ pub fn train(net: *Net, cache: *const Cache, target: f64, lr: f64) void {
     }
 }
 
+/// Dihedral symmetry (issue #72): 8 cell-index permutations, rotations 0..3 then their mirrors 4..7.
+/// `symmetryMap(k, cell)` is the cell that `cell` moves to under transform `k` (k = 0 is identity).
+pub const symmetry_count = 8;
+
+pub fn symmetryMap(k: usize, cell: usize) usize {
+    const n = core.BoardSize;
+    var r = cell / n;
+    var c = cell % n;
+    if (k >= 4) c = n - 1 - c;
+    for (0..k % 4) |_| {
+        const t = r;
+        r = c;
+        c = n - 1 - t;
+    }
+    return r * n + c;
+}
+
+/// Board under the k-th dihedral transform (pure, deterministic).
+pub fn transformBoard(k: usize, board: Board) Board {
+    var out: Board = undefined;
+    for (0..core.BoardCellCount) |cell| {
+        const to = symmetryMap(k, cell);
+        out[to / core.BoardSize][to % core.BoardSize] = board[cell / core.BoardSize][cell % core.BoardSize];
+    }
+    return out;
+}
+
 /// Afterstate chosen by the 1-ply policy, with its scaled reward and value estimate.
 const Pick = struct {
     dir: Direction,
@@ -393,6 +420,11 @@ pub const Options = struct {
     /// Candidate (#63): with `priority` set, the `m` extra updates keep the uniform share over the whole
     /// buffer and draw the rest by |TD error| from the 4..7 empty-cell bucket only.
     midmix: bool = false,
+    /// Candidate (#72): apply every per-move TD update to all 8 dihedral transforms of the afterstate,
+    /// with the same target (8 samples per visited board, deterministic).
+    symmetry: bool = false,
+    /// Candidate (#72): TD(lambda) with accumulating eligibility traces over the parameters; 0 = TD(0).
+    lambda: f64 = 0,
 };
 
 /// Prioritized replay (issue #34): ring buffer of recent TD updates. After each game, `m` extra updates
@@ -479,6 +511,39 @@ pub const Priority = struct {
     }
 };
 
+/// TD(lambda) eligibility trace of the plain per-move path: `trace = lambda * trace + grad V`
+/// (gamma = 1: the target of an afterstate is its reward plus the next afterstate value),
+/// then `net -= lr * (V - target) * trace`.
+fn trainTrace(net: *Net, cache: *const Cache, target: f64, lr: f64, trace: *Net, lambda: f64) void {
+    var grad = gradOf(net, cache);
+    const d = cache.out - target;
+    const tz = flat(trace);
+    for (flat(&grad), tz) |g, *z| z.* = lambda * z.* + g;
+    for (flat(net), tz) |*w, z| w.* -= lr * d * z;
+}
+
+/// Gradient of `forward`'s output with respect to every parameter, using the activations in `cache`.
+fn gradOf(net: *const Net, cache: *const Cache) Net {
+    var g = std.mem.zeroes(Net);
+    var da1: [h1_size]f64 = @splat(0);
+    for (0..h2_size) |j| {
+        const dz2: f64 = if (cache.z2[j] > 0) net.w3[j] else 0;
+        g.w3[j] = cache.a2[j];
+        g.b2[j] = dz2;
+        for (0..h1_size) |i| {
+            g.w2[j][i] = dz2 * cache.a1[i];
+            da1[i] += net.w2[j][i] * dz2;
+        }
+    }
+    g.b3 = 1;
+    for (0..h1_size) |i| {
+        const dz1 = if (cache.z1[i] > 0) da1[i] else 0;
+        g.b1[i] = dz1;
+        for (cache.rows) |row| g.w1[row][i] += dz1;
+    }
+    return g;
+}
+
 /// Stored afterstates of one game for the variants (ring buffer; the last `step_cap` steps are kept).
 /// shortcut: games longer than step_cap only replay/sweep their last step_cap afterstates, upgrade if games get that long.
 const step_cap = 8192;
@@ -495,8 +560,8 @@ pub const GameResult = struct { score: u32, moves: u32 };
 
 /// `trainGame` with options. `diag` is only recorded on the default path (`opts` all off).
 pub fn trainGameOpts(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
-    if (opts.priority) |pr| return trainGamePerMove(net, rng, lr, diag, pr, opts.midgame, opts.midmix);
-    if (!opts.backward and opts.replay_k == 0) return trainGamePerMove(net, rng, lr, diag, null, false, false);
+    if (opts.priority != null) return trainGamePerMove(net, rng, lr, diag, opts);
+    if (!opts.backward and opts.replay_k == 0) return trainGamePerMove(net, rng, lr, diag, opts);
     var steps: [step_cap]Step = undefined;
     var n: usize = 0;
     var state = GameState.gameStart(rng);
@@ -542,33 +607,43 @@ fn valueOf(net: *const Net, after: Board) f64 {
     return forward(net, after, &cache);
 }
 
-fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, pr: ?*Priority, midgame: bool, midmix: bool) GameResult {
+/// One per-move TD update on `after` with `target`: all 8 dihedral transforms when `opts.symmetry`,
+/// and TD(lambda) through `trace` when `opts.lambda > 0` (otherwise the plain TD(0) `train` step).
+fn trainStep(net: *Net, cache: *Cache, after: Board, target: f64, lr: f64, opts: Options, trace: *Net) void {
+    const transforms: usize = if (opts.symmetry) symmetry_count else 1;
+    for (0..transforms) |k| {
+        _ = forward(net, if (opts.symmetry) transformBoard(k, after) else after, cache);
+        if (opts.lambda > 0) trainTrace(net, cache, target, lr, trace, opts.lambda) else train(net, cache, target, lr);
+    }
+}
+
+fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
+    const pr = opts.priority;
     var state = GameState.gameStart(rng);
     var pending: ?Pick = null;
     var cache: Cache = .{};
     var moves: u32 = 0;
+    var trace: Net = std.mem.zeroes(Net);
     while (pickMove(net, state)) |pick| {
         moves += 1;
         if (pending) |p| {
-            _ = forward(net, p.after, &cache);
             const target = p.reward + pick.value;
             if (diag) |d| d.push(countEmpty(p.after), @abs(target - p.value), pick.value - p.value);
             if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = pick.after, .terminal = false, .err = @abs(target - p.value) });
-            train(net, &cache, target, lr);
+            trainStep(net, &cache, p.after, target, lr, opts, &trace);
         }
         pending = pick;
         _ = state.move(pick.dir, rng);
     }
     if (pending) |p| {
-        _ = forward(net, p.after, &cache);
         if (diag) |d| d.push(countEmpty(p.after), @abs(p.reward - p.value), -p.value);
         if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = p.after, .terminal = true, .err = @abs(p.reward - p.value) });
-        train(net, &cache, p.reward, lr);
+        trainStep(net, &cache, p.after, p.reward, lr, opts, &trace);
     }
     if (pr) |b| for (0..b.m) |_| {
-        const e = &b.items[if (midmix)
+        const e = &b.items[if (opts.midmix)
             b.sampleMidmix(rng)
-        else if (midgame)
+        else if (opts.midgame)
             b.sampleMidgame(rng)
         else
             b.sample(rng)];
@@ -1221,4 +1296,152 @@ test "parallel training batch matches a serial run of the same game seeds" {
     var par = base;
     _ = trainBatch(&par, 77, 0, games, 0.001, null);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&serial), std.mem.asBytes(&par));
+}
+
+test "the 8 dihedral transforms are distinct for a non-symmetric board and compose back to identity" {
+    const board: Board = .{
+        .{ 2, 4, 8, 16 },
+        .{ 32, 64, 128, 256 },
+        .{ 2, 0, 4, 0 },
+        .{ 0, 8, 0, 16 },
+    };
+    const boards: [symmetry_count]Board = .{ transformBoard(0, board), transformBoard(1, board), transformBoard(2, board), transformBoard(3, board), transformBoard(4, board), transformBoard(5, board), transformBoard(6, board), transformBoard(7, board) };
+    for (boards, 0..) |a, i| for (boards[i + 1 ..]) |b| {
+        try std.testing.expect(!std.meta.eql(a, b));
+    };
+    // every transform has order 1, 2 or 4, so applying it 8 times is the identity
+    for (0..symmetry_count) |k| {
+        var b = board;
+        for (0..8) |_| b = transformBoard(k, b);
+        try std.testing.expectEqual(board, b);
+    }
+    // composition of two transforms is again one of the 8 (cell-index permutation group)
+    for (0..symmetry_count) |a| for (0..symmetry_count) |b| for (0..core.BoardCellCount) |cell| {
+        const composed = symmetryMap(a, symmetryMap(b, cell));
+        var found = false;
+        for (0..symmetry_count) |c| if (symmetryMap(c, cell) == composed) {
+            found = true;
+        };
+        try std.testing.expect(found);
+    };
+}
+
+test "forward on a transformed board equals forward with transformed weights" {
+    var init_rng = std.Random.DefaultPrng.init(5);
+    const net = Net.init(init_rng.random());
+    var base_cache: Cache = .{};
+    const base_value = forward(&net, sample_board, &base_cache);
+    for (0..symmetry_count) |k| {
+        // rotate the input rows the same way, then the two views of one position must agree
+        var turned = net;
+        for (0..core.BoardCellCount) |cell| for (0..levels) |level| {
+            const to = symmetryMap(k, cell);
+            turned.w1[to * levels + level] = net.w1[cell * levels + level];
+        };
+        var cache: Cache = .{};
+        // same sum, different accumulation order: equal up to float noise
+        try std.testing.expectApproxEqAbs(base_value, forward(&turned, transformBoard(k, sample_board), &cache), 1e-9);
+    }
+}
+
+test "symmetry=false and lambda=0 reproduce the recorded checksum (5 games, seeds 11/12)" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var net = Net.init(init_rng.random());
+    var rng = std.Random.DefaultPrng.init(12);
+    for (0..5) |_| _ = trainGameOpts(&net, rng.random(), 0.003, null, .{ .symmetry = false, .lambda = 0 });
+    try std.testing.expectEqual(@as(u32, 1621370333), std.hash.Crc32.hash(std.mem.asBytes(&net)));
+}
+
+test "TD(lambda) trace on a two-step sequence applies the eligibility-weighted update" {
+    var init_rng = std.Random.DefaultPrng.init(13);
+    const start_net = Net.init(init_rng.random());
+    const board1 = sample_board;
+    const board2: Board = .{
+        .{ 0, 2, 0, 0 },
+        .{ 4, 0, 0, 8 },
+        .{ 0, 0, 16, 0 },
+        .{ 0, 0, 0, 32 },
+    };
+    const target1: f64 = 0.5;
+    const target2: f64 = 1.0;
+    const lr: f64 = 0.01;
+    const lambda: f64 = 0.7;
+
+    var net = start_net;
+    var trace: Net = std.mem.zeroes(Net);
+    var cache: Cache = .{};
+
+    var g1: Net = undefined;
+    var d1: f64 = undefined;
+    _ = forward(&net, board1, &cache);
+    g1 = gradOf(&net, &cache);
+    d1 = cache.out - target1;
+    trainTrace(&net, &cache, target1, lr, &trace, lambda);
+
+    // second step: eligibility is lambda * grad1 + grad2 (gamma = 1)
+    var g2: Net = undefined;
+    var d2: f64 = undefined;
+    _ = forward(&net, board2, &cache);
+    g2 = gradOf(&net, &cache);
+    d2 = cache.out - target2;
+    trainTrace(&net, &cache, target2, lr, &trace, lambda);
+
+    const w0 = flat(@constCast(&start_net));
+    const w = flat(&net);
+    const p1 = flat(&g1);
+    const p2 = flat(&g2);
+    for (w0, w, p1, p2) |start, got, grad1, grad2| {
+        const expected = start - lr * d1 * grad1 - lr * d2 * (lambda * grad1 + grad2);
+        try std.testing.expectApproxEqAbs(expected, got, 1e-12);
+    }
+}
+
+test "lambda=0 trace update matches the plain TD(0) step" {
+    var init_rng = std.Random.DefaultPrng.init(14);
+    const start_net = Net.init(init_rng.random());
+    var a = start_net;
+    var b = start_net;
+    var trace: Net = std.mem.zeroes(Net);
+    var cache_a: Cache = .{};
+    var cache_b: Cache = .{};
+    _ = forward(&a, sample_board, &cache_a);
+    _ = forward(&b, sample_board, &cache_b);
+    train(&a, &cache_a, 0.7, 0.01);
+    trainTrace(&b, &cache_b, 0.7, 0.01, &trace, 0);
+    // Same update, but `train` applies it once per active row while the trace accumulates duplicates,
+    // so the two differ only by float associativity.
+    for (flat(&a), flat(&b)) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-15);
+}
+
+test "one symmetry step equals eight separate transformed TD(0) steps" {
+    var init_rng = std.Random.DefaultPrng.init(15);
+    const start_net = Net.init(init_rng.random());
+    var together = start_net;
+    var manual = start_net;
+    var cache: Cache = .{};
+    var trace: Net = std.mem.zeroes(Net);
+    trainStep(&together, &cache, sample_board, 0.9, 0.001, .{ .symmetry = true }, &trace);
+    for (0..symmetry_count) |k| {
+        var c: Cache = .{};
+        _ = forward(&manual, transformBoard(k, sample_board), &c);
+        train(&manual, &c, 0.9, 0.001);
+    }
+    for (flat(&manual), flat(&together)) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-15);
+}
+
+test "symmetry and symlam change the weights (smoke)" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    const base = Net.init(init_rng.random());
+    var plain = base;
+    var sym = base;
+    var symlam = base;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    var rng_c = std.Random.DefaultPrng.init(12);
+    _ = trainGameOpts(&plain, rng_a.random(), 0.003, null, .{});
+    _ = trainGameOpts(&sym, rng_b.random(), 0.003, null, .{ .symmetry = true });
+    _ = trainGameOpts(&symlam, rng_c.random(), 0.003, null, .{ .symmetry = true, .lambda = 0.7 });
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&plain), std.mem.asBytes(&sym)));
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&sym), std.mem.asBytes(&symlam)));
+    for (std.mem.bytesAsSlice(f64, std.mem.asBytes(&symlam))) |w| try std.testing.expect(std.math.isFinite(w));
 }

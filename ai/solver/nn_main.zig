@@ -17,6 +17,8 @@ const usage =
     \\              priority (#34: 32 extra updates per game sampled from a |TD error| buffer, 50% uniform)
     \\              midgame (#59: 32 extra updates per game from buffer entries with 4..7 empty cells, uniform)
     \\              midmix  (#63: same but 50% uniform over the whole buffer, 50% |TD error| in the 4..7 bucket)
+    \\              sym     (#72: every per-move update applied to all 8 dihedral transforms of the afterstate)
+    \\              symlam  (#72: sym plus TD(lambda) eligibility traces with lambda = 0.7)
     \\              resume  (#66: load weights_path and train train_games more games from those weights, plain per-move path)
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
     \\                game i uses seed train_seed + i and the batch result is the mean of its games.
@@ -112,6 +114,10 @@ pub fn main(init: std.process.Init) !void {
         .{ .priority = &priority, .midgame = true }
     else if (std.mem.eql(u8, variant, "midmix"))
         .{ .priority = &priority, .midmix = true }
+    else if (std.mem.eql(u8, variant, "sym"))
+        .{ .symmetry = true }
+    else if (std.mem.eql(u8, variant, "symlam"))
+        .{ .symmetry = true, .lambda = 0.7 }
     else {
         std.debug.print("{s}", .{usage});
         return;
