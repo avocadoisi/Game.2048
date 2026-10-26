@@ -16,6 +16,11 @@ pub const Summary = struct {
     pub fn movesPerSec(self: Summary) f64 {
         return self.avg_moves * @as(f64, @floatFromInt(self.games)) * 1e9 / @as(f64, @floatFromInt(self.elapsed_ns));
     }
+
+    /// Wall-clock time per move; runs execute in parallel, so use one run for a serial per-move cost.
+    pub fn msPerMove(self: Summary) f64 {
+        return @as(f64, @floatFromInt(self.elapsed_ns)) / 1e6 / (@as(f64, @floatFromInt(self.games)) * self.avg_moves);
+    }
 };
 
 const RunResult = struct { score: u64 = 0, moves: u64 = 0, best_tile: u32 = 0 };

@@ -74,7 +74,7 @@ pub fn bestMoveW(state: GameState, depth: u8, w: Weights) ?Direction {
 }
 
 /// Move-choosing policies compared in the ranking (`zig build ranking`).
-pub const Policy = enum { random, greedy, expectimax, mcts, beam, expectimax_tt, ga, nn, nn2, nnmcts };
+pub const Policy = enum { random, greedy, expectimax, mcts, beam, expectimax_tt, ga, nn, nn2, nnmcts, nnbeam };
 
 /// Weights evolved by `zig build ga-rl` (holdout +4%, see docs/solver-history.md). 3 decimals as printed.
 pub const ga_weights: Weights = .{ .empty = 7.028, .order_penalty = 43.174, .merge = 0, .forced_down = 0 };
@@ -106,14 +106,18 @@ pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Dir
         .beam => return beamMove(state),
         .expectimax_tt => return bestMoveTT(state, 3),
         .ga => return bestMoveW(state, depth, ga_weights),
-        // shortcut: one 148 KB net copy per move for all three NN policies; keep a static copy if
+        // shortcut: one 148 KB net copy per move for all four NN policies; keep a static copy if
         // this shows up in profiles. Separate copies per arm overflowed the wasm stack.
-        .nn, .nn2, .nnmcts => {
+        .nn, .nn2, .nnmcts, .nnbeam => {
             const net = nn.parse(nn_weight_bytes) catch unreachable;
             return switch (policy) {
                 .nn => nn.bestMove(&net, state, .chance),
+                // the 2-ply search itself dominates the cost.
                 .nn2 => nn.bestMove(&net, state, .deep),
-                else => nnmctsMove(&net, state, rng),
+                .nnmcts => nnmctsMove(&net, state, rng),
+                // the sampled beam stays below nn2's leaf count.
+                .nnbeam => if (nnBeamBest(&net, state, rng)) |best| best.first_move else null,
+                else => unreachable,
             };
         },
     }
@@ -321,6 +325,104 @@ fn insertBeam(items: *[beam_width]BeamNode, len: *usize, candidate: BeamNode) vo
     if (len.* < beam_width) len.* += 1;
 }
 
+/// shortcut: fixed small beam so the sampled spawns stay cheap (issue #83); tune only if nnbeam beats nn2.
+const nnbeam_width = 8;
+const nnbeam_horizon = 3;
+const nnbeam_spawn_samples = 2;
+
+/// Leaf score: the NN afterstate value, the same leaf rule `nn` uses (`nn.forward`).
+fn nnLeafValue(net: *const nn.Net, board: Board) f64 {
+    var cache: nn.Cache = .{};
+    return nn.forward(net, board, &cache);
+}
+
+const NnBeamNode = struct {
+    state: GameState,
+    /// root move of the path that reached this leaf; it is the move the policy returns
+    first_move: Direction,
+    /// score_delta / nn.reward_scale summed down the path
+    reward: f64,
+    /// reward + `nnLeafValue(state.board)`
+    value: f64,
+};
+
+/// Beam search with the learned NN leaf and `nnbeam_spawn_samples` sampled spawns per node.
+/// Spawns are drawn from `rng`, so a fixed seed reproduces the same move. Null when no move changes the board.
+fn nnBeamBest(net: *const nn.Net, state: GameState, rng: std.Random) ?NnBeamNode {
+    var beam: [nnbeam_width]NnBeamNode = undefined;
+    beam[0] = .{ .state = state, .first_move = .up, .reward = 0, .value = 0 };
+    var beam_len: usize = 1;
+
+    for (0..nnbeam_horizon) |ply| {
+        var next_beam: [nnbeam_width]NnBeamNode = undefined;
+        var next_len: usize = 0;
+        for (beam[0..beam_len]) |node| {
+            for ([_]Direction{ .up, .left, .down, .right }) |direction| {
+                var moved = node.state;
+                const result = moved.slide(direction);
+                if (!result.changed) continue;
+                const first_move = if (ply == 0) direction else node.first_move;
+                const reward = node.reward + @as(f64, @floatFromInt(result.score_delta)) / nn.reward_scale;
+                var spawned = false;
+                for (0..nnbeam_spawn_samples) |_| {
+                    var child = moved;
+                    if (!sampleSpawn(&child, rng)) break;
+                    spawned = true;
+                    insertNnBeam(&next_beam, &next_len, .{
+                        .state = child,
+                        .first_move = first_move,
+                        .reward = reward,
+                        .value = reward + nnLeafValue(net, child.board),
+                    });
+                }
+                if (!spawned) insertNnBeam(&next_beam, &next_len, .{
+                    .state = moved,
+                    .first_move = first_move,
+                    .reward = reward,
+                    .value = reward + nnLeafValue(net, moved.board),
+                });
+            }
+        }
+        if (next_len == 0) {
+            if (ply == 0) return null;
+            break;
+        }
+        beam = next_beam;
+        beam_len = next_len;
+    }
+    return beam[0];
+}
+
+/// Spawn on a uniformly random empty cell: 2 at 0.9, 4 at 0.1, like the real game.
+/// False when the board is full, so the afterstate itself is the leaf.
+fn sampleSpawn(state: *GameState, rng: std.Random) bool {
+    const empties = nn.countEmpty(state.board);
+    if (empties == 0) return false;
+    const value: core.Tile = if (rng.uintLessThan(u32, 10) == 0) 4 else 2;
+    var index = rng.uintLessThan(usize, empties);
+    for (0..core.BoardSize) |r| {
+        for (0..core.BoardSize) |c| {
+            if (state.board[r][c] != 0) continue;
+            if (index == 0) {
+                state.board[r][c] = value;
+                return true;
+            }
+            index -= 1;
+        }
+    }
+    unreachable; // countEmpty found an empty cell
+}
+
+fn insertNnBeam(items: *[nnbeam_width]NnBeamNode, len: *usize, candidate: NnBeamNode) void {
+    var i = len.*;
+    while (i > 0 and items[i - 1].value < candidate.value) : (i -= 1) {
+        if (i < nnbeam_width) items[i] = items[i - 1];
+    }
+    if (i == nnbeam_width) return;
+    items[i] = candidate;
+    if (len.* < nnbeam_width) len.* += 1;
+}
+
 // shortcut: 8192 direct-mapped entries; collisions only reduce cache hits, increase this if needed.
 const tt_entry_count = 8192;
 
@@ -408,7 +510,6 @@ fn chanceValueTT(state: GameState, depth: u8, table: *[tt_entry_count]TTEntry) f
     ttPut(state.board, depth, .chance, value, table);
     return value;
 }
-
 
 /// Snake path 1..16: row 0 left to right, row 1 right to left, and so on.
 /// The largest tile is expected at the start (top-left).
@@ -637,6 +738,64 @@ test "beam policy returns a legal move and null on a dead board" {
     try std.testing.expectEqual(@as(?Direction, null), choose(.beam, dead, prng.random(), 0));
 }
 
+test "nnbeam policy returns a legal move and null on a dead board" {
+    // only left/right are legal here, so a deeper ply's direction would show up as an illegal move
+    const state: GameState = .{ .board = .{
+        .{ 2, 2, 4, 8 },
+        .{ 16, 32, 64, 128 },
+        .{ 256, 512, 1024, 2048 },
+        .{ 4096, 8192, 16384, 32768 },
+    } };
+    var prng = std.Random.DefaultPrng.init(7);
+    const move = choose(.nnbeam, state, prng.random(), 0).?;
+    try std.testing.expect(move == .left or move == .right);
+    var moved = state;
+    try std.testing.expect(moved.slide(move).changed);
+
+    const dead: GameState = .{ .board = .{
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+    } };
+    try std.testing.expectEqual(@as(?Direction, null), choose(.nnbeam, dead, prng.random(), 0));
+}
+
+test "nnbeam reproduces the same move from the same seed" {
+    var play = std.Random.DefaultPrng.init(11);
+    const rng = play.random();
+    var state = GameState.gameStart(rng);
+    for (0..12) |_| {
+        var first = std.Random.DefaultPrng.init(7);
+        var repeat = std.Random.DefaultPrng.init(7);
+        try std.testing.expectEqual(
+            choose(.nnbeam, state, first.random(), 0),
+            choose(.nnbeam, state, repeat.random(), 0),
+        );
+        const direction = choose(.random, state, rng, 0) orelse break;
+        _ = state.move(direction, rng);
+    }
+}
+
+test "nnbeam returns the root move of the best leaf, not a deeper direction" {
+    const net = nn.parse(nn_weight_bytes) catch unreachable;
+    var play = std.Random.DefaultPrng.init(23);
+    const rng = play.random();
+    var state = GameState.gameStart(rng);
+    for (0..10) |_| {
+        var prng = std.Random.DefaultPrng.init(7);
+        const best = nnBeamBest(&net, state, prng.random()) orelse break;
+        // the first move is a move of the root board and the leaf value is the NN value plus the path reward
+        try std.testing.expect(state.canSlide(best.first_move));
+        try std.testing.expectEqual(best.reward + nnLeafValue(&net, best.state.board), best.value);
+        var repeat = std.Random.DefaultPrng.init(7);
+        try std.testing.expectEqual(@as(?Direction, best.first_move), choose(.nnbeam, state, repeat.random(), 0));
+
+        const direction = choose(.random, state, rng, 0) orelse break;
+        _ = state.move(direction, rng);
+    }
+}
+
 test "expectimax TT depth 3 matches bestMove on random-play boards" {
     var rng_state = std.Random.DefaultPrng.init(100);
     const rng = rng_state.random();
@@ -651,7 +810,6 @@ test "expectimax TT depth 3 matches bestMove on random-play boards" {
         try std.testing.expectEqual(bestMove(state, 3), choose(.expectimax_tt, state, rng, 0));
     }
 }
-
 
 test "random policy only picks legal moves" {
     const state: GameState = .{ .board = .{
