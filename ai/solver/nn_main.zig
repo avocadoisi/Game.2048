@@ -19,6 +19,8 @@ const usage =
     \\              midmix  (#63: same but 50% uniform over the whole buffer, 50% |TD error| in the 4..7 bucket)
     \\              sym     (#72: every per-move update applied to all 8 dihedral transforms of the afterstate)
     \\              symlam  (#72: sym plus TD(lambda) eligibility traces with lambda = 0.7)
+    \\              symbatch (#98: the 8 transformed gradients from one net snapshot, averaged and
+    \\                       norm-clipped, applied as a single step instead of eight)
     \\              nstep   (#84: online n-step TD with n = 4 instead of one-step returns)
     \\              death   (#101: reward -1 per move so the value learns V ≈ -(moves to game over))
     \\              resume  (#66: load weights_path and train train_games more games from those weights, plain per-move path)
@@ -133,6 +135,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .symmetry = true }
     else if (std.mem.eql(u8, variant, "symlam"))
         .{ .symmetry = true, .lambda = 0.7 }
+    else if (std.mem.eql(u8, variant, "symbatch"))
+        .{ .sym_batch = true }
     else if (std.mem.eql(u8, variant, "nstep"))
         .{ .nstep = 4 }
     else if (std.mem.eql(u8, variant, "death"))
@@ -343,4 +347,8 @@ test "par flag is off without arg 10 and on with the literal par" {
 
 test "usage text documents the par flag for stateless variants" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "#99") != null);
+}
+
+test "usage text lists the symbatch variant" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "symbatch (#98") != null);
 }
