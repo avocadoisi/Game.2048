@@ -19,6 +19,7 @@ const usage =
     \\              midmix  (#63: same but 50% uniform over the whole buffer, 50% |TD error| in the 4..7 bucket)
     \\              sym     (#72: every per-move update applied to all 8 dihedral transforms of the afterstate)
     \\              symlam  (#72: sym plus TD(lambda) eligibility traces with lambda = 0.7)
+    \\              nstep   (#84: online n-step TD with n = 4 instead of one-step returns)
     \\              resume  (#66: load weights_path and train train_games more games from those weights, plain per-move path)
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
     \\                game i uses seed train_seed + i and the batch result is the mean of its games.
@@ -118,6 +119,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .symmetry = true }
     else if (std.mem.eql(u8, variant, "symlam"))
         .{ .symmetry = true, .lambda = 0.7 }
+    else if (std.mem.eql(u8, variant, "nstep"))
+        .{ .nstep = 4 }
     else {
         std.debug.print("{s}", .{usage});
         return;
@@ -297,4 +300,8 @@ test "resume starts from the saved weights file instead of a random init" {
 
 test "usage text lists the resume variant" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "resume  (#66") != null);
+}
+
+test "usage text lists the nstep variant" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "nstep   (#84") != null);
 }

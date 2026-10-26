@@ -425,6 +425,9 @@ pub const Options = struct {
     symmetry: bool = false,
     /// Candidate (#72): TD(lambda) with accumulating eligibility traces over the parameters; 0 = TD(0).
     lambda: f64 = 0,
+    /// Candidate (#84): fixed n-step TD on the afterstate chain; 0 = off. Standalone: when set it owns the
+    /// game loop and the other options are ignored. 1 is TD(0), larger n propagates rewards faster.
+    nstep: usize = 0,
 };
 
 /// Prioritized replay (issue #34): ring buffer of recent TD updates. After each game, `m` extra updates
@@ -549,6 +552,54 @@ fn gradOf(net: *const Net, cache: *const Cache) Net {
 const step_cap = 8192;
 const Step = struct { after: Board, reward: f64 };
 
+/// Cap on the n-step lookahead the window allocates; the CLI variant uses 4.
+/// shortcut: longer returns than `nstep_cap` are treated as `nstep_cap`, raise the cap (8 * 72 bytes per game) if tried.
+const nstep_cap = 8;
+
+/// Pending steps of an n-step return, oldest first. A step's target is known once the values of the n-1
+/// steps after it are: their rewards plus V of the next afterstate (0 at game over).
+const NStepWindow = struct {
+    slots: [nstep_cap]Step = undefined,
+    len: usize = 0,
+    n: usize,
+
+    pub const Done = struct { after: Board, target: f64 };
+
+    fn init(n: usize) NStepWindow {
+        std.debug.assert(n >= 1);
+        return .{ .n = @min(n, nstep_cap) };
+    }
+
+    /// Add one step. `value` = V(afterstate) of that step, which closes the target of the step leaving
+    /// the window; that step is returned once the window is full, otherwise null.
+    fn push(self: *NStepWindow, step: Step, value: f64) ?Done {
+        const closed: ?Done = if (self.len == self.n) .{ .after = self.slots[0].after, .target = self.rewardSum() + value } else null;
+        if (closed != null) self.dropFront();
+        self.slots[self.len] = step;
+        self.len += 1;
+        return closed;
+    }
+
+    /// Game over: the remaining steps, oldest first, with the truncated return of their rewards alone.
+    fn nextFinish(self: *NStepWindow) ?Done {
+        if (self.len == 0) return null;
+        const done: Done = .{ .after = self.slots[0].after, .target = self.rewardSum() };
+        self.dropFront();
+        return done;
+    }
+
+    fn rewardSum(self: *const NStepWindow) f64 {
+        var g: f64 = 0;
+        for (self.slots[0..self.len]) |s| g += s.reward;
+        return g;
+    }
+
+    fn dropFront(self: *NStepWindow) void {
+        std.mem.copyForwards(Step, self.slots[0 .. self.len - 1], self.slots[1..self.len]);
+        self.len -= 1;
+    }
+};
+
 /// TD(0) on afterstates over one self-play game (greedy 1-ply moves, fixed rng).
 /// Target for the previous afterstate = its scaled reward + V(next afterstate); 0 after game over.
 /// `diag` (optional) records each step's TD error and value change; it does not touch the rng or the update.
@@ -560,6 +611,7 @@ pub const GameResult = struct { score: u32, moves: u32 };
 
 /// `trainGame` with options. `diag` is only recorded on the default path (`opts` all off).
 pub fn trainGameOpts(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
+    if (opts.nstep > 0) return trainGameNStep(net, rng, lr, opts.nstep);
     if (opts.priority != null) return trainGamePerMove(net, rng, lr, diag, opts);
     if (!opts.backward and opts.replay_k == 0) return trainGamePerMove(net, rng, lr, diag, opts);
     var steps: [step_cap]Step = undefined;
@@ -653,6 +705,24 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
         train(net, &cache, target, lr);
     };
     if (diag) |d| d.finish();
+    return .{ .score = state.score, .moves = moves };
+}
+
+/// Online n-step TD (issue #84) on the same 1-ply self-play policy as `trainGamePerMove`: each step enters
+/// the window with V of its afterstate, and the step leaving the window is trained on its n rewards plus
+/// that value. The last min(n, game length) steps are flushed at game over with the rewards alone.
+fn trainGameNStep(net: *Net, rng: std.Random, lr: f64, n: usize) GameResult {
+    var window = NStepWindow.init(n);
+    var state = GameState.gameStart(rng);
+    var cache: Cache = .{};
+    var moves: u32 = 0;
+    while (pickMove(net, state)) |pick| {
+        moves += 1;
+        if (window.push(.{ .after = pick.after, .reward = pick.reward }, pick.value)) |done|
+            trainAfter(net, &cache, done.after, done.target, lr);
+        _ = state.move(pick.dir, rng);
+    }
+    while (window.nextFinish()) |done| trainAfter(net, &cache, done.after, done.target, lr);
     return .{ .score = state.score, .moves = moves };
 }
 
@@ -1127,6 +1197,80 @@ test "trainGameOpts with default options equals trainGame" {
     _ = trainGame(&a, rng_a.random(), 0.003, null);
     _ = trainGameOpts(&b, rng_b.random(), 0.003, null, .{});
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+}
+
+test "n-step window closes the oldest step with n rewards plus the closing value" {
+    var window = NStepWindow.init(2);
+    const a = boardWithEmpties(2);
+    const b = boardWithEmpties(3);
+    const c = boardWithEmpties(4);
+    try std.testing.expectEqual(@as(?NStepWindow.Done, null), window.push(.{ .after = a, .reward = 0.1 }, 0.5));
+    try std.testing.expectEqual(@as(?NStepWindow.Done, null), window.push(.{ .after = b, .reward = 0.2 }, 0.7));
+    // third step fills the window: step a closes with 0.1 + 0.2 + V(c)
+    const done = window.push(.{ .after = c, .reward = 0.3 }, 1.25).?;
+    try std.testing.expectEqual(a, done.after);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.55), done.target, 1e-12);
+}
+
+test "n-step window finish flushes the pending steps with truncated returns" {
+    var window = NStepWindow.init(4);
+    const a = boardWithEmpties(2);
+    const b = boardWithEmpties(3);
+    const c = boardWithEmpties(4);
+    _ = window.push(.{ .after = a, .reward = 0.5 }, 0);
+    _ = window.push(.{ .after = b, .reward = 0.25 }, 0);
+    _ = window.push(.{ .after = c, .reward = 1.0 }, 0);
+    // game over: V(terminal) = 0, so each remaining step gets the rewards that follow it
+    const f0 = window.nextFinish().?;
+    try std.testing.expectEqual(a, f0.after);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.75), f0.target, 1e-12);
+    const f1 = window.nextFinish().?;
+    try std.testing.expectEqual(b, f1.after);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.25), f1.target, 1e-12);
+    const f2 = window.nextFinish().?;
+    try std.testing.expectEqual(c, f2.after);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), f2.target, 1e-12);
+    try std.testing.expectEqual(@as(?NStepWindow.Done, null), window.nextFinish());
+}
+
+test "nstep = 1 reproduces TD(0) byte for byte" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var base = Net.init(init_rng.random());
+    var one = base;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    const td0 = trainGameOpts(&base, rng_a.random(), 0.003, null, .{});
+    const nstep = trainGameOpts(&one, rng_b.random(), 0.003, null, .{ .nstep = 1 });
+    try std.testing.expectEqual(td0, nstep);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&base), std.mem.asBytes(&one));
+}
+
+test "nstep = 4 changes the weights, stays finite and is deterministic" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    const base = Net.init(init_rng.random());
+    var plain = base;
+    var four = base;
+    var again = base;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    var rng_c = std.Random.DefaultPrng.init(12);
+    _ = trainGameOpts(&plain, rng_a.random(), 0.003, null, .{});
+    _ = trainGameOpts(&four, rng_b.random(), 0.003, null, .{ .nstep = 4 });
+    _ = trainGameOpts(&again, rng_c.random(), 0.003, null, .{ .nstep = 4 });
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&plain), std.mem.asBytes(&four)));
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&four), std.mem.asBytes(&again));
+    for (std.mem.bytesAsSlice(f64, std.mem.asBytes(&four))) |w| try std.testing.expect(std.math.isFinite(w));
+}
+
+test "nstep = 0 equals the default path" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var base = Net.init(init_rng.random());
+    var off = base;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    _ = trainGameOpts(&base, rng_a.random(), 0.003, null, .{});
+    _ = trainGameOpts(&off, rng_b.random(), 0.003, null, .{ .nstep = 0 });
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&base), std.mem.asBytes(&off));
 }
 
 test "backward sweep changes the weights" {
