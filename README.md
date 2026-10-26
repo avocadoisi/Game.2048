@@ -151,7 +151,7 @@ zig build ntuple -- 200 20 2000 0.01 base /tmp/t.bin 1  # train_games eval_games
 zig build ga-rl -- 16 15 8 2 1 500 100                  # population generations games depth seed holdout_seed holdout_games
 ```
 
-`expectimax` 系に加えて、GA の重みを使う `ga` と TD 学習した MLP 価値関数の `nn` (1-ply + 出現1回) / `nn2` (2-ply) も選べる (`/api/solve?algo=nn2` のように指定)。n-tuple は現時点では学習・評価用のランナーのみで、`algo` には未接続。
+`expectimax` 系に加えて、GA の重みを使う `ga` と TD 学習した MLP 価値関数の `nn` (1-ply + 出現1回) / `nn2` (2-ply) も選べる (`/api/solve?algo=nn2` のように指定)。n-tuple は学習・評価用のランナーのみで、`algo` には未接続 (light 表 + 深さ2探索で seed 2000 の 20 ゲーム平均 25,760、expectimax 深さ2 の 21,840 を上回る。`docs/solver-history.md` の "n-tuple: deep search, light tables, resume (#73)")。
 
 ## ソース構成
 
@@ -180,7 +180,7 @@ zig build ga-rl -- 16 15 8 2 1 500 100                  # population generations
 
 1. ✅ `2048.core` の最小実装 + テスト基盤
 2. ✅ CLI でプレイ可能にする / ✅ ローカル HTTP サーバーで試せる
-3. ✅ solver AI の PoC (expectimax, 手作り評価関数) / ✅ 軽量かつ高スコアの方式 (TD 学習の MLP を `nn` ポリシーとして採用。ranking seed 1000 で 64,113 と 1 位) / ⬜ n-tuple の採用 (ランナーのみ実装済み #70)
+3. ✅ solver AI の PoC (expectimax, 手作り評価関数) / ✅ 軽量かつ高スコアの方式 (TD 学習の MLP を `nn` ポリシーとして採用。ranking seed 1000 で 64,113 と 1 位) / ⬜ n-tuple の採用 (ランナーのみ実装済み #70。light 表 + 深さ2 探索で expectimax 深さ2 超えまで確認 #73、`algo` 接続は未着手)
 4. WASM ターゲット対応
 
 ## このプロジェクトで大事にすること

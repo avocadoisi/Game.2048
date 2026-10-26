@@ -561,3 +561,24 @@ Measured with the committed weights/weights-independent expectimax, ReleaseFast,
 - Reading: 15% slower at depth 2 and 7% slower at depth 3, same scores. A slide is 4 LUT lookups plus a transpose for half the directions, while `core.slide` is already a tight 4-row scan, and every recursive leaf pays a `toBoard` conversion because the evaluation function still takes a `core.Board`. The move generation was never the bottleneck: chance-node recursion (6-8 spawns per node) and the position evaluation dominate.
 - Verdict: not adopted, code dropped. It would only pay off with a packed-native evaluation function (no `toBoard` at leaves) and a packed chance-node spawn, i.e. rewriting the whole search around the representation — a separate, much larger change than a faster slider.
 - Cost: 2 x 20 + 2 x 10 games, ~3 min build + 80 s measuring.
+
+## n-tuple: deep search, light tables, resume (#73)
+
+The n-tuple value function (`ai/solver/ntuple.zig`) stores one weight per (pattern, cell-state) pair and learns it with TD(0) self-play. Issue #70 left it at the runner stage with two limits: only 1-ply and 1-spawn lookahead, and a 68 MiB raw table that is dominated by one 2x3 6-tuple pattern.
+
+Added:
+- `Mode.deep` — my move -> exact spawn over empty cells x {2, 4} -> my move -> spawn -> leaf = afterstate value + score_delta / 1000 (same leaf rule as `nn`'s 2-ply `nn2`). Deterministic, leaf counts reported in the eval line (`leaves`, `leaves/move`, `ms/move`).
+- `Set.light` — only the five 4-tuple patterns, 327,680 entries, **1.3 MiB raw** instead of 68 MiB, so the table could actually ship.
+- `resume` / `lightresume` — load the table, then train more games from it (the load validates the file length, so a full-set file cannot be loaded into a light-set table: `error.TableSizeMismatch`).
+
+Measured, 20 games per policy on eval seed 2000, ReleaseFast:
+
+| training | 1-ply | + 1 spawn | depth 2 | ms/move (depth 2) |
+|---|---|---|---|---|
+| light, 2,000 games | 2,444 | 7,502 | 15,915 | 0.39 |
+| light, 500,000 games | 7,134 | 17,987 | **25,760** | 0.24 |
+| expectimax depth 2 (no table) | — | — | 21,840 | 0.02 |
+
+- Reading: greedy self-play training is cheap (500k games in 124 s, 202M moves), but a 1-ply table stays weak (7,134). Almost all of the strength comes from search depth: the same table jumps to 17,987 with one spawn and to 25,760 with a second own move, i.e. depth-2 n-tuple already beats expectimax depth 2 while still running at 0.24 ms/move (~4.6k leaves/move). Search, not more table entries, is where the gain is.
+- Verdict: adopted as the experiments' new best non-MLP option; `light` + `deep` is the default sweep configuration from here (1.3 MiB table, evaluable in seconds). Not wired into `algo` yet: `ranking.json` regeneration and a `Policy.nntuple` connection are separate follow-ups.
+- Cost: 500k-game training 124 s + depth-2 eval 6.5 s per 20 games.
