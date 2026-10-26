@@ -794,3 +794,44 @@ Timing (`ranking`, ReleaseFast, `latency_ms_per_move` from the #89 instrument):
 ```text
 {"seed":2000,"runs":1,"games_per_run":10,"entries":[{"policy":"nn","depth":0,"games":10,"avg_score":66471.2,"avg_moves":3016.5,"best_tile":4096,"latency_ms_per_move":0.1947,"games_per_sec":1.70,"description":"TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）"},{"policy":"nnbeam","depth":0,"games":10,"avg_score":25959.2,"avg_moves":1337.3,"best_tile":4096,"latency_ms_per_move":0.1190,"games_per_sec":6.28,"description":"NNの盤面価値を葉にしたビーム探索。幅8・3手先で、ply間のspawnを2回サンプリングする（固定seedで再現）"}]}
 ```
+
+## Search workspaces reused per thread and per game (#88)
+
+- What changed: `nn2`'s `ValueCache` (built fresh inside every `Search`, i.e. every move) and `expectimax_tt`'s 8192-entry TT (allocated and cleared on every `bestMoveTT` call) are now reused workspaces. `nn.sharedValueCache()` and `ttWorkspace()` hand out one threadlocal workspace each (lazy-cleared on first use), `nn.bestMoveWithCache` lets a caller own the cache, `nn.playWithStats` keeps one cache per game, and `nnmcts` reuses `sharedValueCache()` across rollouts and moves. Entries validate the full board plus depth and kind (`ValueCache` keys on the 64-bit board hash and drops on mismatch), so a warm workspace changes speed only and can never return another position's value.
+- Correctness: same seed 1000 / 5 games give identical scores and move counts before and after (nn2 71,880.0 / 3,267.2, expectimax_tt 51,376.0 / 2,426.2, nnmcts 12,864.8 / 763.4). Four new tests cover fresh-vs-warm move identity over 30 moves (nn) and 2x40 moves across two games (TT, also asserting one shared workspace), plus slot-collision behaviour for both caches (a colliding entry is dropped, never returned as a wrong value). `zig build test` and the wasm smoke (755,150 bytes wasm, 11 policies, 10 applied moves) pass.
+- Timing (`ranking`, ReleaseFast, `latency_ms_per_move`, seed 1000 / 5 games; before = 3 runs on 8986c30, after = 2 runs on 3ac831d):
+
+| policy | before | after | delta |
+|---|---|---|---|
+| nn2 | 1.8399-1.8668 | 1.7395-1.7427 | -5.5% |
+| expectimax_tt | 0.6965-0.7058 | 0.6613-0.6620 | -5.0% |
+| nnmcts | 2.5701-2.5920 | 2.5348-2.5362 | -1.4% |
+
+Every after run sits below every before run: the bands do not overlap for any of the three policies.
+- Cache statistics (temporary counters, seed 1000, 200 moves per case): `nn2` with the shared cache hit 88.2% (2,418,915 hits / 2,743,720 lookups) and evaluated 1,624.0 leaves/move vs 1,745.6 with a fresh cache per move (-7.0% leaf evaluations: 324,805 vs 349,113). `expectimax_tt` with the shared TT made 1,261,389 probes (6,306.9/move) vs 1,313,235 with a fresh table per move (-3.9% node expansions); hit rate 55.7% vs 54.5%.
+- Memory: the same arrays moved from per-call stack to per-thread TLS — TT 8192 x 32 B = 256 KiB per thread, `nn2`'s `ValueCache` 2^13 x 16 B = 128 KiB per thread (2^10 x 16 B = 16 KiB on wasm). What disappeared is per-move init traffic: the 128 KiB `@splat` reset plus the 8,192-entry `valid = false` clear loop now run once per thread instead of once per move.
+- Reading: nnmcts only shares `ValueCache` (it has no TT) and gains the least; expectimax_tt gains from both the removed clear and cross-move hits (a new root is inside the previous search's tree); nn2's gain is mostly the removed per-move init since the leaf saving is only 7%.
+- Verdict: adopted. No behaviour change, all three policies improve, every after run below every before run.
+- Limits: one machine; hit-rate figures come from temporary counters, not a permanent instrument; `latency_ms_per_move` is the serial per-move cost from the #89 instrument. `src/web/ranking.json` untouched.
+
+## Bench run 2026-10-27 01:50:00 +0900
+
+- command: `zig build ranking -Doptimize=ReleaseFast -- 1 5 1000 nn2,nnmcts,expectimax_tt`
+- commit: 8986c30
+- date: 2026-10-27 01:50:00 +0900
+- exit: 0
+
+```text
+{"seed":1000,"runs":1,"games_per_run":5,"entries":[{"policy":"nn2","depth":2,"games":5,"avg_score":71880.0,"avg_moves":3267.2,"best_tile":4096,"latency_ms_per_move":1.8399,"games_per_sec":0.17,"description":"TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）"},{"policy":"expectimax_tt","depth":0,"games":5,"avg_score":51376.0,"avg_moves":2426.2,"best_tile":4096,"latency_ms_per_move":0.6965,"games_per_sec":0.59,"description":"depth 3の期待値探索を置換表で高速化したもの（同じ手を選ぶ）"},{"policy":"nnmcts","depth":0,"games":5,"avg_score":12864.8,"avg_moves":763.4,"best_tile":1024,"latency_ms_per_move":2.5701,"games_per_sec":0.51,"description":"UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）"}]}
+```
+
+## Bench run 2026-10-27 02:03:28 +0900
+
+- command: `zig build ranking -Doptimize=ReleaseFast -- 1 5 1000 nn2,nnmcts,expectimax_tt`
+- commit: 3ac831d
+- date: 2026-10-27 02:03:28 +0900
+- exit: 0
+
+```text
+{"seed":1000,"runs":1,"games_per_run":5,"entries":[{"policy":"nn2","depth":2,"games":5,"avg_score":71880.0,"avg_moves":3267.2,"best_tile":4096,"latency_ms_per_move":1.7395,"games_per_sec":0.18,"description":"TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）"},{"policy":"expectimax_tt","depth":0,"games":5,"avg_score":51376.0,"avg_moves":2426.2,"best_tile":4096,"latency_ms_per_move":0.6620,"games_per_sec":0.62,"description":"depth 3の期待値探索を置換表で高速化したもの（同じ手を選ぶ）"},{"policy":"nnmcts","depth":0,"games":5,"avg_score":12864.8,"avg_moves":763.4,"best_tile":1024,"latency_ms_per_move":2.5348,"games_per_sec":0.52,"description":"UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）"}]}
+```
