@@ -835,3 +835,326 @@ Every after run sits below every before run: the bands do not overlap for any of
 ```text
 {"seed":1000,"runs":1,"games_per_run":5,"entries":[{"policy":"nn2","depth":2,"games":5,"avg_score":71880.0,"avg_moves":3267.2,"best_tile":4096,"latency_ms_per_move":1.7395,"games_per_sec":0.18,"description":"TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）"},{"policy":"expectimax_tt","depth":0,"games":5,"avg_score":51376.0,"avg_moves":2426.2,"best_tile":4096,"latency_ms_per_move":0.6620,"games_per_sec":0.62,"description":"depth 3の期待値探索を置換表で高速化したもの（同じ手を選ぶ）"},{"policy":"nnmcts","depth":0,"games":5,"avg_score":12864.8,"avg_moves":763.4,"best_tile":1024,"latency_ms_per_move":2.5348,"games_per_sec":0.52,"description":"UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）"}]}
 ```
+
+## Order penalty follows the game phase, looser after 4096 (#92)
+
+Issue #92 proposed tuning the snake-order penalty by game phase: keep the mid-game relaxed
+(empties and merge pairs first) and tighten from the 4096 tile on, so the endgame builds the
+merge chain that reaches 8192. The mechanism shipped: `Weights.order_penalty_late`, used by
+`evaluateW` once the board's largest tile reaches 4096 (level >= 12). Default equals
+`order_penalty`, so pre-#92 behavior is unchanged unless a weight sets it; `ga_weights` keeps
+one gene for both phases.
+
+The measurement inverted the hypothesis. expectimax_tt depth 3, 50 games per cell, seeds
+1000-1049 (`TEMP measure order phase`, average score / reach 4096 / reach 8192 / dead below
+2048):
+
+| config (mid / late) | avg score | >=4096 | >=8192 | dead <2048 |
+|---|---|---|---|---|
+| A 30 / 30 (old baseline) | 37,985.2 | 9 | 1 | 10 |
+| B 43.174 / 43.174 | 39,981.5 | 14 | 0 | 8 |
+| 30 / 60 (tighten late) | 35,069.0 | 9 | 0 | 10 |
+| 43.174 / 80 (tighten late) | 39,221.7 | 14 | 0 | 8 |
+| 43.174 / 60 | 40,437.0 | 14 | 1 | 8 |
+| **43.174 / 25 (loosen late, adopted)** | **42,230.7** | 14 | 2 | 8 |
+| 43.174 / 10 | 39,996.6 | 14 | 0 | 8 |
+| 43.174 / 0 | 37,956.9 | 16 | 0 | 8 |
+
+Tightening after 4096 lost to the constant in every variant; loosening won, best at 25.
+Second seed set (2000-2049, 50 games, same cells) confirms: 43.174/25 avg 38,383.7 (>=4096
+16) vs A 38,025.2 (>=4096 13). Across both sets 43.174/25 averages 40,307 vs A 38,005 (+6.1%)
+with 30 vs 22 runs reaching 4096. Same-seed determinism verified by repeating the cell
+(50-game sets reproduce exactly).
+
+The 5-game `ranking` snapshot on seed 1000 moved the other way for expectimax (41,107 -> 19,964)
+and beam (14,369 -> 12,329). Re-measured at 50 games per cell those are small-sample noise:
+expectimax depth 2 is 24,297.7 (C5) vs 24,403.5 (A) on seeds 1000-1049 and 25,385.7 vs
+24,220.1 on 2000-2049; beam 12,346.7 vs 11,373.8; greedy 3,195.5 vs 3,109.8; mcts is
+evaluation-independent (30,709.7 both). No evaluation-weight policy regresses at 50 games.
+
+Adopted as `baseline = .{ .order_penalty = 43.174, .order_penalty_late = 25 }` (commit follows).
+NN policies are unaffected (learned weights, not `Weights`).
+
+Reading: the mid-game wants the snake order enforced (43.174 > 30, same as the old GA weights),
+but after the 4096 anchor is secured the penalty should relax, not tighten — holding the chain
+rigidly costs the merges that grow 4096 into 8192. The 8192 tail (2 runs vs 1) is suggestive,
+not conclusive at 100 games.
+
+Verdict: adopted (expectimax_tt +6.1% avg, more 4096+ runs, no measured regression).
+
+Limits: one machine, 100 games per config; the 5-game ranking table in the run blocks below is
+too small to compare weight sets (expectimax flipped 41,107 -> 19,964 there and back at 50
+games); `ga_weights` keeps the single `order_penalty` gene for both phases, so GA evolution is
+unchanged; an intermediate sweep between 25 and 43.174 was not run.
+
+
+## Bench run 2026-10-27 02:43:24 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 6d8ed10
+- date: 2026-10-27 02:43:24 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 1000-1049: avg_score=37985.2 reach4096=9 reach8192=1 dead_below2048=10 max_tile_seen=8192
+OK
+All 1 tests passed.
+```
+
+## Bench run 2026-10-27 02:44:46 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 6d8ed10
+- date: 2026-10-27 02:44:46 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 1000-1049: avg_score=39981.5 reach4096=14 reach8192=0 dead_below2048=8 max_tile_seen=4096
+OK
+All 1 tests passed.
+```
+
+## Bench run 2026-10-27 02:46:19 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 6d8ed10
+- date: 2026-10-27 02:46:19 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 1000-1049: avg_score=35069.0 reach4096=9 reach8192=0 dead_below2048=10 max_tile_seen=4096
+OK
+All 1 tests passed.
+```
+
+## Bench run 2026-10-27 02:47:30 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 6d8ed10
+- date: 2026-10-27 02:47:30 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 1000-1049: avg_score=39221.7 reach4096=14 reach8192=0 dead_below2048=8 max_tile_seen=4096
+OK
+All 1 tests passed.
+```
+
+## Bench run 2026-10-27 02:48:47 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 6d8ed10
+- date: 2026-10-27 02:48:47 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 1000-1049: avg_score=38056.3 reach4096=13 reach8192=1 dead_below2048=11 max_tile_seen=8192
+OK
+All 1 tests passed.
+```
+
+## Bench run 2026-10-27 02:51:29 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 6d8ed10
+- date: 2026-10-27 02:51:29 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 1000-1049: avg_score=40437.0 reach4096=14 reach8192=1 dead_below2048=8 max_tile_seen=8192
+OK
+All 1 tests passed.
+```
+
+## Bench run 2026-10-27 02:52:46 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 6d8ed10
+- date: 2026-10-27 02:52:46 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 1000-1049: avg_score=42230.7 reach4096=14 reach8192=2 dead_below2048=8 max_tile_seen=8192
+OK
+All 1 tests passed.
+```
+
+## Bench run 2026-10-27 02:54:26 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 6d8ed10
+- date: 2026-10-27 02:54:26 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 1000-1049: avg_score=39996.6 reach4096=14 reach8192=0 dead_below2048=8 max_tile_seen=4096
+OK
+All 1 tests passed.
+```
+
+## Bench run 2026-10-27 02:55:44 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 6d8ed10
+- date: 2026-10-27 02:55:44 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 1000-1049: avg_score=37956.9 reach4096=16 reach8192=0 dead_below2048=8 max_tile_seen=4096
+OK
+All 1 tests passed.
+```
+
+## Bench run 2026-10-27 02:57:01 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 6d8ed10
+- date: 2026-10-27 02:57:01 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 1000-1049: avg_score=39750.6 reach4096=16 reach8192=0 dead_below2048=8 max_tile_seen=4096
+OK
+All 1 tests passed.
+```
+
+## Bench run 2026-10-27 02:58:41 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 6d8ed10
+- date: 2026-10-27 02:58:41 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 2000-2049: avg_score=38972.6 reach4096=15 reach8192=0 dead_below2048=10 max_tile_seen=4096
+OK
+All 1 tests passed.
+```
+
+## Bench run 2026-10-27 02:59:57 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 6d8ed10
+- date: 2026-10-27 02:59:57 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 2000-2049: avg_score=37841.6 reach4096=15 reach8192=0 dead_below2048=10 max_tile_seen=4096
+OK
+All 1 tests passed.
+```
+
+## Bench run 2026-10-27 03:01:09 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 6d8ed10
+- date: 2026-10-27 03:01:09 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 2000-2049: avg_score=38025.2 reach4096=13 reach8192=1 dead_below2048=10 max_tile_seen=8192
+OK
+All 1 tests passed.
+```
+
+## Bench run 2026-10-27 03:13:41 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order phase v2 --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 255bef0
+- date: 2026-10-27 03:13:41 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure order phase v2 (#92)...[order-phase-v2] expectimax_tt d3 50 games seeds 1000-1049: avg_score=42230.7 avg_moves=2074.2 reach4096=14 dead_below2048=8
+[order-phase-v2] expectimax   d2 50 games seeds 1000-1049: avg_score=24297.7 avg_moves=1301.8 reach4096=5 dead_below2048=28
+OK
+All 1 tests passed.
+```
+
+## Bench run 2026-10-27 03:15:22 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order phase v2 --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 255bef0
+- date: 2026-10-27 03:15:22 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure order phase v2 (#92)...[order-phase-v2] expectimax_tt d3 50 games seeds 1000-1049: avg_score=37985.2 avg_moves=1904.5 reach4096=9 dead_below2048=10
+[order-phase-v2] expectimax   d2 50 games seeds 1000-1049: avg_score=24403.5 avg_moves=1304.8 reach4096=5 dead_below2048=26
+OK
+All 1 tests passed.
+```
+
+## Bench run 2026-10-27 03:17:36 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order phase v3 --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 255bef0
+- date: 2026-10-27 03:17:36 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure order phase v3 (#92)...[order-phase-v3] expectimax_tt d3 50 games seeds 2000-2049: avg_score=38025.2 reach4096=13 dead_below2048=10
+[order-phase-v3] expectimax d2 50 games seeds 2000-2049: avg_score=24220.1 reach4096=4 dead_below2048=25
+[order-phase-v3] beam 50 games seeds 2000-2049: avg_score=11373.8 reach4096=0 dead_below2048=47
+[order-phase-v3] greedy 50 games seeds 2000-2049: avg_score=3109.8 reach4096=0 dead_below2048=50
+[order-phase-v3] mcts 50 games seeds 2000-2049: avg_score=30709.7 reach4096=5 dead_below2048=13
+OK
+All 1 tests passed.
+```
+
+## Bench run 2026-10-27 03:20:18 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order phase v3 --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 255bef0
+- date: 2026-10-27 03:20:18 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure order phase v3 (#92)...[order-phase-v3] expectimax_tt d3 50 games seeds 2000-2049: avg_score=38383.7 reach4096=16 dead_below2048=10
+[order-phase-v3] expectimax d2 50 games seeds 2000-2049: avg_score=25385.7 reach4096=3 dead_below2048=24
+[order-phase-v3] beam 50 games seeds 2000-2049: avg_score=12346.7 reach4096=0 dead_below2048=44
+[order-phase-v3] greedy 50 games seeds 2000-2049: avg_score=3195.5 reach4096=0 dead_below2048=50
+[order-phase-v3] mcts 50 games seeds 2000-2049: avg_score=30709.7 reach4096=5 dead_below2048=13
+OK
+All 1 tests passed.
+```
+
+## Bench run 2026-10-27 03:34:23 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order phase v3 --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 255bef0
+- date: 2026-10-27 03:34:23 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure order phase v3 (#92)...[order-phase-v3] expectimax_tt d3 50 games seeds 2000-2049: avg_score=38383.7 reach4096=16 dead_below2048=10
+[order-phase-v3] expectimax d2 50 games seeds 2000-2049: avg_score=25385.7 reach4096=3 dead_below2048=24
+[order-phase-v3] beam 50 games seeds 2000-2049: avg_score=12346.7 reach4096=0 dead_below2048=44
+[order-phase-v3] greedy 50 games seeds 2000-2049: avg_score=3195.5 reach4096=0 dead_below2048=50
+[order-phase-v3] mcts 50 games seeds 2000-2049: avg_score=30709.7 reach4096=5 dead_below2048=13
+OK
+All 1 tests passed.
+```
+
+
+## Bench run 2026-10-27 03:09:30 +0900
+
+- command: `zig build ranking -Doptimize=ReleaseFast -- 1 5 1000`
+- commit: 255bef0
+- date: 2026-10-27 03:09:30 +0900
+- exit: 0
+
+```text
+{"seed":1000,"runs":1,"games_per_run":5,"entries":[{"policy":"nn2","depth":2,"games":5,"avg_score":71880.0,"avg_moves":3267.2,"best_tile":4096,"latency_ms_per_move":1.7518,"games_per_sec":0.17,"description":"TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）"},{"policy":"nn","depth":0,"games":5,"avg_score":69640.8,"avg_moves":3151.2,"best_tile":4096,"latency_ms_per_move":0.1922,"games_per_sec":1.65,"description":"TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）"},{"policy":"expectimax_tt","depth":0,"games":5,"avg_score":50344.8,"avg_moves":2391.2,"best_tile":8192,"latency_ms_per_move":0.7048,"games_per_sec":0.59,"description":"depth 3の期待値探索を置換表で高速化したもの（同じ手を選ぶ）"},{"policy":"ga","depth":2,"games":5,"avg_score":27538.4,"avg_moves":1415.2,"best_tile":4096,"latency_ms_per_move":0.0822,"games_per_sec":8.59,"description":"GAで評価の重みを進化させた期待値探索（depth 2）。GA内のholdout(seed 500〜)では+4%だが、ranking seed 1000では素の expectimax より低い"},{"policy":"mcts","depth":0,"games":5,"avg_score":24463.2,"avg_moves":1301.2,"best_tile":2048,"latency_ms_per_move":1.0935,"games_per_sec":0.70,"description":"UCTで候補手を選び、ランダムな対局を繰り返して評価する"},{"policy":"nnbeam","depth":0,"games":5,"avg_score":21096.8,"avg_moves":1143.8,"best_tile":2048,"latency_ms_per_move":0.1200,"games_per_sec":7.28,"description":"NNの盤面価値を葉にしたビーム探索。幅8・3手先で、ply間のspawnを2回サンプリングする（固定seedで再現）"},{"policy":"expectimax","depth":2,"games":5,"avg_score":19964.0,"avg_moves":1093.0,"best_tile":2048,"latency_ms_per_move":0.0957,"games_per_sec":9.56,"description":"2手先まで探索し、ランダムな出現（2か4）を平均して評価する。評価は蛇行順と合体ペアの手作り関数"},{"policy":"nnmcts","depth":0,"games":5,"avg_score":12864.8,"avg_moves":763.4,"best_tile":1024,"latency_ms_per_move":2.5548,"games_per_sec":0.51,"description":"UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）"},{"policy":"beam","depth":0,"games":5,"avg_score":12328.8,"avg_moves":741.2,"best_tile":1024,"latency_ms_per_move":0.0703,"games_per_sec":19.19,"description":"幅32で3手先まで探索し、各空きマスに2が出現すると仮定して評価する"},{"policy":"greedy","depth":0,"games":5,"avg_score":3110.4,"avg_moves":258.4,"best_tile":256,"latency_ms_per_move":0.0014,"games_per_sec":2665.72,"description":"1手先だけ見る。滑らせた盤面の評価が最も高い手を選ぶ（出現や探索はしない）"},{"policy":"random","depth":0,"games":5,"avg_score":966.4,"avg_moves":110.2,"best_tile":128,"latency_ms_per_move":0.0017,"games_per_sec":5060.51,"description":"合法手からランダムに1手選ぶ（比較の基準）"}]}
+```
+
+## Bench run 2026-10-27 03:11:35 +0900
+
+- command: `zig build ranking -Doptimize=ReleaseFast -- 1 5 1000`
+- commit: 6d8ed10
+- date: 2026-10-27 03:11:35 +0900
+- exit: 0
+
+```text
+{"seed":1000,"runs":1,"games_per_run":5,"entries":[{"policy":"nn2","depth":2,"games":5,"avg_score":71880.0,"avg_moves":3267.2,"best_tile":4096,"latency_ms_per_move":1.7520,"games_per_sec":0.17,"description":"TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）"},{"policy":"nn","depth":0,"games":5,"avg_score":69640.8,"avg_moves":3151.2,"best_tile":4096,"latency_ms_per_move":0.1919,"games_per_sec":1.65,"description":"TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）"},{"policy":"expectimax_tt","depth":0,"games":5,"avg_score":51376.0,"avg_moves":2426.2,"best_tile":4096,"latency_ms_per_move":0.6913,"games_per_sec":0.60,"description":"depth 3の期待値探索を置換表で高速化したもの（同じ手を選ぶ）"},{"policy":"expectimax","depth":2,"games":5,"avg_score":41107.2,"avg_moves":2019.4,"best_tile":4096,"latency_ms_per_move":0.0854,"games_per_sec":5.80,"description":"2手先まで探索し、ランダムな出現（2か4）を平均して評価する。評価は蛇行順と合体ペアの手作り関数"},{"policy":"ga","depth":2,"games":5,"avg_score":27538.4,"avg_moves":1415.2,"best_tile":4096,"latency_ms_per_move":0.0823,"games_per_sec":8.59,"description":"GAで評価の重みを進化させた期待値探索（depth 2）。GA内のholdout(seed 500〜)では+4%だが、ranking seed 1000では素の expectimax より低い"},{"policy":"mcts","depth":0,"games":5,"avg_score":24463.2,"avg_moves":1301.2,"best_tile":2048,"latency_ms_per_move":1.0845,"games_per_sec":0.71,"description":"UCTで候補手を選び、ランダムな対局を繰り返して評価する"},{"policy":"nnbeam","depth":0,"games":5,"avg_score":21096.8,"avg_moves":1143.8,"best_tile":2048,"latency_ms_per_move":0.1211,"games_per_sec":7.22,"description":"NNの盤面価値を葉にしたビーム探索。幅8・3手先で、ply間のspawnを2回サンプリングする（固定seedで再現）"},{"policy":"beam","depth":0,"games":5,"avg_score":14368.8,"avg_moves":817.8,"best_tile":2048,"latency_ms_per_move":0.0674,"games_per_sec":18.14,"description":"幅32で3手先まで探索し、各空きマスに2が出現すると仮定して評価する"},{"policy":"nnmcts","depth":0,"games":5,"avg_score":12864.8,"avg_moves":763.4,"best_tile":1024,"latency_ms_per_move":2.5553,"games_per_sec":0.51,"description":"UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）"},{"policy":"greedy","depth":0,"games":5,"avg_score":3300.8,"avg_moves":272.2,"best_tile":256,"latency_ms_per_move":0.0004,"games_per_sec":8437.64,"description":"1手先だけ見る。滑らせた盤面の評価が最も高い手を選ぶ（出現や探索はしない）"},{"policy":"random","depth":0,"games":5,"avg_score":966.4,"avg_moves":110.2,"best_tile":128,"latency_ms_per_move":0.0005,"games_per_sec":18373.91,"description":"合法手からランダムに1手選ぶ（比較の基準）"}]}
+```
