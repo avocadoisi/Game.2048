@@ -678,3 +678,27 @@ Measured, ReleaseFast, one run per policy, same seed and policy order (`zig buil
 - Verdict: kept as an experimental policy (`algo=nnbeam`), not a default; `nn` stays the fast option and `nn2` the strong one. Either widening the beam or averaging the spawns would recover strength, but at `nn2`-class cost, so it stays a bounded experiment.
 - Correction: the first version of this section reported seed-1000 10-game numbers (23,875 / 28,493 / 16,513) from an implementation whose *last* ply also inserted a post-spawn child, so it asked the net about spawn boards at the leaf. Those numbers describe a different leaf rule and were dropped rather than mixed with the table above; the code now ends the last ply on the afterstate, and the focused test (`nnbeam evaluates the afterstate before spawn at the final ply`) pins the rule at horizon 1: the returned leaf board must equal the afterstate of the returned move.
 - `src/web/ranking.json` is not regenerated here (the canonical 5 x 20 run costs ~5 min and the policy is experimental); the file still lists the nine earlier policies.
+## n-step TD: worse than TD(0) at n = 4 (#84)
+
+TD(0) trains each afterstate from the next afterstate's value, i.e. from a value estimate one move old. A finite n-step return (`reward_t + ... + reward_{t+n-1} + V(s_{t+n})`) propagates a terminal reward back n moves per update and is still fully online, unlike the failed backward sweep (#33) which re-swept the whole game after it ended.
+
+Mechanism (opt-in, `nn.Options.nstep`): 0 = off, 1 = TD(0), n > 1 = n-step. `NStepWindow` holds the pending steps; each new step's `V` closes the target of the step leaving the window (`sum of its n rewards + V`), and at game over `nextFinish` flushes the last min(n, game length) steps with the rewards alone (`V(terminal) = 0`). The moves come from the same 1-ply policy and the rng is used only by `state.move`, so the trajectory matches TD(0) exactly while the updates are identical (`n = 1` is byte-identical to TD(0), tested). CLI variant `nstep` (n = 4), standalone: other options are ignored and the weight file format is unchanged. Default weights and every existing variant stay byte-identical (recorded-checksum tests untouched).
+
+Correctness: the window closes a step with exactly its n rewards plus the closing value and flushes truncated returns in order (unit tests); `nstep = 1` reproduces TD(0) scores and weights byte-for-byte; `nstep = 4` is deterministic and finite; `nstep = 0` equals the default path. So the implementation does what it says; the outcome is what fails.
+
+20,000 training games, training seed 1, eval ranges 2000/3000/4000/5000/6000 x 20 games (100 games, same seeds for both nets), ReleaseFast, committed `nn` eval protocol:
+
+| variant | lr | train moves | train time | 1-ply | + 1 spawn | 2-ply (deep) |
+|---|---|---|---|---|---|---|
+| base TD(0) | 0.003 | 13,346,693 | 145.0 s | 19,175 ± 895 | 30,918 ± 816 | 43,048 ± 1,549 |
+| `nstep` (n = 4) | 0.003 | 10,150,588 | 100.6 s | 13,055 ± 641 | 23,755 ± 296 | 29,886 ± 679 |
+| `nstep` (n = 4) | 0.00075 (lr/4) | 8,335,318 | 89.1 s | 9,019 ± 231 | 15,253 ± 415 | 20,351 ± 584 |
+
+(± is the stderr over the 5 eval ranges; expectimax depth 2 on the same seeds is 25,004 ± 1,108, same for every run.)
+
+- Reading: at the normal lr n = 4 loses 6,120 points on 1-ply (−32%) and 13,162 on 2-ply (−31%), far outside the stderr. It is not a step-size problem: lr/4 is worse again (−53% on 1-ply, −42% on 2-ply), so the n-step target itself is the problem, not the size of the update.
+- The same game budget also yields fewer training moves (10.15M vs 13.35M, −24%): the policy being learned plays shorter games, so n-step training compounds its own regression instead of seeing more data. The faster wall time is that, not a gain.
+- Why: the update for a state is applied n−1 moves after it was visited, against a net that has already moved on, so the bootstrapped part of the return is stale and the target's scale is n rewards instead of one. TD(0)'s one-move-old target is exactly what this net, lr schedule and `reward_scale` were tuned for. Same failure mode as the backward sweep (#33) and TD(λ) (#72): value-side tricks that lag behind, or multiply, the online update.
+- Verdict: not adopted. `nstep` stays an opt-in experiment variant, `nstep = 0` is the default, no default or committed weights change. A version that could work would accumulate the n-step targets over a batch and apply one averaged step against a frozen snapshot, and normalise the target scale — a different, larger change, not a knob.
+- Limits: one training seed and one budget (20,000 games) at n = 4 only; lr/4 was the only extra diagnostic. The drop is far larger than the eval stderr, so more seeds would only sharpen the size of the loss, not its sign.
+- Cost: 3 x 20,000 games (145 / 101 / 89 s training) + 4 policies x 5 ranges x 20 eval games per run (2m51s-4m52s wall each, dominated by the 2-ply eval).
