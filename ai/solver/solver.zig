@@ -16,6 +16,9 @@ const beam_horizon = 3;
 pub const Weights = struct {
     empty: f64 = 10,
     order_penalty: f64 = 30,
+    /// order penalty once the board's largest tile reaches 4096 (endgame phase, issue #92).
+    /// Default equals `order_penalty`, so shipped weights behave the same in both phases.
+    order_penalty_late: f64 = 30,
     merge: f64 = 10,
     /// extra penalty when only `down` is legal (the top-left anchor breaks)
     forced_down: f64 = 100,
@@ -77,7 +80,7 @@ pub fn bestMoveW(state: GameState, depth: u8, w: Weights) ?Direction {
 pub const Policy = enum { random, greedy, expectimax, mcts, beam, expectimax_tt, ga, nn, nn2, nnmcts, nnbeam };
 
 /// Weights evolved by `zig build ga-rl` (holdout +4%, see docs/solver-history.md). 3 decimals as printed.
-pub const ga_weights: Weights = .{ .empty = 7.028, .order_penalty = 43.174, .merge = 0, .forced_down = 0 };
+pub const ga_weights: Weights = .{ .empty = 7.028, .order_penalty = 43.174, .order_penalty_late = 43.174, .merge = 0, .forced_down = 0 };
 /// Trained value net (`zig build nn`), embedded at build time.
 const nn_weight_bytes = @embedFile("nn_weights.bin");
 
@@ -574,6 +577,7 @@ pub fn evaluateW(board: Board, w: Weights) f64 {
     var empties: f64 = 0;
     var penalty: f64 = 0;
     var prev: ?f64 = null;
+    var max_level: f64 = 0;
     for (order) |p| {
         const value = board[p.row][p.col];
         if (value == 0) {
@@ -583,8 +587,11 @@ pub fn evaluateW(board: Board, w: Weights) f64 {
         const level: f64 = @floatFromInt(@ctz(value));
         if (prev) |before| penalty += @max(0, level - before);
         prev = level;
+        max_level = @max(max_level, level);
     }
-    return empties * w.empty - penalty * w.order_penalty + mergePairs(board) * w.merge;
+    // endgame phase once the largest tile reaches 4096 = 2^12 (issue #92)
+    const order_penalty = if (max_level >= 12) w.order_penalty_late else w.order_penalty;
+    return empties * w.empty - penalty * order_penalty + mergePairs(board) * w.merge;
 }
 
 /// Count of horizontally or vertically adjacent equal non-empty tiles: more merges available.
@@ -1056,6 +1063,37 @@ test "evaluate prefers boards with more empty cells" {
         .{ 2, 4, 8, 0 },
     };
     try std.testing.expect(evaluate(sparse) > evaluate(dense));
+}
+
+test "order penalty follows the game phase at the 4096 tile (#92)" {
+    const mid: Board = .{
+        .{ 2, 2048, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    const late: Board = .{
+        .{ 2, 4096, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    const w: Weights = .{ .empty = 10, .order_penalty = 30, .order_penalty_late = 300, .merge = 0 };
+    // 14 empties x10; snake-order inversion 1->11 (mid) / 1->12 (late)
+    try std.testing.expectEqual(@as(f64, 140 - 10 * 30), evaluateW(mid, w));
+    try std.testing.expectEqual(@as(f64, 140 - 11 * 300), evaluateW(late, w));
+}
+
+test "default weights keep one order penalty across phases (#92)" {
+    const late: Board = .{
+        .{ 2, 4096, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    // shipped weights must evaluate >=4096 boards exactly as before
+    try std.testing.expectEqual(@as(f64, 140 - 11 * 30), evaluateW(late, baseline));
+    try std.testing.expectApproxEqAbs(@as(f64, 14 * 7.028 - 11 * 43.174), evaluateW(late, ga_weights), 1e-9);
 }
 
 test "playGame finishes a game and reports its result" {

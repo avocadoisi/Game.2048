@@ -14,7 +14,8 @@ fn toGenes(w: Weights) [gene_count]f64 {
 }
 
 fn fromGenes(g: [gene_count]f64) Weights {
-    return .{ .empty = g[0], .order_penalty = g[1], .merge = g[2], .forced_down = g[3] };
+    // the late-phase penalty tracks the same gene so evolution stays phase-invariant
+    return .{ .empty = g[0], .order_penalty = g[1], .order_penalty_late = g[1], .merge = g[2], .forced_down = g[3] };
 }
 
 /// Tournament selection: the fittest of `tournament_size` random individuals.
