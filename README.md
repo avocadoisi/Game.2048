@@ -96,7 +96,7 @@ zig build run -- help         # 使い方
 - `serve`: `http://127.0.0.1:8080/` を開くと矢印キー/WASD で遊べる (日本語 IME が有効なままでも操作できる)
   - `GET /api/state`, `POST /api/new`, `POST /api/move?dir=up|left|down|right`
   - `GET /api/ranking`: ポリシーの比較結果 (`src/web/ranking.json`) を返す
-  - `GET /api/solve?depth=N&algo=<policy>`: solver の次の一手を返す (盤面は変えない)。`algo` は `random` / `greedy` / `expectimax` (既定) / `mcts` / `beam` / `expectimax_tt` / `ga` / `nn` / `nn2` / `nnmcts`。`depth` の既定は 2。レスポンスは `{"algo","depth","dir","ranking"}` で、`dir` は合法手なしのとき `null`、`ranking` は `expectimax` / `greedy` のときだけ各手の評価が入り、それ以外は空配列
+  - `GET /api/solve?depth=N&algo=<policy>`: solver の次の一手を返す (盤面は変えない)。`algo` は `random` / `greedy` / `expectimax` (既定) / `mcts` / `beam` / `expectimax_tt` / `ga` / `nn` / `nn2` / `nnmcts` / `nnbeam`。`depth` の既定は 2。レスポンスは `{"algo","depth","dir","ranking"}` で、`dir` は合法手なしのとき `null`、`ranking` は `expectimax` / `greedy` のときだけ各手の評価が入り、それ以外は空配列
   - ブラウザの「Solver: 1 step」「Solver: auto」で solver が手を打つ様子を確認できる
   - 「speed」で auto の再生速度を選べる (600 / 300 / 150 / 50 ms / max = 待ち時間なし)。auto 中に変えると即座に反映される
   - 例: `curl -X POST "localhost:8080/api/move?dir=left"`
@@ -171,7 +171,7 @@ zig build ntuple -- 200 20 2000 0.01 base /tmp/t.bin 1  # train_games eval_games
 zig build ga-rl -- 16 15 8 2 1 500 100                  # population generations games depth seed holdout_seed holdout_games
 ```
 
-`expectimax` 系に加えて、GA の重みを使う `ga` と TD 学習した MLP 価値関数の `nn` (1-ply + 出現1回) / `nn2` (2-ply)、実験中の `nnmcts` (8 手で打ち切ったランダムロールアウトを NN の盤面価値で評価する UCT) も選べる (`/api/solve?algo=nnmcts` のように指定)。`nnmcts` は seed 1000 の 10 ゲームで 20,137 (5.4 ms/手) と `nn` に遠く及ばないため `ranking.json` には入れていない (`docs/solver-history.md` の "Truncated-rollout MCTS with the NN leaf: nnmcts (#82)")。n-tuple は学習・評価用のランナーのみで、`algo` には未接続 (light 表 + 深さ2探索で seed 2000 の 20 ゲーム平均 25,760、expectimax 深さ2 の 21,840 を上回る。`docs/solver-history.md` の "n-tuple: deep search, light tables, resume (#73)")。
+`expectimax` 系に加えて、GA の重みを使う `ga` と TD 学習した MLP 価値関数の `nn` (1-ply + 出現1回) / `nn2` (2-ply)、実験中の `nnmcts` (8 手で打ち切ったランダムロールアウトを NN の盤面価値で評価する UCT) と `nnbeam` (NN 評価のビーム探索: 幅8・3手先・各ノードで spawn を2回サンプリング) も選べる (`/api/solve?algo=nnmcts` のように指定)。`nnmcts` は seed 1000 の 10 ゲームで 20,137 (5.4 ms/手)、`nnbeam` は同 seed で 23,875 といずれも `nn` (68,772) に遠く及ばないため `ranking.json` には入れていない (`docs/solver-history.md` の "Truncated-rollout MCTS with the NN leaf: nnmcts (#82)" と "NN-value beam with sampled spawns (#83)")。n-tuple は学習・評価用のランナーのみで、`algo` には未接続 (light 表 + 深さ2探索で seed 2000 の 20 ゲーム平均 25,760、expectimax 深さ2 の 21,840 を上回る。`docs/solver-history.md` の "n-tuple: deep search, light tables, resume (#73)")。
 
 ## ソース構成
 
