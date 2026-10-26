@@ -166,10 +166,13 @@ x3 は約 10,500、x10 は 19,275、x30 は 22,522 (採用)、x50 は 20,308、x
 
 ```bash
 zig build ranking -Doptimize=ReleaseFast -- 5 20 1000   # runs games/run seed (全ポリシーを同じ seed で比較、JSON 出力)
-zig build nn -Doptimize=ReleaseFast -- 0 100 2000 0.003 # train_games eval_games seed lr (train_games=0 は保存済み重みを読み込む)
+zig build nn -Doptimize=ReleaseFast -- 0 100 2000 0.003                              # train_games eval_games seed lr (train_games=0 は保存済み重みを読み込む)
+zig build nn -Doptimize=ReleaseFast -- 20000 100 2000 0.003 - nstep 30 /tmp/n.bin 1  # ... [seed_ranges|diag] variant replay_k weights_path train_seed
 zig build ntuple -- 200 20 2000 0.01 base /tmp/t.bin 1  # train_games eval_games seed lr variant table_path train_seed
 zig build ga-rl -- 16 15 8 2 1 500 100                  # population generations games depth seed holdout_seed holdout_games
 ```
+
+`nn` の学習 variant は `base` (TD(0)、既定) のほか `backward` / `replay` / `priority` / `midgame` / `midmix` / `sym` / `symlam` / `nstep` / `resume` (`par` は並列学習、`resume` は `weights_path` から継続)。variant の実行では重みを `/tmp` などリポジトリ外へ出す。`nstep` は n=4 のオンライン n-step TD の実験 variant で、同じ 20,000 ゲームでは TD(0) より弱い (`docs/solver-history.md` の "n-step TD: worse than TD(0) at n = 4 (#84)") ため既定にしていない。
 
 `expectimax` 系に加えて、GA の重みを使う `ga` と TD 学習した MLP 価値関数の `nn` (1-ply + 出現1回) / `nn2` (2-ply)、実験中の `nnmcts` (8 手で打ち切ったランダムロールアウトを NN の盤面価値で評価する UCT) と `nnbeam` (NN 評価のビーム探索: 幅8・3手先、ply 間で spawn を2回サンプリング) も選べる (`/api/solve?algo=nnmcts` のように指定)。`nnmcts` は seed 1000 の 10 ゲームで 20,137 (5.4 ms/手) と `nn` に遠く及ばず、`nnbeam` も ranking seed 2000 の 20 ゲームで 25,480 と `nn` (63,486) に届かないため `ranking.json` には入れていない (`docs/solver-history.md` の "Truncated-rollout MCTS with the NN leaf: nnmcts (#82)" と "NN-value beam with sampled spawns (#83)")。n-tuple は学習・評価用のランナーのみで、`algo` には未接続 (light 表 + 深さ2探索で seed 2000 の 20 ゲーム平均 25,760、expectimax 深さ2 の 21,840 を上回る。`docs/solver-history.md` の "n-tuple: deep search, light tables, resume (#73)")。
 
