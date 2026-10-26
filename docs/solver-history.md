@@ -582,3 +582,15 @@ Measured, 20 games per policy on eval seed 2000, ReleaseFast:
 - Reading: greedy self-play training is cheap (500k games in 124 s, 202M moves), but a 1-ply table stays weak (7,134). Almost all of the strength comes from search depth: the same table jumps to 17,987 with one spawn and to 25,760 with a second own move, i.e. depth-2 n-tuple already beats expectimax depth 2 while still running at 0.24 ms/move (~4.6k leaves/move). Search, not more table entries, is where the gain is.
 - Verdict: adopted as the experiments' new best non-MLP option; `light` + `deep` is the default sweep configuration from here (1.3 MiB table, evaluable in seconds). Not wired into `algo` yet: `ranking.json` regeneration and a `Policy.nntuple` connection are separate follow-ups.
 - Cost: 500k-game training 124 s + depth-2 eval 6.5 s per 20 games.
+
+## Static WASM build (#68)
+
+The web UI used to need the Zig server (`zig build run -- serve`): the board lived in server state and every policy call went through `/api/solve`. `zig build wasm -Doptimize=ReleaseFast` now produces a static site in `zig-out/web/` — `index.html` plus `game2048.wasm` — that plays and solves entirely in the browser, no backend, so it can be hosted on GitHub Pages or any static file server.
+
+Mechanism: `src/wasm.zig` exposes a small C ABI (`init(seed_lo, seed_hi)`, `move(dir)`, `solve(algo, depth)`, `board_ptr()`, `score()`, `best_tile()`, `algo_count()`, `algo_name(i)`) over the same `core`/`solver` code the server uses; the nn weights are `@embedFile`-ed, so all nine policies (random, greedy, expectimax, mcts, beam, expectimax_tt, ga, nn, nn2) work offline. `src/web/index.static.html` is a separate static UI because it never talks to `/api/*`. `scripts/wasm-smoke.mjs` (node, no dependencies) builds a game, applies moves, and calls every policy, failing non-zero on a bad direction or an unchanged board.
+
+Two fixes were needed to make the module run in a browser:
+- `nn.ValueCache.get` indexed with `key & (capacity - 1)` where `usize` is 32-bit on wasm32; the slot is now explicitly `usize`.
+- The 8,192-entry value cache (128 KiB) lives on the stack of `deepMove` and overflowed the wasm stack (`RuntimeError: memory access out of bounds` on the first `nn2` call). The capacity is now comptime-selected: 1,024 entries on wasm, 8,192 elsewhere, so native `nn2` performance is unchanged.
+
+Measured: wasm module 745,167 bytes, smoke test passes for all nine policies and ten applied moves.

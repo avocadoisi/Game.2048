@@ -213,6 +213,62 @@ pub fn build(b: *std.Build) void {
     });
     const run_ga_tests = b.addRunArtifact(ga_tests);
 
+    // WASM build for static hosting: `zig build wasm -Doptimize=ReleaseFast`
+    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const wasm_core_mod = b.addModule("core-wasm", .{
+        .root_source_file = b.path("src/core.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const wasm_parallel_mod = b.addModule("parallel-wasm", .{
+        .root_source_file = b.path("ai/solver/parallel.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const wasm_nn_mod = b.addModule("nn-wasm", .{
+        .root_source_file = b.path("ai/solver/nn.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core", .module = wasm_core_mod },
+            .{ .name = "parallel", .module = wasm_parallel_mod },
+        },
+    });
+    const wasm_solver_mod = b.addModule("solver-wasm", .{
+        .root_source_file = b.path("ai/solver/solver.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core", .module = wasm_core_mod },
+            .{ .name = "nn", .module = wasm_nn_mod },
+        },
+    });
+    const wasm_exe = b.addExecutable(.{
+        .name = "game2048",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm.zig"),
+            .target = wasm_target,
+            .optimize = optimize,
+            .strip = true,
+            .imports = &.{
+                .{ .name = "core", .module = wasm_core_mod },
+                .{ .name = "solver", .module = wasm_solver_mod },
+            },
+        }),
+    });
+    // No `_start`: JS instantiates and calls the exports directly; memory is exported.
+    wasm_exe.entry = .disabled;
+    wasm_exe.import_memory = false;
+    wasm_exe.rdynamic = true;
+    wasm_exe.export_memory = true;
+
+    const install_wasm = b.addInstallFileWithDir(wasm_exe.getEmittedBin(), .{ .custom = "web" }, "game2048.wasm");
+    const install_static_html = b.addInstallFileWithDir(b.path("src/web/index.static.html"), .{ .custom = "web" }, "index.html");
+
+    const wasm_step = b.step("wasm", "Build the WebAssembly module and static site into zig-out/web");
+    wasm_step.dependOn(&install_wasm.step);
+    wasm_step.dependOn(&install_static_html.step);
+
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_exe_tests.step);

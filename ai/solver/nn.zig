@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const core = @import("core");
 const parallel = @import("parallel");
 
@@ -171,7 +172,8 @@ pub const Stats = struct { leaves: u64 = 0, hits: u64 = 0 };
 /// shortcut: 2^13 slots (128 KiB) keyed by the full 64-bit board hash; a collision drops the
 /// entry (a miss, never a wrong value), so the table only changes speed, not the chosen move.
 pub const ValueCache = struct {
-    pub const capacity = 1 << 13;
+    /// The cache lives on the stack: wasm gets a smaller one (the 8K-entry version overflowed it).
+    pub const capacity = if (builtin.target.cpu.arch.isWasm()) 1 << 10 else 1 << 13;
     const empty_key = std.math.maxInt(u64);
     const Entry = struct { key: u64 = empty_key, value: f64 = 0 };
     entries: [capacity]Entry = @splat(.{}),
@@ -188,7 +190,7 @@ pub const ValueCache = struct {
     pub fn get(self: *ValueCache, net: *const Net, board: Board, stats: *Stats) f64 {
         const key = keyOf(board);
         if (key == empty_key) return leafValue(net, board, stats);
-        const slot = key & (capacity - 1);
+        const slot: usize = @intCast(key & (capacity - 1));
         if (self.entries[slot].key == key) {
             stats.hits += 1;
             return self.entries[slot].value;
