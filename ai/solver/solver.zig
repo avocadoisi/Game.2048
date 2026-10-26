@@ -74,7 +74,7 @@ pub fn bestMoveW(state: GameState, depth: u8, w: Weights) ?Direction {
 }
 
 /// Move-choosing policies compared in the ranking (`zig build ranking`).
-pub const Policy = enum { random, greedy, expectimax, mcts, beam, expectimax_tt, ga, nn, nn2 };
+pub const Policy = enum { random, greedy, expectimax, mcts, beam, expectimax_tt, ga, nn, nn2, nnmcts };
 
 /// Weights evolved by `zig build ga-rl` (holdout +4%, see docs/solver-history.md). 3 decimals as printed.
 pub const ga_weights: Weights = .{ .empty = 7.028, .order_penalty = 43.174, .merge = 0, .forced_down = 0 };
@@ -106,21 +106,26 @@ pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Dir
         .beam => return beamMove(state),
         .expectimax_tt => return bestMoveTT(state, 3),
         .ga => return bestMoveW(state, depth, ga_weights),
-        // shortcut: copies the 148 KB net per move; keep a static copy if this shows up in profiles
-        .nn => {
+        // shortcut: one 148 KB net copy per move for all three NN policies; keep a static copy if
+        // this shows up in profiles. Separate copies per arm overflowed the wasm stack.
+        .nn, .nn2, .nnmcts => {
             const net = nn.parse(nn_weight_bytes) catch unreachable;
-            return nn.bestMove(&net, state, .chance);
-        },
-        // shortcut: same per-move net copy as `nn`; the 2-ply search itself dominates the cost.
-        .nn2 => {
-            const net = nn.parse(nn_weight_bytes) catch unreachable;
-            return nn.bestMove(&net, state, .deep);
+            return switch (policy) {
+                .nn => nn.bestMove(&net, state, .chance),
+                .nn2 => nn.bestMove(&net, state, .deep),
+                else => nnmctsMove(&net, state, rng),
+            };
         },
     }
 }
 
 /// shortcut: fixed 200 full random rollouts per move; raise only while the 6 s/game limit holds.
 const mcts_simulations: usize = 200;
+
+/// shortcut: 1,000 truncated rollouts per move with 8 random plies before the net leaf; the score
+/// keeps climbing with more simulations (~27k at 2,000, docs/solver-history.md) at a linear cost.
+const nnmcts_simulations: usize = 1000;
+const nnmcts_rollout_moves: usize = 8;
 
 const MctsArm = struct {
     dir: Direction,
@@ -141,36 +146,87 @@ fn mctsMove(state: GameState, rng: std.Random) ?Direction {
     if (arm_count == 0) return null;
 
     for (0..mcts_simulations) |simulation| {
-        var selected: usize = 0;
-        var best_ucb: f64 = -std.math.inf(f64);
-        for (arms[0..arm_count], 0..) |arm, i| {
-            const ucb = if (arm.visits == 0)
-                std.math.inf(f64)
-            else
-                arm.reward / @as(f64, @floatFromInt(arm.visits)) +
-                    @sqrt(2 * @log(@as(f64, @floatFromInt(simulation + 1))) / @as(f64, @floatFromInt(arm.visits)));
-            if (ucb > best_ucb) {
-                best_ucb = ucb;
-                selected = i;
-            }
-        }
-
+        const selected = selectArm(arms[0..arm_count], simulation);
         var rollout = state;
         _ = rollout.move(arms[selected].dir, rng);
-        while (randomMove(&rollout, rng)) {}
+        while (randomMove(&rollout, rng) != null) {}
         arms[selected].visits += 1;
         arms[selected].reward += @as(f64, @floatFromInt(rollout.score)) / 100000;
     }
-
-    var best = arms[0];
-    for (arms[1..arm_count]) |arm| {
-        if (arm.reward / @as(f64, @floatFromInt(arm.visits)) > best.reward / @as(f64, @floatFromInt(best.visits))) best = arm;
-    }
-    return best.dir;
+    return bestArm(arms[0..arm_count]).dir;
 }
 
-/// Apply one uniformly random legal move; false when the rollout is over.
-fn randomMove(state: *GameState, rng: std.Random) bool {
+/// Root UCT with truncated random rollouts that end at the learned net's afterstate value.
+fn nnmctsMove(net: *const nn.Net, state: GameState, rng: std.Random) ?Direction {
+    var arms: [4]MctsArm = undefined;
+    var arm_count: usize = 0;
+    for ([_]Direction{ .up, .left, .down, .right }) |d| {
+        var next = state;
+        if (!next.slide(d).changed) continue;
+        arms[arm_count] = .{ .dir = d };
+        arm_count += 1;
+    }
+    if (arm_count == 0) return null;
+
+    var cache: nn.ValueCache = .{};
+    var stats: nn.Stats = .{};
+    for (0..nnmcts_simulations) |simulation| {
+        const selected = selectArm(arms[0..arm_count], simulation);
+        var rollout = state;
+        const moved = rollout.move(arms[selected].dir, rng);
+        arms[selected].visits += 1;
+        arms[selected].reward += nnmctsRollout(net, &cache, &stats, rollout, moved.score_delta, rng);
+    }
+    return bestArm(arms[0..arm_count]).dir;
+}
+
+/// Arm with the highest UCB; unvisited arms first, ties keep the earlier direction.
+fn selectArm(arms: []const MctsArm, simulation: usize) usize {
+    var selected: usize = 0;
+    var best_ucb: f64 = -std.math.inf(f64);
+    for (arms, 0..) |arm, i| {
+        const ucb = if (arm.visits == 0)
+            std.math.inf(f64)
+        else
+            arm.reward / @as(f64, @floatFromInt(arm.visits)) +
+                @sqrt(2 * @log(@as(f64, @floatFromInt(simulation + 1))) / @as(f64, @floatFromInt(arm.visits)));
+        if (ucb > best_ucb) {
+            best_ucb = ucb;
+            selected = i;
+        }
+    }
+    return selected;
+}
+
+/// Arm with the highest mean reward; ties keep the earlier direction.
+fn bestArm(arms: []const MctsArm) MctsArm {
+    var best = arms[0];
+    for (arms[1..]) |arm| {
+        if (arm.reward / @as(f64, @floatFromInt(arm.visits)) > best.reward / @as(f64, @floatFromInt(best.visits))) best = arm;
+    }
+    return best;
+}
+
+/// Truncated random rollout from the post-move board: score gained along it (plus `gained`) over
+/// `nn.reward_scale`, then the net's afterstate value when the budget runs out. The leaf is an
+/// afterstate before its spawn, the board shape the net was trained on; a dead board adds 0 for
+/// the future, so terminal and leaf values share the net's scale.
+fn nnmctsRollout(net: *const nn.Net, cache: *nn.ValueCache, stats: *nn.Stats, state: GameState, gained: u32, rng: std.Random) f64 {
+    var rollout = state;
+    var score = gained;
+    var plies: usize = 0;
+    while (plies < nnmcts_rollout_moves) : (plies += 1) {
+        const direction = randomSlide(&rollout, rng) orelse break;
+        score += rollout.slide(direction).score_delta;
+        if (plies + 1 < nnmcts_rollout_moves) _ = rollout.spawnRandomTile(rng);
+    }
+    const gained_value = @as(f64, @floatFromInt(score)) / nn.reward_scale;
+    if (rollout.isGameOver()) return gained_value;
+    return gained_value + cache.get(net, rollout.board, stats);
+}
+
+/// Uniformly random direction that changes the board; null when the board has no legal move.
+fn randomSlide(state: *const GameState, rng: std.Random) ?Direction {
     var legal: [4]Direction = undefined;
     var count: usize = 0;
     for ([_]Direction{ .up, .left, .down, .right }) |d| {
@@ -180,9 +236,14 @@ fn randomMove(state: *GameState, rng: std.Random) bool {
             count += 1;
         }
     }
-    if (count == 0) return false;
-    _ = state.move(legal[rng.uintLessThan(usize, count)], rng);
-    return true;
+    if (count == 0) return null;
+    return legal[rng.uintLessThan(usize, count)];
+}
+
+/// Apply one uniformly random legal move (slide + spawn); null when the rollout is over, else the score gained.
+fn randomMove(state: *GameState, rng: std.Random) ?u32 {
+    const direction = randomSlide(state, rng) orelse return null;
+    return state.move(direction, rng).score_delta;
 }
 
 pub fn playPolicy(rng: std.Random, policy: Policy, depth: u8) GameResult {
@@ -504,6 +565,55 @@ test "mcts returns only legal moves and null on a dead board" {
         .{ 4, 2, 4, 2 },
     } };
     try std.testing.expectEqual(@as(?Direction, null), choose(.mcts, dead, prng.random(), 0));
+}
+
+test "nnmcts returns only legal moves and null on a dead board" {
+    const state: GameState = .{ .board = .{
+        .{ 2, 2, 4, 8 },
+        .{ 16, 32, 64, 128 },
+        .{ 256, 512, 1024, 2048 },
+        .{ 4096, 8192, 16384, 32768 },
+    } };
+    var prng = std.Random.DefaultPrng.init(7);
+    const move = choose(.nnmcts, state, prng.random(), 0).?;
+    var repeat_prng = std.Random.DefaultPrng.init(7);
+    try std.testing.expectEqual(move, choose(.nnmcts, state, repeat_prng.random(), 0).?);
+    var next = state;
+    try std.testing.expect(next.slide(move).changed);
+
+    const dead: GameState = .{ .board = .{
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+    } };
+    try std.testing.expectEqual(@as(?Direction, null), choose(.nnmcts, dead, prng.random(), 0));
+}
+
+test "nnmcts rollout value shares the NN scale and a dead board adds no future value" {
+    const net = nn.parse(nn_weight_bytes) catch unreachable;
+    var cache: nn.ValueCache = .{};
+    var stats: nn.Stats = .{};
+    var prng = std.Random.DefaultPrng.init(11);
+
+    const dead: GameState = .{ .board = .{
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+    } };
+    try std.testing.expectEqual(@as(f64, 0), nnmctsRollout(&net, &cache, &stats, dead, 0, prng.random()));
+
+    const live: GameState = .{ .board = .{
+        .{ 2, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    } };
+    const value = nnmctsRollout(&net, &cache, &stats, live, 0, prng.random());
+    // unit scale like the net (remaining score / reward_scale); a raw total score would be in the thousands
+    try std.testing.expect(-100 < value and value < 100);
+    try std.testing.expect(value > 0);
 }
 
 test "beam policy returns a legal move and null on a dead board" {

@@ -616,3 +616,35 @@ Two fixes were needed to make the module run in a browser:
 - The 8,192-entry value cache (128 KiB) lives on the stack of `deepMove` and overflowed the wasm stack (`RuntimeError: memory access out of bounds` on the first `nn2` call). The capacity is now comptime-selected: 1,024 entries on wasm, 8,192 elsewhere, so native `nn2` performance is unchanged.
 
 Measured: wasm module 745,167 bytes, smoke test passes for all nine policies and ten applied moves.
+
+## Truncated-rollout MCTS with the NN leaf: nnmcts (#82)
+
+`mcts` plays whole random games out to a terminal state and scores them with the raw game score, so it only knows what a random player accumulates. `nnmcts` keeps the same root UCT but stops each rollout after 8 random plies and scores the truncated board with the trained MLP: a simulation's reward is `score gained along the rollout / 1000 + net value of the final board`, where 1000 is the `reward_scale` the net was trained on, so a truncated leaf and a terminal position are comparable. A dead board adds 0 future value, which keeps terminal positions on that same scale.
+
+Mechanism (`ai/solver/solver.zig`): `nnmctsMove` builds the four root arms from slide legality (null on a dead board) and per simulation runs `selectArm` — the UCT rule extracted verbatim from `mctsMove` — then adds one reward from `nnmctsRollout`. The rollout takes uniformly random legal slides and spawns after each ply except the last, so the leaf board is a post-slide, pre-spawn afterstate: the input shape the net was trained on. The first version evaluated the post-spawn board instead and scored 8,745 (200 sims x 8 plies) against 17,023 for the same budget once the leaf matched the training shape — the leaf's board shape matters more than the rollout length.
+
+Wiring: `Policy.nnmcts` is appended after `nn2`, so `algo=nnmcts` over HTTP, `algo_count`/`algo_name` in the wasm ABI, the static wasm UI and `scripts/wasm-smoke.mjs` pick it up without further changes. `src/web/ranking.json` is deliberately not regenerated, so the server UI table still lists the nine adopted policies.
+
+Measured (ReleaseFast, committed weights only, eval seed 1000, 10 games per row, serial play):
+
+| sims x plies | avg score | ms/move |
+|---|---|---|
+| 200 x 2 | 17,085 | 0.27 |
+| 200 x 8 | 17,023 | 0.91 |
+| 200 x 16 | 13,717 | 1.19 |
+| 500 x 16 | 20,054 | 2.82 |
+| 1,000 x 2 | 17,115 | 1.65 |
+| 1,000 x 4 | 23,646 | 3.16 |
+| 1,000 x 8 (shipped) | 20,137 | 5.41 |
+| 1,000 x 16 | 23,113 | 4.12 |
+| 2,000 x 8 | 27,346 | 9.61 |
+| 5,000 x 2 | 20,026 | 2.91 |
+
+References on the same seed: `mcts` 29,722 (committed `ranking.json`, 5 x 20 games), `nn` 64,601 at 0.34 ms/move and its 1-ply greedy variant 38,616 at 0.008 ms/move (same seed, 10 games).
+
+- Truncation plus the net leaf does not beat plain `mcts`: 2,000 simulations reach 27,346, i.e. `mcts`'s 29,722 at roughly 7x the per-move cost, and the shipped 1,000 x 8 point lands at 20,137 for 5.4 ms/move (~6.9 s/game against `mcts`'s ~1.3 ms/move).
+- Random play drives the board off the distribution the net was trained on, so after 8 random plies the leaf value is noisy and the arm means collapse toward each other. The same leaf used the way it was trained — argmax over 1-ply afterstates plus one spawn sample — is worth 64,601 at 0.34 ms/move: 3x the score for 1/16 of the time per move. The net reads afterstates; random play before the leaf only destroys information.
+- More simulations or deeper rollouts did not produce a consistent improvement at the tested budgets; even the best point (2,000 x 8) stayed below plain `mcts` and `nn` while costing more.
+- Verdict: not adopted for `ranking.json` or as the default policy; kept as an experimental policy (`Policy.nnmcts`, `algo=nnmcts`, wasm) because it documents the limit of pairing random rollouts with this value net.
+- The canonical 5 x 20 same-seed `zig build ranking` run for `nnmcts` was started but skipped — it did not finish within the working timeout — so the decision rests on the 10-game table above, which carries a few thousand points of noise per row. Existing `mcts` and `nn`/`nn2` behaviour is unchanged: the UCT and best-arm rules were extracted verbatim with the same RNG call order, and both NN policies still call the same `nn.bestMove`.
+- Wasm: three separate 148 KB per-move net copies (one per NN arm) overflowed the wasm stack — `solve` failed with `RuntimeError: memory access out of bounds` even for `algo=0`, since the copies live in `choose`'s frame. The three NN arms now share one copy; the module grew from 745,167 to 753,911 bytes (286,245 gzipped) and the smoke test passes for all ten policies and ten applied moves.
