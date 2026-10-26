@@ -450,6 +450,9 @@ pub const Options = struct {
     death: bool = false,
     /// Candidate (#72): TD(lambda) with accumulating eligibility traces over the parameters; 0 = TD(0).
     lambda: f64 = 0,
+    /// Candidate (#98): true batch symmetry augmentation — one averaged step per afterstate, where all 8
+    /// transformed gradients come from one net snapshot (unlike `symmetry`, which steps 8 times sequentially).
+    sym_batch: bool = false,
     /// Candidate (#84): fixed n-step TD on the afterstate chain; 0 = off. Standalone: when set it owns the
     /// game loop and the other options are ignored. 1 is TD(0), larger n propagates rewards faster.
     nstep: usize = 0,
@@ -684,9 +687,23 @@ fn valueOf(net: *const Net, after: Board) f64 {
     return forward(net, after, &cache);
 }
 
+/// Batch symmetry (#98): 8 gradients from one snapshot, averaged elementwise, one SGD step.
+fn trainSymBatch(net: *Net, after: Board, target: f64, lr: f64) void {
+    var grad = std.mem.zeroes(Net);
+    var cache: Cache = .{};
+    for (0..symmetry_count) |k| {
+        const v = forward(net, transformBoard(k, after), &cache);
+        const step = gradOf(net, &cache);
+        for (flat(&grad), flat(@constCast(&step))) |*acc, x| acc.* += (v - target) * x;
+    }
+    for (flat(&grad)) |*acc| acc.* /= @as(f64, @floatFromInt(symmetry_count));
+    for (flat(net), flat(&grad)) |*w, x| w.* -= lr * x;
+}
+
 /// One per-move TD update on `after` with `target`: all 8 dihedral transforms when `opts.symmetry`,
 /// and TD(lambda) through `trace` when `opts.lambda > 0` (otherwise the plain TD(0) `train` step).
 fn trainStep(net: *Net, cache: *Cache, after: Board, target: f64, lr: f64, opts: Options, trace: *Net) void {
+    if (opts.sym_batch) return trainSymBatch(net, after, target, lr);
     const transforms: usize = if (opts.symmetry) symmetry_count else 1;
     for (0..transforms) |k| {
         _ = forward(net, if (opts.symmetry) transformBoard(k, after) else after, cache);
@@ -1796,4 +1813,44 @@ test "symmetry and symlam change the weights (smoke)" {
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&plain), std.mem.asBytes(&sym)));
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&sym), std.mem.asBytes(&symlam)));
     for (std.mem.bytesAsSlice(f64, std.mem.asBytes(&symlam))) |w| try std.testing.expect(std.math.isFinite(w));
+}
+
+/// Unclipped averaged symmetry gradient of one afterstate: mean over the 8 transforms of
+/// (V(k) - target) * grad V(k), every transform evaluated on the same (unmodified) `net`.
+/// Test-only, deliberately not shared with `trainSymBatch` so the tests compare two computations.
+fn avgSymGrad(net: *const Net, after: Board, target: f64) Net {
+    var g = std.mem.zeroes(Net);
+    var cache: Cache = .{};
+    for (0..symmetry_count) |k| {
+        const v = forward(net, transformBoard(k, after), &cache);
+        const step = gradOf(net, &cache);
+        for (flat(&g), flat(@constCast(&step))) |*acc, x| acc.* += (v - target) * x;
+    }
+    for (flat(&g)) |*acc| acc.* /= @as(f64, @floatFromInt(symmetry_count));
+    return g;
+}
+
+test "one symbatch step equals the averaged symmetry gradient applied once" {
+    var init_rng = std.Random.DefaultPrng.init(16);
+    var start = Net.init(init_rng.random());
+    var batched = start;
+    var cache: Cache = .{};
+    var trace: Net = std.mem.zeroes(Net);
+    trainStep(&batched, &cache, sample_board, 0.4, 0.01, .{ .sym_batch = true }, &trace);
+
+    var g = avgSymGrad(&start, sample_board, 0.4);
+    for (flat(&batched), flat(&start), flat(&g)) |got, w0, grad| try std.testing.expectApproxEqAbs(w0 - 0.01 * grad, got, 1e-15);
+}
+
+test "one symbatch step differs from the eight sequential symmetry steps" {
+    var init_rng = std.Random.DefaultPrng.init(17);
+    const start = Net.init(init_rng.random());
+    var batched = start;
+    var sequential = start;
+    var cache: Cache = .{};
+    var trace: Net = std.mem.zeroes(Net);
+    trainStep(&batched, &cache, sample_board, 0.4, 0.01, .{ .sym_batch = true }, &trace);
+    trainStep(&sequential, &cache, sample_board, 0.4, 0.01, .{ .symmetry = true }, &trace);
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&batched), std.mem.asBytes(&sequential)));
+    for (flat(&batched)) |w| try std.testing.expect(std.math.isFinite(w));
 }
