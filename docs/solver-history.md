@@ -545,6 +545,23 @@ Comparison with the committed weights (200,000 + 40,000 games), eval ranges 2000
 - Verdict: adopted as an extra policy (`nn2`); `nn` stays the default for speed, `nn2` is the quality option. `ranking.json` is regenerated separately once all pending policy changes land.
 - Cost: 5 x 20 games, 63 s per range for nn2.
 
+## Row-LUT board representation: no gain (#71)
+
+Idea: pack the board into one `u64` (4 bits per cell, tile level 0..15, the same encoding `nn.zig` uses) and generate moves with 65,536-entry row tables for left/right plus a transpose for up/down, so a slide is four table lookups instead of a per-row scan. Implemented as `ai/solver/fastboard.zig` (`fromBoard`/`toBoard`, `slidePacked(board, dir) -> {board, score, changed}`, `emptyMask`, `setCell`) and wired into `solver.zig`'s expectimax (`maxValuePacked`/`chanceValuePacked`, with the old path kept as the test oracle).
+
+Correctness: 1,000 pseudo-random boards x 4 directions reproduce `core.GameState.slide` exactly (board, score delta, `changed`), round-trip `toBoard(fromBoard(b)) == b`, and the searched values/best moves match the core-slide search. The scores in the table below are byte-identical, so the LUT is right — it just is not faster.
+
+Measured with the committed weights/weights-independent expectimax, ReleaseFast, seed 2000:
+
+| mode | moves/s (branch) | moves/s (main) | avg score | avg moves |
+|---|---|---|---|---|
+| expectimax depth 2, 20 games | 10,845 | 12,707 | 26,153.6 | 1,373.8 |
+| expectimax depth 3, 10 games | 280 | 301 | 42,718.8 | 2,084.0 |
+
+- Reading: 15% slower at depth 2 and 7% slower at depth 3, same scores. A slide is 4 LUT lookups plus a transpose for half the directions, while `core.slide` is already a tight 4-row scan, and every recursive leaf pays a `toBoard` conversion because the evaluation function still takes a `core.Board`. The move generation was never the bottleneck: chance-node recursion (6-8 spawns per node) and the position evaluation dominate.
+- Verdict: not adopted, code dropped. It would only pay off with a packed-native evaluation function (no `toBoard` at leaves) and a packed chance-node spawn, i.e. rewriting the whole search around the representation — a separate, much larger change than a faster slider.
+- Cost: 2 x 20 + 2 x 10 games, ~3 min build + 80 s measuring.
+
 ## n-tuple: deep search, light tables, resume (#73)
 
 The n-tuple value function (`ai/solver/ntuple.zig`) stores one weight per (pattern, cell-state) pair and learns it with TD(0) self-play. Issue #70 left it at the runner stage with two limits: only 1-ply and 1-spawn lookahead, and a 68 MiB raw table that is dominated by one 2x3 6-tuple pattern.
