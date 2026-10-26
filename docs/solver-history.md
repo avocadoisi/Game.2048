@@ -317,7 +317,8 @@ takes batches of `N = min(cpu count, 8)` games (clamped to the games left). Game
 `train_seed + i` and trains its own copy of the batch-start net; the next net is
 `net_start + (1/N) * sum_i (net_after_i - net_start)`, summed in game index order. The sum order is
 fixed, so the weights do not depend on the thread count; the serial path (no `par`) is unchanged.
-`diag` works with `par` (per-game diagnostics are merged into one table).
+`diag` works with `par` (per-game diagnostics are merged into one table). #99 extends batching to the
+stateless variants (`par` in arg 10): see `par for stateless variants (#99)` at the end of this file.
 
 - Command: `zig build nn -Doptimize=ReleaseFast -- 2000 1 2000 0.003` (serial) vs
   `zig build nn -Doptimize=ReleaseFast -- 2000 1 2000 0.003 1 par` (parallel), 8 logical CPUs,
@@ -900,6 +901,33 @@ Limits: one machine, 100 games per config; the 5-game ranking table in the run b
 too small to compare weight sets (expectimax flipped 41,107 -> 19,964 there and back at 50
 games); `ga_weights` keeps the single `order_penalty` gene for both phases, so GA evolution is
 unchanged; an intermediate sweep between 25 and 43.174 was not run.
+
+
+## par for stateless variants (#99)
+
+`trainBatch` used to hard-code `trainGame`, so only the plain per-move variant could batch. It now
+delegates to `trainBatchOpts(.., opts)` (`ai/solver/nn.zig`), which runs each game with
+`trainGameOpts(.., opts)`: same `net_start + (1/N) * sum_i (net_after_i - net_start)` aggregation,
+now over variant-trained per-game nets. `trainBatch` stays as the default-options wrapper, so the
+plain path and its recorded checksum are unchanged.
+
+- CLI: arg 6 `par` keeps its meaning (base + parallel). The new positional arg 10 `par` batches the
+  variant named in arg 6: `zig build nn -Doptimize=ReleaseFast -- 20000 20 2000 0.003 - sym 30 /tmp/nnb/sym.bin 1 par`.
+  Arg 10 was an unused trailing slot (any 10th positional forced the usage error), so every existing
+  command line keeps its exact meaning. The training log prints the composed label (`variant=sym+par`).
+- Works: `base`, `backward`, `replay`, `sym`, `symlam`, `nstep`, and `resume` (the batch starts from
+  the net `startNet` loaded out of `weights_path`).
+- Not supported: `priority`, `midgame`, `midmix`. Their 1024-entry ring buffer is cross-game state
+  shared by pointer and the batch mean would change their semantics, so the CLI prints the usage text
+  and refuses; `trainBatchOpts` asserts the buffer is null.
+- Reproducibility: `parallel training batch with variant opts matches a serial run of the same game
+  seeds` (`ai/solver/nn.zig`) runs 4-game batches with `symmetry` and with `replay_k = 4` on threads
+  and compares the weights byte-for-byte with the serial reconstruction over seeds 77..80. Two CLI
+  runs each of `sym` + `par` and `replay` + `par` wrote identical weight files. `zig build test` passes.
+- Experiment pending: the 5.7x of #35 was measured on `base`. Whether the speedup carries over to the
+  heavier variants (`sym` does 8 transforms per move) and whether batched aggregation moves a
+  variant's score (it is not the same update as applying the games one after another) is not measured
+  yet. The `resume` fine-tune of #66 and the `sym` runs of #72 are the first candidates.
 
 
 ## Bench run 2026-10-27 02:43:24 +0900
