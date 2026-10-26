@@ -129,6 +129,11 @@ pub fn build(b: *std.Build) void {
     ranking_cmd.addPassthruArgs();
     ranking_cmd.step.dependOn(b.getInstallStep());
 
+    const ranking_tests = b.addTest(.{
+        .root_module = ranking_exe.root_module,
+    });
+    const run_ranking_tests = b.addRunArtifact(ranking_tests);
+
     const ranking_step = b.step("ranking", "Compare policies and print JSON ranking");
     ranking_step.dependOn(&ranking_cmd.step);
 
@@ -280,4 +285,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_ntuple_main_tests.step);
     test_step.dependOn(&run_parallel_tests.step);
     test_step.dependOn(&run_ga_tests.step);
+    test_step.dependOn(&run_ranking_tests.step);
 }

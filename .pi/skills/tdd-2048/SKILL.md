@@ -9,7 +9,7 @@ Project: Zig 2048. Pure logic lives in `src/core.zig` (module `core`). `src/main
 
 ## Commands
 
-- Test everything: `zig build test` (runs the unit tests of 7 targets: core, exe, solver, bench, nn, parallel, ga-rl)
+- Test everything: `zig build test` (runs the unit tests of 11 targets: core, exe, solver, bench, parallel, nn, nn_main, ntuple, ntuple_main, ga-rl, ranking)
 - Run CLI: `zig build run` (play); `zig build run -- serve 8080` (HTTP server)
 - Files: `src/core.zig` (logic), `src/render.zig`, `src/cli.zig`, `src/server.zig` (+ `src/web/index.html`), `src/main.zig` (dispatch)
 - Zig version: **0.17** (`build.zig` uses `addPassthruArgs`; `std.Io` APIs). Check with `zig version` before building.
