@@ -171,7 +171,7 @@ zig build ntuple -- 200 20 2000 0.01 base /tmp/t.bin 1  # train_games eval_games
 zig build ga-rl -- 16 15 8 2 1 500 100                  # population generations games depth seed holdout_seed holdout_games
 ```
 
-`expectimax` 系に加えて、GA の重みを使う `ga` と TD 学習した MLP 価値関数の `nn` (1-ply + 出現1回) / `nn2` (2-ply)、実験中の `nnmcts` (8 手で打ち切ったランダムロールアウトを NN の盤面価値で評価する UCT) と `nnbeam` (NN 評価のビーム探索: 幅8・3手先・各ノードで spawn を2回サンプリング) も選べる (`/api/solve?algo=nnmcts` のように指定)。`nnmcts` は seed 1000 の 10 ゲームで 20,137 (5.4 ms/手)、`nnbeam` は同 seed で 23,875 といずれも `nn` (68,772) に遠く及ばないため `ranking.json` には入れていない (`docs/solver-history.md` の "Truncated-rollout MCTS with the NN leaf: nnmcts (#82)" と "NN-value beam with sampled spawns (#83)")。n-tuple は学習・評価用のランナーのみで、`algo` には未接続 (light 表 + 深さ2探索で seed 2000 の 20 ゲーム平均 25,760、expectimax 深さ2 の 21,840 を上回る。`docs/solver-history.md` の "n-tuple: deep search, light tables, resume (#73)")。
+`expectimax` 系に加えて、GA の重みを使う `ga` と TD 学習した MLP 価値関数の `nn` (1-ply + 出現1回) / `nn2` (2-ply)、実験中の `nnmcts` (8 手で打ち切ったランダムロールアウトを NN の盤面価値で評価する UCT) と `nnbeam` (NN 評価のビーム探索: 幅8・3手先、ply 間で spawn を2回サンプリング) も選べる (`/api/solve?algo=nnmcts` のように指定)。`nnmcts` は seed 1000 の 10 ゲームで 20,137 (5.4 ms/手) と `nn` に遠く及ばず、`nnbeam` も ranking seed 2000 の 20 ゲームで 25,480 と `nn` (63,486) に届かないため `ranking.json` には入れていない (`docs/solver-history.md` の "Truncated-rollout MCTS with the NN leaf: nnmcts (#82)" と "NN-value beam with sampled spawns (#83)")。n-tuple は学習・評価用のランナーのみで、`algo` には未接続 (light 表 + 深さ2探索で seed 2000 の 20 ゲーム平均 25,760、expectimax 深さ2 の 21,840 を上回る。`docs/solver-history.md` の "n-tuple: deep search, light tables, resume (#73)")。
 
 ## ソース構成
 
