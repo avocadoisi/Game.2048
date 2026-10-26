@@ -702,3 +702,30 @@ Correctness: the window closes a step with exactly its n rewards plus the closin
 - Verdict: not adopted. `nstep` stays an opt-in experiment variant, `nstep = 0` is the default, no default or committed weights change. A version that could work would accumulate the n-step targets over a batch and apply one averaged step against a frozen snapshot, and normalise the target scale — a different, larger change, not a knob.
 - Limits: one training seed and one budget (20,000 games) at n = 4 only; lr/4 was the only extra diagnostic. The drop is far larger than the eval stderr, so more seeds would only sharpen the size of the loss, not its sign.
 - Cost: 3 x 20,000 games (145 / 101 / 89 s training) + 4 policies x 5 ranges x 20 eval games per run (2m51s-4m52s wall each, dominated by the 2-ply eval).
+## Bench run 2026-10-27 00:09:04 +0900
+
+- command: `/usr/bin/time -p zig build ranking -Doptimize=ReleaseFast -- 1 2 1000`
+- commit: 83af5aa
+- date: 2026-10-27 00:09:04 +0900
+- exit: 0
+
+```text
+{"seed":1000,"runs":1,"games_per_run":2,"entries":[{"policy":"nn2","depth":2,"games":2,"avg_score":67424.0,"avg_moves":3091.0,"best_tile":4096,"latency_ms_per_move":1.911,"games_per_sec":0.17,"description":"TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）"},{"policy":"nn","depth":0,"games":2,"avg_score":66624.0,"avg_moves":2992.5,"best_tile":4096,"latency_ms_per_move":0.197,"games_per_sec":1.69,"description":"TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）"},{"policy":"expectimax","depth":2,"games":2,"avg_score":60220.0,"avg_moves":2804.0,"best_tile":4096,"latency_ms_per_move":0.080,"games_per_sec":4.46,"description":"2手先まで探索し、ランダムな出現（2か4）を平均して評価する。評価は蛇行順と合体ペアの手作り関数"},{"policy":"ga","depth":2,"games":2,"avg_score":46584.0,"avg_moves":2287.0,"best_tile":4096,"latency_ms_per_move":0.068,"games_per_sec":6.43,"description":"GAで評価の重みを進化させた期待値探索（depth 2）。GA内のholdout(seed 500〜)では+4%だが、ranking seed 1000では素の expectimax より低い"},{"policy":"expectimax_tt","depth":0,"games":2,"avg_score":37282.0,"avg_moves":1825.0,"best_tile":4096,"latency_ms_per_move":0.686,"games_per_sec":0.80,"description":"depth 3の期待値探索を置換表で高速化したもの（同じ手を選ぶ）"},{"policy":"mcts","depth":0,"games":2,"avg_score":29732.0,"avg_moves":1533.0,"best_tile":2048,"latency_ms_per_move":1.018,"games_per_sec":0.64,"description":"UCTで候補手を選び、ランダムな対局を繰り返して評価する"},{"policy":"beam","depth":0,"games":2,"avg_score":17038.0,"avg_moves":943.5,"best_tile":2048,"latency_ms_per_move":0.061,"games_per_sec":17.45,"description":"幅32で3手先まで探索し、各空きマスに2が出現すると仮定して評価する"},{"policy":"greedy","depth":0,"games":2,"avg_score":3020.0,"avg_moves":251.0,"best_tile":256,"latency_ms_per_move":0.000,"games_per_sec":9428.40,"description":"1手先だけ見る。滑らせた盤面の評価が最も高い手を選ぶ（出現や探索はしない）"},{"policy":"random","depth":0,"games":2,"avg_score":1368.0,"avg_moves":140.0,"best_tile":128,"latency_ms_per_move":0.000,"games_per_sec":30207.83,"description":"合法手からランダムに1手選ぶ（比較の基準）"}]}
+real 19.65
+user 19.54
+sys 0.16
+```
+
+## Bench run 2026-10-27 00:09:36 +0900
+
+- command: `/usr/bin/time -p zig build ranking -Doptimize=ReleaseFast -- 1 2 1000 nn2`
+- commit: 83af5aa
+- date: 2026-10-27 00:09:36 +0900
+- exit: 0
+
+```text
+{"seed":1000,"runs":1,"games_per_run":2,"entries":[{"policy":"nn2","depth":2,"games":2,"avg_score":67424.0,"avg_moves":3091.0,"best_tile":4096,"latency_ms_per_move":1.911,"games_per_sec":0.17,"description":"TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）"}]}
+real 11.97
+user 11.89
+sys 0.13
+```

@@ -165,7 +165,8 @@ x3 は約 10,500、x10 は 19,275、x30 は 22,522 (採用)、x50 は 20,308、x
 ポリシー比較・NN・GA のランナー:
 
 ```bash
-zig build ranking -Doptimize=ReleaseFast -- 5 20 1000   # runs games/run seed (全ポリシーを同じ seed で比較、JSON 出力)
+zig build ranking -Doptimize=ReleaseFast -- 5 20 1000              # runs games/run seed (全ポリシーを同じ seed で比較、JSON 出力)
+zig build ranking -Doptimize=ReleaseFast -- 5 20 1000 nn,nn2       # 末尾引数でカンマ区切りのポリシー名に絞り込み (未指定は全件)
 zig build nn -Doptimize=ReleaseFast -- 0 100 2000 0.003                              # train_games eval_games seed lr (train_games=0 は保存済み重みを読み込む)
 zig build nn -Doptimize=ReleaseFast -- 20000 100 2000 0.003 - nstep 30 /tmp/n.bin 1  # ... [seed_ranges|diag] variant replay_k weights_path train_seed
 zig build ntuple -- 200 20 2000 0.01 base /tmp/t.bin 1  # train_games eval_games seed lr variant table_path train_seed
@@ -175,6 +176,13 @@ zig build ga-rl -- 16 15 8 2 1 500 100                  # population generations
 `nn` の学習 variant は `base` (TD(0)、既定) のほか `backward` / `replay` / `priority` / `midgame` / `midmix` / `sym` / `symlam` / `nstep` / `resume` (`par` は並列学習、`resume` は `weights_path` から継続)。variant の実行では重みを `/tmp` などリポジトリ外へ出す。`nstep` は n=4 のオンライン n-step TD の実験 variant で、同じ 20,000 ゲームでは TD(0) より弱い (`docs/solver-history.md` の "n-step TD: worse than TD(0) at n = 4 (#84)") ため既定にしていない。
 
 `expectimax` 系に加えて、GA の重みを使う `ga` と TD 学習した MLP 価値関数の `nn` (1-ply + 出現1回) / `nn2` (2-ply)、実験中の `nnmcts` (8 手で打ち切ったランダムロールアウトを NN の盤面価値で評価する UCT) と `nnbeam` (NN 評価のビーム探索: 幅8・3手先、ply 間で spawn を2回サンプリング) も選べる (`/api/solve?algo=nnmcts` のように指定)。`nnmcts` は seed 1000 の 10 ゲームで 20,137 (5.4 ms/手) と `nn` に遠く及ばず、`nnbeam` も ranking seed 2000 の 20 ゲームで 25,480 と `nn` (63,486) に届かないため `ranking.json` には入れていない (`docs/solver-history.md` の "Truncated-rollout MCTS with the NN leaf: nnmcts (#82)" と "NN-value beam with sampled spawns (#83)")。n-tuple は学習・評価用のランナーのみで、`algo` には未接続 (light 表 + 深さ2探索で seed 2000 の 20 ゲーム平均 25,760、expectimax 深さ2 の 21,840 を上回る。`docs/solver-history.md` の "n-tuple: deep search, light tables, resume (#73)")。
+
+ranking の JSON には共通条件 (`seed` / `runs` / `games_per_run`) に加えて、次の2つの計測値を policy ごとに入れる。
+
+- `latency_ms_per_move`: 1 run (1 本の直列ゲーム列、1 スレッド) の実行時間 ÷ 手数。直列 1 手あたりの計算時間。
+- `games_per_sec`: 並列バッチ全体の wall time からの throughput。並列度に依存する。
+
+policy 絞り込みは高コスト policy を待たずに実験するためのもの (例: `1 2 1000` の全件実行は 19.7 s だが `nn2` のみなら 12.0 s、結果は同じ)。
 
 ## ソース構成
 
@@ -192,7 +200,7 @@ zig build ga-rl -- 16 15 8 2 1 500 100                  # population generations
 | `ai/solver/main.zig` | `zig build solve` の検証用ランナー |
 | `ai/solver/bench.zig` | solver のベンチマーク実行と集計 |
 | `ai/solver/parallel.zig` | ゲーム単位の並列実行 (決定性は seed ごとに保持) |
-| `ai/solver/ranking.zig` | `zig build ranking` (全ポリシー比較、JSON 出力) |
+| `ai/solver/ranking.zig` | `zig build ranking` (全ポリシー比較、policy 絞り込み、latency/throughput 付き JSON 出力) |
 | `ai/solver/nn.zig` | TD(0) で学習する小さな MLP 価値関数 |
 | `ai/solver/nn_main.zig` | `zig build nn` の学習・評価ランナー |
 | `ai/solver/ntuple.zig` | TD(0) で学習する n-tuple 価値関数 (パターン表) |
