@@ -563,6 +563,7 @@ Comparison with the committed weights (200,000 + 40,000 games), eval ranges 2000
 
 - Reading: +7,832 (+12.2%) for about 10x the time per move. Absolute cost is still under 1 ms per move and ~1,200 leaves per move, so it is affordable in the browser; expectimax depth 2, for comparison, needs 0.04-0.08 ms/move and scores ~22-25k.
 - Verdict: adopted as an extra policy (`nn2`); `nn` stays the default for speed, `nn2` is the quality option. `ranking.json` is regenerated separately once all pending policy changes land.
+- Canonical bench `zig build ranking -Doptimize=ReleaseFast -- 5 20 1000` after the policy landed: nn2 **71,611.4** (best tile 4096) > nn 65,409.9 > expectimax_tt 41,216.4 > mcts 29,722.0 > expectimax 25,266.8 > ga 24,046.1 > beam 12,695.9 > greedy 3,423.8 > random 1,061.5; `src/web/ranking.json` regenerated with these numbers.
 - Cost: 5 x 20 games, 63 s per range for nn2.
 
 ## Row-LUT board representation: no gain (#71)
