@@ -26,6 +26,15 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const ntuple_mod = b.addModule("ntuple", .{
+        .root_source_file = b.path("ai/solver/ntuple.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core", .module = core_mod },
+        },
+    });
+
     const solver_mod = b.addModule("solver", .{
         .root_source_file = b.path("ai/solver/solver.zig"),
         .target = target,
@@ -153,6 +162,33 @@ pub fn build(b: *std.Build) void {
     const nn_step = b.step("nn", "Train the value MLP (TD(0) self-play) and evaluate it against expectimax depth 2");
     nn_step.dependOn(&nn_cmd.step);
 
+    const ntuple_tests = b.addTest(.{ .root_module = ntuple_mod });
+    const run_ntuple_tests = b.addRunArtifact(ntuple_tests);
+
+    const ntuple_exe = b.addExecutable(.{
+        .name = "ntuple",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("ai/solver/ntuple_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "solver", .module = solver_mod },
+                .{ .name = "ntuple", .module = ntuple_mod },
+                .{ .name = "parallel", .module = parallel_mod },
+            },
+        }),
+    });
+    const ntuple_cmd = b.addRunArtifact(ntuple_exe);
+    ntuple_cmd.addPassthruArgs();
+    ntuple_cmd.step.dependOn(b.getInstallStep());
+
+    const ntuple_main_tests = b.addTest(.{ .root_module = ntuple_exe.root_module });
+    const run_ntuple_main_tests = b.addRunArtifact(ntuple_main_tests);
+
+    const ntuple_step = b.step("ntuple", "Train the n-tuple TD value function and evaluate it against expectimax depth 2");
+    ntuple_step.dependOn(&ntuple_cmd.step);
+
     const ga_exe = b.addExecutable(.{
         .name = "ga-rl",
         .root_module = b.createModule(.{
@@ -240,6 +276,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_bench_tests.step);
     test_step.dependOn(&run_nn_tests.step);
     test_step.dependOn(&run_nn_main_tests.step);
+    test_step.dependOn(&run_ntuple_tests.step);
+    test_step.dependOn(&run_ntuple_main_tests.step);
     test_step.dependOn(&run_parallel_tests.step);
     test_step.dependOn(&run_ga_tests.step);
 }

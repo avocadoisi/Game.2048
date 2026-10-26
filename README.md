@@ -96,7 +96,7 @@ zig build run -- help         # 使い方
 - `serve`: `http://127.0.0.1:8080/` を開くと矢印キー/WASD で遊べる (日本語 IME が有効なままでも操作できる)
   - `GET /api/state`, `POST /api/new`, `POST /api/move?dir=up|left|down|right`
   - `GET /api/ranking`: ポリシーの比較結果 (`src/web/ranking.json`) を返す
-  - `GET /api/solve?depth=N&algo=<policy>`: solver の次の一手を返す (盤面は変えない)。`algo` は `random` / `greedy` / `expectimax` (既定) / `mcts` / `beam` / `expectimax_tt` / `ga` / `nn`。`depth` の既定は 2。レスポンスは `{"algo","depth","dir","ranking"}` で、`dir` は合法手なしのとき `null`、`ranking` は `expectimax` / `greedy` のときだけ各手の評価が入り、それ以外は空配列
+  - `GET /api/solve?depth=N&algo=<policy>`: solver の次の一手を返す (盤面は変えない)。`algo` は `random` / `greedy` / `expectimax` (既定) / `mcts` / `beam` / `expectimax_tt` / `ga` / `nn` / `nn2`。`depth` の既定は 2。レスポンスは `{"algo","depth","dir","ranking"}` で、`dir` は合法手なしのとき `null`、`ranking` は `expectimax` / `greedy` のときだけ各手の評価が入り、それ以外は空配列
   - ブラウザの「Solver: 1 step」「Solver: auto」で solver が手を打つ様子を確認できる
   - 「speed」で auto の再生速度を選べる (600 / 300 / 150 / 50 ms / max = 待ち時間なし)。auto 中に変えると即座に反映される
   - 例: `curl -X POST "localhost:8080/api/move?dir=left"`
@@ -167,10 +167,11 @@ x3 は約 10,500、x10 は 19,275、x30 は 22,522 (採用)、x50 は 20,308、x
 ```bash
 zig build ranking -Doptimize=ReleaseFast -- 5 20 1000   # runs games/run seed (全ポリシーを同じ seed で比較、JSON 出力)
 zig build nn -Doptimize=ReleaseFast -- 0 100 2000 0.003 # train_games eval_games seed lr (train_games=0 は保存済み重みを読み込む)
+zig build ntuple -- 200 20 2000 0.01 base /tmp/t.bin 1  # train_games eval_games seed lr variant table_path train_seed
 zig build ga-rl -- 16 15 8 2 1 500 100                  # population generations games depth seed holdout_seed holdout_games
 ```
 
-`expectimax` 系に加えて、GA の重みを使う `ga` と TD 学習した MLP 価値関数の `nn` も選べる (`/api/solve?algo=ga` のように指定)。
+`expectimax` 系に加えて、GA の重みを使う `ga` と TD 学習した MLP 価値関数の `nn` (1-ply + 出現1回) / `nn2` (2-ply) も選べる (`/api/solve?algo=nn2` のように指定)。n-tuple は学習・評価用のランナーのみで、`algo` には未接続 (light 表 + 深さ2探索で seed 2000 の 20 ゲーム平均 25,760、expectimax 深さ2 の 21,840 を上回る。`docs/solver-history.md` の "n-tuple: deep search, light tables, resume (#73)")。
 
 ## ソース構成
 
@@ -191,6 +192,8 @@ zig build ga-rl -- 16 15 8 2 1 500 100                  # population generations
 | `ai/solver/ranking.zig` | `zig build ranking` (全ポリシー比較、JSON 出力) |
 | `ai/solver/nn.zig` | TD(0) で学習する小さな MLP 価値関数 |
 | `ai/solver/nn_main.zig` | `zig build nn` の学習・評価ランナー |
+| `ai/solver/ntuple.zig` | TD(0) で学習する n-tuple 価値関数 (パターン表) |
+| `ai/solver/ntuple_main.zig` | `zig build ntuple` の学習・評価ランナー |
 | `ai/solver/ga_rl.zig` | `zig build ga-rl` (GA による評価重みの進化) |
 | `docs/solver-history.md` | solver の試行錯誤・計測・却下した案の記録 |
 | `scripts/record-bench.sh` | ベンチマーク出力を `docs/solver-history.md` に追記するスクリプト |
@@ -200,7 +203,7 @@ zig build ga-rl -- 16 15 8 2 1 500 100                  # population generations
 
 1. ✅ `2048.core` の最小実装 + テスト基盤
 2. ✅ CLI でプレイ可能にする / ✅ ローカル HTTP サーバーで試せる
-3. ✅ solver AI の PoC (expectimax, 手作り評価関数) / ✅ 軽量かつ高スコアの方式 (TD 学習の MLP を `nn` ポリシーとして採用。ranking seed 1000 で 64,113 と 1 位) / ⬜ n-tuple などの検討
+3. ✅ solver AI の PoC (expectimax, 手作り評価関数) / ✅ 軽量かつ高スコアの方式 (TD 学習の MLP を `nn` ポリシーとして採用。ranking seed 1000 で 64,113 と 1 位) / ⬜ n-tuple の採用 (ランナーのみ実装済み #70。light 表 + 深さ2 探索で expectimax 深さ2 超えまで確認 #73、`algo` 接続は未着手)
 4. ✅ WASM ターゲット対応 (静的配信)
 
 ## このプロジェクトで大事にすること
