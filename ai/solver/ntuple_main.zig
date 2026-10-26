@@ -11,7 +11,9 @@ const usage =
     \\  eval_games    games per policy on the eval seed range (default 100)
     \\  eval_seed     first eval seed; game i uses eval_seed + i (default 1000)
     \\  learning_rate TD step for n-tuple tables (default 0.01)
-    \\  variant       base (greedy 1-ply self-play, fast) or chance (1 spawn lookahead, much slower)
+    \\  variant       base (greedy 1-ply) or chance (1 spawn lookahead); deep (2-ply) adds a
+    \\                second own move. light / lightdeep use only the 5 base 4-tuples.
+    \\                resume loads table_path first, then trains train_games more games.
     \\  table_path    file to load (train_games 0) or write (default ai/solver/ntuple_weights.bin)
     \\  train_seed    seed for self-play games (default 1)
     \\
@@ -32,6 +34,7 @@ const Eval = struct {
     avg_moves: f64 = 0,
     best_tile: core.Tile = 0,
     total_score: u64 = 0,
+    leaves: u64 = 0,
     elapsed_ns: i96 = 0,
 };
 
@@ -60,15 +63,12 @@ pub fn main(init: std.process.Init) !void {
     const eval_games: u32 = if (args.len > 2) try std.fmt.parseInt(u32, args[2], 10) else 100;
     const eval_seed: u64 = if (args.len > 3) try std.fmt.parseInt(u64, args[3], 10) else 1000;
     const learning_rate: f64 = if (args.len > 4) try std.fmt.parseFloat(f64, args[4]) else 0.01;
-    const variant = if (args.len > 5) args[5] else "base";
-    const mode: ntuple.Mode = if (std.mem.eql(u8, variant, "base"))
-        .greedy
-    else if (std.mem.eql(u8, variant, "chance"))
-        .chance
-    else {
+    const variant_name = if (args.len > 5) args[5] else "base";
+    const variant = ntuple.parseVariant(variant_name) orelse {
         std.debug.print("{s}", .{usage});
         return;
     };
+    const mode = variant.mode;
     const table_path = if (args.len > 6) args[6] else default_table_path;
     const train_seed = try parseTrainSeed(args);
     if (args.len > 8 or eval_games == 0) {
@@ -76,10 +76,16 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var net = try ntuple.TupleNet.init(init.gpa);
+    var net = try ntuple.TupleNet.initWith(init.gpa, variant.set);
     defer net.deinit(init.gpa);
+    std.debug.print("table: variant={s} patterns={d} entries={d} raw={d:.1} MiB\n", .{
+        variant_name,
+        net.count,
+        net.storage.len,
+        @as(f64, @floatFromInt(net.storage.len * @sizeOf(f32))) / (1024 * 1024),
+    });
 
-    if (train_games == 0) {
+    if (train_games == 0 or variant.resume_from_file) {
         try ntuple.load(&net, init.io, init.gpa, table_path);
         std.debug.print("loaded {s}\n", .{table_path});
     } else {
@@ -104,7 +110,7 @@ pub fn main(init: std.process.Init) !void {
             @as(f64, @floatFromInt(elapsed)) / 1e9,
             learning_rate,
             train_seed,
-            variant,
+            variant_name,
         });
         try ntuple.save(&net, init.io, init.gpa, table_path);
     }
@@ -112,6 +118,7 @@ pub fn main(init: std.process.Init) !void {
     var results = [_]Eval{
         .{ .name = "ntuple 1-ply" },
         .{ .name = "ntuple + 1 spawn lookahead" },
+        .{ .name = "ntuple depth 2" },
         .{ .name = "expectimax depth 2" },
     };
     const seed_ranges: u32 = 1;
@@ -123,6 +130,7 @@ pub fn main(init: std.process.Init) !void {
             return switch (c.policy) {
                 0 => ntuple.play(c.net, prng.random(), .greedy),
                 1 => ntuple.play(c.net, prng.random(), .chance),
+                2 => ntuple.play(c.net, prng.random(), .deep),
                 else => blk: {
                     const b = solver.playPolicy(prng.random(), .expectimax, 2);
                     break :blk ntuple.PlayResult{ .score = b.score, .max_tile = b.max_tile, .moves = b.moves };
@@ -141,6 +149,7 @@ pub fn main(init: std.process.Init) !void {
             for (res_all[range * eval_games ..][0..eval_games]) |res| {
                 total_score += res.score;
                 r.total_score += res.score;
+                r.leaves += res.leaves;
                 total_moves += res.moves;
                 r.best_tile = @max(r.best_tile, res.max_tile);
             }
@@ -153,7 +162,10 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("eval: games={d}/range ranges={d} seeds={d}..{d}\n", .{ eval_games, seed_ranges, eval_seed, last_seed });
     for (results) |r| {
         const st = meanStderr(r.range_scores);
-        std.debug.print("{s}: avg score={d:.1} ± {d:.1} (stderr over {d} ranges) avg moves={d:.1} best tile={d} elapsed={d:.1} s score/s={d:.1}\n", .{
+        const total_moves = r.avg_moves * @as(f64, @floatFromInt(games));
+        const ms_per_move = @as(f64, @floatFromInt(r.elapsed_ns)) / 1e6 / @max(total_moves, 1);
+        const leaves_per_move = @as(f64, @floatFromInt(r.leaves)) / @max(total_moves, 1);
+        std.debug.print("{s}: avg score={d:.1} ± {d:.1} (stderr over {d} ranges) avg moves={d:.1} best tile={d} elapsed={d:.1} s score/s={d:.1} leaves={d} leaves/move={d:.1} ms/move={d:.2}\n", .{
             r.name,
             st.mean,
             st.stderr,
@@ -162,6 +174,9 @@ pub fn main(init: std.process.Init) !void {
             r.best_tile,
             @as(f64, @floatFromInt(r.elapsed_ns)) / 1e9,
             scorePerSecond(@floatFromInt(r.total_score), r.elapsed_ns),
+            r.leaves,
+            leaves_per_move,
+            ms_per_move,
         });
     }
 }
@@ -178,4 +193,6 @@ test "train seed argument is optional and defaults to 1" {
 test "usage text lists both variants" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "base (greedy") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "chance (1 spawn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "lightdeep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "resume") != null);
 }
