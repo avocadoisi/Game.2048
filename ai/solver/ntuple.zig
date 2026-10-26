@@ -238,6 +238,8 @@ pub fn save(net: *const TupleNet, io: std.Io, gpa: std.mem.Allocator, path: []co
 pub fn load(net: *TupleNet, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(fileLen(pattern_count) + 1));
     defer gpa.free(bytes);
+    // A table from the other `Set` has a different length; refuse it instead of overrunning.
+    if (bytes.len != fileLen(net.count)) return error.TableSizeMismatch;
     var parsed = try parse(gpa, bytes);
     defer parsed.deinit(gpa);
     @memcpy(net.storage, parsed.storage);
@@ -262,6 +264,7 @@ pub fn parseVariant(name: []const u8) ?Variant {
     if (std.mem.eql(u8, name, "light")) return .{ .set = .light };
     if (std.mem.eql(u8, name, "lightdeep")) return .{ .mode = .deep, .set = .light };
     if (std.mem.eql(u8, name, "resume")) return .{ .resume_from_file = true };
+    if (std.mem.eql(u8, name, "lightresume")) return .{ .resume_from_file = true, .set = .light };
     return null;
 }
 
@@ -682,5 +685,8 @@ test "variant names select the mode, the table set and resume" {
     try std.testing.expectEqual(Mode.deep, lightdeep.mode);
     try std.testing.expectEqual(Set.light, lightdeep.set);
     try std.testing.expect(parseVariant("resume").?.resume_from_file);
-    try std.testing.expectEqual(@as(?Variant, null), parseVariant("lightresume"));
+    const lightresume = parseVariant("lightresume").?;
+    try std.testing.expect(lightresume.resume_from_file);
+    try std.testing.expectEqual(Set.light, lightresume.set);
+    try std.testing.expectEqual(@as(?Variant, null), parseVariant("lightresumex"));
 }
