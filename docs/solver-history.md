@@ -729,3 +729,68 @@ real 11.97
 user 11.89
 sys 0.13
 ```
+
+## NN weights parsed once per thread, not once per move (#87)
+
+`choose` re-parsed the embedded ~148 KB weight block into a `Net` value on every move of every NN policy (one shared copy per move since the wasm-stack fix). Now a `threadlocal` cache parses the weights once per thread and every move passes a `*const Net` by reference, so parallel ranking / HTTP / WASM each keep one copy per thread with no shared mutable state. The `parse_count` seam in `nn.zig` pins the behaviour in a test (a fixed-seed nn/nn2 game parses exactly once), and the golden tests pin the move sequences.
+
+Correctness: same seed 1000 / 5 games give identical scores and move counts before and after (nn2 71,880.0 / 3,267.2, nn 69,640.8 / 3,151.2, nnbeam 21,096.8 / 1,143.8, nnmcts 12,864.8 / 763.4); `zig build test` and the wasm smoke (11 policies, 10 applied moves) pass on the rebased branch.
+
+Timing (`ranking`, ReleaseFast, `latency_ms_per_move` from the #89 instrument):
+
+| policy | before (b389ba5) | after | delta |
+|---|---|---|---|
+| nn2 | 1.8864 | 1.8658 | -1.1% |
+| nn | 0.1995 | 0.1955 | -2.0% |
+| nnbeam | 0.1233 | 0.1197 | -2.9% |
+| nnmcts | 2.5574 | 2.5930 | +1.4% (noise) |
+
+(seed 1000, 5 games.) A second pair at seed 2000 / 10 games reproduces the direction: nn 0.1961 -> 0.1947 (-0.7%), nnbeam 0.1210 -> 0.1190 (-1.7%). Same-code repeat runs span nn 0.1902-0.1947 and nnbeam 0.1175-0.1190, so every before run sits above every after run for nn and nnbeam: the 1-3% gain is small but outside the run-to-run noise band. nn2's -1.1% is inside the band and nnmcts is flat.
+
+- Reading: the removed work is one 148 KB `Net` copy per move; against nn/nnbeam's 0.1-0.2 ms/move that is the visible 1-3%. For nn2 the 2-ply search dominates and hides it. The copy also lived in `choose`'s frame, the last wasm-stack footprint of the NN arms (per-arm copies used to overflow the wasm stack).
+- Verdict: adopted. Behaviour is byte-identical, the gain is small but consistent for the fast policies, and the change is the enabling step for reusing the parsed net inside a search.
+- Limits: one machine; one A/B pair per seed plus the repeats above; `latency_ms_per_move` is the serial per-move cost from the #89 instrument. `src/web/ranking.json` untouched.
+
+## Bench run 2026-10-27 01:26:14 +0900
+
+- command: `zig build ranking -Doptimize=ReleaseFast -- 1 5 1000 nn,nn2,nnmcts,nnbeam`
+- commit: b389ba5
+- date: 2026-10-27 01:26:14 +0900
+- exit: 0
+
+```text
+{"seed":1000,"runs":1,"games_per_run":5,"entries":[{"policy":"nn2","depth":2,"games":5,"avg_score":71880.0,"avg_moves":3267.2,"best_tile":4096,"latency_ms_per_move":1.8864,"games_per_sec":0.16,"description":"TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）"},{"policy":"nn","depth":0,"games":5,"avg_score":69640.8,"avg_moves":3151.2,"best_tile":4096,"latency_ms_per_move":0.1995,"games_per_sec":1.59,"description":"TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）"},{"policy":"nnbeam","depth":0,"games":5,"avg_score":21096.8,"avg_moves":1143.8,"best_tile":2048,"latency_ms_per_move":0.1233,"games_per_sec":7.09,"description":"NNの盤面価値を葉にしたビーム探索。幅8・3手先で、ply間のspawnを2回サンプリングする（固定seedで再現）"},{"policy":"nnmcts","depth":0,"games":5,"avg_score":12864.8,"avg_moves":763.4,"best_tile":1024,"latency_ms_per_move":2.5574,"games_per_sec":0.51,"description":"UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）"}]}
+```
+
+## Bench run 2026-10-27 01:25:05 +0900
+
+- command: `zig build ranking -Doptimize=ReleaseFast -- 1 5 1000 nn,nn2,nnmcts,nnbeam`
+- commit: 1380349
+- date: 2026-10-27 01:25:05 +0900
+- exit: 0
+
+```text
+{"seed":1000,"runs":1,"games_per_run":5,"entries":[{"policy":"nn2","depth":2,"games":5,"avg_score":71880.0,"avg_moves":3267.2,"best_tile":4096,"latency_ms_per_move":1.8658,"games_per_sec":0.16,"description":"TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）"},{"policy":"nn","depth":0,"games":5,"avg_score":69640.8,"avg_moves":3151.2,"best_tile":4096,"latency_ms_per_move":0.1955,"games_per_sec":1.62,"description":"TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）"},{"policy":"nnbeam","depth":0,"games":5,"avg_score":21096.8,"avg_moves":1143.8,"best_tile":2048,"latency_ms_per_move":0.1197,"games_per_sec":7.31,"description":"NNの盤面価値を葉にしたビーム探索。幅8・3手先で、ply間のspawnを2回サンプリングする（固定seedで再現）"},{"policy":"nnmcts","depth":0,"games":5,"avg_score":12864.8,"avg_moves":763.4,"best_tile":1024,"latency_ms_per_move":2.5930,"games_per_sec":0.51,"description":"UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）"}]}
+```
+
+## Bench run 2026-10-27 01:28:19 +0900
+
+- command: `zig build ranking -Doptimize=ReleaseFast -- 1 10 2000 nn,nnbeam`
+- commit: b389ba5
+- date: 2026-10-27 01:28:19 +0900
+- exit: 0
+
+```text
+{"seed":2000,"runs":1,"games_per_run":10,"entries":[{"policy":"nn","depth":0,"games":10,"avg_score":66471.2,"avg_moves":3016.5,"best_tile":4096,"latency_ms_per_move":0.1961,"games_per_sec":1.69,"description":"TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）"},{"policy":"nnbeam","depth":0,"games":10,"avg_score":25959.2,"avg_moves":1337.3,"best_tile":4096,"latency_ms_per_move":0.1210,"games_per_sec":6.18,"description":"NNの盤面価値を葉にしたビーム探索。幅8・3手先で、ply間のspawnを2回サンプリングする（固定seedで再現）"}]}
+```
+
+## Bench run 2026-10-27 01:28:27 +0900
+
+- command: `zig build ranking -Doptimize=ReleaseFast -- 1 10 2000 nn,nnbeam`
+- commit: 1380349
+- date: 2026-10-27 01:28:27 +0900
+- exit: 0
+
+```text
+{"seed":2000,"runs":1,"games_per_run":10,"entries":[{"policy":"nn","depth":0,"games":10,"avg_score":66471.2,"avg_moves":3016.5,"best_tile":4096,"latency_ms_per_move":0.1947,"games_per_sec":1.70,"description":"TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）"},{"policy":"nnbeam","depth":0,"games":10,"avg_score":25959.2,"avg_moves":1337.3,"best_tile":4096,"latency_ms_per_move":0.1190,"games_per_sec":6.28,"description":"NNの盤面価値を葉にしたビーム探索。幅8・3手先で、ply間のspawnを2回サンプリングする（固定seedで再現）"}]}
+```

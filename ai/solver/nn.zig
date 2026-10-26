@@ -807,7 +807,12 @@ pub fn encode(net: *const Net) [file_len]u8 {
     return out;
 }
 
+/// Diagnostic: how many times `parse` ran on this thread (issue #87 tests assert weights are
+/// parsed once per thread, not once per move).
+pub threadlocal var parse_count: usize = 0;
+
 pub fn parse(bytes: []const u8) !Net {
+    parse_count += 1;
     if (bytes.len != file_len) return error.WrongWeightFileSize;
     if (!std.mem.eql(u8, bytes[0..8], file_magic)) return error.BadWeightMagic;
     if (std.mem.readInt(u32, bytes[8..12], .little) != file_version) return error.UnsupportedWeightVersion;

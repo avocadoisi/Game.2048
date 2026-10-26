@@ -81,6 +81,17 @@ pub const ga_weights: Weights = .{ .empty = 7.028, .order_penalty = 43.174, .mer
 /// Trained value net (`zig build nn`), embedded at build time.
 const nn_weight_bytes = @embedFile("nn_weights.bin");
 
+/// The embedded net parsed once per thread (issue #87). Every move passes this `*const Net` by
+/// reference instead of re-parsing the ~148 KB weight block, so parallel ranking / HTTP / WASM each
+/// keep their own copy with no shared mutable state.
+threadlocal var cached_net: ?nn.Net = null;
+
+/// Per-thread net, parsed from the embedded weights on first use and reused for every later move.
+fn nnNet() *const nn.Net {
+    if (cached_net == null) cached_net = nn.parse(nn_weight_bytes) catch unreachable;
+    return &cached_net.?;
+}
+
 /// Next move for a policy; null when no move changes the board.
 pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Direction {
     switch (policy) {
@@ -106,17 +117,16 @@ pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Dir
         .beam => return beamMove(state),
         .expectimax_tt => return bestMoveTT(state, 3),
         .ga => return bestMoveW(state, depth, ga_weights),
-        // shortcut: one 148 KB net copy per move for all four NN policies; keep a static copy if
-        // this shows up in profiles. Separate copies per arm overflowed the wasm stack.
+        // The net is parsed once per thread and reused by reference (issue #87), never copied per move.
         .nn, .nn2, .nnmcts, .nnbeam => {
-            const net = nn.parse(nn_weight_bytes) catch unreachable;
+            const net = nnNet();
             return switch (policy) {
-                .nn => nn.bestMove(&net, state, .chance),
+                .nn => nn.bestMove(net, state, .chance),
                 // the 2-ply search itself dominates the cost.
-                .nn2 => nn.bestMove(&net, state, .deep),
-                .nnmcts => nnmctsMove(&net, state, rng),
+                .nn2 => nn.bestMove(net, state, .deep),
+                .nnmcts => nnmctsMove(net, state, rng),
                 // the sampled beam stays below nn2's leaf count.
-                .nnbeam => if (nnBeamBest(&net, state, rng)) |best| best.first_move else null,
+                .nnbeam => if (nnBeamBest(net, state, rng)) |best| best.first_move else null,
                 else => unreachable,
             };
         },
@@ -983,4 +993,58 @@ test "playGame finishes a game and reports its result" {
     const result = playGame(prng.random(), 1);
     try std.testing.expect(result.moves > 0);
     try std.testing.expect(result.max_tile >= 2);
+}
+
+/// Golden fingerprint of a full game's move sequence and outcome (issue #87 regression guard).
+const Golden = struct { score: u32, max_tile: core.Tile, moves: u32, checksum: u64 };
+
+/// Play one full game with `policy` on `seed`, returning its outcome plus an FNV-1a checksum of
+/// the move sequence so any change to the picked moves shows up in the result.
+fn goldenPlay(policy: Policy, seed: u64, depth: u8) Golden {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+    var state = GameState.gameStart(rng);
+    var checksum: u64 = 0xcbf29ce484222325;
+    var moves: u32 = 0;
+    while (choose(policy, state, rng, depth)) |d| {
+        checksum = (checksum ^ @intFromEnum(d)) *% 0x100000001b3;
+        _ = state.move(d, rng);
+        moves += 1;
+    }
+    var max_tile: core.Tile = 0;
+    for (state.board) |row| for (row) |value| {
+        max_tile = @max(max_tile, value);
+    };
+    return .{ .score = state.score, .max_tile = max_tile, .moves = moves, .checksum = checksum };
+}
+
+test "nn policy reproduces the same move sequence and score on a fixed seed" {
+    const g = goldenPlay(.nn, 20240601, 0);
+    try std.testing.expectEqual(@as(u32, 70364), g.score);
+    try std.testing.expectEqual(@as(core.Tile, 4096), g.max_tile);
+    try std.testing.expectEqual(@as(u32, 3176), g.moves);
+    try std.testing.expectEqual(@as(u64, 16210708713020604363), g.checksum);
+}
+
+test "nn2 policy reproduces the same move sequence and score on a fixed seed" {
+    const g = goldenPlay(.nn2, 20240601, 0);
+    try std.testing.expectEqual(@as(u32, 73964), g.score);
+    try std.testing.expectEqual(@as(core.Tile, 4096), g.max_tile);
+    try std.testing.expectEqual(@as(u32, 3320), g.moves);
+    try std.testing.expectEqual(@as(u64, 14931741200977583578), g.checksum);
+}
+
+test "nn policy parses the weights once per thread, not once per move" {
+    var prng = std.Random.DefaultPrng.init(7);
+    const rng = prng.random();
+    var state = GameState.gameStart(rng);
+    const before = nn.parse_count;
+    var moves: usize = 0;
+    while (moves < 32) : (moves += 1) {
+        const d = choose(.nn, state, rng, 0) orelse break;
+        _ = state.move(d, rng);
+    }
+    try std.testing.expectEqual(@as(usize, 32), moves);
+    // the ~148 KB net is parsed at most once for the whole game, then reused by reference
+    try std.testing.expect(nn.parse_count - before <= 1);
 }
