@@ -234,10 +234,21 @@ fn leafValue(net: *const Net, board: Board, stats: *Stats) f64 {
     return forward(net, board, &cache);
 }
 
+/// Per-thread cache reused across moves (issue #88). A value is a pure function of the board and
+/// the net, so a warm cache can only change speed, never the chosen move; there is no shared
+/// mutable state because each thread keeps its own workspace.
+threadlocal var move_cache: ValueCache = .{};
+
+/// The calling thread's reusable cache, e.g. for policies that keep their own search loops.
+pub fn sharedValueCache() *ValueCache {
+    return &move_cache;
+}
+
 /// Depth-limited expectimax: our moves and every spawn (2 at 0.9, 4 at 0.1) exactly, no RNG.
+/// The caller owns the value cache so a game can reuse one workspace for all of its moves.
 const Search = struct {
     net: *const Net,
-    cache: ValueCache = .{},
+    cache: *ValueCache,
     stats: Stats = .{},
 
     /// Max over legal moves of reward + expected value after the spawn; 0 when no move changes the board.
@@ -274,8 +285,8 @@ const Search = struct {
 };
 
 /// 2-ply: my move -> spawn -> my move -> spawn -> afterstate value + score_delta/reward_scale.
-fn deepMove(net: *const Net, state: GameState, stats: *Stats) ?Direction {
-    var search: Search = .{ .net = net };
+fn deepMove(net: *const Net, state: GameState, stats: *Stats, cache: *ValueCache) ?Direction {
+    var search: Search = .{ .net = net, .cache = cache };
     defer stats.* = search.stats;
     var best: ?Direction = null;
     var best_value: f64 = -std.math.inf(f64);
@@ -303,15 +314,23 @@ pub const Mode = enum {
 
 pub fn bestMove(net: *const Net, state: GameState, mode: Mode) ?Direction {
     var stats: Stats = .{};
-    return bestMoveWithStats(net, state, mode, &stats);
+    return bestMoveWithCache(net, state, mode, &stats, sharedValueCache());
 }
 
 /// `bestMove` plus search counters (leaves = `forward` evaluations, hits = value-cache reuse).
+/// Uses a fresh cache per call, so the counters describe exactly this search.
 pub fn bestMoveWithStats(net: *const Net, state: GameState, mode: Mode, stats: *Stats) ?Direction {
+    var cache: ValueCache = .{};
+    return bestMoveWithCache(net, state, mode, stats, &cache);
+}
+
+/// `bestMoveWithStats` with a caller-owned cache: reuse it across moves (issue #88) for speed.
+/// A warm cache returns the same moves as a fresh one — only faster.
+pub fn bestMoveWithCache(net: *const Net, state: GameState, mode: Mode, stats: *Stats, cache: *ValueCache) ?Direction {
     return switch (mode) {
         .greedy => if (pickMove(net, state)) |p| p.dir else null,
         .chance => chanceMove(net, state),
-        .deep => deepMove(net, state, stats),
+        .deep => deepMove(net, state, stats, cache),
     };
 }
 
@@ -333,9 +352,10 @@ pub fn playWithStats(net: *const Net, rng: std.Random, mode: Mode, stats: *Stats
     var state = GameState.gameStart(rng);
     var moves: u32 = 0;
     var move_stats: Stats = .{};
+    var cache: ValueCache = .{}; // one workspace for the whole game (issue #88)
     while (true) {
         move_stats = .{};
-        const dir = bestMoveWithStats(net, state, mode, &move_stats) orelse break;
+        const dir = bestMoveWithCache(net, state, mode, &move_stats, &cache) orelse break;
         stats.leaves += move_stats.leaves;
         stats.hits += move_stats.hits;
         _ = state.move(dir, rng);
@@ -1029,6 +1049,75 @@ test "value cache returns the forward value and counts leaf evaluations" {
     try std.testing.expectEqual(plain, cache.get(&net, sample_board, &stats));
     try std.testing.expectEqual(@as(u64, 1), stats.leaves);
     try std.testing.expectEqual(@as(u64, 1), stats.hits);
+}
+
+test "reused value cache returns the same moves as a fresh cache (#88)" {
+    var prng = std.Random.DefaultPrng.init(6);
+    const net = Net.init(prng.random());
+    var warm: ValueCache = .{};
+    var play_rng = std.Random.DefaultPrng.init(2048);
+    const rng = play_rng.random();
+    var state = GameState.gameStart(rng);
+    for (0..30) |_| {
+        var fresh: ValueCache = .{};
+        var warm_stats: Stats = .{};
+        var fresh_stats: Stats = .{};
+        const fresh_move = bestMoveWithCache(&net, state, .deep, &fresh_stats, &fresh);
+        const warm_move = bestMoveWithCache(&net, state, .deep, &warm_stats, &warm);
+        try std.testing.expectEqual(fresh_move, warm_move);
+        const dir = warm_move orelse break;
+        _ = state.move(dir, rng);
+    }
+    // a repeated search on one board is mostly served from the warm workspace (the few
+    // recomputes are the entries a slot collision evicted inside the first search)
+    var once: Stats = .{};
+    const once_move = bestMoveWithCache(&net, mid_board, .deep, &once, &warm);
+    var twice: Stats = .{};
+    const twice_move = bestMoveWithCache(&net, mid_board, .deep, &twice, &warm);
+    try std.testing.expectEqual(once_move, twice_move);
+    try std.testing.expect(once.leaves > 0);
+    try std.testing.expect(twice.hits > 0);
+    try std.testing.expect(twice.leaves < once.leaves);
+}
+
+test "value cache slot collision drops the entry, never returns a wrong value (#88)" {
+    var prng = std.Random.DefaultPrng.init(8);
+    const net = Net.init(prng.random());
+    // deterministic pair of distinct boards (valid power-of-two tiles) sharing one cache slot
+    var boards: [512]Board = undefined;
+    for (&boards, 0..) |*board, i| {
+        board.* = @splat(@splat(0));
+        board.*[0][0] = std.math.shl(core.Tile, 1, 1 + i % 15);
+        board.*[0][1] = std.math.shl(core.Tile, 1, 1 + (i / 15) % 15);
+        board.*[3][3] = std.math.shl(core.Tile, 1, 1 + (i / 225) % 15);
+    }
+    var pair: ?[2]Board = null;
+    search: for (0..boards.len) |i| {
+        for (i + 1..boards.len) |j| {
+            const ka = ValueCache.keyOf(boards[i]);
+            const kb = ValueCache.keyOf(boards[j]);
+            if (ka != kb and (ka & (ValueCache.capacity - 1)) == (kb & (ValueCache.capacity - 1))) {
+                pair = .{ boards[i], boards[j] };
+                break :search;
+            }
+        }
+    }
+    try std.testing.expect(pair != null);
+    const a_board = pair.?[0];
+    const b_board = pair.?[1];
+    var cache: ValueCache = .{};
+    var stats: Stats = .{};
+    var scratch: Cache = .{};
+    const va = forward(&net, a_board, &scratch);
+    const vb = forward(&net, b_board, &scratch);
+    try std.testing.expectEqual(va, cache.get(&net, a_board, &stats));
+    try std.testing.expectEqual(@as(u64, 1), stats.leaves);
+    // the colliding slot must be treated as a miss: a fresh evaluation, never board a's value
+    try std.testing.expectEqual(vb, cache.get(&net, b_board, &stats));
+    try std.testing.expectEqual(@as(u64, 2), stats.leaves);
+    // board a's entry was dropped by the collision and is recomputed correctly
+    try std.testing.expectEqual(va, cache.get(&net, a_board, &stats));
+    try std.testing.expectEqual(@as(u64, 3), stats.leaves);
 }
 
 test "trainGame is deterministic for a fixed seed" {

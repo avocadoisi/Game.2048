@@ -182,14 +182,14 @@ fn nnmctsMove(net: *const nn.Net, state: GameState, rng: std.Random) ?Direction 
     }
     if (arm_count == 0) return null;
 
-    var cache: nn.ValueCache = .{};
+    const cache = nn.sharedValueCache(); // reused across moves (issue #88)
     var stats: nn.Stats = .{};
     for (0..nnmcts_simulations) |simulation| {
         const selected = selectArm(arms[0..arm_count], simulation);
         var rollout = state;
         const moved = rollout.move(arms[selected].dir, rng);
         arms[selected].visits += 1;
-        arms[selected].reward += nnmctsRollout(net, &cache, &stats, rollout, moved.score_delta, rng);
+        arms[selected].reward += nnmctsRollout(net, cache, &stats, rollout, moved.score_delta, rng);
     }
     return bestArm(arms[0..arm_count]).dir;
 }
@@ -461,15 +461,30 @@ const TTEntry = struct {
 };
 
 fn bestMoveTT(state: GameState, depth: u8) ?Direction {
-    var table: [tt_entry_count]TTEntry = undefined;
-    for (&table) |*entry| entry.valid = false;
+    return bestMoveTTWith(state, depth, ttWorkspace());
+}
 
+/// Per-thread table reused across moves and games (issue #88). An entry is only returned on a
+/// full board + depth + kind match, so stale entries are misses at worst, never wrong values;
+/// no shared mutable state because each thread keeps its own table.
+threadlocal var tt_workspace: [tt_entry_count]TTEntry = undefined;
+threadlocal var tt_workspace_ready: bool = false;
+
+fn ttWorkspace() *[tt_entry_count]TTEntry {
+    if (!tt_workspace_ready) {
+        for (&tt_workspace) |*entry| entry.valid = false;
+        tt_workspace_ready = true;
+    }
+    return &tt_workspace;
+}
+
+fn bestMoveTTWith(state: GameState, depth: u8, table: *[tt_entry_count]TTEntry) ?Direction {
     var best: ?Direction = null;
     var best_value = lost_score;
     for ([_]Direction{ .up, .left, .down, .right }) |d| {
         var next = state;
         if (!next.slide(d).changed) continue;
-        const value = chanceValueTT(next, depth, &table);
+        const value = chanceValueTT(next, depth, table);
         if (best == null or value > best_value) {
             best = d;
             best_value = value;
@@ -849,6 +864,61 @@ test "expectimax TT depth 3 matches bestMove on random-play boards" {
         }
         try std.testing.expectEqual(bestMove(state, 3), choose(.expectimax_tt, state, rng, 0));
     }
+}
+
+test "reused TT returns the same moves as a fresh table across games (#88)" {
+    const warm = ttWorkspace();
+    try std.testing.expectEqual(warm, ttWorkspace()); // one workspace per thread, reused
+    for ([_]u64{ 100, 200 }) |seed| {
+        var rng_a = std.Random.DefaultPrng.init(seed);
+        var rng_b = std.Random.DefaultPrng.init(seed);
+        var state_a = GameState.gameStart(rng_a.random());
+        var state_b = GameState.gameStart(rng_b.random());
+        for (0..40) |_| {
+            var fresh: [tt_entry_count]TTEntry = undefined;
+            for (&fresh) |*entry| entry.valid = false;
+            const fresh_move = bestMoveTTWith(state_b, 3, &fresh);
+            const warm_move = bestMoveTTWith(state_a, 3, warm);
+            try std.testing.expectEqual(fresh_move, warm_move);
+            const dir = warm_move orelse break;
+            _ = state_a.move(dir, rng_a.random());
+            _ = state_b.move(dir, rng_b.random());
+        }
+    }
+}
+
+test "TT slot collision drops the entry, never returns a wrong value (#88)" {
+    var table: [tt_entry_count]TTEntry = undefined;
+    for (&table) |*entry| entry.valid = false;
+    // deterministic pair of distinct boards (valid power-of-two tiles) sharing one slot
+    var boards: [512]Board = undefined;
+    for (&boards, 0..) |*board, i| {
+        board.* = @splat(@splat(0));
+        board.*[0][0] = std.math.shl(core.Tile, 1, 1 + i % 15);
+        board.*[0][1] = std.math.shl(core.Tile, 1, 1 + (i / 15) % 15);
+        board.*[3][3] = std.math.shl(core.Tile, 1, 1 + (i / 225) % 15);
+    }
+    var pair: ?[2]Board = null;
+    search: for (0..boards.len) |i| {
+        for (i + 1..boards.len) |j| {
+            if (ttSlot(boards[i], 3, .max) == ttSlot(boards[j], 3, .max) and
+                !std.meta.eql(boards[i], boards[j]))
+            {
+                pair = .{ boards[i], boards[j] };
+                break :search;
+            }
+        }
+    }
+    try std.testing.expect(pair != null);
+    const a_board = pair.?[0];
+    const b_board = pair.?[1];
+    ttPut(a_board, 3, .max, 42, &table);
+    try std.testing.expectEqual(@as(?f64, 42), ttGet(a_board, 3, .max, &table));
+    try std.testing.expectEqual(@as(?f64, null), ttGet(b_board, 3, .max, &table));
+    ttPut(b_board, 3, .max, 7, &table);
+    try std.testing.expectEqual(@as(?f64, 7), ttGet(b_board, 3, .max, &table));
+    // board a's entry was dropped by the collision and must never be reported for either board
+    try std.testing.expectEqual(@as(?f64, null), ttGet(a_board, 3, .max, &table));
 }
 
 test "random policy only picks legal moves" {
