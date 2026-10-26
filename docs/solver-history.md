@@ -601,6 +601,7 @@ Measured, 20 games per policy on eval seed 2000, ReleaseFast:
 | expectimax depth 2 (no table) | — | — | 21,840 | 0.02 |
 
 - Reading: greedy self-play training is cheap (500k games in 124 s, 202M moves), but a 1-ply table stays weak (7,134). Almost all of the strength comes from search depth: the same table jumps to 17,987 with one spawn and to 25,760 with a second own move, i.e. depth-2 n-tuple already beats expectimax depth 2 while still running at 0.24 ms/move (~4.6k leaves/move). Search, not more table entries, is where the gain is.
+- Against the MLP on the same protocol (eval seed 2000, 20 games): `nn` 64,052, `nn2` 72,220, depth-2 n-tuple 25,760 — roughly 2.5x below `nn`, so the n-tuple table is not a replacement for the learned MLP value function; it stays an experiment/runner (and a possible cheap browser-side fallback if the 1.3 MiB table ever matters more than strength).
 - Verdict: adopted as the experiments' new best non-MLP option; `light` + `deep` is the default sweep configuration from here (1.3 MiB table, evaluable in seconds). Not wired into `algo` yet: `ranking.json` regeneration and a `Policy.nntuple` connection are separate follow-ups.
 - Cost: 500k-game training 124 s + depth-2 eval 6.5 s per 20 games.
 
