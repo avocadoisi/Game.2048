@@ -16,11 +16,14 @@ const beam_horizon = 3;
 pub const Weights = struct {
     empty: f64 = 10,
     order_penalty: f64 = 30,
+    /// order penalty once the board's largest tile reaches 4096 (endgame phase, issue #92).
+    /// Default equals `order_penalty`, so shipped weights behave the same in both phases.
+    order_penalty_late: f64 = 30,
     merge: f64 = 10,
     /// extra penalty when only `down` is legal (the top-left anchor breaks)
     forced_down: f64 = 100,
 };
-pub const baseline: Weights = .{};
+pub const baseline: Weights = .{ .order_penalty = 43.174, .order_penalty_late = 25 };
 
 pub const Algorithm = enum { expectimax, greedy };
 
@@ -77,7 +80,7 @@ pub fn bestMoveW(state: GameState, depth: u8, w: Weights) ?Direction {
 pub const Policy = enum { random, greedy, expectimax, mcts, beam, expectimax_tt, ga, nn, nn2, nnmcts, nnbeam };
 
 /// Weights evolved by `zig build ga-rl` (holdout +4%, see docs/solver-history.md). 3 decimals as printed.
-pub const ga_weights: Weights = .{ .empty = 7.028, .order_penalty = 43.174, .merge = 0, .forced_down = 0 };
+pub const ga_weights: Weights = .{ .empty = 7.028, .order_penalty = 43.174, .order_penalty_late = 43.174, .merge = 0, .forced_down = 0 };
 /// Trained value net (`zig build nn`), embedded at build time.
 const nn_weight_bytes = @embedFile("nn_weights.bin");
 
@@ -574,6 +577,7 @@ pub fn evaluateW(board: Board, w: Weights) f64 {
     var empties: f64 = 0;
     var penalty: f64 = 0;
     var prev: ?f64 = null;
+    var max_level: f64 = 0;
     for (order) |p| {
         const value = board[p.row][p.col];
         if (value == 0) {
@@ -583,8 +587,11 @@ pub fn evaluateW(board: Board, w: Weights) f64 {
         const level: f64 = @floatFromInt(@ctz(value));
         if (prev) |before| penalty += @max(0, level - before);
         prev = level;
+        max_level = @max(max_level, level);
     }
-    return empties * w.empty - penalty * w.order_penalty + mergePairs(board) * w.merge;
+    // endgame phase once the largest tile reaches 4096 = 2^12 (issue #92)
+    const order_penalty = if (max_level >= 12) w.order_penalty_late else w.order_penalty;
+    return empties * w.empty - penalty * order_penalty + mergePairs(board) * w.merge;
 }
 
 /// Count of horizontally or vertically adjacent equal non-empty tiles: more merges available.
@@ -663,14 +670,14 @@ fn chanceValueW(state: GameState, depth: u8, w: Weights) f64 {
 }
 
 test "baseline weights reproduce evaluate on a hand-computed board" {
-    // 12 empty cells x10, level steps 1->2->3->4 (three x30 penalties), no equal neighbours
+    // 12 empty cells x10, level steps 1->2->3->4 (three x43.174 penalties), no equal neighbours
     const sorted: Board = .{
         .{ 2, 4, 8, 16 },
         .{ 0, 0, 0, 0 },
         .{ 0, 0, 0, 0 },
         .{ 0, 0, 0, 0 },
     };
-    try std.testing.expectEqual(@as(f64, 30), evaluate(sorted));
+    try std.testing.expectApproxEqAbs(@as(f64, 120 - 3 * 43.174), evaluate(sorted), 1e-9);
     try std.testing.expectEqual(evaluate(sorted), evaluateW(sorted, baseline));
 }
 
@@ -1058,6 +1065,45 @@ test "evaluate prefers boards with more empty cells" {
     try std.testing.expect(evaluate(sparse) > evaluate(dense));
 }
 
+test "order penalty follows the game phase at the 4096 tile (#92)" {
+    const mid: Board = .{
+        .{ 2, 2048, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    const late: Board = .{
+        .{ 2, 4096, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    const w: Weights = .{ .empty = 10, .order_penalty = 30, .order_penalty_late = 300, .merge = 0 };
+    // 14 empties x10; snake-order inversion 1->11 (mid) / 1->12 (late)
+    try std.testing.expectEqual(@as(f64, 140 - 10 * 30), evaluateW(mid, w));
+    try std.testing.expectEqual(@as(f64, 140 - 11 * 300), evaluateW(late, w));
+}
+
+test "baseline weights follow the adopted phase weights (#92)" {
+    const mid: Board = .{
+        .{ 2, 2048, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    const late: Board = .{
+        .{ 2, 4096, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    // adopted values (see docs/solver-history.md, issue #92): 43.174 before 4096, 25 from 4096
+    try std.testing.expectApproxEqAbs(@as(f64, 140 - 10 * 43.174), evaluateW(mid, baseline), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 140 - 11 * 25), evaluateW(late, baseline), 1e-9);
+    // ga weights stay phase-invariant at their evolved 43.174
+    try std.testing.expectApproxEqAbs(@as(f64, 14 * 7.028 - 11 * 43.174), evaluateW(late, ga_weights), 1e-9);
+}
+
 test "playGame finishes a game and reports its result" {
     var prng = std.Random.DefaultPrng.init(1);
     const result = playGame(prng.random(), 1);
@@ -1118,3 +1164,4 @@ test "nn policy parses the weights once per thread, not once per move" {
     // the ~148 KB net is parsed at most once for the whole game, then reused by reference
     try std.testing.expect(nn.parse_count - before <= 1);
 }
+
