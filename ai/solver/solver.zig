@@ -23,7 +23,7 @@ pub const Weights = struct {
     /// extra penalty when only `down` is legal (the top-left anchor breaks)
     forced_down: f64 = 100,
 };
-pub const baseline: Weights = .{};
+pub const baseline: Weights = .{ .order_penalty = 43.174, .order_penalty_late = 25 };
 
 pub const Algorithm = enum { expectimax, greedy };
 
@@ -670,14 +670,14 @@ fn chanceValueW(state: GameState, depth: u8, w: Weights) f64 {
 }
 
 test "baseline weights reproduce evaluate on a hand-computed board" {
-    // 12 empty cells x10, level steps 1->2->3->4 (three x30 penalties), no equal neighbours
+    // 12 empty cells x10, level steps 1->2->3->4 (three x43.174 penalties), no equal neighbours
     const sorted: Board = .{
         .{ 2, 4, 8, 16 },
         .{ 0, 0, 0, 0 },
         .{ 0, 0, 0, 0 },
         .{ 0, 0, 0, 0 },
     };
-    try std.testing.expectEqual(@as(f64, 30), evaluate(sorted));
+    try std.testing.expectApproxEqAbs(@as(f64, 120 - 3 * 43.174), evaluate(sorted), 1e-9);
     try std.testing.expectEqual(evaluate(sorted), evaluateW(sorted, baseline));
 }
 
@@ -1084,15 +1084,23 @@ test "order penalty follows the game phase at the 4096 tile (#92)" {
     try std.testing.expectEqual(@as(f64, 140 - 11 * 300), evaluateW(late, w));
 }
 
-test "default weights keep one order penalty across phases (#92)" {
+test "baseline weights follow the adopted phase weights (#92)" {
+    const mid: Board = .{
+        .{ 2, 2048, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
     const late: Board = .{
         .{ 2, 4096, 0, 0 },
         .{ 0, 0, 0, 0 },
         .{ 0, 0, 0, 0 },
         .{ 0, 0, 0, 0 },
     };
-    // shipped weights must evaluate >=4096 boards exactly as before
-    try std.testing.expectEqual(@as(f64, 140 - 11 * 30), evaluateW(late, baseline));
+    // adopted values (see docs/solver-history.md, issue #92): 43.174 before 4096, 25 from 4096
+    try std.testing.expectApproxEqAbs(@as(f64, 140 - 10 * 43.174), evaluateW(mid, baseline), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 140 - 11 * 25), evaluateW(late, baseline), 1e-9);
+    // ga weights stay phase-invariant at their evolved 43.174
     try std.testing.expectApproxEqAbs(@as(f64, 14 * 7.028 - 11 * 43.174), evaluateW(late, ga_weights), 1e-9);
 }
 
@@ -1156,3 +1164,4 @@ test "nn policy parses the weights once per thread, not once per move" {
     // the ~148 KB net is parsed at most once for the whole game, then reused by reference
     try std.testing.expect(nn.parse_count - before <= 1);
 }
+
