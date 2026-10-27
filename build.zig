@@ -162,6 +162,30 @@ pub fn build(b: *std.Build) void {
     const evalab_step = b.step("evalab", "Compare evaluation variants (path shape, anchor, extra terms) on the same seeds");
     evalab_step.dependOn(&evalab_cmd.step);
 
+    const probe_exe = b.addExecutable(.{
+        .name = "probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("ai/solver/probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "solver", .module = solver_mod },
+                .{ .name = "nn", .module = nn_mod },
+                .{ .name = "ntuple", .module = ntuple_mod },
+            },
+        }),
+    });
+    const probe_cmd = b.addRunArtifact(probe_exe);
+    probe_cmd.addPassthruArgs();
+    probe_cmd.step.dependOn(b.getInstallStep());
+
+    const probe_tests = b.addTest(.{ .filters = test_filters, .root_module = probe_exe.root_module });
+    const run_probe_tests = b.addRunArtifact(probe_tests);
+
+    const probe_step = b.step("probe", "Score one tile multiset on probe board shapes with snake / nn / n-tuple evaluations");
+    probe_step.dependOn(&probe_cmd.step);
+
     const nn_tests = b.addTest(.{ .filters = test_filters, .root_module = nn_mod });
     const run_nn_tests = b.addRunArtifact(nn_tests);
 
@@ -309,4 +333,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_ga_tests.step);
     test_step.dependOn(&run_ranking_tests.step);
     test_step.dependOn(&run_evalab_tests.step);
+    test_step.dependOn(&run_probe_tests.step);
 }

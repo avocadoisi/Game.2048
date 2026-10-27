@@ -127,3 +127,73 @@ seed 6000 では 24–32 に山がある。32 で 8192 に到達した局が出�
 - 評価は seed 4000–7000 の holdout で確認したが、depth 2 の expectimax のみ。depth 3 以上や
   nn ポリシーでの順位は未検証（depth 3 は 1 局あたりのコストが跳ね上がる）。
 - avg score / moves / best だけを見ている。到達率の分布・死因（盤面が詰まる形）は未記録。
+
+## 学習型評価の選好 (#115)
+
+手作りの snake 評価と比べて、学習型の値関数（NN / n-tuple）が違う盤面形状を好むかを、
+少数の固定プローブ盤面で測る。`ai/solver/probe.zig`:
+
+```sh
+zig build probe
+# n-tuple のテーブルを差し替える場合
+zig build probe -- ai/solver/ntuple_weights.bin
+```
+
+全プローブ盤面は同じタイル多重集合 `{2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4}`（残り 6 マスが空）で、
+置き方（形）だけを変えている。タイルは経路に沿って降順に置く。
+
+| board | 置き方 |
+| --- | --- |
+| `snake` | 左上から行スネーク（出荷時経路） |
+| `column_snake` | 列スネーク（`snake` の anchor 3 と同じ経路） |
+| `spiral` | 外回り時計回り → 内側 2x2 |
+| `flex` | flex 経路（順位 1..7 のセル）に降順。2048 は (1,3) |
+| `block2` | 2x2 ブロック単位。左上 2x2 に 2048–256 |
+| `snake anchor 7` | snake 経路を 180° 回転＋列ミラー（右下アンカー） |
+| `scrambled` | 大きいタイルを飛び飛びに散らした最悪形 |
+
+評価器は 3 つ: `snake` = `solver.evaluateW`（出荷時重み）、`nn` = 埋め込み `nn_weights.bin`、
+`ntuple` = `ntuple_weights.bin`（68 MB を実行時に読み込み）。値は評価値そのもの、`rank` は評価器内の順位（1 = 最良）。
+
+```
+board                     snake  rank             nn  rank         ntuple  rank
+snake                   60.0000   1.5         0.9222     3         0.7336   2.5
+column_snake          -371.7400     5        -3.3625     6         0.7336   2.5
+spiral                  60.0000   1.5         1.5035     2         0.1955     5
+flex                  -501.2620     7        -1.6711     5        -0.0048     7
+block2                -155.8700     3        -4.3314     7         0.7336   2.5
+snake anchor 7        -414.9140     6         9.0475     1         0.7336   2.5
+scrambled             -328.5660     4        -1.4902     4         0.0445     6
+
+spearman rank correlation (1 = same preference order, -1 = reversed, 0 = unrelated)
+  snake  vs nn       0.126
+  snake  vs ntuple   0.288
+  nn     vs ntuple  -0.020
+```
+
+### 結論
+
+- 評価器ペアの順位相関は snake↔nn 0.13、snake↔ntuple 0.29、nn↔ntuple −0.02 で、いずれも 1.0 から遠い。
+  学習型評価は手作り snake と同じ形を好んでいない。ただし盤面 7 枚では Spearman の標準誤差が約 0.4 あり、
+  個々の値は「無相関」と区別できない。言えるのは「一致していない」ところまで。
+- `nn` は 180° 回転した snake 盤（9.05）と spiral（1.50）を左上 snake 盤（0.92）より高く評価し、
+  flex・column_snake・block2 は負値にする。手作り snake が 3 位に置く block2 を nn は最下位にする。
+  形の好みは明確に違う。
+- `ntuple` は経路順に並んだ 4 盤（snake / column_snake / block2 / 回転 snake）が同値 0.7336 で並ぶ。
+  `ntuple.indices` は各パターンで 8 対称変換の最小を取るため、評価は盤面の回転・鏡像で不変（テストで固定）。
+  n-tuple は「角・アンカー」の好みを原理的に表現できない。値の順は spiral 0.196 > scrambled 0.044 > flex −0.005 で、
+  flex 形状は最下位。
+- 手作り snake との一致/不一致: 手作り snake は snake 経路に沿って降順の盤（snake / spiral、どちらも順序違反 0 で
+  空きマス項だけの 60.0）を高く評価し、経路が回転・変形した盤（column_snake −372、anchor 7 −415、flex −501）を
+  低く評価する。NN も flex・column_snake を負値にする点は同じだが、block2（snake は 3 位、nn は最下位）と
+  回転 snake（snake は 6 位、nn は 1 位）で真逆になる。n-tuple は向きを区別しないので、向きを除けば
+  snake に近い順（経路順 4 盤が上位、flex が最下位）を付ける。つまり「snake の経路形状が最良」は
+  手作り評価に固有の主張で、学習型評価はそれぞれ別の形を好む。
+
+### 既知の限界
+
+- プローブ盤面は 7 枚、タイル多重集合は 1 種類（10 タイル）。順位相関の標本としては小さい。
+- 比較しているのは value であり、対局結果ではない。depth 2 の expectimax や実プレイでの強さとの対応は未検証。
+- NN は推論時に 8 対称を平均しないため、回転で値が跳ねる。上の nn 列の差は「学習した選好」と
+  「推論時の非対称性」が混ざっている。
+- n-tuple は min-over-8-symmetries のため形状の向きを測れない。向きの選好を見たい場合は別の評価器が要る。
