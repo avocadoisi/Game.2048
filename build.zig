@@ -137,8 +137,29 @@ pub fn build(b: *std.Build) void {
     const ranking_step = b.step("ranking", "Compare policies and print JSON ranking");
     ranking_step.dependOn(&ranking_cmd.step);
 
-    const parallel_tests = b.addTest(.{ .root_module = parallel_mod });
-    const run_parallel_tests = b.addRunArtifact(parallel_tests);
+    const parallel_tests = b.addTest(.{ .root_module = parallel_mod });    const run_parallel_tests = b.addRunArtifact(parallel_tests);
+
+    const evalab_exe = b.addExecutable(.{
+        .name = "evalab",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("ai/solver/evalab.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "solver", .module = solver_mod },
+                .{ .name = "parallel", .module = parallel_mod },
+            },
+        }),
+    });
+    const evalab_cmd = b.addRunArtifact(evalab_exe);
+    evalab_cmd.addPassthruArgs();
+    evalab_cmd.step.dependOn(b.getInstallStep());
+
+    const evalab_tests = b.addTest(.{ .root_module = evalab_exe.root_module });
+    const run_evalab_tests = b.addRunArtifact(evalab_tests);
+
+    const evalab_step = b.step("evalab", "Compare evaluation variants (path shape, anchor, extra terms) on the same seeds");
+    evalab_step.dependOn(&evalab_cmd.step);
 
     const nn_tests = b.addTest(.{ .root_module = nn_mod });
     const run_nn_tests = b.addRunArtifact(nn_tests);
@@ -286,4 +307,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_parallel_tests.step);
     test_step.dependOn(&run_ga_tests.step);
     test_step.dependOn(&run_ranking_tests.step);
+    test_step.dependOn(&run_evalab_tests.step);
 }

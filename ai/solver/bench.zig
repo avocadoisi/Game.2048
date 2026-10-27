@@ -34,7 +34,17 @@ pub const Summary = struct {
 
 const RunResult = struct { score: u64 = 0, moves: u64 = 0, best_tile: u32 = 0, elapsed_ns: i96 = 0 };
 
-const RunCtx = struct { policy: solver.Policy, depth: u8, games_per_run: u32, seed: u64, io: std.Io };
+/// What a run plays with: a named policy, or custom evaluation weights (`zig build evalab`).
+const Plan = union(enum) { policy: solver.Policy, weights: solver.Weights };
+
+const RunCtx = struct { plan: Plan, depth: u8, games_per_run: u32, seed: u64, io: std.Io };
+
+fn playOne(rng: std.Random, plan: Plan, depth: u8) solver.GameResult {
+    return switch (plan) {
+        .policy => |p| solver.playPolicy(rng, p, depth),
+        .weights => |w| solver.playWeights(rng, w, depth),
+    };
+}
 
 /// One run: one PRNG seeded `seed + r`, games played in order (same stream as the serial loop).
 fn playRun(c: RunCtx, r: usize) RunResult {
@@ -42,7 +52,7 @@ fn playRun(c: RunCtx, r: usize) RunResult {
     var prng = std.Random.DefaultPrng.init(c.seed + r);
     var res: RunResult = .{};
     for (0..c.games_per_run) |_| {
-        const result = solver.playPolicy(prng.random(), c.policy, c.depth);
+        const result = playOne(prng.random(), c.plan, c.depth);
         res.score += result.score;
         res.moves += result.moves;
         res.best_tile = @max(res.best_tile, result.max_tile);
@@ -53,10 +63,19 @@ fn playRun(c: RunCtx, r: usize) RunResult {
 
 /// Play `runs * games_per_run` games, one PRNG seed per run (seed, seed+1, ...). Runs execute in parallel.
 pub fn run(io: std.Io, gpa: std.mem.Allocator, policy: solver.Policy, runs: u32, games_per_run: u32, depth: u8, seed: u64) !Summary {
+    return runPlan(io, gpa, .{ .policy = policy }, runs, games_per_run, depth, seed);
+}
+
+/// Same games and seeds as `run`, but with custom evaluation weights (`zig build evalab`).
+pub fn runW(io: std.Io, gpa: std.mem.Allocator, w: solver.Weights, runs: u32, games_per_run: u32, depth: u8, seed: u64) !Summary {
+    return runPlan(io, gpa, .{ .weights = w }, runs, games_per_run, depth, seed);
+}
+
+fn runPlan(io: std.Io, gpa: std.mem.Allocator, plan: Plan, runs: u32, games_per_run: u32, depth: u8, seed: u64) !Summary {
     const start = std.Io.Clock.awake.now(io);
     const per_run = try gpa.alloc(RunResult, runs);
     defer gpa.free(per_run);
-    parallel.map(RunResult, per_run, RunCtx{ .policy = policy, .depth = depth, .games_per_run = games_per_run, .seed = seed, .io = io }, playRun);
+    parallel.map(RunResult, per_run, RunCtx{ .plan = plan, .depth = depth, .games_per_run = games_per_run, .seed = seed, .io = io }, playRun);
     var total_score: u64 = 0;
     var total_moves: u64 = 0;
     var best_tile: u32 = 0;
@@ -79,6 +98,14 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, policy: solver.Policy, runs: u32,
         .serial_elapsed_ns = serial_elapsed,
         .total_moves = total_moves,
     };
+}
+
+test "run with the baseline weights matches the expectimax policy on the same games" {
+    const s = try runW(std.testing.io, std.testing.allocator, solver.baseline, 2, 2, 1, 5);
+    const p = try run(std.testing.io, std.testing.allocator, .expectimax, 2, 2, 1, 5);
+    try std.testing.expectEqual(p.avg_score, s.avg_score);
+    try std.testing.expectEqual(p.avg_moves, s.avg_moves);
+    try std.testing.expectEqual(p.best_tile, s.best_tile);
 }
 
 test "summary separates serial latency from parallel throughput" {
