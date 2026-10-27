@@ -481,6 +481,20 @@ Protocol: start from `ai/solver/nn_weights.bin` (200,000 games, training seed 1)
 - New committed weights: `ai/solver/nn_weights.bin`, `md5 e501bae176f5cf2ff11a25c6f99e75a0` (old `6c9a164b5e05519ca2298c26e30431c4`).
 - Caveat: fine-tuning cannot pass the point the 200k run already reached, so the gain is bounded. The single-lr and longer schedules were only tried at training seed 1 (seed 2 fine-tunes were clearly worse), so a small seed effect cannot be excluded.
 
+## Fine-tune extra rounds: overfit past the #66 peak (#97)
+
+The 20k to 40k learning curve was still climbing (#66), so the question was whether more `resume` rounds on top of the current committed weights (200k + the #66 40k) keep paying. Same protocol as #66: `resume` from `ai/solver/nn_weights.bin`, training seed 1, nn 1-ply, in-protocol ranges 2000..6000 and held-out ranges 7000..10000, 20 games per range.
+
+| candidate (from committed) | in-protocol | held-out | vs committed (held-out) |
+|---|---|---|---|
+| committed (200k + 40k, seed 1) | 43,187 | 45,342 | — |
+| +20k, lr 3e-4 (a2) | 43,083 | 41,936 | -3,406 |
+| +20k lr 1e-3 then +20k lr 3e-4 (a1r2) | 42,974 | 41,290 | -4,052 |
+
+- The held-out column is the decider (the #66 adoption rule): both candidates are flat in-protocol (spread ~200 against per-range noise of several thousand) but lose 3.4k-4.1k on the ranges that never select a candidate. The exact recipe that won +8,109 when applied once loses -4,052 when applied again — fine-tuning has passed its peak and is now fitting the training distribution.
+- Verdict: not adopted, `ai/solver/nn_weights.bin` unchanged (md5 `e501bae176f5cf2ff11a25c6f99e75a0`). More rounds on this recipe are spent; further gains need new training signal (search-based self-play, or the batched-update line in #98/#99), not more of the same.
+- Cost: 3 x 20,000 games serial (`resume`), 460 s / 319 s + 345 s / 460 s, plus 3 nets x 9 ranges x 20 eval games.
+
 ## 200,000 games from scratch across seeds (#62)
 
 Same protocol, `train_games` 200,000, training seeds 1 and 2, compared against the committed net.
