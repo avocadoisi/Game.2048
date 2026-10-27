@@ -762,7 +762,7 @@ pub fn trainingSeed(seed: u64, index: usize) u64 {
     return seed +% @as(u64, @intCast(index));
 }
 
-const BatchGameCtx = struct { net: Net, seed: u64, first_game: usize, lr: f64, want_diag: bool };
+const BatchGameCtx = struct { net: Net, seed: u64, first_game: usize, lr: f64, want_diag: bool, opts: Options };
 
 const BatchGame = struct {
     net: Net,
@@ -774,7 +774,7 @@ fn runBatchGame(ctx: BatchGameCtx, i: usize) BatchGame {
     const game = ctx.first_game + i;
     var result: BatchGame = .{ .net = ctx.net, .score = 0 };
     var rng = std.Random.DefaultPrng.init(trainingSeed(ctx.seed, game));
-    result.score = trainGame(&result.net, rng.random(), ctx.lr, if (ctx.want_diag) &result.diag else null);
+    result.score = trainGameOpts(&result.net, rng.random(), ctx.lr, if (ctx.want_diag) &result.diag else null, ctx.opts).score;
     return result;
 }
 
@@ -790,7 +790,15 @@ fn mergeDiag(dst: *Diag, src: *const Diag) void {
 /// `net` to net_start + (1/games) * sum_i (net_after_i - net_start), summed in game order.
 /// Each game i uses `trainingSeed(seed, first_game + i)`, so the result is the same for any thread count.
 pub fn trainBatch(net: *Net, seed: u64, first_game: usize, games: usize, lr: f64, diag: ?*Diag) u32 {
+    return trainBatchOpts(net, seed, first_game, games, lr, diag, .{});
+}
+
+/// `trainBatch` with options: every game trains with `trainGameOpts(.., opts)`, so any stateless
+/// variant (`backward`, `replay`, `sym`, `symlam`, `nstep`) batches the same way `base` does.
+pub fn trainBatchOpts(net: *Net, seed: u64, first_game: usize, games: usize, lr: f64, diag: ?*Diag, opts: Options) u32 {
     std.debug.assert(games >= 1 and games <= parallel.max_threads);
+    // the priority buffer is cross-game state shared by pointer: batching it would be a data race
+    std.debug.assert(opts.priority == null);
     var units: [parallel.max_threads]BatchGame = undefined;
     parallel.map(BatchGame, units[0..games], BatchGameCtx{
         .net = net.*,
@@ -798,6 +806,7 @@ pub fn trainBatch(net: *Net, seed: u64, first_game: usize, games: usize, lr: f64
         .first_game = first_game,
         .lr = lr,
         .want_diag = diag != null,
+        .opts = opts,
     }, runBatchGame);
 
     const start = net.*;
@@ -1609,6 +1618,36 @@ test "parallel training batch matches a serial run of the same game seeds" {
     var par = base;
     _ = trainBatch(&par, 77, 0, games, 0.001, null);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&serial), std.mem.asBytes(&par));
+}
+
+test "parallel training batch with variant opts matches a serial run of the same game seeds" {
+    const games = 4;
+    // symmetric per-move updates and the post-game replay pass take different branches of trainGameOpts
+    const variants = [_]Options{ .{ .symmetry = true }, .{ .replay_k = 4 } };
+    for (variants) |opts| {
+        var init_rng = std.Random.DefaultPrng.init(77);
+        var base = Net.init(init_rng.random());
+
+        // Serial reference (same reconstruction as the plain batch test), one trainGameOpts per game.
+        var units: [games]Net = undefined;
+        for (&units, 0..) |*u, i| {
+            u.* = base;
+            var rng = std.Random.DefaultPrng.init(77 + i);
+            _ = trainGameOpts(u, rng.random(), 0.001, null, opts);
+        }
+        const flat_len = @sizeOf(Net) / @sizeOf(f64);
+        var sums: [flat_len]f64 = @splat(0);
+        const start = flat(&base);
+        for (&units) |*u| {
+            for (flat(u), start, 0..) |v, s, k| sums[k] += v - s;
+        }
+        var serial = base;
+        for (flat(&serial), start, sums) |*w, s, sum| w.* = s + sum / games;
+
+        var par = base;
+        _ = trainBatchOpts(&par, 77, 0, games, 0.001, null, opts);
+        try std.testing.expectEqualSlices(u8, std.mem.asBytes(&serial), std.mem.asBytes(&par));
+    }
 }
 
 test "the 8 dihedral transforms are distinct for a non-symmetric board and compose back to identity" {

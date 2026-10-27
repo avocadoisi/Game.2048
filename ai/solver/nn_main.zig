@@ -5,7 +5,7 @@ const nn = @import("nn");
 const parallel = @import("parallel");
 
 const usage =
-    \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate] [seed_ranges|diag] [variant|par] [replay_k] [weights_path] [train_seed]
+    \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate] [seed_ranges|diag] [variant|par] [replay_k] [weights_path] [train_seed] [par]
     \\
     \\  train_games   TD(0) self-play games; 0 loads ai/solver/nn_weights.bin (default 2000)
     \\  eval_games    games per seed range per policy, same seeds for every policy (default 100)
@@ -24,8 +24,10 @@ const usage =
     \\              resume  (#66: load weights_path and train train_games more games from those weights, plain per-move path)
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
     \\                game i uses seed train_seed + i and the batch result is the mean of its games.
-    \\                par trains the plain per-move variant only: replay_k is ignored, but its
-    \\                slot must be filled to reach weights_path
+    \\                (#99) as arg 10 it batches any stateless variant (base|backward|replay|sym|symlam|
+    \\                nstep|resume); as arg 6 it keeps its old meaning, the plain per-move variant only,
+    \\                so replay_k is ignored there but its slot must be filled to reach weights_path.
+    \\                Not supported for priority|midgame|midmix (cross-game replay buffer)
     \\  replay_k      afterstates re-trained per game for variant replay (default 30)
     \\  weights_path  file to load (train_games 0) or write (default ai/solver/nn_weights.bin); use a temp path for variant runs
     \\  train_seed    seed for weight init and self-play games (default 1, omitted = same weights as before #56)
@@ -40,6 +42,14 @@ const default_weights_path = "ai/solver/nn_weights.bin";
 /// Positional arg 9, appended after `weights_path` so existing command lines keep their meaning.
 fn parseTrainSeed(args: []const []const u8) !u64 {
     return if (args.len > 9) try std.fmt.parseInt(u64, args[9], 10) else 1;
+}
+
+/// Positional arg 10, appended after `train_seed`: the literal "par" runs the variant of arg 6 in
+/// parallel batches (issue #99). Arg 6 `par` keeps its meaning (base + parallel).
+fn parseParFlag(args: []const []const u8) !bool {
+    if (args.len <= 10) return false;
+    if (!std.mem.eql(u8, args[10], "par")) return error.InvalidParFlag;
+    return true;
 }
 
 /// Starting net for `main`: `weights_path` when resuming (or eval-only), otherwise a random init
@@ -98,13 +108,16 @@ pub fn main(init: std.process.Init) !void {
     const no_diag = arg5 != null and std.mem.eql(u8, arg5.?, "-");
     const seed_ranges: u32 = if (arg5) |a| (if (want_diag or no_diag) 1 else try std.fmt.parseInt(u32, a, 10)) else 1;
     const variant = if (args.len > 6) args[6] else "base";
-    const use_par = std.mem.eql(u8, variant, "par");
+    // arg 6 `par` means base + parallel (unchanged); arg 10 `par` batches the variant of arg 6
+    const par_variant = std.mem.eql(u8, variant, "par");
+    const par_tail = try parseParFlag(args);
+    const use_par = par_variant or par_tail;
     const use_resume = std.mem.eql(u8, variant, "resume");
     const replay_k: usize = if (args.len > 7) try std.fmt.parseInt(usize, args[7], 10) else 30;
     const weights_path = if (args.len > 8) args[8] else default_weights_path;
     const train_seed = try parseTrainSeed(args);
     var priority: nn.Priority = .{};
-    const opts: nn.Options = if (use_par or use_resume or std.mem.eql(u8, variant, "base"))
+    const opts: nn.Options = if (par_variant or use_resume or std.mem.eql(u8, variant, "base"))
         .{}
     else if (std.mem.eql(u8, variant, "backward"))
         .{ .backward = true }
@@ -128,7 +141,12 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}", .{usage});
         return;
     };
-    if (args.len > 10 or eval_games == 0 or seed_ranges == 0) {
+    if (args.len > 11 or eval_games == 0 or seed_ranges == 0) {
+        std.debug.print("{s}", .{usage});
+        return;
+    }
+    // the priority ring buffer is cross-game state shared by pointer: batching would race on it
+    if (use_par and opts.priority != null) {
         std.debug.print("{s}", .{usage});
         return;
     }
@@ -148,7 +166,7 @@ pub fn main(init: std.process.Init) !void {
             while (g < train_games) : (g += @min(batch_size, train_games - g)) {
                 const games = @min(batch_size, train_games - g);
                 const frac = @as(f64, @floatFromInt(g)) / @as(f64, @floatFromInt(train_games));
-                last_score = nn.trainBatch(&net, train_seed, g, games, learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null);
+                last_score = nn.trainBatchOpts(&net, train_seed, g, games, learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null, opts);
                 if ((g + games) % 5000 == 0) {
                     std.debug.print("train {d}/{d} last game score {d}\n", .{ g + games, train_games, last_score });
                     try nn.save(&net, init.io, weights_path); // checkpoint
@@ -168,13 +186,14 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         const elapsed = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
+        const variant_label = if (par_tail) try std.fmt.allocPrint(init.arena.allocator(), "{s}+par", .{variant}) else variant;
         std.debug.print("trained {d} games, {d} moves in {d:.1} s (lr={d}, seed={d}, variant={s})\n", .{
             train_games,
             total_moves,
             @as(f64, @floatFromInt(elapsed)) / 1e9,
             learning_rate,
             train_seed,
-            variant,
+            variant_label,
         });
         if (want_diag) printDiag(&diag);
         try nn.save(&net, init.io, weights_path);
@@ -311,4 +330,17 @@ test "usage text lists the nstep variant" {
 
 test "usage text lists the death variant" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "death   (#101") != null);
+}
+
+test "par flag is off without arg 10 and on with the literal par" {
+    const ten_args = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "sym", "30", "x.bin", "3" };
+    try std.testing.expect(!try parseParFlag(&ten_args));
+    const eleven_args = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "sym", "30", "x.bin", "3", "par" };
+    try std.testing.expect(try parseParFlag(&eleven_args));
+    const typo = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "sym", "30", "x.bin", "3", "pa" };
+    try std.testing.expectError(error.InvalidParFlag, parseParFlag(&typo));
+}
+
+test "usage text documents the par flag for stateless variants" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "#99") != null);
 }
