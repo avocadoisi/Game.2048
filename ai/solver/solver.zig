@@ -13,7 +13,9 @@ const beam_width = 32;
 const beam_horizon = 3;
 
 /// Path shapes for the order penalty, compared by `zig build evalab` (issue #112).
-pub const Layout = enum { snake, column_snake, spiral, block2 };
+/// `flex` / `flex_reverse` are the user-supplied "flex" layout (#112 comment): only 7 ranked cells
+/// are ordered, the other 9 stay free.
+pub const Layout = enum { snake, column_snake, spiral, block2, flex, flex_reverse };
 
 /// Weights of the snake heuristic (`evaluateW`, `evaluateStateW`). `baseline` is the hand-set version.
 pub const Weights = struct {
@@ -30,6 +32,9 @@ pub const Weights = struct {
     /// anchor of that path: rotation (anchor >> 1, 90° clockwise each) plus a column mirror
     /// (anchor & 1) (issue #113). 0 keeps the shipped top-left anchor.
     anchor: u8 = 0,
+    /// number of leading path cells that must stay ordered; the rest are free cells (issue #112,
+    /// "flex" layouts). 16 keeps the whole path constrained, which is the shipped behaviour.
+    ordered: u8 = 16,
     /// penalty for |log2| steps between adjacent tiles (issue #114). 0 keeps the shipped evaluation.
     smoothness: f64 = 0,
     /// penalty for the monotonicity violation of each row and column (issue #114).
@@ -600,15 +605,17 @@ pub fn evaluateW(board: Board, w: Weights) f64 {
     var penalty: f64 = 0;
     var prev: ?f64 = null;
     var max_level: f64 = 0;
-    for (path) |p| {
+    for (path, 0..) |p, i| {
         const value = board[p.row][p.col];
         if (value == 0) {
             empties += 1;
             continue;
         }
         const level: f64 = @floatFromInt(@ctz(value));
-        if (prev) |before| penalty += @max(0, level - before);
-        prev = level;
+        if (i < w.ordered) {
+            if (prev) |before| penalty += @max(0, level - before);
+            prev = level;
+        }
         max_level = @max(max_level, level);
     }
     // endgame phase once the largest tile reaches 4096 = 2^12 (issue #92)
@@ -649,6 +656,8 @@ fn baseCell(layout: Layout, i: usize) core.Position {
         // columns instead of rows; the largest tile ends up top-right of the anchor column pair
         .column_snake => .{ .row = if ((i / n) % 2 == 0) i % n else n - 1 - i % n, .col = i / n },
         .spiral => spiral[i],
+        .flex => flex[i],
+        .flex_reverse => flex[core.BoardCellCount - 1 - i],
         // 2x2 blocks in row-major order, each block walked as a small snake
         .block2 => blk: {
             const blocks_per_row = n / 2;
@@ -659,6 +668,17 @@ fn baseCell(layout: Layout, i: usize) core.Position {
         },
     };
 }
+
+/// flex layout: the 7 ranked cells in size order (1 = largest), then the 9 free cells.
+/// rank 1..7 sit at (1,3) (2,2) (2,3) (2,0) (3,2) (3,0) (3,3); empties are skipped by the penalty,
+/// so their order is irrelevant.
+const flex: [core.BoardCellCount]core.Position = .{
+    .{ .row = 1, .col = 3 }, .{ .row = 2, .col = 2 }, .{ .row = 2, .col = 3 }, .{ .row = 2, .col = 0 },
+    .{ .row = 3, .col = 2 }, .{ .row = 3, .col = 0 }, .{ .row = 3, .col = 3 },
+    .{ .row = 0, .col = 0 }, .{ .row = 0, .col = 1 }, .{ .row = 0, .col = 2 }, .{ .row = 0, .col = 3 },
+    .{ .row = 1, .col = 0 }, .{ .row = 1, .col = 1 }, .{ .row = 1, .col = 2 }, .{ .row = 2, .col = 1 },
+    .{ .row = 3, .col = 1 },
+};
 
 /// Cells of one 2x2 block in walk order: top-left, top-right, bottom-right, bottom-left.
 const block2_step: [4]core.Position = .{
@@ -1202,6 +1222,22 @@ test "layouts give different paths" {
     try std.testing.expectEqual(core.Position{ .row = 1, .col = 1 }, block[2]);
     try std.testing.expectEqual(core.Position{ .row = 2, .col = 2 }, block[12]);
     try std.testing.expect(snake[1].col != column[1].col);
+}
+
+test "ordered cut keeps only the leading path cells constrained" {
+    // (3,0) and (2,1) are path cells 8 and 13 of the snake, so a cut at 8 ignores their rise
+    const board: Board = .{
+        .{ 0, 0, 0, 2 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 8, 0, 0 },
+        .{ 16, 0, 0, 0 },
+    };
+    var cut = baseline;
+    cut.ordered = 8;
+    try std.testing.expect(evaluateW(board, cut) > evaluateW(board, baseline));
+    var full = baseline;
+    full.ordered = 16;
+    try std.testing.expectEqual(evaluateW(board, baseline), evaluateW(board, full));
 }
 
 test "zero extra weights keep the shipped evaluation" {

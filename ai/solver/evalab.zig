@@ -32,6 +32,8 @@ fn parseSpec(spec: []const u8) !solver.Weights {
             w.layout = std.meta.stringToEnum(solver.Layout, value) orelse return error.BadSpec;
         } else if (std.mem.eql(u8, key, "anchor")) {
             w.anchor = try std.fmt.parseInt(u8, value, 10);
+        } else if (std.mem.eql(u8, key, "ordered")) {
+            w.ordered = try std.fmt.parseInt(u8, value, 10);
         } else if (std.mem.eql(u8, key, "empty")) {
             w.empty = try std.fmt.parseFloat(f64, value);
         } else if (std.mem.eql(u8, key, "order")) {
