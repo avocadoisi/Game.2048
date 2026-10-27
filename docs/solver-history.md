@@ -540,7 +540,20 @@ Why the clip value: measured averaged-gradient norms over one self-play game are
 
 Correctness: one `symbatch` step equals the averaged gradient applied once (tested to 1e-15), differs from the eight sequential `sym` steps, and on a large TD error (t = 100) the applied step's norm is exactly `lr * sym_batch_clip` while the unclipped averaged gradient is more than 10x the clip, so the clipping branch is exercised.
 
-Measurement: pending. The protocol is the one from #72 — 20,000 training games per seed, eval ranges 2000/3000/4000/5000/6000 x 20 games, `nn` 1-ply, against the `base` reference (18,754 ± 534) and the `sym` rows above; the numbers go in this section when the sweep has run.
+Measurement (#72 protocol: 20,000 training games, training seed 1, eval ranges 2000/3000/4000/5000/6000 x 20 games, `nn` 1-ply):
+
+| variant | lr | mean over ranges | per-range scores | training moves (games) |
+|---|---|---|---|---|
+| base (reference, #56) | 0.003 | 18,754 ± 534 (5 seeds) | — | — |
+| `sym` (reference, #72) | 0.003 | 2,702 ± 264 | — | — |
+| `sym` (reference, #72) | 0.000375 | 4,621 ± 1,187 | — | — |
+| `symbatch` | 0.003 | 1,314 | 1,292 / 1,337 / 1,404 / 1,309 / 1,227 | 2,568,519 (~128/game) |
+| `symbatch` | 0.000375 (lr/8) | 794 | 732 / 883 / 766 / 788 / 803 | 1,858,935 (~93/game) |
+
+- Reading: the averaged-snapshot step does not diverge (no NaN/Inf, unlike `sym`), but it collapses anyway — both nets play 90-130-move games that die at tile 128-256, below even the collapsed `sym` rows and an order of magnitude below `base`. The likely mechanism is the clip: the measured averaged-gradient norms reach 4-300 late in training, so `sym_batch_clip = 1.0` caps those updates at 1/4-1/300 of their natural size exactly when the value function would mature, and lr/8 shrinks the early updates too — so the lr/8 row is worse, not better. The #72 failure mode (eight correlated over-updates) is gone, but TD(0) with a bootstrapped target gets no benefit from the extra transforms and the throttled step cannot recover.
+- Verdict: not adopted; `symbatch` stays an opt-in experiment variant, `sym_batch = false` is the default, no default-path change (recorded-checksum tests untouched).
+- Next candidates if this line is retried: a clip sweep (`sym_batch_clip` at 10 or 100, or no clip), and/or a target averaged over the same 8 transforms so the regression is self-consistent.
+- Cost: 2 x 20,000 games (435 s + 335 s training), plus 5 ranges x 20 eval games per net.
 ## n-tuple network runner (#70)
 
 The classic 2048 SOTA value function, as a standalone runner: `ai/solver/ntuple.zig` holds flat f32 pattern tables (`[16^k]f32`) indexed by the same `levelOf` cell encoding as the MLP, `ai/solver/ntuple_main.zig` trains them by TD(0) on afterstates and evaluates them.
