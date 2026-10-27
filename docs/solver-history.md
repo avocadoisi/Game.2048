@@ -1071,6 +1071,53 @@ OK
 All 1 tests passed.
 ```
 
+## Death reward learns moves-to-death, but the fragility penalty does not pay (#101)
+
+Issue #101 asked whether a net trained to die fast can measure board fragility, and whether
+penalizing fragile boards in `evaluateW` raises the score or the survival rate. Two pieces
+shipped. `nn` gains an opt-in `death` variant: per-move reward is -1/reward_scale instead of
+the score delta, so the value learns V ≈ -(moves to game over)/1000. Training uses the
+backward full-return sweep, not one-step TD — with -1 per move the TD target is identical on
+every board and the net collapsed to a constant (observed, then fixed; the naive scale also
+blew up to NaN, hence the /reward_scale unit). `evaluateW` gains `Weights.fragility` +
+`Weights.death_net`, adding `fragility * (0 - V)`; both default to inert, so every existing
+policy is bit-identical unless a caller opts in. The CLI variant is `nn ... death`.
+
+Probe (TEMP harnesses, removed): 1k and 5k death games, then V vs true moves-left on
+expectimax_tt depth 3 games (seeds 3000+). In-distribution (the death policy's own games) the
+net works: pearson(V, ml) = -0.447 (1k) → -0.606 (5k). On real games it does not:
+pearson(V, ml) = 0.023 (1k) / -0.001 (5k) overall, and inside every empties bucket |r| <= 0.12
+with mixed signs. The ml <= 100 tail keeps the signal: n=2000, r = -0.230 overall, empties 1-6
+r = -0.137 / -0.030 / -0.216 / -0.056 / -0.197 / -0.496, terciles monotone. So V ranks
+near-death boards correctly and saturates OOD — exactly the training horizon.
+
+A/B of the penalty (50 games x 2 seed sets, expectimax depth 2, death net trained 5k games):
+
+| fragility | avg (1000-1049) | avg (2000-2049) | dead <2048 (both sets) |
+|---|---|---|---|
+| 0 (off) | 24,297.7 | 25,385.7 | 52/100 |
+| 300 | 19,420.6 | 24,644.3 | 58/100 |
+| 1000 | 26,354.1 | 25,614.8 | 50/100 |
+| 3000 | 26,345.5 | 24,204.2 | 49/100 |
+
+The λ=1000 bump did not replicate: a paired run (same seeds, off vs on) over 200 games on
+fresh sets 1000/2000/3000/4000 gives per-set diffs +2056.4 / +229.1 / -1306.3 / -1490.8,
+total -127.9 ± 1477.3, and deaths move the wrong way (93 → 104 of 200). That is noise with a
+hint of harm.
+
+Verdict: not adopted. `fragility` stays an opt-in field (tested, default 0 = current
+evaluation), nothing sets it, committed weights unchanged. The death variant itself works as
+advertised within its horizon and stays as `nn ... death`.
+
+Reading: the tail correlation (r ≈ -0.23..-0.50 at ml <= 100) is real but too thin to rank
+mid-game moves, and OOD saturation makes the term nearly constant across candidate boards —
+it cannot distinguish moves where it matters. A usable fragility signal would need training
+on the real policy's game lengths, not on self-play deaths.
+
+Limits: one machine; the sweep is 4 λ x 100 games plus a 200-game paired run; the probe's
+ml <= 100 cut is post-hoc; death nets were trained 1k/5k games only; the A/B plays expectimax
+depth 2 (the `Weights` consumer), not nn/nn2.
+
 ## Bench run 2026-10-27 03:15:22 +0900
 
 - command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order phase v2 --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
@@ -1157,4 +1204,145 @@ All 1 tests passed.
 
 ```text
 {"seed":1000,"runs":1,"games_per_run":5,"entries":[{"policy":"nn2","depth":2,"games":5,"avg_score":71880.0,"avg_moves":3267.2,"best_tile":4096,"latency_ms_per_move":1.7520,"games_per_sec":0.17,"description":"TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）"},{"policy":"nn","depth":0,"games":5,"avg_score":69640.8,"avg_moves":3151.2,"best_tile":4096,"latency_ms_per_move":0.1919,"games_per_sec":1.65,"description":"TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）"},{"policy":"expectimax_tt","depth":0,"games":5,"avg_score":51376.0,"avg_moves":2426.2,"best_tile":4096,"latency_ms_per_move":0.6913,"games_per_sec":0.60,"description":"depth 3の期待値探索を置換表で高速化したもの（同じ手を選ぶ）"},{"policy":"expectimax","depth":2,"games":5,"avg_score":41107.2,"avg_moves":2019.4,"best_tile":4096,"latency_ms_per_move":0.0854,"games_per_sec":5.80,"description":"2手先まで探索し、ランダムな出現（2か4）を平均して評価する。評価は蛇行順と合体ペアの手作り関数"},{"policy":"ga","depth":2,"games":5,"avg_score":27538.4,"avg_moves":1415.2,"best_tile":4096,"latency_ms_per_move":0.0823,"games_per_sec":8.59,"description":"GAで評価の重みを進化させた期待値探索（depth 2）。GA内のholdout(seed 500〜)では+4%だが、ranking seed 1000では素の expectimax より低い"},{"policy":"mcts","depth":0,"games":5,"avg_score":24463.2,"avg_moves":1301.2,"best_tile":2048,"latency_ms_per_move":1.0845,"games_per_sec":0.71,"description":"UCTで候補手を選び、ランダムな対局を繰り返して評価する"},{"policy":"nnbeam","depth":0,"games":5,"avg_score":21096.8,"avg_moves":1143.8,"best_tile":2048,"latency_ms_per_move":0.1211,"games_per_sec":7.22,"description":"NNの盤面価値を葉にしたビーム探索。幅8・3手先で、ply間のspawnを2回サンプリングする（固定seedで再現）"},{"policy":"beam","depth":0,"games":5,"avg_score":14368.8,"avg_moves":817.8,"best_tile":2048,"latency_ms_per_move":0.0674,"games_per_sec":18.14,"description":"幅32で3手先まで探索し、各空きマスに2が出現すると仮定して評価する"},{"policy":"nnmcts","depth":0,"games":5,"avg_score":12864.8,"avg_moves":763.4,"best_tile":1024,"latency_ms_per_move":2.5553,"games_per_sec":0.51,"description":"UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）"},{"policy":"greedy","depth":0,"games":5,"avg_score":3300.8,"avg_moves":272.2,"best_tile":256,"latency_ms_per_move":0.0004,"games_per_sec":8437.64,"description":"1手先だけ見る。滑らせた盤面の評価が最も高い手を選ぶ（出現や探索はしない）"},{"policy":"random","depth":0,"games":5,"avg_score":966.4,"avg_moves":110.2,"best_tile":128,"latency_ms_per_move":0.0005,"games_per_sec":18373.91,"description":"合法手からランダムに1手選ぶ（比較の基準）"}]}
+```
+
+
+## Bench run 2026-10-27 10:34:47 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure fragility --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 7ed57f9
+- date: 2026-10-27 10:34:47 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure fragility probe (#101)...#101 probe: 43057 afterstates, expectimax_tt d3 games (seeds 3000+), death net 1000 games
+#101 overall: pearson(empties, ml) = 0.278, pearson(V, ml) = 0.023
+#101 empties= 1 n=  1292 pearson(V, ml)=-0.007 tercile_ml=845.5/867.3/884.5
+#101 empties= 2 n=  2757 pearson(V, ml)=0.070 tercile_ml=808.4/931.3/957.3
+#101 empties= 3 n=  5063 pearson(V, ml)=0.089 tercile_ml=961.9/1011.3/1136.3
+#101 empties= 4 n=  7244 pearson(V, ml)=0.120 tercile_ml=1051.4/1129.0/1334.4
+#101 empties= 5 n=  7920 pearson(V, ml)=0.078 tercile_ml=1175.2/1276.7/1365.2
+#101 empties= 6 n=  7431 pearson(V, ml)=0.037 tercile_ml=1327.7/1406.8/1430.1
+#101 empties= 7 n=  5393 pearson(V, ml)=-0.016 tercile_ml=1578.4/1512.4/1584.1
+#101 empties= 8 n=  3245 pearson(V, ml)=-0.006 tercile_ml=1724.7/1644.4/1731.7
+#101 empties= 9 n=  1614 pearson(V, ml)=-0.033 tercile_ml=1917.8/1791.4/1900.1
+#101 empties=10 n=   657 pearson(V, ml)=-0.104 tercile_ml=2280.3/2049.6/1991.8
+#101 empties=11 n=   227 pearson(V, ml)=-0.044 tercile_ml=2088.6/2065.2/2075.5
+#101 empties=12 n=   119 pearson(V, ml)=0.011 tercile_ml=2242.3/2157.5/2486.9
+OK
+All 1 tests passed.
+```
+
+
+## Bench run 2026-10-27 10:38:38 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP death in-distribution --dep core --dep parallel -Mroot=ai/solver/nn.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mparallel=ai/solver/parallel.zig`
+- commit: 7ed57f9
+- date: 2026-10-27 10:38:38 +0900
+- exit: 0
+
+```text
+1/1 nn.test.TEMP death in-distribution (#101)...#101 in-dist: n=1706 pearson(V, ml)=-0.447
+OK
+All 1 tests passed.
+```
+
+
+## Bench run 2026-10-27 10:45:17 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure fragility probe robust --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 7ed57f9
+- date: 2026-10-27 10:45:17 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure fragility probe robust (#101)...#101 probe-5k: 43057 afterstates
+#101 overall-5k: pearson(empties, ml) = 0.278, pearson(V, ml) = -0.001
+#101 empties= 1 n=  1292 pearson(V, ml)=-0.059 tercile_ml=932.2/894.4/771.2
+#101 empties= 2 n=  2757 pearson(V, ml)=0.059 tercile_ml=825.1/928.9/942.9
+#101 empties= 3 n=  5063 pearson(V, ml)=0.076 tercile_ml=968.1/1030.1/1111.2
+#101 empties= 4 n=  7244 pearson(V, ml)=0.125 tercile_ml=1041.9/1133.1/1339.8
+#101 empties= 5 n=  7920 pearson(V, ml)=0.084 tercile_ml=1177.6/1281.7/1357.8
+#101 empties= 6 n=  7431 pearson(V, ml)=0.053 tercile_ml=1314.2/1395.1/1455.3
+#101 empties= 7 n=  5393 pearson(V, ml)=-0.012 tercile_ml=1540.1/1542.0/1592.7
+#101 empties= 8 n=  3245 pearson(V, ml)=0.004 tercile_ml=1696.2/1655.0/1749.6
+#101 empties= 9 n=  1614 pearson(V, ml)=-0.046 tercile_ml=1950.4/1761.7/1897.3
+#101 empties=10 n=   657 pearson(V, ml)=-0.112 tercile_ml=2267.5/2089.5/1964.7
+#101 empties=11 n=   227 pearson(V, ml)=-0.057 tercile_ml=2203.4/1954.8/2071.2
+#101 empties=12 n=   119 pearson(V, ml)=0.032 tercile_ml=2325.4/2250.3/2319.6
+OK
+All 1 tests passed.
+```
+
+
+## Bench run 2026-10-27 10:48:08 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP death in-dist robust --dep core --dep parallel -Mroot=ai/solver/nn.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mparallel=ai/solver/parallel.zig`
+- commit: 7ed57f9
+- date: 2026-10-27 10:48:08 +0900
+- exit: 0
+
+```text
+1/1 nn.test.TEMP death in-dist robust (#101)...#101 in-dist-5k: n=1385 pearson(V, ml)=-0.606
+OK
+All 1 tests passed.
+```
+
+
+## Bench run 2026-10-27 10:55:16 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure fragility probe tail --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: 7ed57f9
+- date: 2026-10-27 10:55:16 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure fragility probe tail (#101)...#101 tail-5k: n=2000 pearson(V, ml)=-0.230
+#101 tail empties= 1 n=   336 pearson(V, ml)=-0.137 tercile_ml=36.2/32.6/29.3
+#101 tail empties= 2 n=   516 pearson(V, ml)=-0.030 tercile_ml=45.2/44.1/38.6
+#101 tail empties= 3 n=   514 pearson(V, ml)=-0.216 tercile_ml=56.8/54.4/43.9
+#101 tail empties= 4 n=   357 pearson(V, ml)=-0.056 tercile_ml=62.0/63.2/61.1
+#101 tail empties= 5 n=   191 pearson(V, ml)=-0.197 tercile_ml=70.7/70.3/67.1
+#101 tail empties= 6 n=    77 pearson(V, ml)=-0.496 tercile_ml=79.5/71.5/57.4
+OK
+All 1 tests passed.
+```
+
+
+## Bench run 2026-10-27 13:08:07 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure fragility A/B --dep core --dep nn --dep parallel -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: da3364c
+- date: 2026-10-27 13:08:07 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure fragility A/B (#101)...#101 fragility lam=0 seed=1000 avg=24297.7 moves=1301.8 reach4096=5 reach8192=0 dead=28
+#101 fragility lam=0 seed=2000 avg=25385.7 moves=1360.2 reach4096=3 reach8192=0 dead=24
+#101 fragility lam=300 seed=1000 avg=19420.6 moves=1082.9 reach4096=2 reach8192=0 dead=34
+#101 fragility lam=300 seed=2000 avg=24644.3 moves=1331.2 reach4096=2 reach8192=0 dead=24
+#101 fragility lam=1000 seed=1000 avg=26354.1 moves=1388.7 reach4096=5 reach8192=0 dead=23
+#101 fragility lam=1000 seed=2000 avg=25614.8 moves=1365.2 reach4096=5 reach8192=0 dead=27
+#101 fragility lam=3000 seed=1000 avg=26345.5 moves=1393.9 reach4096=5 reach8192=0 dead=22
+#101 fragility lam=3000 seed=2000 avg=24204.2 moves=1294.8 reach4096=4 reach8192=0 dead=27
+OK
+All 1 tests passed.
+```
+
+
+## Bench run 2026-10-27 13:29:16 +0900
+
+- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure fragility A/B v2 --dep core --dep nn --dep parallel -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
+- commit: da3364c
+- date: 2026-10-27 13:29:16 +0900
+- exit: 0
+
+```text
+1/1 solver.test.TEMP measure fragility A/B v2 (#101)...#101 v2 set 1000: paired mean diff = 2056.4
+#101 v2 set 2000: paired mean diff = 229.1
+#101 v2 set 3000: paired mean diff = -1306.3
+#101 v2 set 4000: paired mean diff = -1490.8
+#101 v2 total n=200 avg0=25400.4 avg1000=25272.5 paired diff=-127.9 stderr=1477.3 dead0=93 dead1=104
+OK
+All 1 tests passed.
 ```
