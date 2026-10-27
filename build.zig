@@ -67,20 +67,21 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the CLI app");
     run_step.dependOn(&run_cmd.step);
 
-    const core_tests = b.addTest(.{
+    const test_filters: []const []const u8 = if (b.option([]const u8, "test-filter", "only run tests whose name contains this substring")) |f| &.{f} else &.{};
+    const core_tests = b.addTest(.{ .filters = test_filters,
         .root_module = core_mod,
     });
     const run_core_tests = b.addRunArtifact(core_tests);
 
-    const exe_tests = b.addTest(.{
+    const exe_tests = b.addTest(.{ .filters = test_filters,
         .root_module = exe.root_module,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
-    const solver_tests = b.addTest(.{
+    const solver_tests = b.addTest(.{ .filters = test_filters,
         .root_module = solver_mod,
     });
-    const bench_tests = b.addTest(.{
+    const bench_tests = b.addTest(.{ .filters = test_filters,
         .root_module = b.createModule(.{
             .root_source_file = b.path("ai/solver/bench.zig"),
             .target = target,
@@ -129,7 +130,7 @@ pub fn build(b: *std.Build) void {
     ranking_cmd.addPassthruArgs();
     ranking_cmd.step.dependOn(b.getInstallStep());
 
-    const ranking_tests = b.addTest(.{
+    const ranking_tests = b.addTest(.{ .filters = test_filters,
         .root_module = ranking_exe.root_module,
     });
     const run_ranking_tests = b.addRunArtifact(ranking_tests);
@@ -137,10 +138,31 @@ pub fn build(b: *std.Build) void {
     const ranking_step = b.step("ranking", "Compare policies and print JSON ranking");
     ranking_step.dependOn(&ranking_cmd.step);
 
-    const parallel_tests = b.addTest(.{ .root_module = parallel_mod });
-    const run_parallel_tests = b.addRunArtifact(parallel_tests);
+    const parallel_tests = b.addTest(.{ .filters = test_filters, .root_module = parallel_mod });    const run_parallel_tests = b.addRunArtifact(parallel_tests);
 
-    const nn_tests = b.addTest(.{ .root_module = nn_mod });
+    const evalab_exe = b.addExecutable(.{
+        .name = "evalab",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("ai/solver/evalab.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "solver", .module = solver_mod },
+                .{ .name = "parallel", .module = parallel_mod },
+            },
+        }),
+    });
+    const evalab_cmd = b.addRunArtifact(evalab_exe);
+    evalab_cmd.addPassthruArgs();
+    evalab_cmd.step.dependOn(b.getInstallStep());
+
+    const evalab_tests = b.addTest(.{ .filters = test_filters, .root_module = evalab_exe.root_module });
+    const run_evalab_tests = b.addRunArtifact(evalab_tests);
+
+    const evalab_step = b.step("evalab", "Compare evaluation variants (path shape, anchor, extra terms) on the same seeds");
+    evalab_step.dependOn(&evalab_cmd.step);
+
+    const nn_tests = b.addTest(.{ .filters = test_filters, .root_module = nn_mod });
     const run_nn_tests = b.addRunArtifact(nn_tests);
 
     const nn_exe = b.addExecutable(.{
@@ -161,13 +183,13 @@ pub fn build(b: *std.Build) void {
     nn_cmd.addPassthruArgs();
     nn_cmd.step.dependOn(b.getInstallStep());
 
-    const nn_main_tests = b.addTest(.{ .root_module = nn_exe.root_module });
+    const nn_main_tests = b.addTest(.{ .filters = test_filters, .root_module = nn_exe.root_module });
     const run_nn_main_tests = b.addRunArtifact(nn_main_tests);
 
     const nn_step = b.step("nn", "Train the value MLP (TD(0) self-play) and evaluate it against expectimax depth 2");
     nn_step.dependOn(&nn_cmd.step);
 
-    const ntuple_tests = b.addTest(.{ .root_module = ntuple_mod });
+    const ntuple_tests = b.addTest(.{ .filters = test_filters, .root_module = ntuple_mod });
     const run_ntuple_tests = b.addRunArtifact(ntuple_tests);
 
     const ntuple_exe = b.addExecutable(.{
@@ -188,7 +210,7 @@ pub fn build(b: *std.Build) void {
     ntuple_cmd.addPassthruArgs();
     ntuple_cmd.step.dependOn(b.getInstallStep());
 
-    const ntuple_main_tests = b.addTest(.{ .root_module = ntuple_exe.root_module });
+    const ntuple_main_tests = b.addTest(.{ .filters = test_filters, .root_module = ntuple_exe.root_module });
     const run_ntuple_main_tests = b.addRunArtifact(ntuple_main_tests);
 
     const ntuple_step = b.step("ntuple", "Train the n-tuple TD value function and evaluate it against expectimax depth 2");
@@ -213,7 +235,7 @@ pub fn build(b: *std.Build) void {
     const ga_step = b.step("ga-rl", "Evolve evaluation weights with a GA and compare on holdout seeds");
     ga_step.dependOn(&ga_cmd.step);
 
-    const ga_tests = b.addTest(.{
+    const ga_tests = b.addTest(.{ .filters = test_filters,
         .root_module = ga_exe.root_module,
     });
     const run_ga_tests = b.addRunArtifact(ga_tests);
@@ -286,4 +308,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_parallel_tests.step);
     test_step.dependOn(&run_ga_tests.step);
     test_step.dependOn(&run_ranking_tests.step);
+    test_step.dependOn(&run_evalab_tests.step);
 }

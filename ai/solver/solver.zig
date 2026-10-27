@@ -12,6 +12,11 @@ const lost_score: f64 = -1e9;
 const beam_width = 32;
 const beam_horizon = 3;
 
+/// Path shapes for the order penalty, compared by `zig build evalab` (issue #112).
+/// `flex` / `flex_reverse` are the user-supplied "flex" layout (#112 comment): only 7 ranked cells
+/// are ordered, the other 9 stay free.
+pub const Layout = enum { snake, column_snake, spiral, block2, flex, flex_reverse };
+
 /// Weights of the snake heuristic (`evaluateW`, `evaluateStateW`). `baseline` is the hand-set version.
 pub const Weights = struct {
     empty: f64 = 10,
@@ -22,6 +27,20 @@ pub const Weights = struct {
     merge: f64 = 10,
     /// extra penalty when only `down` is legal (the top-left anchor breaks)
     forced_down: f64 = 100,
+    /// path shape of the order penalty (issue #112). The default is the shipped row snake.
+    layout: Layout = .snake,
+    /// anchor of that path: rotation (anchor >> 1, 90° clockwise each) plus a column mirror
+    /// (anchor & 1) (issue #113). 0 keeps the shipped top-left anchor.
+    anchor: u8 = 0,
+    /// number of leading path cells that must stay ordered; the rest are free cells (issue #112,
+    /// "flex" layouts). 16 keeps the whole path constrained, which is the shipped behaviour.
+    ordered: u8 = 16,
+    /// penalty for |log2| steps between adjacent tiles (issue #114). 0 keeps the shipped evaluation.
+    smoothness: f64 = 0,
+    /// penalty for the monotonicity violation of each row and column (issue #114).
+    monotonic: f64 = 0,
+    /// bonus for the sum of log2 tile values on the board (issue #114).
+    tile_sum: f64 = 0,
     /// fragility penalty weight (issue #101): boards the death net expects to
     /// die sooner score lower by `fragility * (0 - v)`. 0 keeps evaluateW as-is.
     fragility: f64 = 0,
@@ -580,28 +599,146 @@ pub fn evaluate(board: Board) f64 {
 }
 
 pub fn evaluateW(board: Board, w: Weights) f64 {
+    var path: [core.BoardCellCount]core.Position = undefined;
+    pathFor(w.layout, w.anchor, &path);
     var empties: f64 = 0;
     var penalty: f64 = 0;
     var prev: ?f64 = null;
     var max_level: f64 = 0;
-    for (order) |p| {
+    for (path, 0..) |p, i| {
         const value = board[p.row][p.col];
         if (value == 0) {
             empties += 1;
             continue;
         }
         const level: f64 = @floatFromInt(@ctz(value));
-        if (prev) |before| penalty += @max(0, level - before);
-        prev = level;
+        if (i < w.ordered) {
+            if (prev) |before| penalty += @max(0, level - before);
+            prev = level;
+        }
         max_level = @max(max_level, level);
     }
     // endgame phase once the largest tile reaches 4096 = 2^12 (issue #92)
     const order_penalty = if (max_level >= 12) w.order_penalty_late else w.order_penalty;
-    const base = empties * w.empty - penalty * order_penalty + mergePairs(board) * w.merge;
+    var base = empties * w.empty - penalty * order_penalty + mergePairs(board) * w.merge;
+    if (w.smoothness != 0) base -= rough(board) * w.smoothness;
+    if (w.monotonic != 0) base -= monoViolation(board) * w.monotonic;
+    if (w.tile_sum != 0) base += tileSum(board) * w.tile_sum;
     if (w.fragility == 0) return base;
     const net = w.death_net orelse return base;
     var cache: nn.Cache = .{};
     return base + w.fragility * (0 - nn.forward(net, board, &cache));
+}
+
+/// Traversal order for the order penalty: `layout` shape, rotated clockwise `anchor >> 1` times and
+/// mirrored along the columns when `anchor & 1` is set. anchor 0 / `.snake` is the shipped path.
+pub fn pathFor(layout: Layout, anchor: u8, out: *[core.BoardCellCount]core.Position) void {
+    const rot = anchor >> 1;
+    for (0..core.BoardCellCount) |i| {
+        var p = baseCell(layout, i);
+        // 90° clockwise: (row, col) -> (col, n-1-row). The row is saved first: `p = .{...p...}`
+        // would read the already-written field under result-location semantics.
+        for (0..rot) |_| {
+            const row = p.col;
+            p.col = core.BoardSize - 1 - p.row;
+            p.row = row;
+        }
+        if (anchor & 1 == 1) p.col = core.BoardSize - 1 - p.col;
+        out[i] = p;
+    }
+}
+
+/// cell `i` of the unrotated path for `layout`.
+fn baseCell(layout: Layout, i: usize) core.Position {
+    const n = core.BoardSize;
+    return switch (layout) {
+        .snake => order[i],
+        // columns instead of rows; the largest tile ends up top-right of the anchor column pair
+        .column_snake => .{ .row = if ((i / n) % 2 == 0) i % n else n - 1 - i % n, .col = i / n },
+        .spiral => spiral[i],
+        .flex => flex[i],
+        .flex_reverse => flex[core.BoardCellCount - 1 - i],
+        // 2x2 blocks in row-major order, each block walked as a small snake
+        .block2 => blk: {
+            const blocks_per_row = n / 2;
+            const origin_row = (i / 4 / blocks_per_row) * 2;
+            const origin_col = (i / 4 % blocks_per_row) * 2;
+            const step = block2_step[i % 4];
+            break :blk .{ .row = origin_row + step.row, .col = origin_col + step.col };
+        },
+    };
+}
+
+/// flex layout: the 7 ranked cells in size order (1 = largest), then the 9 free cells.
+/// rank 1..7 sit at (1,3) (2,2) (2,3) (2,0) (3,2) (3,0) (3,3); empties are skipped by the penalty,
+/// so their order is irrelevant.
+const flex: [core.BoardCellCount]core.Position = .{
+    .{ .row = 1, .col = 3 }, .{ .row = 2, .col = 2 }, .{ .row = 2, .col = 3 }, .{ .row = 2, .col = 0 },
+    .{ .row = 3, .col = 2 }, .{ .row = 3, .col = 0 }, .{ .row = 3, .col = 3 },
+    .{ .row = 0, .col = 0 }, .{ .row = 0, .col = 1 }, .{ .row = 0, .col = 2 }, .{ .row = 0, .col = 3 },
+    .{ .row = 1, .col = 0 }, .{ .row = 1, .col = 1 }, .{ .row = 1, .col = 2 }, .{ .row = 2, .col = 1 },
+    .{ .row = 3, .col = 1 },
+};
+
+/// Cells of one 2x2 block in walk order: top-left, top-right, bottom-right, bottom-left.
+const block2_step: [4]core.Position = .{
+    .{ .row = 0, .col = 0 }, .{ .row = 0, .col = 1 }, .{ .row = 1, .col = 1 }, .{ .row = 1, .col = 0 },
+};
+
+/// Outer ring clockwise from the top-left, then the inner 2x2 clockwise.
+const spiral: [core.BoardCellCount]core.Position = .{
+    .{ .row = 0, .col = 0 }, .{ .row = 0, .col = 1 }, .{ .row = 0, .col = 2 }, .{ .row = 0, .col = 3 },
+    .{ .row = 1, .col = 3 }, .{ .row = 2, .col = 3 }, .{ .row = 3, .col = 3 }, .{ .row = 3, .col = 2 },
+    .{ .row = 3, .col = 1 }, .{ .row = 3, .col = 0 }, .{ .row = 2, .col = 0 }, .{ .row = 1, .col = 0 },
+    .{ .row = 1, .col = 1 }, .{ .row = 1, .col = 2 }, .{ .row = 2, .col = 2 }, .{ .row = 2, .col = 1 },
+};
+
+/// log2 of a tile; empties count as level 0.
+fn levelOf(value: core.Tile) f64 {
+    return if (value == 0) 0 else @floatFromInt(@ctz(value));
+}
+
+/// Sum of |log2 difference| between non-empty neighbours: a rough board scores higher (worse).
+fn rough(board: Board) f64 {
+    var total: f64 = 0;
+    for (0..core.BoardSize) |r| {
+        for (0..core.BoardSize) |c| {
+            if (board[r][c] == 0) continue;
+            if (c + 1 < core.BoardSize and board[r][c + 1] != 0) total += @abs(levelOf(board[r][c]) - levelOf(board[r][c + 1]));
+            if (r + 1 < core.BoardSize and board[r + 1][c] != 0) total += @abs(levelOf(board[r][c]) - levelOf(board[r + 1][c]));
+        }
+    }
+    return total;
+}
+
+/// Monotonicity violation over every row and column, counted in the line's better direction.
+fn monoViolation(board: Board) f64 {
+    var total: f64 = 0;
+    for (0..core.BoardSize) |i| {
+        total += lineViolation(.{ board[i][0], board[i][1], board[i][2], board[i][3] });
+        total += lineViolation(.{ board[0][i], board[1][i], board[2][i], board[3][i] });
+    }
+    return total;
+}
+
+/// steps against the better of the two directions: 0 when the line is monotone either way.
+fn lineViolation(tiles: [4]core.Tile) f64 {
+    var rising: f64 = 0;
+    var falling: f64 = 0;
+    for (0..3) |i| {
+        const diff = levelOf(tiles[i + 1]) - levelOf(tiles[i]);
+        if (diff > 0) rising += diff else falling -= diff;
+    }
+    return @min(rising, falling);
+}
+
+/// Sum of log2 tile values: rewards a board of many large tiles.
+fn tileSum(board: Board) f64 {
+    var total: f64 = 0;
+    for (board) |row| {
+        for (row) |value| total += levelOf(value);
+    }
+    return total;
 }
 
 /// Count of horizontally or vertically adjacent equal non-empty tiles: more merges available.
@@ -628,6 +765,21 @@ pub const GameResult = struct {
 /// Play one full game with the solver until no move changes the board.
 pub fn playGame(rng: std.Random, depth: u8) GameResult {
     return playPolicy(rng, .expectimax, depth);
+}
+
+/// Play one full game with custom evaluation weights (`zig build evalab`).
+pub fn playWeights(rng: std.Random, w: Weights, depth: u8) GameResult {
+    var state = GameState.gameStart(rng);
+    var moves: u32 = 0;
+    while (bestMoveW(state, depth, w)) |d| {
+        _ = state.move(d, rng);
+        moves += 1;
+    }
+    var max_tile: core.Tile = 0;
+    for (state.board) |row| {
+        for (row) |value| max_tile = @max(max_tile, value);
+    }
+    return .{ .score = state.score, .max_tile = max_tile, .moves = moves };
 }
 
 pub fn evaluateState(state: GameState) f64 {
@@ -1015,6 +1167,131 @@ test "evaluate rewards adjacent equal tiles (merges available)" {
         .{ 0, 0, 0, 0 },
     };
     try std.testing.expect(evaluate(merges) > evaluate(apart));
+}
+
+test "pathFor snake anchor 0 is the shipped order" {
+    var path: [core.BoardCellCount]core.Position = undefined;
+    pathFor(.snake, 0, &path);
+    try std.testing.expectEqual(order, path);
+}
+
+test "every layout and anchor visits each cell exactly once" {
+    var path: [core.BoardCellCount]core.Position = undefined;
+    for (std.enums.values(Layout)) |layout| {
+        for (0..8) |anchor| {
+            pathFor(layout, @intCast(anchor), &path);
+            var seen: u16 = 0;
+            for (path) |p| {
+                const bit: u4 = @intCast(p.row * core.BoardSize + p.col);
+                try std.testing.expect(seen & (@as(u16, 1) << bit) == 0);
+                seen |= @as(u16, 1) << bit;
+            }
+            try std.testing.expectEqual(@as(u16, 0xffff), seen);
+        }
+    }
+}
+
+test "anchor rotates clockwise then mirrors the columns" {
+    var path: [core.BoardCellCount]core.Position = undefined;
+    // snake path index 1 is (0, 1)
+    const cases = [_]struct { anchor: u8, cell: core.Position }{
+        .{ .anchor = 0, .cell = .{ .row = 0, .col = 1 } },
+        .{ .anchor = 1, .cell = .{ .row = 0, .col = 2 } }, // mirror
+        .{ .anchor = 2, .cell = .{ .row = 1, .col = 3 } }, // 90° clockwise
+        .{ .anchor = 3, .cell = .{ .row = 1, .col = 0 } }, // rotate, then mirror
+        .{ .anchor = 6, .cell = .{ .row = 2, .col = 0 } }, // 270° clockwise
+    };
+    for (cases) |c| {
+        pathFor(.snake, c.anchor, &path);
+        try std.testing.expectEqual(c.cell, path[1]);
+    }
+}
+
+test "layouts give different paths" {
+    var snake: [core.BoardCellCount]core.Position = undefined;
+    var column: [core.BoardCellCount]core.Position = undefined;
+    var spiral_path: [core.BoardCellCount]core.Position = undefined;
+    var block: [core.BoardCellCount]core.Position = undefined;
+    pathFor(.snake, 0, &snake);
+    pathFor(.column_snake, 0, &column);
+    pathFor(.spiral, 0, &spiral_path);
+    pathFor(.block2, 0, &block);
+    // column snake starts down the first column, spiral walks the outer ring, block2 its first 2x2
+    try std.testing.expectEqual(core.Position{ .row = 1, .col = 0 }, column[1]);
+    try std.testing.expectEqual(core.Position{ .row = 1, .col = 3 }, spiral_path[4]);
+    try std.testing.expectEqual(core.Position{ .row = 1, .col = 1 }, block[2]);
+    try std.testing.expectEqual(core.Position{ .row = 2, .col = 2 }, block[12]);
+    try std.testing.expect(snake[1].col != column[1].col);
+}
+
+test "ordered cut keeps only the leading path cells constrained" {
+    // (3,0) and (2,1) are path cells 8 and 13 of the snake, so a cut at 8 ignores their rise
+    const board: Board = .{
+        .{ 0, 0, 0, 2 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 8, 0, 0 },
+        .{ 16, 0, 0, 0 },
+    };
+    var cut = baseline;
+    cut.ordered = 8;
+    try std.testing.expect(evaluateW(board, cut) > evaluateW(board, baseline));
+    var full = baseline;
+    full.ordered = 16;
+    try std.testing.expectEqual(evaluateW(board, baseline), evaluateW(board, full));
+}
+
+test "zero extra weights keep the shipped evaluation" {
+    const board: Board = .{
+        .{ 2, 4, 8, 16 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    var w = baseline;
+    w.smoothness = 0;
+    w.monotonic = 0;
+    w.tile_sum = 0;
+    try std.testing.expectEqual(evaluate(board), evaluateW(board, w));
+}
+
+test "extra terms change the score as documented" {
+    const sorted: Board = .{
+        .{ 2, 4, 8, 16 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    const jumbled: Board = .{
+        .{ 2, 16, 4, 8 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    // three level steps along the row, and the levels sum to 1 + 2 + 3 + 4
+    try std.testing.expectEqual(@as(f64, 3), rough(sorted));
+    try std.testing.expectEqual(@as(f64, 10), tileSum(sorted));
+    try std.testing.expectEqual(@as(f64, 0), monoViolation(sorted));
+    try std.testing.expect(monoViolation(jumbled) > 0);
+    // penalties lower the score, the tile sum raises it (same weights apart from the added term)
+    var smooth = baseline;
+    smooth.smoothness = 5;
+    var mono = baseline;
+    mono.monotonic = 5;
+    var tiles = baseline;
+    tiles.tile_sum = 1;
+    try std.testing.expect(evaluateW(jumbled, smooth) < evaluateW(jumbled, baseline));
+    try std.testing.expect(evaluateW(jumbled, mono) < evaluateW(jumbled, baseline));
+    try std.testing.expect(evaluateW(sorted, tiles) > evaluateW(sorted, baseline));
+}
+
+test "playWeights with the baseline matches the expectimax policy" {
+    var prng_a = std.Random.DefaultPrng.init(11);
+    var prng_b = std.Random.DefaultPrng.init(11);
+    const custom = playWeights(prng_a.random(), baseline, 1);
+    const shipped = playPolicy(prng_b.random(), .expectimax, 1);
+    try std.testing.expectEqual(shipped.score, custom.score);
+    try std.testing.expectEqual(shipped.moves, custom.moves);
+    try std.testing.expectEqual(shipped.max_tile, custom.max_tile);
 }
 
 test "evaluateState penalizes a board where only down is legal" {
