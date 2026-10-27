@@ -22,6 +22,12 @@ pub const Weights = struct {
     merge: f64 = 10,
     /// extra penalty when only `down` is legal (the top-left anchor breaks)
     forced_down: f64 = 100,
+    /// fragility penalty weight (issue #101): boards the death net expects to
+    /// die sooner score lower by `fragility * (0 - v)`. 0 keeps evaluateW as-is.
+    fragility: f64 = 0,
+    /// death-variant net whose value is ≈ -(moves to game over)/reward_scale.
+    /// Without it the fragility term is skipped.
+    death_net: ?*const nn.Net = null,
 };
 pub const baseline: Weights = .{ .order_penalty = 43.174, .order_penalty_late = 25 };
 
@@ -591,7 +597,11 @@ pub fn evaluateW(board: Board, w: Weights) f64 {
     }
     // endgame phase once the largest tile reaches 4096 = 2^12 (issue #92)
     const order_penalty = if (max_level >= 12) w.order_penalty_late else w.order_penalty;
-    return empties * w.empty - penalty * order_penalty + mergePairs(board) * w.merge;
+    const base = empties * w.empty - penalty * order_penalty + mergePairs(board) * w.merge;
+    if (w.fragility == 0) return base;
+    const net = w.death_net orelse return base;
+    var cache: nn.Cache = .{};
+    return base + w.fragility * (0 - nn.forward(net, board, &cache));
 }
 
 /// Count of horizontally or vertically adjacent equal non-empty tiles: more merges available.
@@ -1102,6 +1112,57 @@ test "baseline weights follow the adopted phase weights (#92)" {
     try std.testing.expectApproxEqAbs(@as(f64, 140 - 11 * 25), evaluateW(late, baseline), 1e-9);
     // ga weights stay phase-invariant at their evolved 43.174
     try std.testing.expectApproxEqAbs(@as(f64, 14 * 7.028 - 11 * 43.174), evaluateW(late, ga_weights), 1e-9);
+}
+
+test "fragility is inert at its default and without a death net (#101)" {
+    const board: Board = .{
+        .{ 2, 2048, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    var net: nn.Net = std.mem.zeroes(nn.Net);
+    net.b3 = -0.4; // constant V for every board
+    try std.testing.expectEqual(evaluateW(board, .{}), evaluateW(board, .{ .death_net = &net }));
+    try std.testing.expectEqual(evaluateW(board, .{}), evaluateW(board, .{ .fragility = 500 }));
+}
+
+test "fragility adds the death net value scaled by the weight (#101)" {
+    const board: Board = .{
+        .{ 2, 2048, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    var net: nn.Net = std.mem.zeroes(nn.Net);
+    net.b3 = -0.4; // constant V for every board
+    const w: Weights = .{ .fragility = 500, .death_net = &net };
+    // V = -0.4: fragility * (0 - V) = 500 * 0.4 = 200
+    try std.testing.expectApproxEqAbs(evaluateW(board, .{}) + 200, evaluateW(board, w), 1e-9);
+}
+
+test "fragility penalizes boards the death net expects to die sooner (#101)" {
+    // V = 0.1 * levelOf(board[0][0]) via one hidden unit fed by cell 0's level rows
+    var net: nn.Net = std.mem.zeroes(nn.Net);
+    for (0..nn.levels) |l| net.w1[l][0] = 0.1 * @as(f64, @floatFromInt(l));
+    net.w2[0][0] = 1;
+    net.w3[0] = 1;
+    const fragile: Board = .{ // levelOf(32) = 5 -> V = 0.5 (die sooner)
+        .{ 32, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    const robust: Board = .{ // levelOf(2) = 1 -> V = 0.1
+        .{ 2, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    const w: Weights = .{ .fragility = 100, .death_net = &net };
+    // the fragile board takes the larger deduction: 100 * (0 - 0.5) = -50 vs -10
+    try std.testing.expectApproxEqAbs(evaluateW(fragile, .{}) - 50, evaluateW(fragile, w), 1e-9);
+    try std.testing.expectApproxEqAbs(evaluateW(robust, .{}) - 10, evaluateW(robust, w), 1e-9);
 }
 
 test "playGame finishes a game and reports its result" {
