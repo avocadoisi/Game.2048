@@ -141,14 +141,14 @@ const Pick = struct {
 };
 
 /// Best legal move by reward + V(afterstate); null when no move changes the board.
-fn pickMove(net: *const Net, state: GameState) ?Pick {
+fn pickMove(net: *const Net, state: GameState, death: bool) ?Pick {
     var best: ?Pick = null;
     for ([_]Direction{ .up, .left, .down, .right }) |d| {
         var next = state;
         const moved = next.slide(d);
         if (!moved.changed) continue;
         var cache: Cache = .{};
-        const reward = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale;
+        const reward = if (death) -1 / reward_scale else @as(f64, @floatFromInt(moved.score_delta)) / reward_scale;
         const pick: Pick = .{ .dir = d, .after = next.board, .reward = reward, .value = forward(net, next.board, &cache) };
         if (best == null or pick.reward + pick.value > best.?.reward + best.?.value) best = pick;
     }
@@ -157,7 +157,7 @@ fn pickMove(net: *const Net, state: GameState) ?Pick {
 
 /// Value of a post-spawn board for the chance-node search: best reward + V over the legal moves (0 if none).
 fn bestAfterValue(net: *const Net, board_state: GameState) f64 {
-    const pick = pickMove(net, board_state) orelse return 0;
+    const pick = pickMove(net, board_state, false) orelse return 0;
     return pick.reward + pick.value;
 }
 
@@ -328,7 +328,7 @@ pub fn bestMoveWithStats(net: *const Net, state: GameState, mode: Mode, stats: *
 /// A warm cache returns the same moves as a fresh one — only faster.
 pub fn bestMoveWithCache(net: *const Net, state: GameState, mode: Mode, stats: *Stats, cache: *ValueCache) ?Direction {
     return switch (mode) {
-        .greedy => if (pickMove(net, state)) |p| p.dir else null,
+        .greedy => if (pickMove(net, state, false)) |p| p.dir else null,
         .chance => chanceMove(net, state),
         .deep => deepMove(net, state, stats, cache),
     };
@@ -443,6 +443,11 @@ pub const Options = struct {
     /// Candidate (#72): apply every per-move TD update to all 8 dihedral transforms of the afterstate,
     /// with the same target (8 samples per visited board, deterministic).
     symmetry: bool = false,
+    /// Candidate (#101): reward every move with -1 and sweep the afterstates backward at game over, so
+    /// the value learns V ≈ -(moves to game over) and the self-play policy plays the fastest game over
+    /// (a death net). Backward full return instead of per-move TD(0): with -1 per move the TD target is
+    /// the same for every board and the net collapses to a constant (observed while building #101).
+    death: bool = false,
     /// Candidate (#72): TD(lambda) with accumulating eligibility traces over the parameters; 0 = TD(0).
     lambda: f64 = 0,
     /// Candidate (#84): fixed n-step TD on the afterstate chain; 0 = off. Standalone: when set it owns the
@@ -632,23 +637,23 @@ pub const GameResult = struct { score: u32, moves: u32 };
 /// `trainGame` with options. `diag` is only recorded on the default path (`opts` all off).
 pub fn trainGameOpts(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
     if (opts.nstep > 0) return trainGameNStep(net, rng, lr, opts.nstep);
-    if (opts.priority != null) return trainGamePerMove(net, rng, lr, diag, opts);
-    if (!opts.backward and opts.replay_k == 0) return trainGamePerMove(net, rng, lr, diag, opts);
+    if (opts.priority != null and !opts.death) return trainGamePerMove(net, rng, lr, diag, opts);
+    if (!opts.backward and opts.replay_k == 0 and !opts.death) return trainGamePerMove(net, rng, lr, diag, opts);
     var steps: [step_cap]Step = undefined;
     var n: usize = 0;
     var state = GameState.gameStart(rng);
     var cache: Cache = .{};
     var pending: ?Pick = null;
-    while (pickMove(net, state)) |pick| {
-        if (pending) |p| if (!opts.backward) trainAfter(net, &cache, p.after, p.reward + pick.value, lr);
+    while (pickMove(net, state, opts.death)) |pick| {
+        if (pending) |p| if (!opts.backward and !opts.death) trainAfter(net, &cache, p.after, p.reward + pick.value, lr);
         steps[n % step_cap] = .{ .after = pick.after, .reward = pick.reward };
         n += 1;
         pending = pick;
         _ = state.move(pick.dir, rng);
     }
-    if (pending) |p| if (!opts.backward) trainAfter(net, &cache, p.after, p.reward, lr);
+    if (pending) |p| if (!opts.backward and !opts.death) trainAfter(net, &cache, p.after, p.reward, lr);
 
-    if (opts.backward) {
+    if (opts.backward or opts.death) {
         var i = n;
         while (i > n -| step_cap) {
             i -= 1;
@@ -696,7 +701,7 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
     var cache: Cache = .{};
     var moves: u32 = 0;
     var trace: Net = std.mem.zeroes(Net);
-    while (pickMove(net, state)) |pick| {
+    while (pickMove(net, state, opts.death)) |pick| {
         moves += 1;
         if (pending) |p| {
             const target = p.reward + pick.value;
@@ -736,7 +741,7 @@ fn trainGameNStep(net: *Net, rng: std.Random, lr: f64, n: usize) GameResult {
     var state = GameState.gameStart(rng);
     var cache: Cache = .{};
     var moves: u32 = 0;
-    while (pickMove(net, state)) |pick| {
+    while (pickMove(net, state, false)) |pick| {
         moves += 1;
         if (window.push(.{ .after = pick.after, .reward = pick.reward }, pick.value)) |done|
             trainAfter(net, &cache, done.after, done.target, lr);
@@ -1131,6 +1136,39 @@ test "trainGame is deterministic for a fixed seed" {
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
 }
 
+test "death reward is the scaled -1 per move instead of the score delta (#101)" {
+    var net = std.mem.zeroes(Net);
+    const state = GameState{ .board = .{ .{ 2, 2, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 } } };
+    const scored = pickMove(&net, state, false).?;
+    try std.testing.expectEqual(Direction.left, scored.dir);
+    try std.testing.expectApproxEqAbs(@as(f64, 4) / reward_scale, scored.reward, 1e-12);
+    const death = pickMove(&net, state, true).?;
+    try std.testing.expectEqual(@as(f64, -1) / reward_scale, death.reward);
+}
+
+test "death training drives values toward minus moves to game over (#101)" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var net = Net.init(init_rng.random());
+    var train_rng = std.Random.DefaultPrng.init(12);
+    for (0..60) |_| _ = trainGameOpts(&net, train_rng.random(), 0.02, null, .{ .death = true });
+
+    var play_rng = std.Random.DefaultPrng.init(13);
+    const rng = play_rng.random();
+    var state = GameState.gameStart(rng);
+    var first_value: f64 = 0;
+    var last_value: f64 = 0;
+    var moves: u32 = 0;
+    while (pickMove(&net, state, true)) |p| {
+        if (moves == 0) first_value = p.value;
+        last_value = p.value;
+        moves += 1;
+        _ = state.move(p.dir, rng);
+    }
+    try std.testing.expect(moves > 10);
+    try std.testing.expect(first_value < last_value);
+    try std.testing.expect(last_value < 0);
+}
+
 /// Mean and standard error (sample sd / sqrt(n)) of per-seed-range averages.
 pub const MeanErr = struct { mean: f64, stderr: f64 };
 
@@ -1157,6 +1195,43 @@ test "meanStderr gives mean and sample standard error" {
     try std.testing.expectApproxEqAbs(@as(f64, 5), r.mean, 1e-12);
     // sample variance = 32 / 7, stderr = sqrt(32/7) / sqrt(8)
     try std.testing.expectApproxEqAbs(@sqrt(32.0 / 7.0) / @sqrt(8.0), r.stderr, 1e-12);
+}
+
+/// Linear correlation of two equal-length samples (issue #101 probe); 0 when either is constant.
+pub fn pearson(xs: []const f64, ys: []const f64) f64 {
+    std.debug.assert(xs.len == ys.len);
+    if (xs.len < 2) return 0;
+    const n: f64 = @floatFromInt(xs.len);
+    var sx: f64 = 0;
+    var sy: f64 = 0;
+    for (xs, ys) |x, y| {
+        sx += x;
+        sy += y;
+    }
+    const mx = sx / n;
+    const my = sy / n;
+    var cov: f64 = 0;
+    var vx: f64 = 0;
+    var vy: f64 = 0;
+    for (xs, ys) |x, y| {
+        const dx = x - mx;
+        const dy = y - my;
+        cov += dx * dy;
+        vx += dx * dx;
+        vy += dy * dy;
+    }
+    if (vx == 0 or vy == 0) return 0;
+    return cov / @sqrt(vx * vy);
+}
+
+test "pearson gives the linear correlation of two samples (#101)" {
+    const xs = [_]f64{ 1, 2, 3, 4 };
+    const ys = [_]f64{ 2, 4, 6, 8 };
+    try std.testing.expectApproxEqAbs(@as(f64, 1), pearson(&xs, &ys), 1e-12);
+    const down = [_]f64{ 8, 6, 4, 2 };
+    try std.testing.expectApproxEqAbs(@as(f64, -1), pearson(&xs, &down), 1e-12);
+    const steady = [_]f64{ 3, 3, 3, 3 };
+    try std.testing.expectEqual(@as(f64, 0), pearson(&xs, &steady));
 }
 
 test "meanStderr of one value has zero stderr" {
