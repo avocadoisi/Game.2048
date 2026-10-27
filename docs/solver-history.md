@@ -924,10 +924,15 @@ plain path and its recorded checksum are unchanged.
   seeds` (`ai/solver/nn.zig`) runs 4-game batches with `symmetry` and with `replay_k = 4` on threads
   and compares the weights byte-for-byte with the serial reconstruction over seeds 77..80. Two CLI
   runs each of `sym` + `par` and `replay` + `par` wrote identical weight files. `zig build test` passes.
-- Experiment pending: the 5.7x of #35 was measured on `base`. Whether the speedup carries over to the
-  heavier variants (`sym` does 8 transforms per move) and whether batched aggregation moves a
-  variant's score (it is not the same update as applying the games one after another) is not measured
-  yet. The `resume` fine-tune of #66 and the `sym` runs of #72 are the first candidates.
+- Measured speedup (8 logical CPUs, batches of 8 games): `sym` 2,000 games 16.5 s serial -> 2.7 s
+  with `par` (**6.1x**), and the #66 `resume` fine-tune +20,000 games lr 3e-4 460 s serial -> 90.9 s
+  with `par` (**5.1x**). The speedup of #35's `base` (5.7x) carries over to the heavier variants.
+- Measured score (does batched aggregation change the outcome?): `resume` +20,000 games lr 3e-4,
+  training seed 1, the exact recipe of the #97 serial run `a2`, run as `resume` + `par`:
+  in-protocol (2000..6000, 20 games/range) 42,736 vs serial 43,083, held-out (7000..10000) 43,388
+  vs serial 41,936. The two update orders land within the eval noise of each other on both range
+  sets, so batching trades nothing measurable for the ~5x speedup. (Both stay below the committed
+  net's 45,342 held-out, which is the #97 overfit finding, not a batching effect.)
 
 
 ## Bench run 2026-10-27 02:43:24 +0900
