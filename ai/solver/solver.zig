@@ -103,7 +103,7 @@ pub fn bestMoveW(state: GameState, depth: u8, w: Weights) ?Direction {
 }
 
 /// Move-choosing policies compared in the ranking (`zig build ranking`).
-pub const Policy = enum { random, greedy, expectimax, mcts, beam, expectimax_tt, ga, nn, nn2, nnmcts, nnbeam, expectimax_id };
+pub const Policy = enum { random, greedy, expectimax, mcts, beam, expectimax_tt, ga, nn, nn2, nnmcts, nnbeam, expectimax_id, nn3 };
 
 /// Weights evolved by `zig build ga-rl` (holdout +4%, see docs/solver-history.md). 3 decimals as printed.
 pub const ga_weights: Weights = .{ .empty = 7.028, .order_penalty = 43.174, .order_penalty_late = 43.174, .merge = 0, .forced_down = 0 };
@@ -150,12 +150,14 @@ pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Dir
         .expectimax_id => return bestMoveID(state, if (depth == 0) id_budget_ms else depth),
         .ga => return bestMoveW(state, depth, ga_weights),
         // The net is parsed once per thread and reused by reference (issue #87), never copied per move.
-        .nn, .nn2, .nnmcts, .nnbeam => {
+        .nn, .nn2, .nn3, .nnmcts, .nnbeam => {
             const net = nnNet();
             return switch (policy) {
                 .nn => nn.bestMove(net, state, .chance),
                 // the 2-ply search itself dominates the cost.
                 .nn2 => nn.bestMove(net, state, .deep),
+                // 3-ply with the spawn cut (issue #108): a few times nn2's cost, so ranking leaves it out.
+                .nn3 => nn.bestMove(net, state, .deep3),
                 .nnmcts => nnmctsMove(net, state, rng),
                 // the sampled beam stays below nn2's leaf count.
                 .nnbeam => if (nnBeamBest(net, state, rng)) |best| best.first_move else null,

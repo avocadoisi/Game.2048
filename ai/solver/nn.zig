@@ -244,49 +244,71 @@ pub fn sharedValueCache() *ValueCache {
     return &move_cache;
 }
 
-/// Depth-limited expectimax: our moves and every spawn (2 at 0.9, 4 at 0.1) exactly, no RNG.
+/// shortcut: branch probability cut for `deep3` (issue #108), the same idea as `solver.zig`'s
+/// `prob_cutoff` at a coarser scale. A 4 under a 4 is already ~1e-3 of the path at the second spawn
+/// layer, so 1e-2 drops those subtrees (about 10% of a node's mass, renormalized away) while the
+/// last spawn layer next to the leaves stays full width. Raise it for speed, lower it for accuracy,
+/// 0 disables the cut (that is `.deep`).
+const deep3_cutoff: f64 = 1e-2;
+
+/// Depth-limited expectimax: our moves and every spawn (2 at 0.9, 4 at 0.1), no RNG.
 /// The caller owns the value cache so a game can reuse one workspace for all of its moves.
 const Search = struct {
     net: *const Net,
     cache: *ValueCache,
     stats: Stats = .{},
+    /// Spawn branches under this path probability are dropped; 0 searches every branch (`.deep`).
+    cutoff: f64 = 0,
 
     /// Max over legal moves of reward + expected value after the spawn; 0 when no move changes the board.
-    fn value(self: *Search, state: GameState, depth: u8) f64 {
+    fn value(self: *Search, state: GameState, depth: u8, cprob: f64) f64 {
         var best: f64 = -std.math.inf(f64);
         for ([_]Direction{ .up, .left, .down, .right }) |d| {
             var next = state;
             const moved = next.slide(d);
             if (!moved.changed) continue;
-            const v = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale + self.chance(next, depth - 1);
+            const v = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale + self.chance(next, depth - 1, cprob);
             best = @max(best, v);
         }
         return if (best == -std.math.inf(f64)) 0 else best;
     }
 
     /// Expected value of a post-move board after spawning; depth 0 is the value leaf (the afterstate itself).
-    fn chance(self: *Search, state: GameState, depth: u8) f64 {
+    /// `cprob` is the probability of reaching this node. Kept branches are averaged over their own
+    /// mass, so a cut node keeps the scale of a full average instead of shrinking with the dropped ones.
+    fn chance(self: *Search, state: GameState, depth: u8, cprob: f64) f64 {
         if (depth == 0) return self.cache.get(self.net, state.board, &self.stats);
-        var total: f64 = 0;
         var empties: f64 = 0;
         for (0..core.BoardSize) |r| {
             for (0..core.BoardSize) |c| {
+                if (state.board[r][c] == 0) empties += 1;
+            }
+        }
+        if (empties == 0) return self.value(state, depth, cprob);
+        var total: f64 = 0;
+        var mass: f64 = 0;
+        for (0..core.BoardSize) |r| {
+            for (0..core.BoardSize) |c| {
                 if (state.board[r][c] != 0) continue;
-                empties += 1;
                 for ([_]struct { value: core.Tile, p: f64 }{ .{ .value = 2, .p = 0.9 }, .{ .value = 4, .p = 0.1 } }) |spawn| {
+                    const p = cprob * spawn.p;
+                    if (depth > 1 and p / empties < self.cutoff) continue;
                     var child = state;
                     child.board[r][c] = spawn.value;
-                    total += spawn.p * self.value(child, depth);
+                    total += p * self.value(child, depth, p);
+                    mass += p;
                 }
             }
         }
-        return if (empties == 0) self.value(state, depth) else total / empties;
+        // every branch cut: the node is already that unlikely, so the afterstate leaf is the answer
+        return if (mass == 0) self.cache.get(self.net, state.board, &self.stats) else total / mass;
     }
 };
 
-/// 2-ply: my move -> spawn -> my move -> spawn -> afterstate value + score_delta/reward_scale.
-fn deepMove(net: *const Net, state: GameState, stats: *Stats, cache: *ValueCache) ?Direction {
-    var search: Search = .{ .net = net, .cache = cache };
+/// `ply` own moves deep: my move -> spawn -> ... -> afterstate value + score_delta/reward_scale.
+/// `ply` 2 is `deep` (full width); `ply` 3 is `deep3`, whose cost only fits with a spawn-probability cut.
+fn deepMove(net: *const Net, state: GameState, stats: *Stats, cache: *ValueCache, ply: u8, cutoff: f64) ?Direction {
+    var search: Search = .{ .net = net, .cache = cache, .cutoff = cutoff };
     defer stats.* = search.stats;
     var best: ?Direction = null;
     var best_value: f64 = -std.math.inf(f64);
@@ -294,7 +316,7 @@ fn deepMove(net: *const Net, state: GameState, stats: *Stats, cache: *ValueCache
         var next = state;
         const moved = next.slide(d);
         if (!moved.changed) continue;
-        const v = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale + search.chance(next, 2);
+        const v = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale + search.chance(next, ply, 1);
         if (best == null or v > best_value) {
             best = d;
             best_value = v;
@@ -310,6 +332,8 @@ pub const Mode = enum {
     chance,
     /// 2-ply: one more own move and spawn layer below `chance` (see `deepMove`).
     deep,
+    /// 3-ply: `deep` plus one more own move and spawn layer, with the probability cut (issue #108).
+    deep3,
 };
 
 pub fn bestMove(net: *const Net, state: GameState, mode: Mode) ?Direction {
@@ -330,7 +354,8 @@ pub fn bestMoveWithCache(net: *const Net, state: GameState, mode: Mode, stats: *
     return switch (mode) {
         .greedy => if (pickMove(net, state, false)) |p| p.dir else null,
         .chance => chanceMove(net, state),
-        .deep => deepMove(net, state, stats, cache),
+        .deep => deepMove(net, state, stats, cache, 2, 0),
+        .deep3 => deepMove(net, state, stats, cache, 3, deep3_cutoff),
     };
 }
 
@@ -1066,6 +1091,49 @@ test "deep is deterministic and searches more leaves than chance" {
     try std.testing.expectEqual(a.leaves, b.leaves);
     try std.testing.expectEqual(a.hits, b.hits);
     try std.testing.expect(a.leaves > chance_stats.leaves);
+}
+
+/// Late-game board (4 empties): the unpruned 3-ply tree is cheap enough to compare against the cut.
+const late_board: GameState = .{ .board = .{
+    .{ 2, 4, 8, 16 },
+    .{ 32, 64, 128, 0 },
+    .{ 2, 4, 8, 0 },
+    .{ 4, 2, 0, 0 },
+} };
+
+test "deep3 returns only legal moves on random boards" {
+    var prng = std.Random.DefaultPrng.init(108);
+    const net = Net.init(prng.random());
+    var rng = std.Random.DefaultPrng.init(3);
+    const random = rng.random();
+    for (0..10) |_| {
+        var state: GameState = .{};
+        for (0..core.BoardSize) |r| {
+            for (0..core.BoardSize) |c| {
+                if (random.uintLessThan(u8, 4) != 0) continue;
+                state.board[r][c] = @as(core.Tile, 2) << random.uintLessThan(u5, 8);
+            }
+        }
+        if (bestMove(&net, state, .deep3)) |d| {
+            var moved = state;
+            try std.testing.expect(moved.slide(d).changed);
+        } else {
+            for ([_]Direction{ .up, .left, .down, .right }) |d| {
+                var moved = state;
+                try std.testing.expect(!moved.slide(d).changed);
+            }
+        }
+    }
+}
+
+test "deep3 keeps the value within 5% of the unpruned 3-ply search" {
+    const net = try parse(@embedFile("nn_weights.bin"));
+    var cache: ValueCache = .{};
+    var full: Search = .{ .net = &net, .cache = &cache };
+    var pruned: Search = .{ .net = &net, .cache = &cache, .cutoff = deep3_cutoff };
+    const plain = full.value(late_board, 3, 1);
+    const cut = pruned.value(late_board, 3, 1);
+    try std.testing.expect(@abs(cut - plain) <= 0.05 * @abs(plain));
 }
 
 test "greedy and chance moves are unchanged by the deep mode" {
