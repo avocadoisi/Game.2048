@@ -12,7 +12,7 @@ zig build evalab -Doptimize=ReleaseFast -- "<specs>" <runs> <games_per_run> <dep
 ```
 
 spec は `;` 区切り、各 spec は `,` 区切りの `key=value`。
-key: `layout` `anchor` `ordered` `empty` `order` `merge` `forced_down` `smoothness` `monotonic` `tile_sum`、
+key: `layout` `anchor` `ordered` `empty` `order` `order_late` `merge` `forced_down` `smoothness` `monotonic` `tile_sum`、
 preset: `baseline` `ga`。
 
 ## 追加したノブ (#111)
@@ -220,3 +220,72 @@ holdout (5×40, seed 7000, depth 2, ReleaseFast) を採用後に取り直した�
 - 戻すときは `baseline` の `.monotonic = 32` を消す（0 が既定）。
 
 副作用として、`greedy` ポリシーの一手も変わる（評価関数を共有しているため）。`order_penalty` 系は据え置き。
+
+## CMA-ES で重みを最適化 (#105)
+
+手動スイープの代わりに、`Weights` の連続パラメータを CMA-ES でメタ最適化できるようにした。
+`ai/solver/cmaes.zig` が汎用の簡易 CMA-ES、`ai/solver/tune.zig` が `Weights` への適応。
+
+```sh
+zig build tune -Doptimize=ReleaseFast -- --gens 20 --pop 6 --games 15 --depth 2
+# best weights: order=60.515,order_late=17.706,merge=20.342,monotonic=45.042
+```
+
+- 実装: CSA（累積ステップサイズ適応）+ 共分散の rank-one 更新のみで、rank-mu 更新は入れていない。
+  共分散は Cholesky 分解してサンプリングする（固有分解なし）。探索範囲外のサンプルはクリップして評価する。
+  seed 固定で決定的（テストで固定）。
+- 探索次元: `order_penalty` `order_penalty_late` `merge` `monotonic` の 4 本だけ。他の重み
+  （`empty` `forced_down` `layout` `anchor` など）は出荷時重みで固定。`--dims` で部分集合を選べる
+  （選ばなかった次元は探索範囲を `[baseline, baseline]` に潰して固定する）。
+- 探索範囲: `order_penalty` / `order_penalty_late` 0..120、`merge` 0..40、`monotonic` 0..96。
+- 目的関数: `bench.runW` の avg score（最大化。内部的には符号反転して最小化）。1 評価 = 15 局
+  （seed 8000..8014 を 1 局ずつ、depth 2）。初期点は出荷時重み、初期 sigma 8。
+- 時間予算 600 秒（既定）。この設定での実測は **100 秒**（120 評価 = 1,800 局, ReleaseFast, 8 コア）。
+
+### 結果
+
+| 集合 | variant | avg score | avg moves | best | games/s |
+| --- | --- | --- | --- | --- | --- |
+| 訓練 (seed 8000..8014, 15 局) | `baseline` | 25550.7 | 1373.3 | 2048 | 22.6 |
+| 訓練 | CMA-ES の最良 | 44696.3 | 2203.9 | 4096 | 17.7 |
+| holdout (seed 9000, 5×40) | `baseline` | 32380.8 | 1670.5 | 8192 | 18.6 |
+| holdout | CMA-ES の最良 | 33656.1 | 1730.0 | 4096 | 15.1 |
+
+holdout の数値は
+
+```sh
+zig build evalab -Doptimize=ReleaseFast -- "baseline;order=60.515,order_late=17.706,merge=20.342,monotonic=45.042" 5 40 2 9000
+```
+
+で再現できる（`order_late` キーはこのために追加した）。
+
+- 訓練 **+74.9%**、holdout **+3.9%**（32380.8 → 33656.1）。holdout の 200 局でも、
+  同じ `baseline` は seed 7000 で 34052.5（[採用: monotonic](#採用-monotonic-117)）と 5% 動く。
+  +3.9% は seed 間ばらつきと同じ桁で、改善が本物だとは言えない。
+- 訓練と holdout の差 (+75% vs +4%) は過学習。1 評価 15 局の平均は標準誤差が十数%あり、
+  CMA-ES は「その 15 局でたまたま良かった重み」を選ぶ。
+- 動いた向きは手動スイープと整合する: `monotonic` 32 → 45.0、`merge` 10 → 20.3 に上げ、
+  `order_penalty_late` 25 → 17.7 に下げる。`order_penalty` は 43.2 → 60.5。
+- 出力 spec は 3 桁丸め。同じ 15 局でも `monotonic` を 45.042 → 45.043 に変えるだけで
+  44696 → 47603 と動く（ゲームが混沌的で、重みの微小変化が手の選択を反転させる）。
+  訓練の数字は 3 桁 spec を evalab で測り直した値で、探索内部の最良値 (46728.5) とは一致しない。
+
+### 結論: 手動スイープ / GA の置き換え候補になるか
+
+- この設定では**置き換え候補にならない**。holdout の改善 +3.9% は seed ばらつきと区別できず、
+  出荷時重みを CMA-ES の結果に差し替える根拠にならない（`baseline` は変更していない）。
+- GA (`ga` policy, 24,046) と比べても、CMA-ES の holdout 33656 は同条件の expectimax
+  `baseline` 32381 を僅かに上回るだけ。GA 版の 24,046 は policy 比較の数字なので直接は並べられないが、
+  どちらも「手動重み + monotonic (#117)」を明確には超えていない。
+- ただし探索の向き（`monotonic` と `merge` を上げる）は #114 / #117 の手動結論と一致する。
+  実装は残す価値があり、次は下の限界を潰す。
+
+### 既知の限界
+
+- 目的関数の分散が大きすぎる。1 評価 15 局は標準誤差 10〜20%。世代 20 × 個体 6 ではノイズを
+  平均化できない。評価局数を増やす（例: 100 局）か、複数 seed の平均を取る必要がある。
+- 訓練 seed が 1 本（8000..8014）、holdout も 1 本（9000..9199）だけ。seed をまたいだ再現性は未検証。
+- 次元は 4 に固定。`empty` `forced_down` と離散ノブ（`layout` / `anchor` / `ordered`）は動かしていない。
+- CMA-ES 側は rank-one 更新のみ + 境界クリップ + sigma の上下限。次元を増やすなら rank-mu 更新と
+  固有分解が要る。
+- depth 2 で最適化した重みが depth 3 でも最適とは限らない。

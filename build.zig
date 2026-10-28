@@ -264,6 +264,37 @@ pub fn build(b: *std.Build) void {
     });
     const run_ga_tests = b.addRunArtifact(ga_tests);
 
+    const tune_exe = b.addExecutable(.{
+        .name = "tune",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("ai/solver/tune.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "solver", .module = solver_mod },
+                .{ .name = "parallel", .module = parallel_mod },
+            },
+        }),
+    });
+    const tune_cmd = b.addRunArtifact(tune_exe);
+    tune_cmd.addPassthruArgs();
+    tune_cmd.step.dependOn(b.getInstallStep());
+
+    const tune_tests = b.addTest(.{ .filters = test_filters, .root_module = tune_exe.root_module });
+    const run_tune_tests = b.addRunArtifact(tune_tests);
+
+    const tune_step = b.step("tune", "Optimise the evaluation weights with CMA-ES");
+    tune_step.dependOn(&tune_cmd.step);
+
+    const cmaes_tests = b.addTest(.{ .filters = test_filters,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("ai/solver/cmaes.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_cmaes_tests = b.addRunArtifact(cmaes_tests);
+
     // WASM build for static hosting: `zig build wasm -Doptimize=ReleaseFast`
     const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
     const wasm_core_mod = b.addModule("core-wasm", .{
@@ -331,6 +362,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_ntuple_main_tests.step);
     test_step.dependOn(&run_parallel_tests.step);
     test_step.dependOn(&run_ga_tests.step);
+    test_step.dependOn(&run_tune_tests.step);
+    test_step.dependOn(&run_cmaes_tests.step);
     test_step.dependOn(&run_ranking_tests.step);
     test_step.dependOn(&run_evalab_tests.step);
     test_step.dependOn(&run_probe_tests.step);
