@@ -11,6 +11,8 @@ pub const Summary = struct {
     /// Sum of the per-run serial times (each run plays its games on one thread).
     serial_elapsed_ns: i96,
     total_moves: u64,
+    /// Deepest expectimax depth any move of the whole batch finished (`expectimax_id` only, else 0).
+    max_depth: u8,
 
     pub fn gamesPerSec(self: Summary) f64 {
         return @as(f64, @floatFromInt(self.games)) * 1e9 / @as(f64, @floatFromInt(self.elapsed_ns));
@@ -32,7 +34,7 @@ pub const Summary = struct {
     }
 };
 
-const RunResult = struct { score: u64 = 0, moves: u64 = 0, best_tile: u32 = 0, elapsed_ns: i96 = 0 };
+const RunResult = struct { score: u64 = 0, moves: u64 = 0, best_tile: u32 = 0, elapsed_ns: i96 = 0, max_depth: u8 = 0 };
 
 /// What a run plays with: a named policy, or custom evaluation weights (`zig build evalab`).
 const Plan = union(enum) { policy: solver.Policy, weights: solver.Weights };
@@ -56,6 +58,7 @@ fn playRun(c: RunCtx, r: usize) RunResult {
         res.score += result.score;
         res.moves += result.moves;
         res.best_tile = @max(res.best_tile, result.max_tile);
+        res.max_depth = @max(res.max_depth, solver.id_depth_reached);
     }
     res.elapsed_ns = start.durationTo(std.Io.Clock.awake.now(c.io)).toNanoseconds();
     return res;
@@ -80,10 +83,12 @@ fn runPlan(io: std.Io, gpa: std.mem.Allocator, plan: Plan, runs: u32, games_per_
     var total_moves: u64 = 0;
     var best_tile: u32 = 0;
     var serial_elapsed: i96 = 0;
+    var max_depth: u8 = 0;
     for (per_run) |r| {
         total_score += r.score;
         total_moves += r.moves;
         best_tile = @max(best_tile, r.best_tile);
+        max_depth = @max(max_depth, r.max_depth);
         serial_elapsed += r.elapsed_ns;
     }
     const games: u32 = runs * games_per_run;
@@ -97,6 +102,7 @@ fn runPlan(io: std.Io, gpa: std.mem.Allocator, plan: Plan, runs: u32, games_per_
         .elapsed_ns = elapsed,
         .serial_elapsed_ns = serial_elapsed,
         .total_moves = total_moves,
+        .max_depth = max_depth,
     };
 }
 

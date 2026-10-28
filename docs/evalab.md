@@ -289,3 +289,29 @@ zig build evalab -Doptimize=ReleaseFast -- "baseline;order=60.515,order_late=17.
 - CMA-ES 側は rank-one 更新のみ + 境界クリップ + sigma の上下限。次元を増やすなら rank-mu 更新と
   固有分解が要る。
 - depth 2 で最適化した重みが depth 3 でも最適とは限らない。
+
+## 反復深化 + 確率枝刈り (#104)
+
+expectimax に 2 つ足した（`Policy.expectimax_id`, `zig build solve` の policy 名で選ぶ）。
+
+- **確率枝刈り**: chance node で経路確率が `prob_cutoff = 1e-4` 未満になった枝を落とし、残った枝の確率和で
+  再正規化する（値のスケールを保つ）。葉に近い `depth <= 1` では切らない。
+- **反復深化**: `bestMoveID(state, budget_ms)` が depth 2 から 1 ずつ深くし、予算内に**完了した**最後の深さの
+  最善手を返す（`id_max_depth = 8` で頭打ち）。`depth` 引数はこのポリシーでは時間予算 (ms) として渡す。
+- 枝刈り有無で同じ盤面・深さの値が変わるので、TT の種別を `max_pruned` / `chance_pruned` に分けて
+  既存の `.max` / `.chance` と混ぜない。
+
+### 結果（5 runs × 10 局, seed 7000, ReleaseFast）
+
+| policy | 予算 | avg score | avg moves | best | games/s | 到達深さ |
+|---|---|---|---|---|---|---|
+| `expectimax_tt`（現行の depth 3） | — | 51814.2 | 2488.3 | 8192 | 1.19 | 3 |
+| `expectimax_id` | 1 ms/move | 69382.6 | 3189.3 | 8192 | 0.17 | 8（上限） |
+| `expectimax_id` | 2 ms/move | 76811.5 | 3492.6 | 8192 | 0.07 | 8（上限） |
+
+- スコアは **+34%（1 ms）/ +48%（2 ms）**。到達深さは上限の 8 に張り付き、予算を増やすとまだ伸びる。
+- 代償は時間: 1 ms 予算でも **5.8 s/game**（depth 3 は 0.84 s/game）。予算は深さの切れ目でしか見ないので
+  1 手あたり最大 1 回ぶん超過する。
+- **再現性が落ちる**: 予算が実時間なので、同じ seed でもマシン負荷で手が変わる（上の 1 ms の 2 回の測定は
+  71008.2 と 69382.6）。`ranking` の既定ポリシーには入れていない（固定 seed の再現性を保つため）。
+- 6 s/game の制限に収めるなら 1 ms 予算が上限。深さではなく時間で切る設計なので、速いマシンほど強くなる。
