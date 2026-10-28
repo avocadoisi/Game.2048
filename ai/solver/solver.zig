@@ -103,7 +103,7 @@ pub fn bestMoveW(state: GameState, depth: u8, w: Weights) ?Direction {
 }
 
 /// Move-choosing policies compared in the ranking (`zig build ranking`).
-pub const Policy = enum { random, greedy, expectimax, mcts, beam, expectimax_tt, ga, nn, nn2, nnmcts, nnbeam };
+pub const Policy = enum { random, greedy, expectimax, mcts, beam, expectimax_tt, ga, nn, nn2, nnmcts, nnbeam, expectimax_id };
 
 /// Weights evolved by `zig build ga-rl` (holdout +4%, see docs/solver-history.md). 3 decimals as printed.
 pub const ga_weights: Weights = .{ .empty = 7.028, .order_penalty = 43.174, .order_penalty_late = 43.174, .merge = 0, .forced_down = 0 };
@@ -145,6 +145,9 @@ pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Dir
         .mcts => return mctsMove(state, rng),
         .beam => return beamMove(state),
         .expectimax_tt => return bestMoveTT(state, 3),
+        // `depth` carries the time budget in ms for this policy (0 = the shipped `id_budget_ms`),
+        // the way `depth` is per-policy elsewhere: bench/ranking/solve pass it through.
+        .expectimax_id => return bestMoveID(state, if (depth == 0) id_budget_ms else depth),
         .ga => return bestMoveW(state, depth, ga_weights),
         // The net is parsed once per thread and reused by reference (issue #87), never copied per move.
         .nn, .nn2, .nnmcts, .nnbeam => {
@@ -479,7 +482,9 @@ fn insertNnBeam(items: *[nnbeam_width]NnBeamNode, len: *usize, candidate: NnBeam
 // shortcut: 8192 direct-mapped entries; collisions only reduce cache hits, increase this if needed.
 const tt_entry_count = 8192;
 
-const TTKind = enum { max, chance };
+/// `*_pruned` keep the probability-pruned values apart from the full-width ones: once branches are
+/// cut the same board and depth is worth a different number, so the keys must not mix (issue #104).
+const TTKind = enum { max, chance, max_pruned, chance_pruned };
 
 const TTEntry = struct {
     board: Board,
@@ -505,6 +510,12 @@ fn ttWorkspace() *[tt_entry_count]TTEntry {
         tt_workspace_ready = true;
     }
     return &tt_workspace;
+}
+
+fn freshTable() [tt_entry_count]TTEntry {
+    var table: [tt_entry_count]TTEntry = undefined;
+    for (&table) |*entry| entry.valid = false;
+    return table;
 }
 
 fn bestMoveTTWith(state: GameState, depth: u8, table: *[tt_entry_count]TTEntry) ?Direction {
@@ -576,6 +587,126 @@ fn chanceValueTT(state: GameState, depth: u8, table: *[tt_entry_count]TTEntry) f
     }
     const value = if (empties == 0) evaluateState(state) else total / empties;
     ttPut(state.board, depth, .chance, value, table);
+    return value;
+}
+
+/// shortcut: cut a branch when its probability along the path falls under this. 1e-4 keeps the
+/// dropped mass under ~0.01% of a depth-4 tree (the test pins the value to the full-width one) and
+/// reaches depth +1 in the same budget; raise it for speed, lower it for accuracy, 0 disables the cut.
+const prob_cutoff: f64 = 1e-4;
+
+/// Iterative deepening never searches shallower than this, so a zero budget still gets the depth-2 move.
+const id_min_depth: u8 = 2;
+/// shortcut: cap for one move's overrun, since the budget is only checked between depths (issue #104).
+const id_max_depth: u8 = 8;
+/// Time budget per move of `expectimax_id`.
+/// shortcut: measured, not derived; a larger budget plays stronger and must still fit the 6 s/game limit.
+const id_budget_ms: u32 = 1;
+
+/// Deepest fully searched depth on this thread so far (0 before the first move). Only grows, so a
+/// batch reports the deepest move of the whole batch, not just the last one.
+pub threadlocal var id_depth_reached: u8 = 0;
+
+/// Iterative-deepening expectimax: depth 2, then +1 while `budget_ms` lasts, returning the best move
+/// of the last depth that ran to completion. The TT is keyed by depth, so all depths share it.
+pub fn bestMoveID(state: GameState, budget_ms: u32) ?Direction {
+    const table = ttWorkspace();
+    const start = clockNow();
+    var best = bestMoveTTPruned(state, id_min_depth, prob_cutoff, table);
+    id_depth_reached = @max(id_depth_reached, id_min_depth);
+    var depth: u8 = id_min_depth;
+    while (best != null and depth < id_max_depth and elapsedMs(start) < budget_ms) {
+        const move = bestMoveTTPruned(state, depth + 1, prob_cutoff, table);
+        if (move == null) break;
+        best = move;
+        depth += 1;
+        id_depth_reached = @max(id_depth_reached, depth);
+    }
+    return best;
+}
+
+/// Zig 0.17 has no `std.time.Instant`; the monotonic clock lives behind `std.Io`. The global
+/// single-threaded instance's `now` only reads the OS clock and touches no shared state.
+fn clockNow() std.Io.Timestamp {
+    return std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io());
+}
+
+fn elapsedMs(start: std.Io.Timestamp) i96 {
+    return @divTrunc(start.durationTo(clockNow()).nanoseconds, std.time.ns_per_ms);
+}
+
+fn bestMoveTTPruned(state: GameState, depth: u8, cutoff: f64, table: *[tt_entry_count]TTEntry) ?Direction {
+    var best: ?Direction = null;
+    var best_value = lost_score;
+    for ([_]Direction{ .up, .left, .down, .right }) |d| {
+        var next = state;
+        if (!next.slide(d).changed) continue;
+        const value = chanceValueTTPruned(next, depth, 1, cutoff, table);
+        if (best == null or value > best_value) {
+            best = d;
+            best_value = value;
+        }
+    }
+    return best;
+}
+
+/// `maxValueTT` of the pruned search. The TT key leaves the path probability out, so the first
+/// board+depth pair to be stored wins (the approximation nneonneo's table makes); `.max_pruned` keeps
+/// these values from ever mixing with the full-width `.max` entries.
+fn maxValueTTPruned(state: GameState, depth: u8, cutoff: f64, table: *[tt_entry_count]TTEntry) f64 {
+    if (depth == 0) return evaluateState(state);
+    if (ttGet(state.board, depth, .max_pruned, table)) |value| return value;
+    var best: f64 = lost_score;
+    var any_move = false;
+    for ([_]Direction{ .up, .left, .down, .right }) |d| {
+        var next = state;
+        if (!next.slide(d).changed) continue;
+        any_move = true;
+        best = @max(best, chanceValueTTPruned(next, depth, 1, cutoff, table));
+    }
+    if (!any_move) best = lost_score;
+    ttPut(state.board, depth, .max_pruned, best, table);
+    return best;
+}
+
+/// `chanceValueTT` with the probability cut: branches below `cutoff` are dropped and the kept ones
+/// are renormalized by their summed probability, so the value keeps the scale of a full average.
+/// The last chance node (depth 1) keeps every branch, because cutting next to the leaves bends the value.
+fn chanceValueTTPruned(state: GameState, depth: u8, cprob: f64, cutoff: f64, table: *[tt_entry_count]TTEntry) f64 {
+    if (ttGet(state.board, depth, .chance_pruned, table)) |value| return value;
+    var total: f64 = 0;
+    var mass: f64 = 0;
+    var empties: usize = 0;
+    for (0..core.BoardSize) |r| {
+        for (0..core.BoardSize) |c| {
+            if (state.board[r][c] == 0) empties += 1;
+        }
+    }
+    if (empties == 0) {
+        const value = evaluateState(state);
+        ttPut(state.board, depth, .chance_pruned, value, table);
+        return value;
+    }
+    const cell_prob = cprob / @as(f64, @floatFromInt(empties));
+    for (0..core.BoardSize) |r| {
+        for (0..core.BoardSize) |c| {
+            if (state.board[r][c] != 0) continue;
+            for ([_]struct { value: core.Tile, p: f64 }{
+                .{ .value = 2, .p = 0.9 },
+                .{ .value = 4, .p = 0.1 },
+            }) |spawn| {
+                const p = cell_prob * spawn.p;
+                if (depth > 1 and p < cutoff) continue;
+                var next = state;
+                next.board[r][c] = spawn.value;
+                total += p * maxValueTTPruned(next, depth - 1, cutoff, table);
+                mass += p;
+            }
+        }
+    }
+    // every branch cut (the node itself is already this unlikely): fall back to the leaf rule
+    const value = if (mass == 0) evaluateState(state) else total / mass;
+    ttPut(state.board, depth, .chance_pruned, value, table);
     return value;
 }
 
@@ -1089,6 +1220,68 @@ test "TT slot collision drops the entry, never returns a wrong value (#88)" {
     try std.testing.expectEqual(@as(?f64, 7), ttGet(b_board, 3, .max, &table));
     // board a's entry was dropped by the collision and must never be reported for either board
     try std.testing.expectEqual(@as(?f64, null), ttGet(a_board, 3, .max, &table));
+}
+
+test "probability cut drops the 4-spawn and renormalizes the kept branches" {
+    // two empty cells: each 2-spawn carries p=0.45 and each 4-spawn p=0.05, so a cutoff of 0.06
+    // keeps only the two 2-spawns and renormalizes them to a plain average
+    const state: GameState = .{ .board = .{
+        .{ 2, 4, 8, 16 },
+        .{ 32, 64, 128, 256 },
+        .{ 512, 1024, 2048, 4096 },
+        .{ 8192, 16384, 0, 0 },
+    } };
+    var pruned_table = freshTable();
+    var full_table = freshTable();
+    var first = state;
+    first.board[3][2] = 2;
+    var second = state;
+    second.board[3][3] = 2;
+    const want = (maxValueTT(first, 1, &full_table) + maxValueTT(second, 1, &full_table)) / 2;
+    try std.testing.expectApproxEqRel(want, chanceValueTTPruned(state, 2, 1, 0.06, &pruned_table), 1e-9);
+}
+
+test "probability cut keeps the value within 5% of the full-width search" {
+    const state: GameState = .{ .board = .{
+        .{ 2, 4, 8, 16 },
+        .{ 32, 64, 128, 256 },
+        .{ 512, 1024, 2048, 4096 },
+        .{ 8192, 16384, 0, 0 },
+    } };
+    var pruned_table = freshTable();
+    var full_table = freshTable();
+    const full = chanceValueTT(state, 4, &full_table);
+    const pruned = chanceValueTTPruned(state, 4, 1, prob_cutoff, &pruned_table);
+    try std.testing.expectApproxEqRel(full, pruned, 0.05);
+}
+
+test "iterative deepening returns a legal move on random boards" {
+    var prng = std.Random.DefaultPrng.init(41);
+    const rng = prng.random();
+    var state = GameState.gameStart(rng);
+    for (0..20) |_| {
+        if (bestMoveID(state, 1)) |d| {
+            var next = state;
+            try std.testing.expect(next.slide(d).changed);
+        } else {
+            try std.testing.expect(state.isGameOver());
+        }
+        const direction = choose(.random, state, rng, 0) orelse break;
+        _ = state.move(direction, rng);
+    }
+}
+
+test "iterative deepening with a zero budget returns the depth 2 move" {
+    var prng = std.Random.DefaultPrng.init(11);
+    const rng = prng.random();
+    var state = GameState.gameStart(rng);
+    for (0..8) |_| {
+        const direction = choose(.random, state, rng, 0) orelse break;
+        _ = state.move(direction, rng);
+    }
+    var table = freshTable();
+    try std.testing.expectEqual(bestMoveTTPruned(state, id_min_depth, prob_cutoff, &table), bestMoveID(state, 0));
+    try std.testing.expectEqual(id_min_depth, id_depth_reached);
 }
 
 test "random policy only picks legal moves" {
