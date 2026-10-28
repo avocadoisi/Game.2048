@@ -42,6 +42,21 @@ fn uniform(rng: std.Random, scale: f64) f64 {
     return (rng.float(f64) * 2 - 1) * scale;
 }
 
+/// Optimistic initialization (#107): multiply every weight by `k`, so the initial value surface has
+/// `k` times more spread and the self-play policy explores more early on. Only the spread can matter:
+/// a constant shift of `b3` adds the same amount to every afterstate, so the argmax over moves is
+/// unchanged and such an "optimistic" bias is a no-op for the data the learner sees.
+/// `shortcut: one scalar for all layers, per-layer scales if this shows an effect.`
+pub fn scaleInit(net: *Net, k: f64) void {
+    for (&net.w1) |*row| {
+        for (row) |*w| w.* *= k;
+    }
+    for (&net.w2) |*row| {
+        for (row) |*w| w.* *= k;
+    }
+    for (&net.w3) |*w| w.* *= k;
+}
+
 /// Activations kept from one forward pass; needed by `train`.
 pub const Cache = struct {
     rows: [core.BoardCellCount]usize = undefined,
@@ -1952,4 +1967,16 @@ test "a large averaged gradient is clipped to the module norm" {
         d2 += delta * delta;
     }
     try std.testing.expectApproxEqRel(0.001 * sym_batch_clip, @sqrt(d2), 1e-12);
+}
+
+test "scaleInit multiplies the initial weights by the scale (#107)" {
+    var rng_a = std.Random.DefaultPrng.init(7);
+    const plain = Net.init(rng_a.random());
+    var rng_b = std.Random.DefaultPrng.init(7);
+    var optimistic = Net.init(rng_b.random());
+    scaleInit(&optimistic, 4);
+    try std.testing.expectEqual(plain.w1[3][5] * 4, optimistic.w1[3][5]);
+    try std.testing.expectEqual(plain.w2[0][1] * 4, optimistic.w2[0][1]);
+    try std.testing.expectEqual(plain.w3[2] * 4, optimistic.w3[2]);
+    try std.testing.expect(optimistic.b1[0] == plain.b1[0]);
 }

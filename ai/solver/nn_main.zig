@@ -23,6 +23,8 @@ const usage =
     \\                       norm-clipped, applied as a single step instead of eight)
     \\              nstep   (#84: online n-step TD with n = 4 instead of one-step returns)
     \\              death   (#101: reward -1 per move so the value learns V ≈ -(moves to game over))
+    \\              oi / oi16 (#107: multiply the initial weights by 4 / 16 = optimistic initialization,
+    \\                       then train exactly like base; only the init differs, so `par` works)
     \\              resume  (#66: load weights_path and train train_games more games from those weights, plain per-move path)
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
     \\                game i uses seed train_seed + i and the batch result is the mean of its games.
@@ -141,6 +143,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .nstep = 4 }
     else if (std.mem.eql(u8, variant, "death"))
         .{ .death = true }
+    else if (std.mem.eql(u8, variant, "oi") or std.mem.eql(u8, variant, "oi16"))
+        .{}
     else {
         std.debug.print("{s}", .{usage});
         return;
@@ -158,6 +162,9 @@ pub fn main(init: std.process.Init) !void {
     var net: nn.Net = undefined;
     if (try startNet(&net, init.io, init.gpa, train_games, use_resume, train_seed, weights_path))
         std.debug.print("loaded {s}\n", .{weights_path});
+    // Optimistic initialization (#107) only rescales the random init, so it stays out of `nn.Options`.
+    if (std.mem.eql(u8, variant, "oi")) nn.scaleInit(&net, 4)
+    else if (std.mem.eql(u8, variant, "oi16")) nn.scaleInit(&net, 16);
     if (train_games > 0) {
         var rng = std.Random.DefaultPrng.init(train_seed);
         const start = std.Io.Clock.awake.now(init.io);
