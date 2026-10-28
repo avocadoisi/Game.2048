@@ -13,6 +13,7 @@ const usage =
     \\  learning_rate TD step for n-tuple tables (default 0.01)
     \\  variant       base (greedy 1-ply) or chance (1 spawn lookahead); deep (2-ply) adds a
     \\                second own move. light / lightdeep use only the 5 base 4-tuples.
+    \\                wide / widedeep add the second 2x3 6-tuple (both 2x3 orbits, #106).
     \\                resume loads table_path first, then trains train_games more games.
     \\  table_path    file to load (train_games 0) or write (default ai/solver/ntuple_weights.bin)
     \\  train_seed    seed for self-play games (default 1)
@@ -194,5 +195,6 @@ test "usage text lists both variants" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "base (greedy") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "chance (1 spawn") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "lightdeep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "widedeep") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "resume") != null);
 }

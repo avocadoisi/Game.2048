@@ -26,6 +26,10 @@ pub const patterns = [_]Pattern{
     .{ .len = 4, .cells = .{ 1, 2, 5, 6, 0, 0 } }, // 2x2 middle column
     .{ .len = 4, .cells = .{ 0, 5, 10, 15, 0, 0 } }, // main diagonal
     .{ .len = 6, .cells = .{ 0, 1, 2, 4, 5, 6 } }, // 2x3 top-left
+    // #106: the 2x3 rectangles split into two translation orbits under the 8 dihedral transforms
+    // (8 positions around the edge, 4 positions through the middle). The first 6-tuple above is the
+    // `min` index of orbit 0 for every board, so orbit 1 needs exactly this one more table.
+    .{ .len = 6, .cells = .{ 4, 5, 6, 8, 9, 10 } }, // 2x3 middle-left (orbit 1)
 };
 pub const pattern_count = patterns.len;
 
@@ -118,10 +122,20 @@ pub const offsets = blk: {
     break :blk off;
 };
 
-/// Table set: `.light` drops the 2x3 6-tuple, which holds 16/17 of the raw table.
-pub const Set = enum { full, light };
+/// Table set: `.light` keeps only the five 4-tuples, `.full` adds the first 2x3 6-tuple (the
+/// committed `ntuple_weights.bin` and every existing policy), `.wide` adds both 2x3 orbits (#106).
+pub const Set = enum { light, full, wide };
 
-pub const light_count = pattern_count - 1;
+pub const light_count = 5;
+pub const full_count = 6;
+
+pub fn countOf(set: Set) usize {
+    return switch (set) {
+        .light => light_count,
+        .full => full_count,
+        .wide => pattern_count,
+    };
+}
 
 fn entriesOf(n: usize) usize {
     var entries: usize = 0;
@@ -130,7 +144,7 @@ fn entriesOf(n: usize) usize {
 }
 
 pub fn entryCount(set: Set) usize {
-    return entriesOf(if (set == .light) light_count else pattern_count);
+    return entriesOf(countOf(set));
 }
 
 pub const TupleNet = struct {
@@ -143,7 +157,7 @@ pub const TupleNet = struct {
     }
 
     pub fn initWith(gpa: std.mem.Allocator, set: Set) !TupleNet {
-        return initCount(gpa, if (set == .light) light_count else pattern_count);
+        return initCount(gpa, countOf(set));
     }
 
     fn initCount(gpa: std.mem.Allocator, n: usize) !TupleNet {
@@ -183,7 +197,7 @@ pub const file_magic = "2048-NT\x00";
 pub const file_version: u32 = 1;
 const endian_marker: u32 = 0x01020304;
 const header_len: usize = 8 + 4 + 4 + 4;
-/// File length for `n` tables; `.full` is `fileLen(pattern_count)`.
+/// File length for `n` tables; `.wide` is `fileLen(pattern_count)`.
 pub fn fileLen(n: usize) usize {
     return header_len + n * 4 + entriesOf(n) * 4;
 }
@@ -265,6 +279,8 @@ pub fn parseVariant(name: []const u8) ?Variant {
     if (std.mem.eql(u8, name, "lightdeep")) return .{ .mode = .deep, .set = .light };
     if (std.mem.eql(u8, name, "resume")) return .{ .resume_from_file = true };
     if (std.mem.eql(u8, name, "lightresume")) return .{ .resume_from_file = true, .set = .light };
+    if (std.mem.eql(u8, name, "wide")) return .{ .set = .wide };
+    if (std.mem.eql(u8, name, "widedeep")) return .{ .mode = .deep, .set = .wide };
     return null;
 }
 
@@ -529,7 +545,7 @@ test "one TD step changes only the touched table entries" {
     var net = try testNet();
     defer net.deinit(std.testing.allocator);
     const idx = indices(sample_board);
-    for (0..pattern_count) |p| net.storage[offsets[p] + idx[p]] = 0.5;
+    for (0..net.count) |p| net.storage[offsets[p] + idx[p]] = 0.5;
 
     const before = try std.testing.allocator.dupe(f32, net.storage);
     defer std.testing.allocator.free(before);
@@ -539,14 +555,14 @@ test "one TD step changes only the touched table entries" {
     for (net.storage, before) |now, old| {
         if (now != old) changed += 1;
     }
-    try std.testing.expectEqual(pattern_count, changed);
+    try std.testing.expectEqual(net.count, changed);
 }
 
 test "save and load round-trip exactly" {
     var net = try testNet();
     defer net.deinit(std.testing.allocator);
     const idx = indices(sample_board);
-    for (0..pattern_count) |p| net.storage[offsets[p] + idx[p]] = @floatCast(@as(f64, @floatFromInt(p)) + 0.25);
+    for (0..net.count) |p| net.storage[offsets[p] + idx[p]] = @floatCast(@as(f64, @floatFromInt(p)) + 0.25);
 
     const bytes = try encode(std.testing.allocator, &net);
     defer std.testing.allocator.free(bytes);
@@ -609,10 +625,40 @@ test "deep is deterministic and counts leaf evaluations" {
     try std.testing.expectEqual(a.leaves, b.leaves);
 }
 
+test "the wide set adds the second 2x3 orbit and keeps light/full unchanged (#106)" {
+    try std.testing.expectEqual(@as(usize, 5), light_count);
+    try std.testing.expectEqual(@as(usize, 6), full_count);
+    try std.testing.expectEqual(@as(usize, 7), pattern_count);
+    try std.testing.expectEqual(@as(usize, 5 * 65536), entryCount(.light));
+    try std.testing.expectEqual(@as(usize, 5 * 65536 + 16777216), entryCount(.full));
+    try std.testing.expectEqual(total_entries, entryCount(.wide));
+    try std.testing.expectEqual(entryCount(.full) + 16777216, entryCount(.wide));
+
+    var wide = try TupleNet.initWith(std.testing.allocator, .wide);
+    defer wide.deinit(std.testing.allocator);
+    try std.testing.expectEqual(pattern_count, wide.count);
+    try std.testing.expectEqual(entryCount(.wide), wide.storage.len);
+}
+
+test "the second 6-tuple is not a transform of the first (#106)" {
+    var same_orbit = false;
+    for (0..8) |t| {
+        var cells: [6]u8 = undefined;
+        for (patterns[5].cells, 0..) |cell, j| cells[j] = @intCast(transformCell(t, cell));
+        std.mem.sort(u8, &cells, {}, std.sort.asc(u8));
+        var want = patterns[6].cells[0..6].*;
+        std.mem.sort(u8, &want, {}, std.sort.asc(u8));
+        if (std.mem.eql(u8, &cells, &want)) same_orbit = true;
+    }
+    try std.testing.expect(!same_orbit);
+    // ... and it is a 2x3 rectangle as well.
+    try std.testing.expectEqual(@as(u8, 6), patterns[6].len);
+}
+
 test "light tables keep the five base tuples and drop the 6-tuple" {
     try std.testing.expectEqual(@as(usize, 5), light_count);
     try std.testing.expectEqual(@as(usize, 5 * 65536), entryCount(.light));
-    try std.testing.expectEqual(total_entries, entryCount(.full));
+    try std.testing.expectEqual(entryCount(.wide), total_entries);
     try std.testing.expect(fileLen(light_count) * 17 <= fileLen(pattern_count) * 1);
 
     var light = try TupleNet.initWith(std.testing.allocator, .light);
@@ -688,5 +734,8 @@ test "variant names select the mode, the table set and resume" {
     const lightresume = parseVariant("lightresume").?;
     try std.testing.expect(lightresume.resume_from_file);
     try std.testing.expectEqual(Set.light, lightresume.set);
+    try std.testing.expectEqual(Set.wide, parseVariant("wide").?.set);
+    try std.testing.expectEqual(Mode.deep, parseVariant("widedeep").?.mode);
+    try std.testing.expectEqual(Set.wide, parseVariant("widedeep").?.set);
     try std.testing.expectEqual(@as(?Variant, null), parseVariant("lightresumex"));
 }
