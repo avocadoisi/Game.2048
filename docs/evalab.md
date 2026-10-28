@@ -3,6 +3,9 @@
 `ai/solver/evalab.zig` は同じ seed で複数の評価重みを対局させ、avg score / moves / best / 速度を並べる。
 `Weights` の既定値は出荷時の評価と同じなので、`baseline` は従来の expectimax そのもの。
 
+> 2026-10-27 以降、出荷時重みには `monotonic = 32` が入っている（[採用: monotonic](#採用-monotonic-117)）。
+> それより前の節に出てくる `baseline` は `monotonic = 0` の意味なので、`monotonic=0` と読み替える。
+
 ```sh
 zig build evalab -Doptimize=ReleaseFast -- "<specs>" <runs> <games_per_run> <depth> <seed>
 # 例: zig build evalab -Doptimize=ReleaseFast -- "baseline;monotonic=24" 10 40 2 7000
@@ -197,3 +200,23 @@ spearman rank correlation (1 = same preference order, -1 = reversed, 0 = unrelat
 - NN は推論時に 8 対称を平均しないため、回転で値が跳ねる。上の nn 列の差は「学習した選好」と
   「推論時の非対称性」が混ざっている。
 - n-tuple は min-over-8-symmetries のため形状の向きを測れない。向きの選好を見たい場合は別の評価器が要る。
+
+## 採用: monotonic (#117)
+
+`ai/solver/solver.zig` の出荷時重み `baseline` に `.monotonic = 32` を入れた（#114 の ablation で depth 2 +37%、#117 で depth 3 +42%）。
+`monotonic = 0` が従来の挙動。
+
+holdout (5×40, seed 7000, depth 2, ReleaseFast) を採用後に取り直した結果:
+
+| variant | avg score | avg moves | best | games/s |
+|---|---|---|---|---|
+| `monotonic=0`（従来） | 25230.3 | 1343.5 | 4096 | 22.28 |
+| `baseline`（採用後, monotonic=32） | 34052.5 | 1742.0 | 4096 | 18.25 |
+| `monotonic=24` | 33341.2 | 1701.3 | 4096 | 17.87 |
+
+- 従来比 **+35.0%**。#114 の測定（24757.7 → 34116.9）と一致する。
+- コストは盤面走査 1 回分で **games/s が −18%**（22.3 → 18.3、depth 2）。
+- 24 と 32 の差は小さい（+2.1%）が、depth 2/3 の両方で 32 が上なので 32 を採った。
+- 戻すときは `baseline` の `.monotonic = 32` を消す（0 が既定）。
+
+副作用として、`greedy` ポリシーの一手も変わる（評価関数を共有しているため）。`order_penalty` 系は据え置き。

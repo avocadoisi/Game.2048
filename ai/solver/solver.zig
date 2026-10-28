@@ -48,7 +48,8 @@ pub const Weights = struct {
     /// Without it the fragility term is skipped.
     death_net: ?*const nn.Net = null,
 };
-pub const baseline: Weights = .{ .order_penalty = 43.174, .order_penalty_late = 25 };
+/// Shipped weights. `monotonic = 32` was adopted in #117 (see docs/evalab.md).
+pub const baseline: Weights = .{ .order_penalty = 43.174, .order_penalty_late = 25, .monotonic = 32 };
 
 pub const Algorithm = enum { expectimax, greedy };
 
@@ -1116,7 +1117,8 @@ test "rank lists legal moves best first" {
     try std.testing.expectEqual(@as(usize, 2), r.len);
     try std.testing.expect(r.items[0].value >= r.items[1].value);
     try std.testing.expect(r.items[0].dir == .left or r.items[0].dir == .right);
-    try std.testing.expectEqual(bestMove(state, 2), r.items[0].dir);
+    // since monotonic (#117) greedy and expectimax disagree here; compare like with like
+    try std.testing.expectEqual(bestMove(state, 2), rank(state, .expectimax, 2).items[0].dir);
 }
 
 test "greedy ranks by one-ply evaluation, not expectimax" {
@@ -1273,15 +1275,37 @@ test "extra terms change the score as documented" {
     try std.testing.expectEqual(@as(f64, 0), monoViolation(sorted));
     try std.testing.expect(monoViolation(jumbled) > 0);
     // penalties lower the score, the tile sum raises it (same weights apart from the added term)
-    var smooth = baseline;
+    var plain = baseline;
+    plain.monotonic = 0;
+    var smooth = plain;
     smooth.smoothness = 5;
-    var mono = baseline;
+    var mono = plain;
     mono.monotonic = 5;
-    var tiles = baseline;
+    var tiles = plain;
     tiles.tile_sum = 1;
-    try std.testing.expect(evaluateW(jumbled, smooth) < evaluateW(jumbled, baseline));
-    try std.testing.expect(evaluateW(jumbled, mono) < evaluateW(jumbled, baseline));
-    try std.testing.expect(evaluateW(sorted, tiles) > evaluateW(sorted, baseline));
+    try std.testing.expect(evaluateW(jumbled, smooth) < evaluateW(jumbled, plain));
+    try std.testing.expect(evaluateW(jumbled, mono) < evaluateW(jumbled, plain));
+    try std.testing.expect(evaluateW(sorted, tiles) > evaluateW(sorted, plain));
+}
+
+test "shipped baseline penalizes monotonicity violations (#117)" {
+    const monotone: Board = .{
+        .{ 2, 4, 8, 16 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    const broken: Board = .{
+        .{ 2, 16, 4, 8 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    var off = baseline;
+    off.monotonic = 0;
+    const shipped_gap = evaluateW(monotone, baseline) - evaluateW(broken, baseline);
+    const off_gap = evaluateW(monotone, off) - evaluateW(broken, off);
+    try std.testing.expect(shipped_gap > off_gap);
 }
 
 test "playWeights with the baseline matches the expectimax policy" {
@@ -1384,9 +1408,10 @@ test "baseline weights follow the adopted phase weights (#92)" {
         .{ 0, 0, 0, 0 },
         .{ 0, 0, 0, 0 },
     };
-    // adopted values (see docs/solver-history.md, issue #92): 43.174 before 4096, 25 from 4096
-    try std.testing.expectApproxEqAbs(@as(f64, 140 - 10 * 43.174), evaluateW(mid, baseline), 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f64, 140 - 11 * 25), evaluateW(late, baseline), 1e-9);
+    // adopted values (see docs/solver-history.md, issue #92): 43.174 before 4096, 25 from 4096;
+    // the monotonic term adds 10 / 11 violation steps x32 since #117
+    try std.testing.expectApproxEqAbs(@as(f64, 140 - 10 * 43.174 - 10 * 32), evaluateW(mid, baseline), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 140 - 11 * 25 - 11 * 32), evaluateW(late, baseline), 1e-9);
     // ga weights stay phase-invariant at their evolved 43.174
     try std.testing.expectApproxEqAbs(@as(f64, 14 * 7.028 - 11 * 43.174), evaluateW(late, ga_weights), 1e-9);
 }
