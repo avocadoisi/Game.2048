@@ -8,7 +8,8 @@ const usage =
     \\Compares evaluation variants on the same seeds and prints one row each (issues #111-#115).
     \\  specs           ';'-separated variants, e.g. "layout=snake;layout=spiral;monotonic=3"
     \\                  keys: layout=<snake|column_snake|spiral|block2>, anchor=<0..7>,
-    \\                        empty, order, merge, forced_down, smoothness, monotonic, tile_sum
+    \\                        empty, order, order_late, merge, forced_down, smoothness, monotonic,
+    \\                        tile_sum
     \\                  "baseline" and "ga" are shorthands; missing keys keep the shipped weights.
     \\                  `order` sets both the mid and the late-phase order penalty.
     \\  runs            number of runs, one PRNG seed each (default 5)
@@ -39,6 +40,8 @@ fn parseSpec(spec: []const u8) !solver.Weights {
         } else if (std.mem.eql(u8, key, "order")) {
             w.order_penalty = try std.fmt.parseFloat(f64, value);
             w.order_penalty_late = w.order_penalty;
+        } else if (std.mem.eql(u8, key, "order_late")) {
+            w.order_penalty_late = try std.fmt.parseFloat(f64, value);
         } else if (std.mem.eql(u8, key, "merge")) {
             w.merge = try std.fmt.parseFloat(f64, value);
         } else if (std.mem.eql(u8, key, "forced_down")) {
@@ -91,6 +94,12 @@ test "parseSpec starts from the shipped weights and applies every key" {
     try std.testing.expectEqual(@as(f64, 1.5), w.smoothness);
     try std.testing.expectEqual(@as(f64, 2), w.monotonic);
     try std.testing.expectEqual(@as(f64, 0.5), w.tile_sum);
+}
+
+test "parseSpec sets the late-phase order penalty on its own" {
+    const w = try parseSpec("order=40,order_late=25");
+    try std.testing.expectEqual(@as(f64, 40), w.order_penalty);
+    try std.testing.expectEqual(@as(f64, 25), w.order_penalty_late);
 }
 
 test "parseSpec keeps the shipped weights for the presets" {
