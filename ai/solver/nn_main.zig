@@ -26,6 +26,9 @@ const usage =
     \\              oi / oi16 (#107: multiply the initial weights by 4 / 16 = optimistic initialization,
     \\                       then train exactly like base; only the init differs, so `par` works)
     \\              resume  (#66: load weights_path and train train_games more games from those weights, plain per-move path)
+    \\              mstd    (#107 MS-TD: one MLP per empty-cell stage (0..2, 3..4, 5..6, 7..8, 9..10,
+    \\                       11..12, 13..16 empties); each TD step trains only the stage of the afterstate
+    \\                       it reached. Weights go to a staged file (its own magic), so eval needs the same file)
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
     \\                game i uses seed train_seed + i and the batch result is the mean of its games.
     \\                (#99) as arg 10 it batches any stateless variant (base|backward|replay|sym|symlam|
@@ -65,6 +68,18 @@ fn startNet(net: *nn.Net, io: std.Io, gpa: std.mem.Allocator, train_games: u32, 
     }
     var init_rng = std.Random.DefaultPrng.init(train_seed);
     net.* = nn.Net.init(init_rng.random());
+    return false;
+}
+
+/// Starting staged value for `mstd`: `weights_path` when resuming (train_games 0) or otherwise 7 random
+/// inits from `train_seed`. Returns whether the file was loaded.
+fn startStaged(staged: *nn.Staged, io: std.Io, gpa: std.mem.Allocator, train_games: u32, train_seed: u64, weights_path: []const u8) !bool {
+    if (train_games == 0) {
+        try staged.loadFile(io, gpa, weights_path);
+        return true;
+    }
+    var init_rng = std.Random.DefaultPrng.init(train_seed);
+    staged.* = nn.Staged.init(init_rng.random());
     return false;
 }
 
@@ -117,6 +132,7 @@ pub fn main(init: std.process.Init) !void {
     const par_tail = try parseParFlag(args);
     const use_par = par_variant or par_tail;
     const use_resume = std.mem.eql(u8, variant, "resume");
+    const is_mstd = std.mem.eql(u8, variant, "mstd");
     const replay_k: usize = if (args.len > 7) try std.fmt.parseInt(usize, args[7], 10) else 30;
     const weights_path = if (args.len > 8) args[8] else default_weights_path;
     const train_seed = try parseTrainSeed(args);
@@ -143,7 +159,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .nstep = 4 }
     else if (std.mem.eql(u8, variant, "death"))
         .{ .death = true }
-    else if (std.mem.eql(u8, variant, "oi") or std.mem.eql(u8, variant, "oi16"))
+    else if (std.mem.eql(u8, variant, "oi") or std.mem.eql(u8, variant, "oi16") or is_mstd)
         .{}
     else {
         std.debug.print("{s}", .{usage});
@@ -153,15 +169,20 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}", .{usage});
         return;
     }
-    // the priority ring buffer is cross-game state shared by pointer: batching would race on it
-    if (use_par and opts.priority != null) {
+    // the priority ring buffer is cross-game state shared by pointer: batching would race on it.
+    // `mstd` has no batch path either (one staged net is ~1 MB).
+    if (use_par and (opts.priority != null or is_mstd)) {
         std.debug.print("{s}", .{usage});
         return;
     }
 
     var net: nn.Net = undefined;
-    if (try startNet(&net, init.io, init.gpa, train_games, use_resume, train_seed, weights_path))
-        std.debug.print("loaded {s}\n", .{weights_path});
+    var staged: nn.Staged = undefined;
+    const loaded = if (is_mstd)
+        try startStaged(&staged, init.io, init.gpa, train_games, train_seed, weights_path)
+    else
+        try startNet(&net, init.io, init.gpa, train_games, use_resume, train_seed, weights_path);
+    if (loaded) std.debug.print("loaded {s}\n", .{weights_path});
     // Optimistic initialization (#107) only rescales the random init, so it stays out of `nn.Options`.
     if (std.mem.eql(u8, variant, "oi")) nn.scaleInit(&net, 4)
     else if (std.mem.eql(u8, variant, "oi16")) nn.scaleInit(&net, 16);
@@ -171,7 +192,18 @@ pub fn main(init: std.process.Init) !void {
         var last_score: u64 = 0;
         var total_moves: u64 = 0;
         var diag: nn.Diag = .{};
-        if (use_par) {
+        if (is_mstd) {
+            for (0..train_games) |g| {
+                const frac = @as(f64, @floatFromInt(g)) / @as(f64, @floatFromInt(train_games));
+                const game = nn.trainGameStaged(&staged, rng.random(), learning_rate * (1 - 0.9 * frac));
+                last_score = game.score;
+                total_moves += game.moves;
+                if ((g + 1) % 5000 == 0) {
+                    std.debug.print("train {d}/{d} last game score {d}\n", .{ g + 1, train_games, last_score });
+                    try staged.saveFile(init.io, init.gpa, weights_path); // checkpoint
+                }
+            }
+        } else if (use_par) {
             const batch_size = nn.trainBatchSize();
             var g: usize = 0;
             while (g < train_games) : (g += @min(batch_size, train_games - g)) {
@@ -206,8 +238,8 @@ pub fn main(init: std.process.Init) !void {
             train_seed,
             variant_label,
         });
-        if (want_diag) printDiag(&diag);
-        try nn.save(&net, init.io, weights_path);
+        if (want_diag and !is_mstd) printDiag(&diag);
+        if (is_mstd) try staged.saveFile(init.io, init.gpa, weights_path) else try nn.save(&net, init.io, weights_path);
     }
 
     var results = [_]Eval{
@@ -217,15 +249,17 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "expectimax depth 2" },
     };
     const games = eval_games * seed_ranges;
-    const EvalCtx = struct { net: *const nn.Net, policy: usize, eval_seed: u64 };
+    // `mstd` evaluates through the staged value, everything else through the single net (#107)
+    const eval_value: nn.Value = if (is_mstd) .{ .staged = &staged } else .{ .single = &net };
+    const EvalCtx = struct { vfn: nn.Value, policy: usize, eval_seed: u64 };
     // Game i uses seed eval_seed + i (= eval_seed + range*eval_games + g); games run in parallel.
     const playGame = struct {
         fn f(c: EvalCtx, i: usize) nn.PlayResult {
             var prng = std.Random.DefaultPrng.init(c.eval_seed + i);
             return switch (c.policy) {
-                0 => nn.play(c.net, prng.random(), .greedy),
-                1 => nn.play(c.net, prng.random(), .chance),
-                2 => nn.play(c.net, prng.random(), .deep),
+                0 => nn.playValue(c.vfn, prng.random(), .greedy),
+                1 => nn.playValue(c.vfn, prng.random(), .chance),
+                2 => nn.playValue(c.vfn, prng.random(), .deep),
                 else => blk: {
                     const b = solver.playPolicy(prng.random(), .expectimax, 2);
                     break :blk nn.PlayResult{ .score = b.score, .max_tile = b.max_tile, .moves = b.moves };
@@ -237,7 +271,7 @@ pub fn main(init: std.process.Init) !void {
         r.range_scores = try init.arena.allocator().alloc(f64, seed_ranges);
         const res_all = try init.arena.allocator().alloc(nn.PlayResult, games);
         const start = std.Io.Clock.awake.now(init.io);
-        parallel.map(nn.PlayResult, res_all, EvalCtx{ .net = &net, .policy = idx, .eval_seed = eval_seed }, playGame);
+        parallel.map(nn.PlayResult, res_all, EvalCtx{ .vfn = eval_value, .policy = idx, .eval_seed = eval_seed }, playGame);
         var total_moves: u64 = 0;
         for (0..seed_ranges) |range| {
             var total_score: u64 = 0;
@@ -358,4 +392,32 @@ test "usage text documents the par flag for stateless variants" {
 
 test "usage text lists the symbatch variant" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "symbatch (#98") != null);
+}
+
+test "usage text lists the mstd variant" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "mstd    (#107") != null);
+}
+
+test "mstd starts from the staged weights file on eval and from 7 random nets otherwise" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/mstd.bin", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+
+    var prng = std.Random.DefaultPrng.init(41);
+    const saved = nn.Staged.init(prng.random());
+    try saved.saveFile(io, std.testing.allocator, path);
+
+    // eval-only (train_games 0) and resume load the staged file byte for byte
+    var resumed: nn.Staged = undefined;
+    try std.testing.expect(try startStaged(&resumed, io, std.testing.allocator, 0, 41, path));
+    for (saved.nets, resumed.nets) |a, b| try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+
+    // training without resume starts from a random init (seed 99, so it must differ)
+    var fresh: nn.Staged = undefined;
+    try std.testing.expect(!try startStaged(&fresh, io, std.testing.allocator, 5, 99, path));
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&saved.nets), std.mem.asBytes(&fresh.nets)));
 }

@@ -120,6 +120,96 @@ pub fn train(net: *Net, cache: *const Cache, target: f64, lr: f64) void {
     }
 }
 
+/// MS-TD (#107): one value net per afterstate stage, staged by the number of empty cells.
+/// Boundaries: 0..2, 3..4, 5..6, 7..8, 9..10, 11..12, 13..16 empties.
+pub const stage_count: usize = 7;
+
+pub fn stageOfEmpties(empties: usize) usize {
+    return switch (empties) {
+        0...2 => 0,
+        3...4 => 1,
+        5...6 => 2,
+        7...8 => 3,
+        9...10 => 4,
+        11...12 => 5,
+        else => 6,
+    };
+}
+
+/// Value function used by the search: one net for every board, or one net per empty-cell stage (#107).
+pub const Value = union(enum) { single: *const Net, staged: *const Staged };
+
+/// `forward` for a `Value`; `cache` belongs to the net being evaluated and is unused for staged values.
+pub fn valueAt(value: Value, board: Board, cache: *Cache) f64 {
+    return switch (value) {
+        .single => |net| forward(net, board, cache),
+        .staged => |staged| staged.forward(board),
+    };
+}
+
+// Container-level aliases: the `Staged` methods below shadow `forward` / `train` by name.
+const netForward = forward;
+const netTrain = train;
+
+/// Multi-stage TD value function (#107): `stage_count` nets of the `Net` architecture, chosen by the
+/// afterstate's empty-cell count. Search and training reach it through `Value`.
+pub const Staged = struct {
+    nets: [stage_count]Net,
+
+    pub fn init(rng: std.Random) Staged {
+        var self: Staged = undefined;
+        for (&self.nets) |*net| net.* = Net.init(rng);
+        return self;
+    }
+
+    /// Stage of a board; afterstates with fewer empty cells use the earlier nets.
+    pub fn stageOf(board: Board) usize {
+        return stageOfEmpties(countEmpty(board));
+    }
+
+    /// Value of `board` from the net of its own stage.
+    pub fn forward(self: *const Staged, board: Board) f64 {
+        var cache: Cache = .{};
+        return netForward(&self.nets[stageOf(board)], board, &cache);
+    }
+
+    /// One TD(0) step (gamma = 1, like the rest of the learner): `after` is the afterstate the move
+    /// reached, `next` the afterstate of the following step (null at game over). Only the net of
+    /// `after`'s stage is updated. Returns the TD error `reward + V(next) - V(after)`.
+    pub fn train(self: *Staged, after: Board, next: ?Board, reward: f64, lr: f64) f64 {
+        const stage = stageOf(after);
+        var cache: Cache = .{};
+        const v = netForward(&self.nets[stage], after, &cache);
+        const target = reward + if (next) |n| self.forward(n) else 0;
+        netTrain(&self.nets[stage], &cache, target, lr);
+        return target - v;
+    }
+
+    pub fn saveFile(self: *const Staged, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
+        const bytes = try gpa.alloc(u8, staged_file_len);
+        defer gpa.free(bytes);
+        @memcpy(bytes[0..8], staged_file_magic);
+        std.mem.writeInt(u32, bytes[8..12], file_version, .little);
+        std.mem.writeInt(u32, bytes[12..16], endian_marker, .little);
+        for (0..stage_count) |k| writeWeights(bytes[header_len + k * @sizeOf(Net) ..][0..@sizeOf(Net)], &self.nets[k]);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+    }
+
+    pub fn loadFile(self: *Staged, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(staged_file_len + 1));
+        defer gpa.free(bytes);
+        try self.parseStaged(bytes);
+    }
+
+    fn parseStaged(self: *Staged, bytes: []const u8) !void {
+        if (bytes.len != staged_file_len) return error.WrongWeightFileSize;
+        if (!std.mem.eql(u8, bytes[0..8], staged_file_magic)) return error.BadWeightMagic;
+        if (std.mem.readInt(u32, bytes[8..12], .little) != file_version) return error.UnsupportedWeightVersion;
+        if (std.mem.readInt(u32, bytes[12..16], .little) != endian_marker) return error.WrongWeightEndianness;
+        for (0..stage_count) |k| self.nets[k] = readWeights(bytes[header_len + k * @sizeOf(Net) ..][0..@sizeOf(Net)]);
+    }
+};
+
 /// Dihedral symmetry (issue #72): 8 cell-index permutations, rotations 0..3 then their mirrors 4..7.
 /// `symmetryMap(k, cell)` is the cell that `cell` moves to under transform `k` (k = 0 is identity).
 pub const symmetry_count = 8;
@@ -157,6 +247,11 @@ const Pick = struct {
 
 /// Best legal move by reward + V(afterstate); null when no move changes the board.
 fn pickMove(net: *const Net, state: GameState, death: bool) ?Pick {
+    return pickMoveValue(.{ .single = net }, state, death);
+}
+
+/// `pickMove` for a single or staged value function (#107).
+fn pickMoveValue(vfn: Value, state: GameState, death: bool) ?Pick {
     var best: ?Pick = null;
     for ([_]Direction{ .up, .left, .down, .right }) |d| {
         var next = state;
@@ -164,20 +259,20 @@ fn pickMove(net: *const Net, state: GameState, death: bool) ?Pick {
         if (!moved.changed) continue;
         var cache: Cache = .{};
         const reward = if (death) -1 / reward_scale else @as(f64, @floatFromInt(moved.score_delta)) / reward_scale;
-        const pick: Pick = .{ .dir = d, .after = next.board, .reward = reward, .value = forward(net, next.board, &cache) };
+        const pick: Pick = .{ .dir = d, .after = next.board, .reward = reward, .value = valueAt(vfn, next.board, &cache) };
         if (best == null or pick.reward + pick.value > best.?.reward + best.?.value) best = pick;
     }
     return best;
 }
 
 /// Value of a post-spawn board for the chance-node search: best reward + V over the legal moves (0 if none).
-fn bestAfterValue(net: *const Net, board_state: GameState) f64 {
-    const pick = pickMove(net, board_state, false) orelse return 0;
+fn bestAfterValue(vfn: Value, board_state: GameState) f64 {
+    const pick = pickMoveValue(vfn, board_state, false) orelse return 0;
     return pick.reward + pick.value;
 }
 
 /// Expectimax with one spawn of lookahead: for each move, average over spawns of the best NN afterstate value.
-fn chanceMove(net: *const Net, state: GameState) ?Direction {
+fn chanceMove(vfn: Value, state: GameState) ?Direction {
     var best: ?Direction = null;
     var best_value: f64 = -std.math.inf(f64);
     for ([_]Direction{ .up, .left, .down, .right }) |d| {
@@ -193,11 +288,11 @@ fn chanceMove(net: *const Net, state: GameState) ?Direction {
                 for ([_]struct { value: core.Tile, p: f64 }{ .{ .value = 2, .p = 0.9 }, .{ .value = 4, .p = 0.1 } }) |spawn| {
                     var child = moved;
                     child.board[r][c] = spawn.value;
-                    total += spawn.p * bestAfterValue(net, child);
+                    total += spawn.p * bestAfterValue(vfn, child);
                 }
             }
         }
-        const chance = if (empties == 0) bestAfterValue(net, moved) else total / empties;
+        const chance = if (empties == 0) bestAfterValue(vfn, moved) else total / empties;
         const value = @as(f64, @floatFromInt(result.score_delta)) / reward_scale + chance;
         if (best == null or value > best_value) {
             best = d;
@@ -230,23 +325,28 @@ pub const ValueCache = struct {
 
     /// `forward(net, board)` with memoization; `stats` counts leaf evaluations and hits.
     pub fn get(self: *ValueCache, net: *const Net, board: Board, stats: *Stats) f64 {
+        return self.getValue(.{ .single = net }, board, stats);
+    }
+
+    /// `get` for a single or staged value function (#107).
+    pub fn getValue(self: *ValueCache, vfn: Value, board: Board, stats: *Stats) f64 {
         const key = keyOf(board);
-        if (key == empty_key) return leafValue(net, board, stats);
+        if (key == empty_key) return leafValue(vfn, board, stats);
         const slot: usize = @intCast(key & (capacity - 1));
         if (self.entries[slot].key == key) {
             stats.hits += 1;
             return self.entries[slot].value;
         }
-        const value_ = leafValue(net, board, stats);
+        const value_ = leafValue(vfn, board, stats);
         self.entries[slot] = .{ .key = key, .value = value_ };
         return value_;
     }
 };
 
-fn leafValue(net: *const Net, board: Board, stats: *Stats) f64 {
+fn leafValue(vfn: Value, board: Board, stats: *Stats) f64 {
     var cache: Cache = .{};
     stats.leaves += 1;
-    return forward(net, board, &cache);
+    return valueAt(vfn, board, &cache);
 }
 
 /// Per-thread cache reused across moves (issue #88). A value is a pure function of the board and
@@ -269,7 +369,7 @@ const deep3_cutoff: f64 = 1e-2;
 /// Depth-limited expectimax: our moves and every spawn (2 at 0.9, 4 at 0.1), no RNG.
 /// The caller owns the value cache so a game can reuse one workspace for all of its moves.
 const Search = struct {
-    net: *const Net,
+    vfn: Value,
     cache: *ValueCache,
     stats: Stats = .{},
     /// Spawn branches under this path probability are dropped; 0 searches every branch (`.deep`).
@@ -292,7 +392,7 @@ const Search = struct {
     /// `cprob` is the probability of reaching this node. Kept branches are averaged over their own
     /// mass, so a cut node keeps the scale of a full average instead of shrinking with the dropped ones.
     fn chance(self: *Search, state: GameState, depth: u8, cprob: f64) f64 {
-        if (depth == 0) return self.cache.get(self.net, state.board, &self.stats);
+        if (depth == 0) return self.cache.getValue(self.vfn, state.board, &self.stats);
         var empties: f64 = 0;
         for (0..core.BoardSize) |r| {
             for (0..core.BoardSize) |c| {
@@ -316,14 +416,14 @@ const Search = struct {
             }
         }
         // every branch cut: the node is already that unlikely, so the afterstate leaf is the answer
-        return if (mass == 0) self.cache.get(self.net, state.board, &self.stats) else total / mass;
+        return if (mass == 0) self.cache.getValue(self.vfn, state.board, &self.stats) else total / mass;
     }
 };
 
 /// `ply` own moves deep: my move -> spawn -> ... -> afterstate value + score_delta/reward_scale.
 /// `ply` 2 is `deep` (full width); `ply` 3 is `deep3`, whose cost only fits with a spawn-probability cut.
-fn deepMove(net: *const Net, state: GameState, stats: *Stats, cache: *ValueCache, ply: u8, cutoff: f64) ?Direction {
-    var search: Search = .{ .net = net, .cache = cache, .cutoff = cutoff };
+fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, ply: u8, cutoff: f64) ?Direction {
+    var search: Search = .{ .vfn = vfn, .cache = cache, .cutoff = cutoff };
     defer stats.* = search.stats;
     var best: ?Direction = null;
     var best_value: f64 = -std.math.inf(f64);
@@ -352,8 +452,13 @@ pub const Mode = enum {
 };
 
 pub fn bestMove(net: *const Net, state: GameState, mode: Mode) ?Direction {
+    return bestMoveValue(.{ .single = net }, state, mode);
+}
+
+/// `bestMove` for a single or staged value function (#107).
+pub fn bestMoveValue(vfn: Value, state: GameState, mode: Mode) ?Direction {
     var stats: Stats = .{};
-    return bestMoveWithCache(net, state, mode, &stats, sharedValueCache());
+    return bestMoveWithCacheValue(vfn, state, mode, &stats, sharedValueCache());
 }
 
 /// `bestMove` plus search counters (leaves = `forward` evaluations, hits = value-cache reuse).
@@ -366,11 +471,15 @@ pub fn bestMoveWithStats(net: *const Net, state: GameState, mode: Mode, stats: *
 /// `bestMoveWithStats` with a caller-owned cache: reuse it across moves (issue #88) for speed.
 /// A warm cache returns the same moves as a fresh one — only faster.
 pub fn bestMoveWithCache(net: *const Net, state: GameState, mode: Mode, stats: *Stats, cache: *ValueCache) ?Direction {
+    return bestMoveWithCacheValue(.{ .single = net }, state, mode, stats, cache);
+}
+
+pub fn bestMoveWithCacheValue(vfn: Value, state: GameState, mode: Mode, stats: *Stats, cache: *ValueCache) ?Direction {
     return switch (mode) {
-        .greedy => if (pickMove(net, state, false)) |p| p.dir else null,
-        .chance => chanceMove(net, state),
-        .deep => deepMove(net, state, stats, cache, 2, 0),
-        .deep3 => deepMove(net, state, stats, cache, 3, deep3_cutoff),
+        .greedy => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
+        .chance => chanceMove(vfn, state),
+        .deep => deepMove(vfn, state, stats, cache, 2, 0),
+        .deep3 => deepMove(vfn, state, stats, cache, 3, deep3_cutoff),
     };
 }
 
@@ -384,18 +493,27 @@ pub const PlayResult = struct {
 
 /// Play one game to game over with the network policy.
 pub fn play(net: *const Net, rng: std.Random, mode: Mode) PlayResult {
+    return playValue(.{ .single = net }, rng, mode);
+}
+
+/// `play` for a single or staged value function (#107).
+pub fn playValue(vfn: Value, rng: std.Random, mode: Mode) PlayResult {
     var stats: Stats = .{};
-    return playWithStats(net, rng, mode, &stats);
+    return playWithStatsValue(vfn, rng, mode, &stats);
 }
 
 pub fn playWithStats(net: *const Net, rng: std.Random, mode: Mode, stats: *Stats) PlayResult {
+    return playWithStatsValue(.{ .single = net }, rng, mode, stats);
+}
+
+pub fn playWithStatsValue(vfn: Value, rng: std.Random, mode: Mode, stats: *Stats) PlayResult {
     var state = GameState.gameStart(rng);
     var moves: u32 = 0;
     var move_stats: Stats = .{};
     var cache: ValueCache = .{}; // one workspace for the whole game (issue #88)
     while (true) {
         move_stats = .{};
-        const dir = bestMoveWithCache(net, state, mode, &move_stats, &cache) orelse break;
+        const dir = bestMoveWithCacheValue(vfn, state, mode, &move_stats, &cache) orelse break;
         stats.leaves += move_stats.leaves;
         stats.hits += move_stats.hits;
         _ = state.move(dir, rng);
@@ -817,6 +935,23 @@ fn trainGameNStep(net: *Net, rng: std.Random, lr: f64, n: usize) GameResult {
     return .{ .score = state.score, .moves = moves };
 }
 
+/// MS-TD (#107) self-play game over the staged value: the same 1-ply policy as `trainGamePerMove`,
+/// one TD(0) step per move (gamma = 1), and each step trains only the net of the afterstate it reached.
+pub fn trainGameStaged(staged: *Staged, rng: std.Random, lr: f64) GameResult {
+    const value: Value = .{ .staged = staged };
+    var state = GameState.gameStart(rng);
+    var pending: ?Pick = null;
+    var moves: u32 = 0;
+    while (pickMoveValue(value, state, false)) |pick| {
+        moves += 1;
+        if (pending) |p| _ = staged.train(p.after, pick.after, p.reward, lr);
+        pending = pick;
+        _ = state.move(pick.dir, rng);
+    }
+    if (pending) |p| _ = staged.train(p.after, null, p.reward, lr);
+    return .{ .score = state.score, .moves = moves };
+}
+
 /// Games per parallel training batch: min(cpu count, max_threads), at least 1.
 pub fn trainBatchSize() usize {
     const cpus = std.Thread.getCpuCount() catch 1;
@@ -896,14 +1031,30 @@ const endian_marker: u32 = 0x01020304;
 const header_len = 16;
 pub const file_len = header_len + @sizeOf(Net);
 
+/// Staged weight file (#107): the same header with its own 8-byte magic and `stage_count` weight blocks.
+pub const staged_file_magic = "2048-MS\x00";
+pub const staged_file_len = header_len + @sizeOf(Net) * stage_count;
+
+fn writeWeights(out: []u8, net: *const Net) void {
+    for (std.mem.bytesAsSlice(f64, std.mem.asBytes(net)), 0..) |w, i| {
+        std.mem.writeInt(u64, out[i * 8 ..][0..8], @bitCast(w), .little);
+    }
+}
+
+fn readWeights(bytes: []const u8) Net {
+    var net: Net = undefined;
+    for (std.mem.bytesAsSlice(f64, std.mem.asBytes(&net)), 0..) |*w, i| {
+        w.* = @bitCast(std.mem.readInt(u64, bytes[i * 8 ..][0..8], .little));
+    }
+    return net;
+}
+
 pub fn encode(net: *const Net) [file_len]u8 {
     var out: [file_len]u8 = undefined;
     @memcpy(out[0..8], file_magic);
     std.mem.writeInt(u32, out[8..12], file_version, .little);
     std.mem.writeInt(u32, out[12..16], endian_marker, .little);
-    for (std.mem.bytesAsSlice(f64, std.mem.asBytes(net)), 0..) |w, i| {
-        std.mem.writeInt(u64, out[header_len + i * 8 ..][0..8], @bitCast(w), .little);
-    }
+    writeWeights(out[header_len..], net);
     return out;
 }
 
@@ -917,11 +1068,7 @@ pub fn parse(bytes: []const u8) !Net {
     if (!std.mem.eql(u8, bytes[0..8], file_magic)) return error.BadWeightMagic;
     if (std.mem.readInt(u32, bytes[8..12], .little) != file_version) return error.UnsupportedWeightVersion;
     if (std.mem.readInt(u32, bytes[12..16], .little) != endian_marker) return error.WrongWeightEndianness;
-    var net: Net = undefined;
-    for (std.mem.bytesAsSlice(f64, std.mem.asBytes(&net)), 0..) |*w, i| {
-        w.* = @bitCast(std.mem.readInt(u64, bytes[header_len + i * 8 ..][0..8], .little));
-    }
-    return net;
+    return readWeights(bytes[header_len..]);
 }
 
 pub fn save(net: *const Net, io: std.Io, path: []const u8) !void {
@@ -1144,8 +1291,8 @@ test "deep3 returns only legal moves on random boards" {
 test "deep3 keeps the value within 5% of the unpruned 3-ply search" {
     const net = try parse(@embedFile("nn_weights.bin"));
     var cache: ValueCache = .{};
-    var full: Search = .{ .net = &net, .cache = &cache };
-    var pruned: Search = .{ .net = &net, .cache = &cache, .cutoff = deep3_cutoff };
+    var full: Search = .{ .vfn = .{ .single = &net }, .cache = &cache };
+    var pruned: Search = .{ .vfn = .{ .single = &net }, .cache = &cache, .cutoff = deep3_cutoff };
     const plain = full.value(late_board, 3, 1);
     const cut = pruned.value(late_board, 3, 1);
     try std.testing.expect(@abs(cut - plain) <= 0.05 * @abs(plain));
@@ -1980,3 +2127,128 @@ test "scaleInit multiplies the initial weights by the scale (#107)" {
     try std.testing.expectEqual(plain.w3[2] * 4, optimistic.w3[2]);
     try std.testing.expect(optimistic.b1[0] == plain.b1[0]);
 }
+
+test "stageOfEmpties maps empty-cell counts to the 7 stages" {
+    const cases = [_]struct { empties: usize, stage: usize }{
+        .{ .empties = 0, .stage = 0 },
+        .{ .empties = 2, .stage = 0 },
+        .{ .empties = 3, .stage = 1 },
+        .{ .empties = 4, .stage = 1 },
+        .{ .empties = 5, .stage = 2 },
+        .{ .empties = 6, .stage = 2 },
+        .{ .empties = 7, .stage = 3 },
+        .{ .empties = 8, .stage = 3 },
+        .{ .empties = 9, .stage = 4 },
+        .{ .empties = 10, .stage = 4 },
+        .{ .empties = 11, .stage = 5 },
+        .{ .empties = 12, .stage = 5 },
+        .{ .empties = 13, .stage = 6 },
+        .{ .empties = 16, .stage = 6 },
+    };
+    for (cases) |c| try std.testing.expectEqual(c.stage, stageOfEmpties(c.empties));
+    try std.testing.expectEqual(@as(usize, 7), stage_count);
+    // out-of-range empties clamp to the last stage instead of indexing past `nets`
+    try std.testing.expectEqual(@as(usize, 6), stageOfEmpties(17));
+}
+
+test "Staged.forward reads the net of the board's own stage" {
+    var prng = std.Random.DefaultPrng.init(11);
+    var staged = Staged.init(prng.random());
+    const full = boardWithEmpties(16); // stage 6
+    const dense = boardWithEmpties(1); // stage 0
+    const full_before = staged.forward(full);
+    const dense_before = staged.forward(dense);
+    // b3 is added straight to the output, so bumping one stage's b3 shifts exactly that stage's values
+    staged.nets[0].b3 += 1;
+    try std.testing.expectEqual(full_before, staged.forward(full));
+    try std.testing.expectEqual(dense_before + 1, staged.forward(dense));
+}
+
+test "Staged.train updates only the destination afterstate's stage" {
+    var prng = std.Random.DefaultPrng.init(13);
+    var staged = Staged.init(prng.random());
+    const after = boardWithEmpties(16); // stage 6, the net that gets the step
+    const next = boardWithEmpties(1); // stage 0, read for the target only
+    var pristine = staged;
+    const before = staged.forward(after);
+    const err = staged.train(after, next, 0.5, 0.01);
+    const target = 0.5 + pristine.forward(next);
+    try std.testing.expectApproxEqAbs(target - before, err, 1e-12);
+    for (staged.nets, pristine.nets, 0..) |a, b, k| {
+        const changed = !std.mem.eql(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+        try std.testing.expectEqual(k == 6, changed);
+    }
+    // the step moves V(after) toward the target
+    try std.testing.expect(@abs(staged.forward(after) - target) < @abs(before - target));
+}
+
+test "Staged.train with a terminal step uses the reward alone" {
+    var prng = std.Random.DefaultPrng.init(15);
+    var staged = Staged.init(prng.random());
+    const after = boardWithEmpties(4); // stage 1
+    const before = staged.forward(after);
+    const err = staged.train(after, null, -1, 0.01);
+    try std.testing.expectApproxEqAbs(-1 - before, err, 1e-12);
+}
+
+test "staged weights round trip and stay separate from the single-net file" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/mstd.bin", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+
+    var prng = std.Random.DefaultPrng.init(17);
+    const staged = Staged.init(prng.random());
+    try staged.saveFile(io, std.testing.allocator, path);
+    var loaded: Staged = undefined;
+    try loaded.loadFile(io, std.testing.allocator, path);
+    for (staged.nets, loaded.nets) |a, b| try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+
+    // the staged file is its own format, so the single-net reader still rejects it
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, std.testing.allocator, .limited(staged_file_len + 1));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqual(@as(usize, staged_file_len), bytes.len);
+    try std.testing.expectEqualStrings("2048-MS\x00", bytes[0..8]);
+    try std.testing.expectError(error.WrongWeightFileSize, parse(bytes));
+
+    // and the staged reader rejects a single-net file
+    const single_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/net.bin", .{tmp.sub_path});
+    defer std.testing.allocator.free(single_path);
+    try save(&Net.init(prng.random()), io, single_path);
+    try std.testing.expectError(error.WrongWeightFileSize, loaded.loadFile(io, std.testing.allocator, single_path));
+}
+
+test "staged self-play training is deterministic for a fixed seed" {
+    var init_a = std.Random.DefaultPrng.init(19);
+    var init_b = std.Random.DefaultPrng.init(19);
+    var staged_a = Staged.init(init_a.random());
+    var staged_b = Staged.init(init_b.random());
+    const before = staged_a;
+    var rng_a = std.Random.DefaultPrng.init(23);
+    var rng_b = std.Random.DefaultPrng.init(23);
+    const game_a = trainGameStaged(&staged_a, rng_a.random(), 0.003);
+    const game_b = trainGameStaged(&staged_b, rng_b.random(), 0.003);
+    try std.testing.expectEqual(game_a, game_b);
+    for (staged_a.nets, staged_b.nets) |a, b| try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&before.nets), std.mem.asBytes(&staged_a.nets)));
+}
+
+test "bestMove and play accept the staged value" {
+    var prng = std.Random.DefaultPrng.init(29);
+    const staged = Staged.init(prng.random());
+    const value: Value = .{ .staged = &staged };
+    const dead: GameState = .{ .board = .{
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+    } };
+    try std.testing.expectEqual(@as(?Direction, null), bestMoveValue(value, dead, .greedy));
+    var rng = std.Random.DefaultPrng.init(31);
+    const result = playValue(value, rng.random(), .greedy);
+    try std.testing.expect(result.moves > 0);
+}
+
