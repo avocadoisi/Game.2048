@@ -193,6 +193,151 @@ pub const TupleNet = struct {
     }
 };
 
+/// int16 view of a table: one scale per pattern, so the 4-tuples can use a coarser step than the
+/// 6-tuples. `q * scale` reproduces the f32 value to within half a step (129 MiB -> 64.6 MiB, #129).
+pub const Quantized = struct {
+    storage: []i16,
+    /// Value = `storage[i] * scales[p]` for pattern `p`; 0 for an all-zero table.
+    scales: [pattern_count]f64 = @splat(0),
+    count: usize,
+
+    pub fn initWith(gpa: std.mem.Allocator, set: Set) !Quantized {
+        return initCount(gpa, countOf(set));
+    }
+
+    fn initCount(gpa: std.mem.Allocator, n: usize) !Quantized {
+        const storage = try gpa.alloc(i16, entriesOf(n));
+        @memset(storage, 0);
+        return .{ .storage = storage, .count = n };
+    }
+
+    pub fn deinit(self: *Quantized, gpa: std.mem.Allocator) void {
+        gpa.free(self.storage);
+    }
+
+    pub fn value(self: *const Quantized, idx: Indices) f64 {
+        var v: f64 = 0;
+        for (0..self.count) |p| v += @as(f64, @floatFromInt(self.storage[offsets[p] + idx[p]])) * self.scales[p];
+        return v;
+    }
+
+    pub fn eval(self: *const Quantized, board: Board) f64 {
+        return self.value(indices(board));
+    }
+};
+
+/// Largest absolute value of each table; the quantizer step is `max / 32767` per pattern.
+fn tableScales(net: *const TupleNet) [pattern_count]f64 {
+    var scales: [pattern_count]f64 = @splat(0);
+    for (0..net.count) |p| {
+        var max: f32 = 0;
+        for (net.storage[offsets[p]..][0..tableLen(p)]) |w| max = @max(max, @abs(w));
+        scales[p] = if (max == 0) 0 else @as(f64, max) / 32767;
+    }
+    return scales;
+}
+
+/// Round one table into `out` with `scale` (value / scale); a zero scale leaves zeros.
+fn quantizeValues(values: []const f32, scale: f64, out: []i16) void {
+    if (scale == 0) return @memset(out, 0);
+    for (values, out) |w, *q| {
+        const scaled = @as(f64, w) / scale;
+        q.* = @intFromFloat(@round(std.math.clamp(scaled, -32767, 32767)));
+    }
+}
+
+/// Quantize every active table into a fresh int16 buffer.
+pub fn quantize(gpa: std.mem.Allocator, net: *const TupleNet) !Quantized {
+    var q = try Quantized.initCount(gpa, net.count);
+    errdefer q.deinit(gpa);
+    q.scales = tableScales(net);
+    for (0..net.count) |p| {
+        quantizeValues(net.storage[offsets[p]..][0..tableLen(p)], q.scales[p], q.storage[offsets[p]..][0..tableLen(p)]);
+    }
+    return q;
+}
+
+/// Write the quantized values back into an f32 net, so the rounding can be A/B'd with the same
+/// evaluation code that reads float tables (#129).
+pub fn dequantizeInto(q: *const Quantized, net: *TupleNet) void {
+    std.debug.assert(q.count == net.count);
+    for (0..q.count) |p| {
+        const scale: f32 = @floatCast(q.scales[p]);
+        for (q.storage[offsets[p]..][0..tableLen(p)], net.storage[offsets[p]..][0..tableLen(p)]) |v, *w| {
+            w.* = @as(f32, @floatFromInt(v)) * scale;
+        }
+    }
+}
+
+pub const quantized_magic = "2048-NQ\x00";
+
+/// File length for `n` quantized tables.
+pub fn quantizedFileLen(n: usize) usize {
+    return header_len + n * 4 + n * 8 + entriesOf(n) * 2;
+}
+
+/// File: magic, version, endianness marker, pattern count, per-table lengths (u32 LE), per-table
+/// scales (f64 LE), then the i16 LE payload.
+pub fn encodeQuantized(gpa: std.mem.Allocator, q: *const Quantized) ![]u8 {
+    const bytes = try gpa.alloc(u8, quantizedFileLen(q.count));
+    @memcpy(bytes[0..8], quantized_magic);
+    std.mem.writeInt(u32, bytes[8..12], file_version, .little);
+    std.mem.writeInt(u32, bytes[12..16], endian_marker, .little);
+    std.mem.writeInt(u32, bytes[16..20], @intCast(q.count), .little);
+    var pos = header_len;
+    for (0..q.count) |p| {
+        std.mem.writeInt(u32, bytes[pos..][0..4], @intCast(tableLen(p)), .little);
+        pos += 4;
+    }
+    for (0..q.count) |p| {
+        std.mem.writeInt(u64, bytes[pos..][0..8], @bitCast(q.scales[p]), .little);
+        pos += 8;
+    }
+    for (q.storage) |w| {
+        std.mem.writeInt(i16, bytes[pos..][0..2], w, .little);
+        pos += 2;
+    }
+    return bytes;
+}
+
+pub fn parseQuantized(gpa: std.mem.Allocator, bytes: []const u8) !Quantized {
+    if (bytes.len < header_len) return error.WrongTableFileSize;
+    if (!std.mem.eql(u8, bytes[0..8], quantized_magic)) return error.BadTableMagic;
+    if (std.mem.readInt(u32, bytes[8..12], .little) != file_version) return error.UnsupportedTableVersion;
+    if (std.mem.readInt(u32, bytes[12..16], .little) != endian_marker) return error.WrongTableEndianness;
+    const n: usize = std.mem.readInt(u32, bytes[16..20], .little);
+    if (n == 0 or n > pattern_count) return error.WrongPatternCount;
+    if (bytes.len != quantizedFileLen(n)) return error.WrongTableFileSize;
+    var pos = header_len;
+    for (0..n) |p| {
+        if (std.mem.readInt(u32, bytes[pos..][0..4], .little) != tableLen(p)) return error.WrongTableLength;
+        pos += 4;
+    }
+    var q = try Quantized.initCount(gpa, n);
+    errdefer q.deinit(gpa);
+    for (0..n) |p| {
+        q.scales[p] = @bitCast(std.mem.readInt(u64, bytes[pos..][0..8], .little));
+        pos += 8;
+    }
+    for (q.storage) |*w| {
+        w.* = std.mem.readInt(i16, bytes[pos..][0..2], .little);
+        pos += 2;
+    }
+    return q;
+}
+
+pub fn saveQuantized(q: *const Quantized, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
+    const bytes = try encodeQuantized(gpa, q);
+    defer gpa.free(bytes);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+}
+
+pub fn loadQuantized(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !Quantized {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(quantizedFileLen(pattern_count) + 1));
+    defer gpa.free(bytes);
+    return parseQuantized(gpa, bytes);
+}
+
 pub const file_magic = "2048-NT\x00";
 pub const file_version: u32 = 1;
 const endian_marker: u32 = 0x01020304;
@@ -449,6 +594,23 @@ pub fn bestMove(net: *const TupleNet, state: core.GameState, mode: Mode) ?core.D
 pub fn bestMoveWithStats(net: *const TupleNet, state: core.GameState, mode: Mode, stats: *Stats) ?core.Direction {
     stats.* = .{};
     return if (chooseMove(net, state, mode, stats)) |p| p.dir else null;
+}
+
+/// 1-ply greedy move from a quantized table; this is what `algo=ntuple` plays (#129).
+pub fn bestMoveQuantized(q: *const Quantized, state: core.GameState) ?core.Direction {
+    var best: ?core.Direction = null;
+    var best_value: f64 = 0;
+    for ([_]core.Direction{ .up, .left, .down, .right }) |d| {
+        var next = state;
+        const moved = next.slide(d);
+        if (!moved.changed) continue;
+        const value = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale + q.eval(next.board);
+        if (best == null or value > best_value) {
+            best = d;
+            best_value = value;
+        }
+    }
+    return best;
 }
 
 /// Play one game to game over with the table policy.
@@ -738,4 +900,65 @@ test "variant names select the mode, the table set and resume" {
     try std.testing.expectEqual(Mode.deep, parseVariant("widedeep").?.mode);
     try std.testing.expectEqual(Set.wide, parseVariant("widedeep").?.set);
     try std.testing.expectEqual(@as(?Variant, null), parseVariant("lightresumex"));
+}
+
+test "quantizeValues rounds to the nearest step and clamps (#129)" {
+    const values = [_]f32{ 0, 0.5, -0.5, 1.0, 3.0, -3.0 };
+    var q: [6]i16 = undefined;
+    quantizeValues(&values, 1.0, &q);
+    try std.testing.expectEqualSlices(i16, &[_]i16{ 0, 1, -1, 1, 3, -3 }, &q);
+
+    // a zero scale (all-zero table) stays zero instead of dividing by zero
+    var zeros: [3]i16 = @splat(7);
+    quantizeValues(&[_]f32{ 1, 2, 3 }, 0, &zeros);
+    try std.testing.expectEqualSlices(i16, &[_]i16{ 0, 0, 0 }, &zeros);
+
+    // out of range saturates instead of wrapping
+    var big: [2]i16 = undefined;
+    quantizeValues(&[_]f32{ 1e9, -1e9 }, 1.0, &big);
+    try std.testing.expectEqualSlices(i16, &[_]i16{ 32767, -32767 }, &big);
+}
+
+test "quantized table round-trips through the file format (#129)" {
+    const gpa = std.testing.allocator;
+    var q = try Quantized.initWith(gpa, .light);
+    defer q.deinit(gpa);
+    for (0..q.count) |p| q.scales[p] = @floatFromInt(p + 1);
+    q.storage[0] = 1234;
+    q.storage[offsets[1] + 7] = -4321;
+
+    const bytes = try encodeQuantized(gpa, &q);
+    defer gpa.free(bytes);
+    try std.testing.expectEqual(quantizedFileLen(q.count), bytes.len);
+
+    var back = try parseQuantized(gpa, bytes);
+    defer back.deinit(gpa);
+    try std.testing.expectEqual(q.count, back.count);
+    try std.testing.expectEqualSlices(f64, q.scales[0..q.count], back.scales[0..back.count]);
+    try std.testing.expectEqual(q.storage[0], back.storage[0]);
+    try std.testing.expectEqual(q.storage[offsets[1] + 7], back.storage[offsets[1] + 7]);
+}
+
+test "parseQuantized rejects short buffers and the float format (#129)" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.WrongTableFileSize, parseQuantized(gpa, &[_]u8{ 1, 2, 3 }));
+    var f32_header: [header_len]u8 = @splat(0);
+    @memcpy(f32_header[0..8], file_magic);
+    try std.testing.expectError(error.BadTableMagic, parseQuantized(gpa, &f32_header));
+}
+
+test "quantized eval reproduces the float table it came from (#129)" {
+    const gpa = std.testing.allocator;
+    var net = try TupleNet.initCount(gpa, 1);
+    defer net.deinit(gpa);
+    for (net.storage, 0..) |*w, i| w.* = @as(f32, @floatFromInt(i % 977)) - 300;
+
+    var q = try quantize(gpa, &net);
+    defer q.deinit(gpa);
+
+    var idx: Indices = @splat(0);
+    idx[0] = indices(sample_board)[0];
+    // one table only: the value is that table's entry, so the tolerance is a single quantization step
+    try std.testing.expect(@abs(net.value(idx) - q.value(idx)) < 0.02);
+    try std.testing.expect(@abs(net.eval(sample_board) - q.eval(sample_board)) < 0.02);
 }

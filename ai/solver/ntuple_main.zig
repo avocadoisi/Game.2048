@@ -15,7 +15,8 @@ const usage =
     \\                second own move. light / lightdeep use only the 5 base 4-tuples.
     \\                wide / widedeep add the second 2x3 6-tuple (both 2x3 orbits, #106).
     \\                resume loads table_path first, then trains train_games more games.
-    \\  table_path    file to load (train_games 0) or write (default ai/solver/ntuple_weights.bin)
+    \\  table_path    file to load (train_games 0) or write (default ai/solver/ntuple_weights.bin);
+    \\                a path ending in .q16.bin reads/writes the int16 quantized format (#129)
     \\  train_seed    seed for self-play games (default 1)
     \\
     \\The table is written to `table_path` only when train_games > 0.
@@ -86,8 +87,14 @@ pub fn main(init: std.process.Init) !void {
         @as(f64, @floatFromInt(net.storage.len * @sizeOf(f32))) / (1024 * 1024),
     });
 
+    // A `.q16.bin` path writes (or, for an eval-only run, reads) the int16 quantized file (#129).
+    const quantized_path = std.mem.endsWith(u8, table_path, ".q16.bin");
     if (train_games == 0 or variant.resume_from_file) {
-        try ntuple.load(&net, init.io, init.gpa, table_path);
+        if (quantized_path) {
+            var q = try ntuple.loadQuantized(init.io, init.gpa, table_path);
+            defer q.deinit(init.gpa);
+            ntuple.dequantizeInto(&q, &net);
+        } else try ntuple.load(&net, init.io, init.gpa, table_path);
         std.debug.print("loaded {s}\n", .{table_path});
     } else {
         var rng = std.Random.DefaultPrng.init(train_seed);
@@ -113,7 +120,12 @@ pub fn main(init: std.process.Init) !void {
             train_seed,
             variant_name,
         });
-        try ntuple.save(&net, init.io, init.gpa, table_path);
+        if (quantized_path) {
+            var q = try ntuple.quantize(init.gpa, &net);
+            defer q.deinit(init.gpa);
+            try ntuple.saveQuantized(&q, init.io, init.gpa, table_path);
+            std.debug.print("saved {s} (quantized int16)\n", .{table_path});
+        } else try ntuple.save(&net, init.io, init.gpa, table_path);
     }
 
     var results = [_]Eval{
