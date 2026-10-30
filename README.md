@@ -43,6 +43,7 @@ zig build run -- help
 | `greedy` / `random` | 比較用 |
 | `nn` / `nn2` / `nn3` | TD(0) で学習した MLP 価値関数。1-ply + spawn / 2-ply / 3-ply（`nn3` は 25 倍遅い） |
 | `nnmcts` / `nnbeam` | NN を葉にした打ち切りロールアウト UCT / ビーム探索（`ranking` には未採用） |
+| `ntuple` | n-tuple 表（7 パターン、10M ゲーム学習）の 1-ply。`ai/solver/ntuple_wide_q16.bin`（64.6 MiB）を遅延ロードするので API 専用（WASM 非対応、`ranking` 未採用） |
 | `mcts` / `beam` / `ga` | 探索と GA 重みの比較用 |
 
 評価関数は空きマス数・蛇行順の違反ペナルティ・同値隣接ペア（merge）に、monotonic / smoothness / tile_sum を足せる（`solver.Weights`）。

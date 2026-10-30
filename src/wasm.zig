@@ -66,8 +66,10 @@ export fn best_tile() u32 {
     return best;
 }
 
+/// The last policy (`ntuple`) needs a 64 MiB table file, which the browser build cannot read,
+/// so the web UI only ever sees the ones before it (#129).
 export fn algo_count() u32 {
-    return @typeInfo(solver.Policy).@"enum".field_names.len;
+    return @typeInfo(solver.Policy).@"enum".field_names.len - 1;
 }
 
 /// NUL-terminated, static lifetime; index is `0..algo_count()`.

@@ -35,6 +35,24 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const ntuple_quant_exe = b.addExecutable(.{
+        .name = "ntuple-quant",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("ai/solver/ntuple_quant.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "ntuple", .module = ntuple_mod },
+            },
+        }),
+    });
+    b.installArtifact(ntuple_quant_exe);
+    const run_ntuple_quant = b.addRunArtifact(ntuple_quant_exe);
+    run_ntuple_quant.addPassthruArgs();
+    const ntuple_quant_step = b.step("ntuple-quant", "Quantize an n-tuple table to int16 (#129)");
+    ntuple_quant_step.dependOn(&run_ntuple_quant.step);
+
     const solver_mod = b.addModule("solver", .{
         .root_source_file = b.path("ai/solver/solver.zig"),
         .target = target,
@@ -42,6 +60,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core", .module = core_mod },
             .{ .name = "nn", .module = nn_mod },
+            .{ .name = "ntuple", .module = ntuple_mod },
         },
     });
 
@@ -316,6 +335,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "parallel", .module = wasm_parallel_mod },
         },
     });
+    const wasm_ntuple_mod = b.addModule("ntuple-wasm", .{
+        .root_source_file = b.path("ai/solver/ntuple.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core", .module = wasm_core_mod },
+        },
+    });
     const wasm_solver_mod = b.addModule("solver-wasm", .{
         .root_source_file = b.path("ai/solver/solver.zig"),
         .target = wasm_target,
@@ -323,6 +350,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core", .module = wasm_core_mod },
             .{ .name = "nn", .module = wasm_nn_mod },
+            .{ .name = "ntuple", .module = wasm_ntuple_mod },
         },
     });
     const wasm_exe = b.addExecutable(.{

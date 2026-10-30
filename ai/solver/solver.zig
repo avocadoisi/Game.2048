@@ -5,6 +5,8 @@ const Board = core.Board;
 const Direction = core.Direction;
 const GameState = core.GameState;
 const nn = @import("nn");
+const ntuple = @import("ntuple");
+const builtin = @import("builtin");
 
 /// Returned for a board where the player has no legal move.
 const lost_score: f64 = -1e9;
@@ -103,7 +105,9 @@ pub fn bestMoveW(state: GameState, depth: u8, w: Weights) ?Direction {
 }
 
 /// Move-choosing policies compared in the ranking (`zig build ranking`).
-pub const Policy = enum { random, greedy, expectimax, mcts, beam, expectimax_tt, ga, nn, nn2, nnmcts, nnbeam, expectimax_id, nn3 };
+/// `ntuple` stays last: the WASM build cannot read the table file, so `src/wasm.zig` offers
+/// `algo_count() - 1` policies and never lists it (#129).
+pub const Policy = enum { random, greedy, expectimax, mcts, beam, expectimax_tt, ga, nn, nn2, nnmcts, nnbeam, expectimax_id, nn3, ntuple };
 
 /// Weights evolved by `zig build ga-rl` (holdout +4%, see docs/solver-history.md). 3 decimals as printed.
 pub const ga_weights: Weights = .{ .empty = 7.028, .order_penalty = 43.174, .order_penalty_late = 43.174, .merge = 0, .forced_down = 0 };
@@ -119,6 +123,40 @@ threadlocal var cached_net: ?nn.Net = null;
 fn nnNet() *const nn.Net {
     if (cached_net == null) cached_net = nn.parse(nn_weight_bytes) catch unreachable;
     return &cached_net.?;
+}
+
+/// Quantized n-tuple table used by `algo=ntuple`; 64.6 MiB, so it is loaded once per thread and
+/// only when that policy is actually chosen (#129). Missing file -> the policy has no move.
+const ntuple_weight_bytes = "ai/solver/ntuple_wide_q16.bin";
+threadlocal var cached_ntuple: ?ntuple.Quantized = null;
+
+/// Per-thread table, or null when `ntuple_weight_bytes` is not readable (e.g. in the WASM build).
+/// The freestanding target has no filesystem, so its branch is a null-returning stub and the
+/// `std.Io.Dir` path is never analyzed there.
+const ntuple_load = if (builtin.target.os.tag == .freestanding) struct {
+    fn get() ?*const ntuple.Quantized {
+        return null;
+    }
+}.get else struct {
+    fn get() ?*const ntuple.Quantized {
+        if (cached_ntuple == null) {
+            cached_ntuple = ntuple.loadQuantized(
+                std.Io.Threaded.global_single_threaded.io(),
+                std.heap.page_allocator,
+                ntuple_weight_bytes,
+            ) catch return null;
+        }
+        return &cached_ntuple.?;
+    }
+}.get;
+
+fn ntupleTable() ?*const ntuple.Quantized {
+    return ntuple_load();
+}
+
+/// True when `algo=ntuple` can answer on this target (the table file is readable).
+pub fn ntupleAvailable() bool {
+    return ntupleTable() != null;
 }
 
 /// Next move for a policy; null when no move changes the board.
@@ -149,6 +187,8 @@ pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Dir
         // the way `depth` is per-policy elsewhere: bench/ranking/solve pass it through.
         .expectimax_id => return bestMoveID(state, if (depth == 0) id_budget_ms else depth),
         .ga => return bestMoveW(state, depth, ga_weights),
+        // 1-ply greedy from the quantized n-tuple table (#129)
+        .ntuple => return if (ntupleTable()) |q| ntuple.bestMoveQuantized(q, state) else null,
         // The net is parsed once per thread and reused by reference (issue #87), never copied per move.
         .nn, .nn2, .nn3, .nnmcts, .nnbeam => {
             const net = nnNet();
@@ -629,9 +669,17 @@ pub fn bestMoveID(state: GameState, budget_ms: u32) ?Direction {
 
 /// Zig 0.17 has no `std.time.Instant`; the monotonic clock lives behind `std.Io`. The global
 /// single-threaded instance's `now` only reads the OS clock and touches no shared state.
-fn clockNow() std.Io.Timestamp {
-    return std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io());
-}
+/// Freestanding (WASM) has no clock: it returns a fixed timestamp, so a timed search there
+/// degenerates to its minimum depth instead of failing to build.
+const clockNow = if (builtin.target.os.tag == .freestanding) struct {
+    fn now() std.Io.Timestamp {
+        return .{ .nanoseconds = 0 };
+    }
+}.now else struct {
+    fn now() std.Io.Timestamp {
+        return std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io());
+    }
+}.now;
 
 fn elapsedMs(start: std.Io.Timestamp) i96 {
     return @divTrunc(start.durationTo(clockNow()).nanoseconds, std.time.ns_per_ms);
@@ -1723,3 +1771,12 @@ test "nn policy parses the weights once per thread, not once per move" {
     try std.testing.expect(nn.parse_count - before <= 1);
 }
 
+
+test "ntuple policy plays a legal move from the quantized table (#129)" {
+    // The table file ships with the repo; a checkout without it simply skips the check.
+    if (!ntupleAvailable()) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(1);
+    var state = GameState.gameStart(prng.random());
+    const move = choose(.ntuple, state, prng.random(), 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(state.slide(move).changed);
+}
