@@ -1618,3 +1618,51 @@ MS-TD の比較用に `par` 無しの base を回したところ、同じ 100k �
 これまでの nn 系の計測（OI の A/B など）は par 前提だったため絶対値が控えめに出ている
 （同一条件どうしの相対比較はそのまま有効）。速度は 187 s 対 1,064 s（5.7 倍）なので、
 速度が要る場面では lr を上げた par を使う選択肢が残る（未検証）。
+
+## n-tuple 表の量子化と `algo=ntuple` の接続 (#129, 2026-10-30)
+
+`.wide` の n-tuple 表は 33,882,112 entries × f32 = 129.3 MiB あり、そのままでは同梱できない。
+int16 に量子化して 64.6 MiB にし、`solver.Policy.ntuple` として API から使えるようにした。
+
+### 形式
+
+- `ai/solver/ntuple.zig` の `Quantized`: int16 の本体 + パターンごとのスケール（f64 × 7）
+- 量子化は `q = round(w / scale)`、`scale = max|w| / 32767`（表ごと）。復元は `w ≈ q * scale`
+- ファイルは magic `2048-NQ\0` + version + endian + パターン数 + 表長 + スケール + i16 本体
+  （既存の f32 形式 `2048-NT\0` はそのまま読める）
+- 変換は `zig build ntuple-quant -- <in.bin> <out.q16.bin>`。`zig build ntuple` も出力パスが
+  `.q16.bin` で終われば量子化して保存する
+- 実際のステップはパターンあたり 1.7e-4（値の範囲が ±6 程度なので、丸め誤差は無視できる）
+
+### 精度（10M ゲーム wide 表、20 局 seed 2000、量子化表を f32 に戻して同じ評価コードで測定）
+
+| 表 | 1-ply | +1 spawn | depth 2 |
+| --- | ---: | ---: | ---: |
+| f32（129.3 MiB） | 20,013.8 | 32,243.4 | 51,950.6 |
+| int16（64.6 MiB） | 20,060.8 | 28,912.0 | 53,592.2（8192 到達） |
+
+差は 20 局のばらつき（±10%）に埋もれる。**量子化による劣化は観測できない。**
+
+### 接続
+
+- `Policy.ntuple` を enum の末尾に追加。`solver.choose` は `ntuple.bestMoveQuantized`（1-ply）を呼ぶ
+- 表は**遅延ロード**: そのポリシーが初めて選ばれたとき、スレッドごとに 1 回だけ
+  `ai/solver/ntuple_wide_q16.bin` を `std.heap.page_allocator` に読む（64.6 MiB）
+- `/api/solve?algo=ntuple` は表が無ければ 503 と理由を返す（`solver.ntupleAvailable()`）
+- WASM はファイルを読めないので `src/wasm.zig` の `algo_count()` が `-1` して一覧に出さない
+  （enum の末尾に置いたのはこのため）
+- `ranking.zig` の既定リストには入れていない（64.6 MiB の表を CI/計測で読ませない）
+
+### 副産物: WASM ビルドが main で壊れていた
+
+`#104` の `clockNow()` が `std.Io.Threaded.global_single_threaded.io()` を呼ぶため、
+wasm32-freestanding では `std.Io.Threaded` の `getrandom` / `IOV_MAX` 解決に失敗して
+`zig build wasm` が通らなくなっていた（`#104` の PR 以降、誰も wasm をビルドしていなかった）。
+`clockNow` を freestanding 用のスタブ（固定タイムスタンプを返す）に分岐させて修復した。
+その場合 `expectimax_id` は深さ 2 で止まる（時間で深化しない）。
+
+### 限界
+
+- 1-ply のみ。`chance` / `deep`（n-tuple 版の 1 spawn / 2-ply）は `solver` 側からは未接続
+- 1-ply で約 20,000 なので `nn2`（72,205）には遠く、`ranking.json` には入れていない
+- 64.6 MiB を git 管理している（既存の `ntuple_weights.bin` 68.4 MiB と合わせて約 133 MiB）
