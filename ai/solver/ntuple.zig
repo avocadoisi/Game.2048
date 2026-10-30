@@ -413,8 +413,17 @@ pub const Mode = enum {
     deep,
 };
 
-/// Runner variant: policy mode, table set, and whether to load `table_path` before training.
-pub const Variant = struct { mode: Mode = .greedy, set: Set = .full, resume_from_file: bool = false };
+/// Where the TD target comes from: the afterstate the game actually reached, or the best move's
+/// afterstate on the post-spawn board (`r + max_a V(after(s', a))`, the two-stage #131 target).
+pub const Target = enum { on_policy, max_backup };
+
+/// Runner variant: policy mode, table set, TD target, and whether to load `table_path` first.
+pub const Variant = struct {
+    mode: Mode = .greedy,
+    set: Set = .full,
+    target: Target = .on_policy,
+    resume_from_file: bool = false,
+};
 
 pub fn parseVariant(name: []const u8) ?Variant {
     if (std.mem.eql(u8, name, "base")) return .{};
@@ -425,6 +434,9 @@ pub fn parseVariant(name: []const u8) ?Variant {
     if (std.mem.eql(u8, name, "resume")) return .{ .resume_from_file = true };
     if (std.mem.eql(u8, name, "lightresume")) return .{ .resume_from_file = true, .set = .light };
     if (std.mem.eql(u8, name, "wide")) return .{ .set = .wide };
+    if (std.mem.eql(u8, name, "maxb")) return .{ .set = .wide, .target = .max_backup };
+    if (std.mem.eql(u8, name, "maxbchance")) return .{ .set = .wide, .mode = .chance, .target = .max_backup };
+    if (std.mem.eql(u8, name, "maxbdeep")) return .{ .set = .wide, .mode = .deep, .target = .max_backup };
     if (std.mem.eql(u8, name, "widedeep")) return .{ .mode = .deep, .set = .wide };
     return null;
 }
@@ -639,13 +651,26 @@ pub fn playWithStats(net: *const TupleNet, rng: std.Random, mode: Mode, stats: *
 
 /// TD(0) on afterstates over one self-play game.
 pub fn trainGame(net: *TupleNet, rng: std.Random, lr: f64, mode: Mode) GameResult {
+    return trainGameWith(net, rng, lr, mode, .on_policy);
+}
+
+/// `trainGame` with a selectable TD target (#131). `.max_backup` replaces the value of the move the
+/// game actually played with the max over the four moves available on the post-spawn board, so the
+/// table learns the afterstate value of the *best* continuation rather than of the sampled one.
+pub fn trainGameWith(net: *TupleNet, rng: std.Random, lr: f64, mode: Mode, target: Target) GameResult {
     var state = core.GameState.gameStart(rng);
     var pending: ?Pick = null;
     var moves: u32 = 0;
     var stats: Stats = .{};
     while (chooseMove(net, state, mode, &stats)) |pick| {
         moves += 1;
-        if (pending) |p| _ = net.train(p.idx, p.reward + pick.value, lr);
+        if (pending) |p| {
+            const next_value = switch (target) {
+                .on_policy => pick.value,
+                .max_backup => bestAfterValue(net, state),
+            };
+            _ = net.train(p.idx, p.reward + next_value, lr);
+        }
         pending = pick;
         _ = state.move(pick.dir, rng);
     }
@@ -961,4 +986,24 @@ test "quantized eval reproduces the float table it came from (#129)" {
     // one table only: the value is that table's entry, so the tolerance is a single quantization step
     try std.testing.expect(@abs(net.value(idx) - q.value(idx)) < 0.02);
     try std.testing.expect(@abs(net.eval(sample_board) - q.eval(sample_board)) < 0.02);
+}
+
+test "trainGame keeps the on-policy target and max backup differs from it (#131)" {
+    const gpa = std.testing.allocator;
+    var a = try TupleNet.initWith(gpa, .light);
+    defer a.deinit(gpa);
+    var b = try TupleNet.initWith(gpa, .light);
+    defer b.deinit(gpa);
+    var c = try TupleNet.initWith(gpa, .light);
+    defer c.deinit(gpa);
+
+    var pa = std.Random.DefaultPrng.init(7);
+    var pb = std.Random.DefaultPrng.init(7);
+    var pc = std.Random.DefaultPrng.init(7);
+    _ = trainGame(&a, pa.random(), 0.05, .greedy);
+    _ = trainGameWith(&b, pb.random(), 0.05, .greedy, .on_policy);
+    _ = trainGameWith(&c, pc.random(), 0.05, .greedy, .max_backup);
+
+    try std.testing.expectEqualSlices(f32, a.storage, b.storage);
+    try std.testing.expect(!std.mem.eql(f32, a.storage, c.storage));
 }
