@@ -1666,3 +1666,47 @@ wasm32-freestanding では `std.Io.Threaded` の `getrandom` / `IOV_MAX` 解決�
 - 1-ply のみ。`chance` / `deep`（n-tuple 版の 1 spawn / 2-ply）は `solver` 側からは未接続
 - 1-ply で約 20,000 なので `nn2`（72,205）には遠く、`ranking.json` には入れていない
 - 64.6 MiB を git 管理している（既存の `ntuple_weights.bin` 68.4 MiB と合わせて約 133 MiB）
+
+## n-tuple の TD 目標: afterstate + max backup (#131, 2026-10-31)
+
+現行の TD 目標は「実際に選んだ手の次の afterstate の価値」＝on-policy なサンプル目標。
+n-tuple の文献（Szubert ら）で使われる **max backup**、つまり出現後の盤面で
+`r + max_a V(afterstate(s', a))` を目標にする方式に変えて、同じ総ゲーム数で比較した。
+
+### 実装
+
+- `ntuple.Target = enum { on_policy, max_backup }`、`trainGameWith(net, rng, lr, mode, target)`
+  （`trainGame` は `trainGameWith(..., .on_policy)` のままで挙動不変。同じ seed で同じ表になることをテストで固定）
+- `.max_backup` の目標は `p.reward + bestAfterValue(net, state)`（`state` は出現後の盤面）
+- variant 名 `maxb` / `maxbchance` / `maxbdeep`（いずれも `.wide` + 指定の target）
+
+### 結果（20 局、評価 seed 2000、lr 0.01、`.wide`）
+
+| 学習 | 1-ply | depth 2 | 学習時間 |
+| --- | ---: | ---: | ---: |
+| on-policy 1M, seed 1 | 13,795.0 | 39,344.0 | 554 s |
+| on-policy 1M, seed 2 | 14,097.8 | 41,389.2 | 613 s |
+| maxb 1M, seed 1 | **19,347.4** | 43,102.0 | 720 s |
+| maxb 1M, seed 2 | 13,607.4 | 37,849.2 | 758 s |
+| on-policy 5M, seed 1 | 15,777.6 | 50,103.2 | 4,197 s |
+| **maxb 5M, seed 1** | **17,567.6** | **52,953.4** | 6,436 s |
+
+- 1M の平均: 1-ply 13,946 → 16,477（+18%）、depth 2 40,367 → 40,476（±0%）
+- 5M の同一 seed 比較: 1-ply +11%、depth 2 +5.7%（seed 間のばらつき ±5% と同程度）
+- 学習は 1.2〜1.5 倍遅い（`bestAfterValue` が 1 手あたり 4 回の表引きを足す。ゲームも長くなる）
+
+### 解釈
+
+- **1-ply の価値は明確に良くなる**。サンプルされた手ではなく最善手の価値で更新するので、
+  表が「今の自分の方策」より一歩先を評価するようになる。
+- **2-ply 探索の利得は縮む**（maxb 5M は 52,953 / 1-ply 17,568 = 3.0 倍、on-policy は 50,103 / 15,778 = 3.2 倍）。
+  価値自体が先読みを含むぶん、追加の探索で得られるものが減る。
+- 合計では depth 2 で +5.7% だが seed のばらつきに埋もれる。**既定の学習目標は変えない**
+  （`maxb` 系は variant として残す）。
+- 学習時間あたりでは on-policy が有利（6,436 s で +5.7% は割に合わない）。
+
+### 使い方
+
+```bash
+zig build ntuple -Doptimize=ReleaseFast -- 5000000 20 2000 0.01 maxb /tmp/table.bin 1
+```

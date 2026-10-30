@@ -14,6 +14,7 @@ const usage =
     \\  variant       base (greedy 1-ply) or chance (1 spawn lookahead); deep (2-ply) adds a
     \\                second own move. light / lightdeep use only the 5 base 4-tuples.
     \\                wide / widedeep add the second 2x3 6-tuple (both 2x3 orbits, #106).
+    \\                maxb / maxbchance / maxbdeep are wide with the max-backup TD target (#131).
     \\                resume loads table_path first, then trains train_games more games.
     \\  table_path    file to load (train_games 0) or write (default ai/solver/ntuple_weights.bin);
     \\                a path ending in .q16.bin reads/writes the int16 quantized format (#129)
@@ -104,7 +105,7 @@ pub fn main(init: std.process.Init) !void {
         for (0..train_games) |g| {
             // linear decay to 10% of the start rate, same schedule as nn_main
             const frac = @as(f64, @floatFromInt(g)) / @as(f64, @floatFromInt(train_games));
-            const game = ntuple.trainGame(&net, rng.random(), learning_rate * (1 - 0.9 * frac), mode);
+            const game = ntuple.trainGameWith(&net, rng.random(), learning_rate * (1 - 0.9 * frac), mode, variant.target);
             last_score = game.score;
             total_moves += game.moves;
             if ((g + 1) % 5000 == 0) {
