@@ -183,6 +183,25 @@ pub fn spawn(state: *GameState, rng: anytype) bool {
     return state.spawnRandomTile(rng);
 }
 
+/// Number of empty (0) cells. Board predicates live in core so the solver's spawn samplers,
+/// its diagnostics and the play loops do not each carry their own scan (#139).
+pub fn countEmpty(board: Board) usize {
+    var n: usize = 0;
+    for (board) |row| for (row) |value| {
+        if (value == 0) n += 1;
+    };
+    return n;
+}
+
+/// Largest tile on the board; 0 when the board is empty.
+pub fn maxTile(board: Board) Tile {
+    var best: Tile = 0;
+    for (board) |row| for (row) |value| {
+        best = @max(best, value);
+    };
+    return best;
+}
+
 /// Slide tiles toward index 0 and merge each equal pair once (left-to-right).
 /// Uses a precomputed table when every tile is a power of two below 65536; otherwise the
 /// general path (`mergeLineSlow`) runs, so odd tile values still behave the same.
@@ -600,6 +619,31 @@ test "mergeLine falls back for tiles the table cannot hold" {
     try std.testing.expectEqual(@as(u32, 131072), big.score_delta);
     const odd = mergeLine(.{ 3, 3, 0, 0 });
     try std.testing.expectEqual([BoardSize]Tile{ 6, 0, 0, 0 }, odd.line);
+}
+
+test "countEmpty and maxTile on an empty, a full and an equal-maximum board" {
+    const empty: Board = std.mem.zeroes(Board);
+    try std.testing.expectEqual(@as(usize, BoardCellCount), countEmpty(empty));
+    try std.testing.expectEqual(@as(Tile, 0), maxTile(empty));
+
+    const full: Board = .{
+        .{ 2, 4, 8, 16 },
+        .{ 32, 64, 128, 256 },
+        .{ 512, 1024, 2048, 4096 },
+        .{ 2, 4, 8, 16 },
+    };
+    try std.testing.expectEqual(@as(usize, 0), countEmpty(full));
+    try std.testing.expectEqual(@as(Tile, 4096), maxTile(full));
+
+    // two cells share the maximum: maxTile must return it, not depend on the scan order
+    const tie: Board = .{
+        .{ 2048, 0, 0, 0 },
+        .{ 0, 0, 0, 2048 },
+        .{ 0, 512, 0, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    try std.testing.expectEqual(@as(usize, 13), countEmpty(tie));
+    try std.testing.expectEqual(@as(Tile, 2048), maxTile(tie));
 }
 
 test "canSlide matches slide(...).changed without changing the board" {

@@ -1,6 +1,14 @@
 const std = @import("std");
 const solver = @import("solver");
 const bench = @import("bench.zig");
+const cli = @import("args.zig");
+
+// Positional defaults, one named constant each (`usage` above is the compatibility surface).
+const default_specs = "baseline";
+const default_runs: u32 = 5;
+const default_games_per_run: u32 = 20;
+const default_depth: u8 = 2;
+const default_seed: u64 = 1000;
 
 const usage =
     \\usage: evalab [specs] [runs] [games_per_run] [depth] [seed]
@@ -60,11 +68,11 @@ fn parseSpec(spec: []const u8) !solver.Weights {
 /// Play every variant on the same seeds and print avg score / moves / best tile / speed.
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    const specs = if (args.len > 1) args[1] else "baseline";
-    const runs: u32 = if (args.len > 2) try std.fmt.parseInt(u32, args[2], 10) else 5;
-    const games_per_run: u32 = if (args.len > 3) try std.fmt.parseInt(u32, args[3], 10) else 20;
-    const depth: u8 = if (args.len > 4) try std.fmt.parseInt(u8, args[4], 10) else 2;
-    const seed: u64 = if (args.len > 5) try std.fmt.parseInt(u64, args[5], 10) else 1000;
+    const specs: []const u8 = try cli.argOr([]const u8, args, 1, default_specs);
+    const runs: u32 = try cli.argOr(u32, args, 2, default_runs);
+    const games_per_run: u32 = try cli.argOr(u32, args, 3, default_games_per_run);
+    const depth: u8 = try cli.argOr(u8, args, 4, default_depth);
+    const seed: u64 = try cli.argOr(u64, args, 5, default_seed);
     if (args.len > 6 or runs == 0 or games_per_run == 0) {
         std.debug.print("{s}", .{usage});
         return;

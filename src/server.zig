@@ -74,8 +74,9 @@ pub fn route(
         const policy = policyFromQuery(query) orelse
             return .{ .status = .bad_request, .content_type = "text/plain", .body = "algo must be a solver policy name (see /api/ranking)\n" };
         // `algo=ntuple` needs the 64 MiB table file next to the binary; say so instead of
-        // answering "no move" (#129).
-        if (policy == .ntuple and !solver.ntupleAvailable())
+        // answering "no move" (#129). Which policies carry that requirement is a field of
+        // `solver.policy_info`, not a name check here.
+        if (solver.policyInfo(policy).needs_table and !solver.ntupleAvailable())
             return .{ .status = .service_unavailable, .content_type = "text/plain", .body = "algo=ntuple needs ai/solver/ntuple_wide_q16.bin\n" };
         const depth = depthFromQuery(query);
         const dir = solver.choose(policy, session.state, session.prng.random(), depth);

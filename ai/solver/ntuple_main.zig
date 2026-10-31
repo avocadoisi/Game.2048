@@ -3,6 +3,7 @@ const core = @import("core");
 const solver = @import("solver");
 const ntuple = @import("ntuple");
 const parallel = @import("parallel");
+const cli = @import("args.zig");
 
 const usage =
     \\usage: ntuple [train_games] [eval_games] [eval_seed] [learning_rate] [variant] [table_path] [train_seed]
@@ -26,10 +27,13 @@ const usage =
 
 const default_table_path = "ai/solver/ntuple_weights.bin";
 
-/// Positional arg 7, after `table_path`.
-fn parseTrainSeed(args: []const []const u8) !u64 {
-    return if (args.len > 7) try std.fmt.parseInt(u64, args[7], 10) else 1;
-}
+// Positional defaults, one named constant each (`usage` above is the compatibility surface).
+const default_train_games: u32 = 2000;
+const default_eval_games: u32 = 100;
+const default_eval_seed: u64 = 1000;
+const default_learning_rate: f64 = 0.01;
+/// Positional arg 7, after `table_path`, appended so existing command lines keep their meaning.
+const default_train_seed: u64 = 1;
 
 const Eval = struct {
     name: []const u8,
@@ -62,18 +66,18 @@ fn scorePerSecond(total_score: f64, elapsed_ns: i96) f64 {
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    const train_games: u32 = if (args.len > 1) try std.fmt.parseInt(u32, args[1], 10) else 2000;
-    const eval_games: u32 = if (args.len > 2) try std.fmt.parseInt(u32, args[2], 10) else 100;
-    const eval_seed: u64 = if (args.len > 3) try std.fmt.parseInt(u64, args[3], 10) else 1000;
-    const learning_rate: f64 = if (args.len > 4) try std.fmt.parseFloat(f64, args[4]) else 0.01;
-    const variant_name = if (args.len > 5) args[5] else "base";
+    const train_games: u32 = try cli.argOr(u32, args, 1, default_train_games);
+    const eval_games: u32 = try cli.argOr(u32, args, 2, default_eval_games);
+    const eval_seed: u64 = try cli.argOr(u64, args, 3, default_eval_seed);
+    const learning_rate: f64 = try cli.argOr(f64, args, 4, default_learning_rate);
+    const variant_name: []const u8 = try cli.argOr([]const u8, args, 5, "base");
     const variant = ntuple.parseVariant(variant_name) orelse {
         std.debug.print("{s}", .{usage});
         return;
     };
     const mode = variant.mode;
-    const table_path = if (args.len > 6) args[6] else default_table_path;
-    const train_seed = try parseTrainSeed(args);
+    const table_path: []const u8 = try cli.argOr([]const u8, args, 6, default_table_path);
+    const train_seed: u64 = try cli.argOr(u64, args, 7, default_train_seed);
     if (args.len > 8 or eval_games == 0) {
         std.debug.print("{s}", .{usage});
         return;
@@ -195,13 +199,13 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-test "train seed argument is optional and defaults to 1" {
+test "train seed argument (position 7) is optional and defaults to 1" {
     const no_args = [_][]const u8{"ntuple"};
-    try std.testing.expectEqual(@as(u64, 1), try parseTrainSeed(&no_args));
+    try std.testing.expectEqual(@as(u64, 1), try cli.argOr(u64, &no_args, 7, default_train_seed));
     const path_only = [_][]const u8{ "ntuple", "0", "20", "2000", "0.01", "base", "x.bin" };
-    try std.testing.expectEqual(@as(u64, 1), try parseTrainSeed(&path_only));
+    try std.testing.expectEqual(@as(u64, 1), try cli.argOr(u64, &path_only, 7, default_train_seed));
     const with_seed = [_][]const u8{ "ntuple", "0", "20", "2000", "0.01", "base", "x.bin", "3" };
-    try std.testing.expectEqual(@as(u64, 3), try parseTrainSeed(&with_seed));
+    try std.testing.expectEqual(@as(u64, 3), try cli.argOr(u64, &with_seed, 7, default_train_seed));
 }
 
 test "usage text lists both variants" {

@@ -3,6 +3,9 @@ const core = @import("core");
 const solver = @import("solver");
 const nn = @import("nn");
 const ntuple = @import("ntuple");
+const cli = @import("args.zig");
+
+const default_table_path = "ai/solver/ntuple_weights.bin";
 
 const Board = core.Board;
 
@@ -164,7 +167,7 @@ fn renderTable(w: *std.Io.Writer, rows: []const Row) !void {
 pub fn main(init: std.process.Init) !void {
     const gpa = init.arena.allocator();
     const args = try init.minimal.args.toSlice(gpa);
-    const table_path = if (args.len > 1) args[1] else "ai/solver/ntuple_weights.bin";
+    const table_path: []const u8 = try cli.argOr([]const u8, args, 1, default_table_path);
     if (args.len > 2) {
         std.debug.print("{s}", .{usage});
         return;

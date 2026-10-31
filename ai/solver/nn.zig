@@ -519,11 +519,7 @@ pub fn playWithStatsValue(vfn: Value, rng: std.Random, mode: Mode, stats: *Stats
         _ = state.move(dir, rng);
         moves += 1;
     }
-    var max_tile: core.Tile = 0;
-    for (state.board) |row| for (row) |value| {
-        max_tile = @max(max_tile, value);
-    };
-    return .{ .score = state.score, .max_tile = max_tile, .moves = moves, .leaves = stats.leaves };
+    return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves, .leaves = stats.leaves };
 }
 
 /// Buckets for the training diagnostic (issue #32): empty cells 0..3, 4..7, 8+; moves left 0..9, 10..29, 30+.
@@ -574,12 +570,10 @@ pub const Diag = struct {
     }
 };
 
+/// Thin alias so the existing `nn.countEmpty` callers (training diagnostics, replay buckets) keep
+/// compiling; the scan itself is the core board predicate (#139).
 pub fn countEmpty(board: Board) usize {
-    var n: usize = 0;
-    for (board) |row| for (row) |v| {
-        if (v == 0) n += 1;
-    };
-    return n;
+    return core.countEmpty(board);
 }
 
 /// Opt-in training variants (issue #33). Default `.{}` is the plain per-move TD(0) of `trainGame`.

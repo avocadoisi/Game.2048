@@ -1,9 +1,19 @@
 const std = @import("std");
 const core = @import("core");
 const solver = @import("solver");
+const cli = @import("args.zig");
 
 const Weights = solver.Weights;
 const gene_count = 4;
+
+// Positional defaults, one named constant each (`usage` below is the compatibility surface).
+const default_population: usize = 16;
+const default_generations: usize = 15;
+const default_train_games: u32 = 8;
+const default_depth: u8 = 2;
+const default_seed: u64 = 1;
+const default_holdout_seed: u64 = 500;
+const default_holdout_games: u32 = 100;
 
 /// Search range per gene, in the field order of `Weights`.
 const lo = [gene_count]f64{ 0, 0, 0, 0 };
@@ -73,13 +83,13 @@ const usage =
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    const population: usize = if (args.len > 1) try std.fmt.parseInt(usize, args[1], 10) else 16;
-    const generations: usize = if (args.len > 2) try std.fmt.parseInt(usize, args[2], 10) else 15;
-    const train_games: u32 = if (args.len > 3) try std.fmt.parseInt(u32, args[3], 10) else 8;
-    const depth: u8 = if (args.len > 4) try std.fmt.parseInt(u8, args[4], 10) else 2;
-    const seed: u64 = if (args.len > 5) try std.fmt.parseInt(u64, args[5], 10) else 1;
-    const holdout_seed: u64 = if (args.len > 6) try std.fmt.parseInt(u64, args[6], 10) else 500;
-    const holdout_games: u32 = if (args.len > 7) try std.fmt.parseInt(u32, args[7], 10) else 100;
+    const population: usize = try cli.argOr(usize, args, 1, default_population);
+    const generations: usize = try cli.argOr(usize, args, 2, default_generations);
+    const train_games: u32 = try cli.argOr(u32, args, 3, default_train_games);
+    const depth: u8 = try cli.argOr(u8, args, 4, default_depth);
+    const seed: u64 = try cli.argOr(u64, args, 5, default_seed);
+    const holdout_seed: u64 = try cli.argOr(u64, args, 6, default_holdout_seed);
+    const holdout_games: u32 = try cli.argOr(u32, args, 7, default_holdout_games);
     if (args.len > 8 or population < 2 or train_games == 0 or holdout_games == 0) {
         std.debug.print("{s}", .{usage});
         return;

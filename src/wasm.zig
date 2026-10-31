@@ -66,10 +66,11 @@ export fn best_tile() u32 {
     return best;
 }
 
-/// The last policy (`ntuple`) needs a 64 MiB table file, which the browser build cannot read,
-/// so the web UI only ever sees the ones before it (#129).
+/// Policies before the first variant that needs a data file (`ntuple`'s 64 MiB table), which the
+/// browser build cannot read (#129). The split lives in `solver.policy_info`, so it is one edit
+/// there instead of a `- 1` here.
 export fn algo_count() u32 {
-    return @typeInfo(solver.Policy).@"enum".field_names.len - 1;
+    return solver.wasm_policy_count;
 }
 
 /// NUL-terminated, static lifetime; index is `0..algo_count()`.
