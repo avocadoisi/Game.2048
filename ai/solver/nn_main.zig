@@ -24,6 +24,10 @@ const usage =
     \\                       norm-clipped, applied as a single step instead of eight)
     \\              nstep   (#84: online n-step TD with n = 4 instead of one-step returns)
     \\              death   (#101: reward -1 per move so the value learns V ≈ -(moves to game over))
+    \\              t2      (#158: TD target = score delta + the 2-ply value of the post-spawn board,
+    \\                       i.e. what the eval search looks at, instead of V(next afterstate))
+    \\              p2      (#158: self-play move = the eval's 2-ply search (deep) instead of the 1-ply argmax)
+    \\              tp2     (#158: t2 + p2, both sides aligned with the 2-ply eval)
     \\              oi / oi16 (#107: multiply the initial weights by 4 / 16 = optimistic initialization,
     \\                       then train exactly like base; only the init differs, so `par` works)
     \\              resume  (#66: load weights_path and train train_games more games from those weights, plain per-move path)
@@ -36,6 +40,8 @@ const usage =
     \\                nstep|resume); as arg 6 it keeps its old meaning, the plain per-move variant only,
     \\                so replay_k is ignored there but its slot must be filled to reach weights_path.
     \\                Not supported for priority|midgame|midmix (cross-game replay buffer)
+    \\                or t2|p2|tp2 (#158: the extra search per move is the whole cost, batching it too
+    \\                would only multiply the work)
     \\  replay_k      afterstates re-trained per game for variant replay (default 30)
     \\  weights_path  file to load (train_games 0) or write (default ai/solver/nn_weights.bin); use a temp path for variant runs
     \\  train_seed    seed for weight init and self-play games (default 1, omitted = same weights as before #56)
@@ -63,6 +69,13 @@ fn parseParFlag(args: []const []const u8) !bool {
     if (args.len <= 10) return false;
     if (!std.mem.eql(u8, args[10], "par")) return error.InvalidParFlag;
     return true;
+}
+
+/// `par` forks whole games onto threads, so it cannot carry the cross-game priority buffer (shared by
+/// pointer), the staged net (no batch path, one net is ~1 MB), or the #158 2-ply variants (their search
+/// is the whole cost of the run; batching would only multiply it by the thread count).
+fn parSupported(opts: nn.Options, is_mstd: bool) bool {
+    return opts.priority == null and !is_mstd and opts.target == .td1 and opts.selfplay == .greedy1;
 }
 
 /// Starting net for `main`: `weights_path` when resuming (or eval-only), otherwise a random init
@@ -172,6 +185,12 @@ pub fn main(init: std.process.Init) !void {
         .{ .nstep = 4 }
     else if (std.mem.eql(u8, variant, "death"))
         .{ .death = true }
+    else if (std.mem.eql(u8, variant, "t2"))
+        .{ .target = .search2 }
+    else if (std.mem.eql(u8, variant, "p2"))
+        .{ .selfplay = .deep2 }
+    else if (std.mem.eql(u8, variant, "tp2"))
+        .{ .target = .search2, .selfplay = .deep2 }
     else if (std.mem.eql(u8, variant, "oi") or std.mem.eql(u8, variant, "oi16") or is_mstd)
         .{}
     else {
@@ -182,9 +201,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}", .{usage});
         return;
     }
-    // the priority ring buffer is cross-game state shared by pointer: batching would race on it.
-    // `mstd` has no batch path either (one staged net is ~1 MB).
-    if (use_par and (opts.priority != null or is_mstd)) {
+    if (use_par and !parSupported(opts, is_mstd)) {
         std.debug.print("{s}", .{usage});
         return;
     }
@@ -430,6 +447,23 @@ test "usage text lists the symbatch variant" {
 
 test "usage text lists the mstd variant" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "mstd    (#107") != null);
+}
+
+test "usage text lists the aligned 2-ply variants (#158)" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "t2      (#158") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "p2      (#158") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "tp2     (#158") != null);
+}
+
+test "par is refused for the priority buffer, the staged net and the 2-ply variants (#158)" {
+    var pr: nn.Priority = .{};
+    try std.testing.expect(parSupported(.{}, false));
+    try std.testing.expect(parSupported(.{ .symmetry = true, .replay_k = 30 }, false));
+    try std.testing.expect(!parSupported(.{}, true));
+    try std.testing.expect(!parSupported(.{ .priority = &pr }, false));
+    try std.testing.expect(!parSupported(.{ .target = .search2 }, false));
+    try std.testing.expect(!parSupported(.{ .selfplay = .deep2 }, false));
+    try std.testing.expect(!parSupported(.{ .target = .search2, .selfplay = .deep2 }, false));
 }
 
 test "mstd starts from the staged weights file on eval and from 7 random nets otherwise" {
