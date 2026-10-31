@@ -139,6 +139,25 @@ fn printDiag(diag: *const nn.Diag) void {
             100 * s.abs_err / @max(total_err, 1e-300),
         });
     };
+    printTileDiag(diag);
+}
+
+/// Max-tile half of the diagnostic (#159): how many of the trained afterstates ever reach the deep tail.
+fn printTileDiag(diag: *const nn.Diag) void {
+    const tile_names = [_][]const u8{ "<=256", "512", "1024", "2048", "4096", "8192+" };
+    var total: u64 = 0;
+    for (diag.tiles) |s| total += s.count;
+    std.debug.print("diag: steps by max tile of the trained afterstate\n", .{});
+    std.debug.print("{s:<10} {s:>10} {s:>12} {s:>12}\n", .{ "max tile", "steps", "share steps", "mean |err|" });
+    for (diag.tiles, 0..) |s, t| {
+        const n: f64 = @floatFromInt(@max(s.count, 1));
+        std.debug.print("{s:<10} {d:>10} {d:>11.1}% {d:>12.4}\n", .{
+            tile_names[t],
+            s.count,
+            100 * @as(f64, @floatFromInt(s.count)) / @max(@as(f64, @floatFromInt(total)), 1e-300),
+            s.abs_err / n,
+        });
+    }
 }
 
 pub fn main(init: std.process.Init) !void {

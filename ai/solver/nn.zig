@@ -734,6 +734,20 @@ pub fn distBucket(moves_left: usize) usize {
     return if (moves_left < 10) 0 else if (moves_left < 30) 1 else 2;
 }
 
+/// Max-tile buckets of the deep-position diagnostic (issue #159): <=256, 512, 1024, 2048, 4096, 8192+.
+/// The tail beyond 4096 is where the value error is concentrated (#28/#32), so the table has to show
+/// how many training steps ever reach it.
+pub const tile_buckets = 6;
+
+pub fn tileBucket(max_tile: core.Tile) usize {
+    if (max_tile <= 256) return 0;
+    if (max_tile <= 512) return 1;
+    if (max_tile <= 1024) return 2;
+    if (max_tile <= 2048) return 3;
+    if (max_tile <= 4096) return 4;
+    return 5;
+}
+
 /// Per-bucket sums over the training steps: TD error |target - V(s)| and value change V(s_{t+1}) - V(s_t).
 pub const Diag = struct {
     pub const Stat = struct { count: u64 = 0, abs_err: f64 = 0, drop: f64 = 0 };
@@ -742,6 +756,8 @@ pub const Diag = struct {
     const window = 30;
 
     stats: [3][3]Stat = @splat(@splat(.{})),
+    /// Steps and |TD error| by max tile (#159). No window: the bucket of an afterstate is known at once.
+    tiles: [tile_buckets]Stat = @splat(.{}),
     ring: [window]Pending = undefined,
     pushed: usize = 0,
 
@@ -752,8 +768,13 @@ pub const Diag = struct {
         s.drop += drop;
     }
 
-    /// Record one training step of the current game. Steps older than the window are at least 30 moves from the end.
-    pub fn push(self: *Diag, empties: usize, err: f64, drop: f64) void {
+    /// Record one training step of the current game (the afterstate it trained). Steps older than the
+    /// window are at least 30 moves from the end.
+    pub fn push(self: *Diag, after: Board, err: f64, drop: f64) void {
+        const empties = countEmpty(after);
+        const tile = &self.tiles[tileBucket(core.maxTile(after))];
+        tile.count += 1;
+        tile.abs_err += err;
         if (self.pushed >= window) {
             const old = self.ring[self.pushed % window];
             self.add(old.empties, window, old.err, old.drop);
@@ -1104,7 +1125,7 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
             // `state` is still the post-spawn board the pending step led into (this move has not been
             // applied yet), which is the board the `search2` target evaluates.
             const target = p.reward + tdBootstrap(net, pick, state, opts);
-            if (diag) |d| d.push(countEmpty(p.after), @abs(target - p.value), pick.value - p.value);
+            if (diag) |d| d.push(p.after, @abs(target - p.value), pick.value - p.value);
             if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = pick.after, .terminal = false, .err = @abs(target - p.value) });
             trainStep(net, &cache, p.after, target, lr, opts, &trace);
         }
@@ -1112,7 +1133,7 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
         _ = state.move(pick.dir, rng);
     }
     if (pending) |p| {
-        if (diag) |d| d.push(countEmpty(p.after), @abs(p.reward - p.value), -p.value);
+        if (diag) |d| d.push(p.after, @abs(p.reward - p.value), -p.value);
         if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = p.after, .terminal = true, .err = @abs(p.reward - p.value) });
         trainStep(net, &cache, p.after, p.reward, lr, opts, &trace);
     }
@@ -1222,6 +1243,10 @@ fn mergeDiag(dst: *Diag, src: *const Diag) void {
         dst.stats[e][k].abs_err += src.stats[e][k].abs_err;
         dst.stats[e][k].drop += src.stats[e][k].drop;
     };
+    for (0..tile_buckets) |t| {
+        dst.tiles[t].count += src.tiles[t].count;
+        dst.tiles[t].abs_err += src.tiles[t].abs_err;
+    }
 }
 
 /// Runs `games` (<= max_threads) self-play games in parallel from the same starting net, then sets
@@ -2049,12 +2074,51 @@ test "Diag.add accumulates count, abs error and signed drop per bucket" {
 test "Diag push and finish bucket each step by moves to game over" {
     var diag: Diag = .{};
     // 35 steps in one game: step i has 34 - i moves left
-    for (0..35) |_| diag.push(0, 1.0, 0);
+    for (0..35) |_| diag.push(boardWithEmpties(0), 1.0, 0);
     diag.finish();
     try std.testing.expectEqual(@as(u64, 10), diag.stats[0][0].count);
     try std.testing.expectEqual(@as(u64, 20), diag.stats[0][1].count);
     try std.testing.expectEqual(@as(u64, 5), diag.stats[0][2].count);
     try std.testing.expectApproxEqAbs(@as(f64, 35), diag.stats[0][0].abs_err + diag.stats[0][1].abs_err + diag.stats[0][2].abs_err, 1e-12);
+}
+
+test "tileBucket splits the max tile into <=256, 512, 1024, 2048, 4096 and 8192+" {
+    try std.testing.expectEqual(@as(usize, 0), tileBucket(0));
+    try std.testing.expectEqual(@as(usize, 0), tileBucket(256));
+    try std.testing.expectEqual(@as(usize, 1), tileBucket(512));
+    try std.testing.expectEqual(@as(usize, 2), tileBucket(1024));
+    try std.testing.expectEqual(@as(usize, 3), tileBucket(2048));
+    try std.testing.expectEqual(@as(usize, 4), tileBucket(4096));
+    try std.testing.expectEqual(@as(usize, 5), tileBucket(8192));
+    try std.testing.expectEqual(@as(usize, 5), tileBucket(65536));
+}
+
+test "Diag tile table counts steps and |err| per max tile bucket" {
+    var diag: Diag = .{};
+    var small: Board = @splat(@splat(0));
+    small[0][0] = 256;
+    var mid: Board = @splat(@splat(0));
+    mid[3][2] = 4096;
+    var deep: Board = @splat(@splat(0));
+    deep[1][1] = 8192;
+    // hand-computed: two steps at 256 (errors 0.5 + 0.25), one at 4096 (1.0), three at 8192+ (0.1 + 0.2 + 0.3)
+    diag.push(small, 0.5, 0);
+    diag.push(small, 0.25, 0);
+    diag.push(mid, 1.0, 0);
+    diag.push(deep, 0.1, 0);
+    diag.push(deep, 0.2, 0);
+    diag.push(deep, 0.3, 0);
+    try std.testing.expectEqual(@as(u64, 2), diag.tiles[0].count);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), diag.tiles[0].abs_err, 1e-12);
+    try std.testing.expectEqual(@as(u64, 0), diag.tiles[3].count);
+    try std.testing.expectEqual(@as(u64, 1), diag.tiles[4].count);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), diag.tiles[4].abs_err, 1e-12);
+    try std.testing.expectEqual(@as(u64, 3), diag.tiles[5].count);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.6), diag.tiles[5].abs_err, 1e-12);
+    // the empty-cell table still sees the same six steps (15 empties each, no finish yet)
+    try std.testing.expectEqual(@as(u64, 0), diag.stats[2][0].count);
+    diag.finish();
+    try std.testing.expectEqual(@as(u64, 6), diag.stats[2][0].count);
 }
 
 test "trainGame with diagnostic gives the same weights and records steps" {
