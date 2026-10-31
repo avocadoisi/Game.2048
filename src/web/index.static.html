@@ -12,6 +12,7 @@
   .big { background: #edc22e; color: #fff; font-size: 22px; }
   button { font-size: 16px; padding: 6px 14px; margin: 4px; }
   #msg { min-height: 1.5em; font-weight: bold; }
+  #policy-desc { font-size: 12px; line-height: 1.4; color: #8f857d; max-width: 34em; margin: 0 auto; }
 </style>
 </head>
 <body>
@@ -31,6 +32,7 @@
   <button id="auto">Solver: auto</button>
 </p>
 <p>
+  <label>policy <select id="policy"></select></label>
   <label>speed <select id="speed">
     <option value="0">max (no delay)</option>
     <option value="250">slow (250 ms)</option>
@@ -39,7 +41,7 @@
     <option value="2000">1 move per 2 s</option>
   </select></label>
 </p>
-<p id="policy"></p>
+<p id="policy-desc"></p>
 <script>
 // Static build: everything runs in WebAssembly, there is no server.
 // Exports follow src/wasm.zig: move returns 0 no change, 1 moved, 2 game over.
@@ -82,23 +84,20 @@ function newGame() {
 }
 
 // Solver preview: ask the wasm solver for the move, then apply it.
-// The static build has no model picker: one policy, resolved by NAME so that reordering the
-// `Policy` enum cannot silently switch the UI to a different solver (issue #143).
-// nn3 is the strongest policy that fits in the module (native avg score 116,205 vs nn2's 82,772);
-// it costs 4-400 ms per move in V8, which is why the auto play has a speed picker (issue #152).
-const SOLVER_NAME = "nn3";
-const FALLBACK_NAME = "expectimax";
-// nn3 is 3-ply by construction (`nn.bestMove(net, state, .deep3)` ignores `depth`), so this is the
-// depth of the fallback policy only.
-const SOLVER_DEPTH = 2;
+// The policy list comes straight from the module (`wasm.policies`): the page offers exactly what
+// was compiled in, so a policy the module does not ship cannot be selected by mistake (#154).
+// Default is nn3 (native avg score 116,205 vs nn2's 82,772) at 4-400 ms per move in V8; nn2 is
+// 9-14 ms, which is why both exist next to the speed picker (issue #152).
+const DEFAULT_POLICY = "nn3";
 const FRAME_BUDGET_MS = 8;
-let solver = 0;
 let running = false;
 let autoFrame = 0; // pending requestAnimationFrame id, 0 when none is queued
 let nextMoveAt = 0;
 
+function policyIndex() { return Number(document.getElementById("policy").value); }
+
 function solverMove() {
-  const dir = w.solve(solver, SOLVER_DEPTH);
+  const dir = w.solve(policyIndex(), 0);
   if (dir < 0) return false;
   return move(dir, false);
 }
@@ -154,13 +153,32 @@ function autoLoop(now) {
   const { instance } = await WebAssembly.instantiate(bytes, {});
   w = instance.exports;
 
-  const names = [];
+  // One entry per policy compiled into this module, name and one-line description included.
+  const text = (ptr, len) => new TextDecoder().decode(new Uint8Array(w.memory.buffer, ptr, len));
+  const policies = [];
   for (let i = 0; i < w.algo_count(); i++) {
-    names.push(new TextDecoder().decode(new Uint8Array(w.memory.buffer, w.algo_name(i), w.algo_name_len(i))));
+    policies.push({
+      name: text(w.algo_name(i), w.algo_name_len(i)),
+      desc: text(w.algo_desc(i), w.algo_desc_len(i)),
+    });
   }
-  const pick = names.includes(SOLVER_NAME) ? SOLVER_NAME : FALLBACK_NAME;
-  solver = names.indexOf(pick);
-  document.getElementById("policy").textContent = `solver: ${pick}`;
+  const picker = document.getElementById("policy");
+  picker.innerHTML = "";
+  for (const [i, p] of policies.entries()) {
+    const option = document.createElement("option");
+    option.value = String(i);
+    option.textContent = p.name;
+    option.title = p.desc;
+    picker.appendChild(option);
+  }
+  const preferred = policies.findIndex((p) => p.name === DEFAULT_POLICY);
+  picker.value = String(preferred >= 0 ? preferred : policies.length - 1);
+  const showPolicy = () => {
+    const p = policies[policyIndex()];
+    document.getElementById("policy-desc").textContent = p ? `${p.name}: ${p.desc}` : "";
+  };
+  picker.addEventListener("change", showPolicy);
+  showPolicy();
 
   for (const b of document.querySelectorAll("[data-dir]")) {
     b.addEventListener("click", () => move(Number(b.dataset.dir)));
