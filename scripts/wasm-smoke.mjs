@@ -64,11 +64,16 @@ for (let i = 0; i < algoCount; i++) {
 if (!names.includes("expectimax")) fail("algo names missing expectimax: " + JSON.stringify(names));
 if (!names.includes("nn3")) fail("algo names missing nn3 (the static page's fixed policy): " + JSON.stringify(names));
 
+// The page falls back to `expectimax` without a word when its policy name is missing, so bind the
+// two: the shipped HTML and this test must agree on the name.
+const html = readFileSync(join(root, "zig-out/web/index.html"), "utf8");
+if (!html.includes('const SOLVER_NAME = "nn3"')) fail("zig-out/web/index.html is not built around nn3");
+
 // A timed search cannot expire on a frozen clock, so `expectimax_id` used to run to id_max_depth and
 // hang this script for minutes (#143, #145). Budget each call so the regression cannot come back
-// silently. The slowest policy that may legitimately appear here is `nn3` (up to ~0.5 s per move in
+// silently. The slowest policy that may legitimately appear here is `nn3` (up to ~0.4 s per move in
 // V8, #152), so the limit is a hang detector, not a speed budget.
-const SOLVE_LIMIT_MS = 1000;
+const SOLVE_LIMIT_MS = 2000;
 let slowest = 0;
 
 for (let algo = 0; algo < algoCount; algo++) {

@@ -1831,7 +1831,8 @@ train seed 3 で統一し、評価は 100 ゲーム（10 × 10 seed レンジ, s
 
 - **`nn2` を固定**にした。1 手 1.3 ms で、最大速度の自動再生でも 1 フレーム 8 ms の予算に収まる。
   速度優先なら `nn`（0.13 ms / 69,717）、強さ優先なら `nn3`（22.9 ms / 116,205）だが、
-  `nn3` はメインスレッドを掴むので既定にはしない。
+  `nn3` はメインスレッドを掴むので既定にはしない。（#152 で `nn3` 既定に戻した。上の 22.9 ms は
+  終盤の盤面だけの値で、序盤は 0.3〜0.4 s かかる）
 - 方針は **index ではなく名前で解決**する（`algo_name` を走査して `"nn2"` を探し、無ければ
   `expectimax`）。`Policy` の並びが変わったときに黙って別の方針になるのを防ぐ。
 - 自動再生は `requestAnimationFrame` ごとに 8 ms ぶんだけ解いて返す。以前の "max (no delay)" は
@@ -1869,5 +1870,12 @@ wasm（ReleaseFast、V8、このマシン）での 1 手あたりの実測。`nn
   2 倍遅くしてしまうのを避けるため。
 - `nn3` の深さは `nn.bestMove(net, state, .deep3)` で固定なので、`solve` に渡す depth は
   フォールバック（`expectimax`）のためのもの。
+- 自動再生のループは 1 本だけにする。`stopAuto` が保留中の `requestAnimationFrame` を
+  `cancelAnimationFrame` するので、停止→開始が 1 タスク内で起きても 2 本目が生まれない
+  （nn3 の solve が 0.3 s 固まる間に押されると起きていた）。
+- 速度の `<select>` にフォーカスがあるときは矢印キーを盤面に使わない。以前は select の
+  上下キーが `preventDefault` されて手になってしまっていた（サーバー版の `src/web/index.html` も同じ）。
 - `scripts/wasm-smoke.mjs` は「静的版の方針が wasm に載っている」ことを `nn3` の名前で検査する。
-  `nn3` は 1 手 0.5 s まで許す前提なので、solve の上限は速度の予算ではなくハング検出として残す。
+  ページ側は名前が無いと黙って `expectimax` に落ちるので、ビルド済み `zig-out/web/index.html` に
+  `const SOLVER_NAME = "nn3"` があることも見る。`nn3` は 1 手 0.4 s まで許す前提なので、solve の
+  上限（2 s）は速度の予算ではなくハング検出として残す。
