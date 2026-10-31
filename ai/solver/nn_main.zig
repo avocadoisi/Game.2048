@@ -351,6 +351,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "nn phase h1 (#157)" },
         .{ .name = "nn phase h2 (#157)" },
         .{ .name = "nn phase h3 (#157)" },
+        .{ .name = "nn phase h4 (#171)" },
     };
     const games = eval_games * seed_ranges;
     // `mstd` evaluates through the staged value, everything else through the single net (#107)
@@ -372,7 +373,8 @@ pub fn main(init: std.process.Init) !void {
                 4 => nn.playValue(c.vfn, prng.random(), .deep3),
                 5 => nn.playValue(c.vfn, prng.random(), .phase_h1),
                 6 => nn.playValue(c.vfn, prng.random(), .phase_h2),
-                else => nn.playValue(c.vfn, prng.random(), .phase_h3),
+                7 => nn.playValue(c.vfn, prng.random(), .phase_h3),
+                else => nn.playValue(c.vfn, prng.random(), .phase_h4),
             };
         }
     }.f;
