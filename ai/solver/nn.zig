@@ -137,13 +137,17 @@ pub fn stageOfEmpties(empties: usize) usize {
 }
 
 /// Value function used by the search: one net for every board, or one net per empty-cell stage (#107).
-pub const Value = union(enum) { single: *const Net, staged: *const Staged };
+/// `.quantized` is the opt-in int16 path of #170: same policy code, weights from the quantized file.
+/// Nothing selects it on its own; `nn.forward` over the f32 net stays the default.
+pub const Value = union(enum) { single: *const Net, staged: *const Staged, quantized: *const Quantized };
 
-/// `forward` for a `Value`; `cache` belongs to the net being evaluated and is unused for staged values.
+/// `forward` for a `Value`; `cache` belongs to the net being evaluated and is unused for staged and
+/// quantized values.
 pub fn valueAt(value: Value, board: Board, cache: *Cache) f64 {
     return switch (value) {
         .single => |net| forward(net, board, cache),
         .staged => |staged| staged.forward(board),
+        .quantized => |q| forwardQuantized(q, board),
     };
 }
 
@@ -1958,6 +1962,243 @@ fn flat(net: *Net) []f64 {
     return std.mem.bytesAsSlice(f64, std.mem.asBytes(net)[0..@sizeOf(Net)]);
 }
 
+fn flatConst(net: *const Net) []const f64 {
+    return std.mem.bytesAsSlice(f64, std.mem.asBytes(net)[0..@sizeOf(Net)]);
+}
+
+// ---- quantized weights (#170) ----
+//
+// A second file format next to the f32 one, for shipping: the same 18,561 weights as int16 with one
+// step per block (`w ≈ q * step`), 148,504 B -> 37,170 B. The f32 format is untouched and stays the
+// default evaluation path; nothing here is reachable from `parse`/`forward`.
+
+/// Weight blocks that share one step, in `Net` field order. `b3` gets its own block because it is an
+/// order of magnitude larger than `w3` and would otherwise cost `w3` 13x its resolution.
+pub const quant_block_count = 6;
+/// Activations that cross a layer boundary, each with its own step: hidden layer 1 and 2.
+pub const quant_activation_count = 2;
+
+pub const quant_magic = "2048-NQ1";
+pub const quant_version: u32 = 1;
+/// magic + version + endian marker + one f32 per block and per activation step.
+pub const quant_header_len = 16 + (quant_block_count + quant_activation_count) * @sizeOf(f32);
+/// `Net` holds 18,561 f64 weights (256x64 + 64 + 32x64 + 32 + 32 + 1).
+pub const weight_count = @sizeOf(Net) / @sizeOf(f64);
+pub const quant_file_len = quant_header_len + weight_count * @sizeOf(i16);
+
+const Block = struct { offset: usize, len: usize };
+
+/// A block of `Net` as element offsets into its flat weight array. `QPayload` mirrors the fields in the
+/// same order, so the same offsets index the i16 payload.
+fn blockOf(comptime field: []const u8) Block {
+    return .{
+        .offset = @offsetOf(Net, field) / @sizeOf(f64),
+        .len = @sizeOf(@FieldType(Net, field)) / @sizeOf(f64),
+    };
+}
+
+pub const quant_blocks = [quant_block_count]Block{
+    blockOf("w1"), blockOf("b1"), blockOf("w2"), blockOf("b2"), blockOf("w3"), blockOf("b3"),
+};
+
+/// The i16 mirror of `Net`, field for field. `extern` keeps the layout raw, so the payload in the file
+/// is these bytes little-endian (2 B per weight instead of 8).
+pub const QPayload = extern struct {
+    w1: [input_count][h1_size]i16,
+    b1: [h1_size]i16,
+    w2: [h2_size][h1_size]i16,
+    b2: [h2_size]i16,
+    w3: [h2_size]i16,
+    b3: i16,
+};
+
+/// int16 weights plus the steps that turn them back into values (#170): `w ≈ q * steps[block]`,
+/// `activation ≈ q * a_steps[layer]`.
+pub const Quantized = struct {
+    q: QPayload = std.mem.zeroes(QPayload),
+    steps: [quant_block_count]f64 = @splat(0),
+    a_steps: [quant_activation_count]f64 = @splat(0),
+};
+
+/// Step for one block: `max|w| / 32767`, so the block's largest weight lands on the i16 limit. 0 for an
+/// all-zero block, which then reads back as zeros.
+fn blockStep(values: []const f64) f64 {
+    var max: f64 = 0;
+    for (values) |w| max = @max(max, @abs(w));
+    return max / 32767;
+}
+
+/// `q = round(w / step)`, clamped to +-32767 (the step already puts `max|w|` on the limit, so the clamp
+/// only catches the `max|w|/32767 * 32767 < max|w|` edge of the float division).
+fn quantizeBlock(values: []const f64, step: f64, out: []i16) void {
+    if (step == 0) return @memset(out, 0);
+    for (values, 0..) |w, i| out[i] = @intFromFloat(@round(std.math.clamp(w / step, -32767, 32767)));
+}
+
+/// Worst-case activation of hidden layer 1 over every board: a board lights up 16 rows, so per hidden
+/// unit the bound is `b1[i]` plus the 16 largest rows of column `i`. (Slightly loose: the 16 largest
+/// rows may name the same cell twice, which no board does.) Deterministic and computed from the
+/// weights alone, unlike a bound sampled from boards.
+fn activationBound1(net: *const Net) f64 {
+    var bound: f64 = 0;
+    for (0..h1_size) |i| {
+        var positive: [input_count]f64 = undefined;
+        var n: usize = 0;
+        for (0..input_count) |row| {
+            const w = net.w1[row][i];
+            if (w > 0) {
+                positive[n] = w;
+                n += 1;
+            }
+        }
+        var sum = @max(net.b1[i], 0);
+        for (0..@min(core.BoardCellCount, n)) |_| {
+            var best: usize = 0;
+            for (0..n) |k| if (positive[k] > positive[best]) {
+                best = k;
+            };
+            sum += positive[best];
+            positive[best] = -1; // removed: every remaining entry came in positive
+        }
+        bound = @max(bound, sum);
+    }
+    return bound;
+}
+
+/// Worst-case activation of hidden layer 2: `b2[j]` plus every positive `w2[j][i]` at the layer-1 bound.
+/// Loose by construction (all 64 hidden units cannot peak at once), but ~1e-2 absolute on the value —
+/// see `docs/solver-history.md` (#170).
+fn activationBound2(net: *const Net, a1_bound: f64) f64 {
+    var bound: f64 = 0;
+    for (0..h2_size) |j| {
+        var sum = net.b2[j];
+        for (0..h1_size) |i| sum += @max(net.w2[j][i], 0) * a1_bound;
+        bound = @max(bound, sum);
+    }
+    return bound;
+}
+
+/// `Net` -> `Quantized` (#170): every block gets `step = max|w| / 32767` and `q = round(w / step)`; the
+/// hidden activations get the worst-case bound of the layer that produces them as their step, so they
+/// fit i16 without clamping a reachable value.
+pub fn quantize(net: *const Net) Quantized {
+    var q = Quantized{};
+    const values = flatConst(net);
+    const qvalues = std.mem.bytesAsSlice(i16, std.mem.asBytes(&q.q));
+    for (quant_blocks, 0..) |block, b| {
+        const block_values = values[block.offset..][0..block.len];
+        q.steps[b] = blockStep(block_values);
+        quantizeBlock(block_values, q.steps[b], qvalues[block.offset..][0..block.len]);
+    }
+    const a1_bound = activationBound1(net);
+    q.a_steps[0] = a1_bound / 32767;
+    q.a_steps[1] = activationBound2(net, a1_bound) / 32767;
+    return q;
+}
+
+/// Write the quantized weights back into an f32 net, so the rounding can be A/B'd with the same
+/// evaluation code (`w = q * step` loses at most half a step per block).
+pub fn dequantize(q: *const Quantized, net: *Net) void {
+    const qvalues = std.mem.bytesAsSlice(i16, std.mem.asBytes(&q.q));
+    const values = flat(net);
+    for (quant_blocks, 0..) |block, b| {
+        for (block.offset..block.offset + block.len) |i| {
+            values[i] = @as(f64, @floatFromInt(qvalues[i])) * q.steps[b];
+        }
+    }
+}
+
+/// File layout (all little endian, `#170`): 8-byte magic `2048-NQ1`, u32 version, u32 endianness
+/// marker, one f32 step per block (`w1 b1 w2 b2 w3 b3`), one f32 step per activation (`a1 a2`), then
+/// the 18,561 i16 weights in `Net` field order.
+pub fn encodeQuantized(q: *const Quantized) [quant_file_len]u8 {
+    var out: [quant_file_len]u8 = undefined;
+    @memcpy(out[0..8], quant_magic);
+    std.mem.writeInt(u32, out[8..12], quant_version, .little);
+    std.mem.writeInt(u32, out[12..16], endian_marker, .little);
+    var pos: usize = 16;
+    for (q.steps) |step| {
+        std.mem.writeInt(u32, out[pos..][0..4], @bitCast(@as(f32, @floatCast(step))), .little);
+        pos += 4;
+    }
+    for (q.a_steps) |step| {
+        std.mem.writeInt(u32, out[pos..][0..4], @bitCast(@as(f32, @floatCast(step))), .little);
+        pos += 4;
+    }
+    for (std.mem.bytesAsSlice(i16, std.mem.asBytes(&q.q)), 0..) |value, i| {
+        std.mem.writeInt(i16, out[pos + i * 2 ..][0..2], value, .little);
+    }
+    return out;
+}
+
+pub fn parseQuantized(bytes: []const u8) !Quantized {
+    if (bytes.len != quant_file_len) return error.WrongQuantFileSize;
+    if (!std.mem.eql(u8, bytes[0..8], quant_magic)) return error.BadQuantMagic;
+    if (std.mem.readInt(u32, bytes[8..12], .little) != quant_version) return error.UnsupportedQuantVersion;
+    if (std.mem.readInt(u32, bytes[12..16], .little) != endian_marker) return error.WrongQuantEndianness;
+    var q = Quantized{};
+    var pos: usize = 16;
+    for (&q.steps) |*step| {
+        step.* = @floatCast(@as(f32, @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little))));
+        pos += 4;
+    }
+    for (&q.a_steps) |*step| {
+        step.* = @floatCast(@as(f32, @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little))));
+        pos += 4;
+    }
+    for (std.mem.bytesAsSlice(i16, std.mem.asBytes(&q.q)), 0..) |*value, i| {
+        value.* = std.mem.readInt(i16, bytes[pos + i * 2 ..][0..2], .little);
+    }
+    return q;
+}
+
+pub fn saveQuantized(q: *const Quantized, io: std.Io, path: []const u8) !void {
+    const bytes = encodeQuantized(q);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = &bytes });
+}
+
+pub fn loadQuantized(q: *Quantized, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(quant_file_len + 1));
+    defer gpa.free(bytes);
+    q.* = try parseQuantized(bytes);
+}
+
+/// ReLU followed by re-quantization to i16: `round(max(z, 0) / step)`, clamped to the i16 range.
+fn quantizeActivation(z: f64, step: f64) i16 {
+    if (!(z > 0) or step == 0) return 0; // `!(z > 0)` also catches NaN; a zero step is an all-zero net
+    return @intFromFloat(@min(@round(z / step), 32767));
+}
+
+/// Afterstate value from the quantized net (#170). Same arithmetic as `forward`, with int16 weights:
+/// each hidden layer multiplies i16 x i16 into i32 and sums in i64 — the steps are ~1e-4, so the
+/// accumulated integers reach 1e9 and an i32 sum would overflow — then the layer's step is applied
+/// once, at the activation, and the activation is re-quantized with its own step for the next layer.
+pub fn forwardQuantized(q: *const Quantized, board: Board) f64 {
+    const s = q.steps;
+    var h1: [h1_size]i16 = undefined;
+    for (0..h1_size) |i| {
+        var acc: i32 = 0;
+        for (0..core.BoardCellCount) |cell| {
+            const row = cell * levels + levelOf(board[cell / core.BoardSize][cell % core.BoardSize]);
+            acc += q.q.w1[row][i];
+        }
+        const z = @as(f64, @floatFromInt(acc)) * s[0] + @as(f64, @floatFromInt(q.q.b1[i])) * s[1];
+        h1[i] = quantizeActivation(z, q.a_steps[0]);
+    }
+    var h2: [h2_size]i16 = undefined;
+    for (0..h2_size) |j| {
+        var acc: i64 = 0;
+        for (0..h1_size) |i| acc += @as(i32, q.q.w2[j][i]) * @as(i32, h1[i]);
+        const z = @as(f64, @floatFromInt(acc)) * (q.a_steps[0] * s[2]) +
+            @as(f64, @floatFromInt(q.q.b2[j])) * s[3];
+        h2[j] = quantizeActivation(z, q.a_steps[1]);
+    }
+    var acc: i64 = 0;
+    for (0..h2_size) |j| acc += @as(i32, q.q.w3[j]) * @as(i32, h2[j]);
+    return @as(f64, @floatFromInt(acc)) * (q.a_steps[1] * s[4]) +
+        @as(f64, @floatFromInt(q.q.b3)) * s[5];
+}
+
 fn lossOf(net: *const Net, board: Board, target: f64) f64 {
     var cache: Cache = .{};
     const d = forward(net, board, &cache) - target;
@@ -2846,6 +3087,89 @@ test "parse rejects wrong size" {
 
 test "embedded weights file parses" {
     _ = try parse(@embedFile("nn_weights.bin"));
+}
+
+test "quantized file is 48 B of header plus 2 B per weight (#170)" {
+    try std.testing.expectEqual(@as(usize, 18_561), weight_count);
+    try std.testing.expectEqual(weight_count * @sizeOf(i16), @sizeOf(QPayload));
+    try std.testing.expectEqual(@as(usize, 48), quant_header_len);
+    try std.testing.expectEqual(@as(usize, 37_170), quant_file_len);
+    // the i16 payload indexes the same element offsets as `Net`'s fields
+    for (quant_blocks, 0..) |block, b| {
+        if (b > 0) try std.testing.expectEqual(quant_blocks[b - 1].offset + quant_blocks[b - 1].len, block.offset);
+    }
+}
+
+test "quantized round trip keeps every weight within its block step (#170)" {
+    const net = try parse(@embedFile("nn_weights.bin"));
+    const q = quantize(&net);
+    const back = try parseQuantized(&encodeQuantized(&q));
+    var requantized: Net = undefined;
+    dequantize(&back, &requantized);
+
+    const before = flatConst(&net);
+    const after = flatConst(&requantized);
+    for (quant_blocks, 0..) |block, b| {
+        // the step the block was quantized with, recomputed from the f32 weights it came from
+        const step = blockStep(before[block.offset..][0..block.len]);
+        try std.testing.expectApproxEqRel(step, back.steps[b], 1e-6);
+        for (block.offset..block.offset + block.len) |i| {
+            const delta = @abs(before[i] - after[i]);
+            try std.testing.expect(delta <= step); // max|w| / 32767: the contract of the format
+            try std.testing.expect(delta <= step / 2 + step * 1e-6); // what round() actually costs
+        }
+    }
+    // the activation steps are real steps, not the zero default
+    try std.testing.expect(back.a_steps[0] > 0 and back.a_steps[1] > 0);
+}
+
+test "quantized inference of a constant net matches the f32 net within 1e-2 (#170)" {
+    var net = std.mem.zeroes(Net);
+    for (&net.w1, 0..) |*row, r| for (row, 0..) |*w, i| {
+        w.* = @as(f64, @floatFromInt((r * 7 + i * 3) % 11)) * 0.01 - 0.05;
+    };
+    for (&net.b1, 0..) |*b, i| b.* = @as(f64, @floatFromInt(i % 5)) * 0.02 - 0.04;
+    for (&net.w2, 0..) |*row, j| for (row, 0..) |*w, i| {
+        w.* = @as(f64, @floatFromInt((j * 5 + i) % 7)) * 0.02 - 0.06;
+    };
+    for (&net.b2, 0..) |*b, j| b.* = @as(f64, @floatFromInt(j % 3)) * 0.03;
+    for (&net.w3, 0..) |*w, j| w.* = @as(f64, @floatFromInt(j % 4)) * 0.05 - 0.07;
+    net.b3 = 0.25;
+    const q = quantize(&net);
+
+    const empty: Board = @splat(@splat(0));
+    var cache: Cache = .{};
+    try std.testing.expectApproxEqAbs(forward(&net, empty, &cache), forwardQuantized(&q, empty), 1e-2);
+
+    var board: Board = @splat(@splat(0));
+    board[0][0] = 2;
+    board[0][1] = 4;
+    board[1][0] = 8;
+    board[2][2] = 256;
+    board[3][3] = 1024;
+    try std.testing.expectApproxEqAbs(forward(&net, board, &cache), forwardQuantized(&q, board), 1e-2);
+}
+
+test "parseQuantized rejects a foreign magic, another version and a short file (#170)" {
+    var prng = std.Random.DefaultPrng.init(7);
+    const q = quantize(&Net.init(prng.random()));
+    const full = encodeQuantized(&q);
+
+    var bytes = full;
+    bytes[0] ^= 0xff;
+    try std.testing.expectError(error.BadQuantMagic, parseQuantized(&bytes));
+
+    bytes = full;
+    std.mem.writeInt(u32, bytes[8..12], quant_version + 1, .little);
+    try std.testing.expectError(error.UnsupportedQuantVersion, parseQuantized(&bytes));
+
+    bytes = full;
+    std.mem.writeInt(u32, bytes[12..16], 0x04030201, .little);
+    try std.testing.expectError(error.WrongQuantEndianness, parseQuantized(&bytes));
+
+    try std.testing.expectError(error.WrongQuantFileSize, parseQuantized(full[0 .. quant_file_len - 1]));
+    // the f32 weights are not a quantized file: the length alone rules them out
+    try std.testing.expectError(error.WrongQuantFileSize, parseQuantized(@embedFile("nn_weights.bin")));
 }
 
 test "emptyBucket splits empty-cell counts into 0..3, 4..7, 8+" {
