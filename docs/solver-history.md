@@ -1946,3 +1946,34 @@ wasm（ReleaseFast、V8、このマシン）での 1 手あたりの実測。`nn
   `row_table`（`[65536]RowEntry` = 512 KiB、1 行のマージを引く表）で、NN 重み 148 KB よりも
   大きい。次にサイズを削るならここ（`RowEntry` は 8 B。score を半分にして u32 に詰めれば
   256 KiB 減る）で、方針を削っても効かない。
+
+## 2-ply の目標と自己対戦方策を評価側に揃える（#158）
+
+評価は 2-ply の探索値で手を選ぶのに、学習は 1-ply greedy の自己対戦と `reward + V(next afterstate)`
+で回っていた。価値関数が「今の方策の先読み」に寄るほど探索の上乗せが消える（#135 で fine tuning
+すると 1-ply は +24%、2-ply は −8%）ので、学習の両側を評価側に寄せる 4 セルを用意した。
+
+`zig build nn -Doptimize=ReleaseFast -- 100000 10 9000 0.003 10 {t,tp,p,tp2} 30 <tmp> 3`
+
+| セル | 目標 | 自己対戦 |
+| --- | --- | --- |
+| `base`（対照） | `td1`: `reward + V(next afterstate)` | `greedy1`: 1-ply argmax |
+| `t` 目標のみ | `search2`: 2-ply 探索値 | `greedy1` |
+| `p` 方策のみ | `td1` | `deep2`: 評価の `.deep` で手を選ぶ |
+| `tp` 両方 | `search2` | `deep2` |
+
+いずれのセルも spawn を列挙するので乱数の消費は `base` と同じで、ゲームの spawn 列が揃う。
+
+### 目標の二重計上（レビューで見つけて直したこと）
+
+最初の `search2` は `Search.value(spawned, 2, 1)`、つまり「報酬 2 つ + 葉の `V`」だった。`value` の
+葉は**最後の報酬を足した後の afterstate** を評価するので、その `V` には次の報酬が既に入っている。
+決定的な鎖（各手の報酬が 1、割引なし）で確かめると固定点は 1, 2, 4, 5, 7, 10 と真値の約 1.5 倍に
+なっていた（`test "search2 target does not double count the last reward (#158)"` が差を 8/reward_scale
+として固定している）。
+
+`Search.bootValue(state, rewards, cprob)`（同 `bootChance`）を足し、葉を「最後の報酬より 1 手先の
+afterstate」にずらした。`bootValue(S, 0)` は 1 手先 afterstate の最大 `V`、`bootValue(S, r)` は
+`max_d (score_delta / reward_scale + bootChance(S', r - 1))` なので、`search2Value` は
+`r_t + r_{t+1} + V(A_{t+2})` を返す。`Search.ply` を `search2_ply + 1` にして置換表のキーも葉の
+深さに合わせた（値自体は深さ非依存）。
