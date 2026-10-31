@@ -34,8 +34,8 @@ const usage =
     \\              mstd    (#107 MS-TD: one MLP per empty-cell stage (0..2, 3..4, 5..6, 7..8, 9..10,
     \\                       11..12, 13..16 empties); each TD step trains only the stage of the afterstate
     \\                       it reached. Weights go to a staged file (its own magic), so eval needs the same file)
-    \\              dump    (#159: plain per-move training that also stores every afterstate with max tile
-    \\                       >= 4096 into a bounded buffer and writes it to dump_path at the end)
+    \\              dump    (#159: trains from weights_path like resume and also stores every afterstate
+    \\                       with max tile >= 4096 into a bounded buffer, written to dump_path at the end)
     \\              ft2     (#159: fine tuning from dump_path, loaded like resume; every self-play step also
     \\                       trains one uniformly drawn deep afterstate, so 50% of the updates stay on the
     \\                       self-play trajectory (shallow positions included) and 50% land on the deep tail)
@@ -205,9 +205,9 @@ pub fn main(init: std.process.Init) !void {
     const is_dump = std.mem.eql(u8, variant, "dump");
     const is_ft2 = std.mem.eql(u8, variant, "ft2");
     const is_restart = std.mem.eql(u8, variant, "restart");
-    // fine tuning variants load weights_path first, like `resume`
-    const use_resume = std.mem.eql(u8, variant, "resume") or is_ft2 or is_restart;
-    // Variants that read dump_path (index 11) instead of only writing it.
+    // #159 variants train from the net in weights_path (the deep positions come from that net), like `resume`
+    const use_resume = std.mem.eql(u8, variant, "resume") or is_dump or is_ft2 or is_restart;
+    // Variants that take dump_path at index 11: `dump` writes it, `ft2` and `restart` read it.
     const uses_dump = is_dump or is_ft2 or is_restart;
     const replay_k: usize = try cli.argOr(usize, args, 7, default_replay_k);
     const weights_path: []const u8 = try cli.argOr([]const u8, args, 8, default_weights_path);
