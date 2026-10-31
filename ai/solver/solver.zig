@@ -105,9 +105,77 @@ pub fn bestMoveW(state: GameState, depth: u8, w: Weights) ?Direction {
 }
 
 /// Move-choosing policies compared in the ranking (`zig build ranking`).
-/// `ntuple` stays last: the WASM build cannot read the table file, so `src/wasm.zig` offers
-/// `algo_count() - 1` policies and never lists it (#129).
+/// The order is a WASM ABI (`algo` in `src/wasm.zig` is the enum index, see `wasm_policy_count`).
 pub const Policy = enum { random, greedy, expectimax, mcts, beam, expectimax_tt, ga, nn, nn2, nnmcts, nnbeam, expectimax_id, nn3, ntuple };
+
+/// What every layer needs to know about one `Policy`; the name itself is `@tagName`. Keeping it in
+/// one table is the point of #139: the ranking, the HTTP UI and the WASM build used to carry three
+/// hand-written copies that drifted apart (a new variant broke `ranking.describe` in #138).
+pub const PolicyInfo = struct {
+    policy: Policy,
+    /// Depth `zig build ranking` passes; 0 = the policy's own default (see `choose`).
+    depth: u8,
+    /// One line shown next to the ranking row and in the HTTP UI. Japanese, like the UI.
+    description: []const u8,
+    /// Run by `zig build ranking` without a filter. Off for the heavy / experimental variants.
+    ranked: bool = true,
+    /// Needs the 64 MiB n-tuple table file next to the binary. Such a policy must come last, because
+    /// `src/wasm.zig` offers only the policies before it (#129).
+    needs_table: bool = false,
+};
+
+/// The single source of truth for the per-policy metadata, in `Policy` order.
+pub const policy_info = [_]PolicyInfo{
+    .{ .policy = .random, .depth = 0, .description = "合法手からランダムに1手選ぶ（比較の基準）" },
+    .{ .policy = .greedy, .depth = 0, .description = "1手先だけ見る。滑らせた盤面の評価が最も高い手を選ぶ（出現や探索はしない）" },
+    .{ .policy = .expectimax, .depth = 2, .description = "2手先まで探索し、ランダムな出現（2か4）を平均して評価する。評価は蛇行順と合体ペアの手作り関数" },
+    .{ .policy = .mcts, .depth = 0, .description = "UCTで候補手を選び、ランダムな対局を繰り返して評価する" },
+    .{ .policy = .beam, .depth = 0, .description = "幅32で3手先まで探索し、各空きマスに2が出現すると仮定して評価する" },
+    .{ .policy = .expectimax_tt, .depth = 0, .description = "depth 3の期待値探索を置換表で高速化したもの（同じ手を選ぶ）" },
+    .{ .policy = .ga, .depth = 2, .description = "GAで評価の重みを進化させた期待値探索（depth 2）。GA内のholdout(seed 500〜)では+4%だが、ranking seed 1000では素の expectimax より低い" },
+    .{ .policy = .nn, .depth = 0, .description = "TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）" },
+    .{ .policy = .nn2, .depth = 2, .description = "TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）" },
+    .{ .policy = .nnmcts, .depth = 0, .description = "UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）" },
+    .{ .policy = .nnbeam, .depth = 0, .description = "NNの盤面価値を葉にしたビーム探索。幅8・3手先で、ply間のspawnを2回サンプリングする（固定seedで再現）" },
+    .{ .policy = .expectimax_id, .depth = 0, .ranked = false, .description = "時間予算付きの反復深化 + 確率枝刈り（#104）。depth 2から1ずつ深くし、予算内に終わった最後の深さの手を選ぶ。予算はdepth引数（ms、0なら既定の40ms）" },
+    .{ .policy = .nn3, .depth = 0, .ranked = false, .description = "TD学習のMLP価値関数で3手先まで探索する（深い層の出現確率が1e-2未満の枝を落として再正規化）。既定のランキングには入れていない（重い）" },
+    .{ .policy = .ntuple, .depth = 0, .ranked = false, .needs_table = true, .description = "n-tuple 表（量子化した int16、7 パターン）の1手先読み。表は 64 MiB あるので API と CLI 専用" },
+};
+
+/// Number of leading `policy_info` entries that need no data file; `src/wasm.zig`'s `algo_count()`.
+/// Computing it here (instead of a `- 1` in the wasm build) pins "the table policy is last" at
+/// compile time.
+pub const wasm_policy_count: u32 = blk: {
+    var first_table: usize = policy_info.len;
+    for (policy_info, 0..) |info, i| {
+        if (info.needs_table) {
+            first_table = i;
+            break;
+        }
+    }
+    for (policy_info[first_table..]) |info| {
+        if (!info.needs_table) @compileError("a policy that needs the n-tuple table must come last (WASM ABI)");
+    }
+    break :blk @intCast(first_table);
+};
+
+// The table is indexed by `@intFromEnum`, so a missing, out-of-order or unexplained variant is a
+// compile error rather than a runtime surprise.
+comptime {
+    if (policy_info.len != @typeInfo(Policy).@"enum".field_names.len)
+        @compileError("policy_info must list every Policy variant");
+    for (policy_info, 0..) |info, i| {
+        if (@intFromEnum(info.policy) != i)
+            @compileError("policy_info must be in Policy order (WASM ABI)");
+        if (info.description.len == 0)
+            @compileError("policy " ++ @tagName(info.policy) ++ " has no description");
+    }
+}
+
+/// Metadata for `policy`; total because `policy_info` covers every variant, in order.
+pub fn policyInfo(policy: Policy) PolicyInfo {
+    return policy_info[@intFromEnum(policy)];
+}
 
 /// Weights evolved by `zig build ga-rl` (holdout +4%, see docs/solver-history.md). 3 decimals as printed.
 pub const ga_weights: Weights = .{ .empty = 7.028, .order_penalty = 43.174, .order_penalty_late = 43.174, .merge = 0, .forced_down = 0 };
@@ -341,11 +409,7 @@ pub fn playPolicy(rng: std.Random, policy: Policy, depth: u8) GameResult {
         _ = state.move(d, rng);
         moves += 1;
     }
-    var max_tile: core.Tile = 0;
-    for (state.board) |row| {
-        for (row) |value| max_tile = @max(max_tile, value);
-    }
-    return .{ .score = state.score, .max_tile = max_tile, .moves = moves };
+    return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves };
 }
 
 const BeamNode = struct {
@@ -494,7 +558,7 @@ fn nnBeamSearch(net: *const nn.Net, state: GameState, rng: std.Random, horizon: 
 /// Spawn on a uniformly random empty cell: 2 at 0.9, 4 at 0.1, like the real game.
 /// False when the board is full, so the afterstate itself is the leaf.
 fn sampleSpawn(state: *GameState, rng: std.Random) bool {
-    const empties = nn.countEmpty(state.board);
+    const empties = core.countEmpty(state.board);
     if (empties == 0) return false;
     const value: core.Tile = if (rng.uintLessThan(u32, 10) == 0) 4 else 2;
     var index = rng.uintLessThan(usize, empties);
@@ -957,11 +1021,7 @@ pub fn playWeights(rng: std.Random, w: Weights, depth: u8) GameResult {
         _ = state.move(d, rng);
         moves += 1;
     }
-    var max_tile: core.Tile = 0;
-    for (state.board) |row| {
-        for (row) |value| max_tile = @max(max_tile, value);
-    }
-    return .{ .score = state.score, .max_tile = max_tile, .moves = moves };
+    return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves };
 }
 
 pub fn evaluateState(state: GameState) f64 {
@@ -1332,6 +1392,35 @@ test "iterative deepening with a zero budget returns the depth 2 move" {
     var table = freshTable();
     try std.testing.expectEqual(bestMoveTTPruned(state, id_min_depth, prob_cutoff, &table), bestMoveID(state, 0));
     try std.testing.expectEqual(id_min_depth, id_depth_reached);
+}
+
+// `src/wasm.zig` builds `algo` from the enum: `algo_name(i)` is `@tagName(field i)` and
+// `algo_count()` is `wasm_policy_count`. Renaming, reordering or inserting a variant therefore
+// silently changes the browser ABI (and the `algo=` values of the HTTP API), so the order is pinned
+// here — `src/wasm.zig` is an executable with no test step, and it derives everything from this
+// enum, so this test is what fails when `Policy` moves (#139).
+test "Policy order is the WASM ABI and the table policy stays last" {
+    const abi = [_][]const u8{
+        "random",        "greedy",        "expectimax", "mcts",   "beam",
+        "expectimax_tt", "ga",            "nn",         "nn2",    "nnmcts",
+        "nnbeam",        "expectimax_id", "nn3",        "ntuple",
+    };
+    try std.testing.expectEqual(abi.len, std.enums.values(Policy).len);
+    for (std.enums.values(Policy), 0..) |p, i| try std.testing.expectEqualStrings(abi[i], @tagName(p));
+    // the browser build offers every policy up to the one that needs the table file
+    try std.testing.expectEqual(Policy.ntuple, std.enums.values(Policy)[abi.len - 1]);
+    try std.testing.expectEqual(@as(u32, @intCast(abi.len - 1)), wasm_policy_count);
+}
+
+test "policy_info covers every variant and the ranking depth of each" {
+    for (std.enums.values(Policy)) |p| {
+        const info = policyInfo(p);
+        try std.testing.expectEqual(p, info.policy);
+        try std.testing.expect(info.description.len > 0);
+    }
+    // only ntuple carries a data-file requirement, and it is the last variant
+    try std.testing.expect(policyInfo(.ntuple).needs_table);
+    try std.testing.expectEqual(@as(u32, @intCast(policy_info.len - 1)), wasm_policy_count);
 }
 
 test "random policy only picks legal moves" {
@@ -1733,11 +1822,7 @@ fn goldenPlay(policy: Policy, seed: u64, depth: u8) Golden {
         _ = state.move(d, rng);
         moves += 1;
     }
-    var max_tile: core.Tile = 0;
-    for (state.board) |row| for (row) |value| {
-        max_tile = @max(max_tile, value);
-    };
-    return .{ .score = state.score, .max_tile = max_tile, .moves = moves, .checksum = checksum };
+    return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves, .checksum = checksum };
 }
 
 test "nn policy reproduces the same move sequence and score on a fixed seed" {
@@ -1770,7 +1855,6 @@ test "nn policy parses the weights once per thread, not once per move" {
     // the ~148 KB net is parsed at most once for the whole game, then reused by reference
     try std.testing.expect(nn.parse_count - before <= 1);
 }
-
 
 test "ntuple policy plays a legal move from the quantized table (#129)" {
     // The table file ships with the repo; a checkout without it simply skips the check.

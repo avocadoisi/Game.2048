@@ -1,6 +1,11 @@
 const std = @import("std");
 const solver = @import("solver");
 const bench = @import("bench.zig");
+const cli = @import("args.zig");
+
+const default_runs: u32 = 5;
+const default_games_per_run: u32 = 20;
+const default_seed: u64 = 1000;
 
 const usage =
     \\usage: ranking [runs] [games_per_run] [seed] [policies]
@@ -22,18 +27,14 @@ const Entry = struct {
 
 const PolicySpec = struct { policy: solver.Policy, depth: u8 };
 
-const policies = [_]PolicySpec{
-    .{ .policy = .random, .depth = 0 },
-    .{ .policy = .greedy, .depth = 0 },
-    .{ .policy = .expectimax, .depth = 2 },
-    .{ .policy = .mcts, .depth = 0 },
-    .{ .policy = .beam, .depth = 0 },
-    .{ .policy = .expectimax_tt, .depth = 0 },
-    .{ .policy = .ga, .depth = 2 },
-    .{ .policy = .nn, .depth = 0 },
-    .{ .policy = .nn2, .depth = 2 },
-    .{ .policy = .nnmcts, .depth = 0 },
-    .{ .policy = .nnbeam, .depth = 0 },
+/// Policies `zig build ranking` runs without a filter, in `Policy` order: exactly the entries
+/// `solver.policy_info` marks `ranked`, so the list and the depths come from one table (#139).
+const policies = blk: {
+    var list: []const PolicySpec = &.{};
+    for (solver.policy_info) |info| {
+        if (info.ranked) list = list ++ &[_]PolicySpec{.{ .policy = info.policy, .depth = info.depth }};
+    }
+    break :blk list;
 };
 
 fn policyByName(name: []const u8) ?PolicySpec {
@@ -67,24 +68,10 @@ fn runEntries(io: std.Io, gpa: std.mem.Allocator, selected: []const PolicySpec, 
     }
 }
 
-/// One-line summary of each policy, shown next to its ranking row.
+/// One-line summary of each policy, shown next to its ranking row. The text lives in
+/// `solver.policy_info`, so the ranking and the HTTP UI cannot disagree (#139).
 fn describe(policy: solver.Policy) []const u8 {
-    return switch (policy) {
-        .random => "合法手からランダムに1手選ぶ（比較の基準）",
-        .greedy => "1手先だけ見る。滑らせた盤面の評価が最も高い手を選ぶ（出現や探索はしない）",
-        .expectimax => "2手先まで探索し、ランダムな出現（2か4）を平均して評価する。評価は蛇行順と合体ペアの手作り関数",
-        .mcts => "UCTで候補手を選び、ランダムな対局を繰り返して評価する",
-        .beam => "幅32で3手先まで探索し、各空きマスに2が出現すると仮定して評価する",
-        .expectimax_tt => "depth 3の期待値探索を置換表で高速化したもの（同じ手を選ぶ）",
-        .ga => "GAで評価の重みを進化させた期待値探索（depth 2）。GA内のholdout(seed 500〜)では+4%だが、ranking seed 1000では素の expectimax より低い",
-        .nn => "TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）",
-        .nn3 => "TD学習のMLP価値関数で3手先まで探索する（深い層の出現確率が1e-2未満の枝を落として再正規化）。既定のランキングには入れていない（重い）",
-        .nn2 => "TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）",
-        .ntuple => "n-tuple 表（量子化した int16、7 パターン）の1手先読み。表は 64 MiB あるので API と CLI 専用",
-        .nnmcts => "UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）",
-        .nnbeam => "NNの盤面価値を葉にしたビーム探索。幅8・3手先で、ply間のspawnを2回サンプリングする（固定seedで再現）",
-        .expectimax_id => "時間予算付きの反復深化 + 確率枝刈り（#104）。depth 2から1ずつ深くし、予算内に終わった最後の深さの手を選ぶ。予算はdepth引数（ms、0なら既定の40ms）",
-    };
+    return solver.policyInfo(policy).description;
 }
 
 fn byScoreDesc(_: void, a: Entry, b: Entry) bool {
@@ -92,10 +79,26 @@ fn byScoreDesc(_: void, a: Entry, b: Entry) bool {
 }
 
 test "every policy has a ranking description" {
-    // `describe` is an exhaustive switch, so a new Policy variant without a description is a
-    // compile error; this test keeps a description from being emptied out or duplicated.
+    // The wording lives in `solver.policy_info`, which refuses to compile without a description for
+    // every variant; this keeps the table from being emptied out or the text duplicated.
     for (std.enums.values(solver.Policy)) |p| {
         try std.testing.expect(describe(p).len > 0);
+    }
+}
+
+test "the default ranking list is the ranked half of policy_info, in Policy order" {
+    // Compatibility surface: the default `zig build ranking` run (and its output order before the
+    // sort) has always been these 11 policies. Heavy / experimental ones stay opt-in.
+    const expected = [_]solver.Policy{
+        .random, .greedy, .expectimax, .mcts,   .beam,   .expectimax_tt,
+        .ga,     .nn,     .nn2,        .nnmcts, .nnbeam,
+    };
+    try std.testing.expectEqual(expected.len, policies.len);
+    for (expected, 0..) |p, i| try std.testing.expectEqual(p, policies[i].policy);
+    try std.testing.expectEqual(@as(u8, 2), policies[2].depth); // expectimax keeps its depth 2
+    try std.testing.expectEqual(@as(u8, 2), policies[6].depth); // ga and nn2 too
+    for ([_]solver.Policy{ .nn3, .ntuple, .expectimax_id }) |p| {
+        try std.testing.expect(!solver.policyInfo(p).ranked);
     }
 }
 
@@ -127,12 +130,18 @@ test "runEntries executes only the filtered policies" {
     try std.testing.expectEqual(@as(u32, 1), entries[0].summary.games);
 }
 
+test {
+    // `zig build test` only runs tests of files it reaches from a target's root, so the shared CLI
+    // helper's tests ride along with the ranking target instead of adding a 16th one (#139).
+    std.testing.refAllDecls(cli);
+}
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    const runs: u32 = if (args.len > 1) try std.fmt.parseInt(u32, args[1], 10) else 5;
-    const games_per_run: u32 = if (args.len > 2) try std.fmt.parseInt(u32, args[2], 10) else 20;
-    const seed: u64 = if (args.len > 3) try std.fmt.parseInt(u64, args[3], 10) else 1000;
-    const filter: []const u8 = if (args.len > 4) args[4] else "";
+    const runs: u32 = try cli.argOr(u32, args, 1, default_runs);
+    const games_per_run: u32 = try cli.argOr(u32, args, 2, default_games_per_run);
+    const seed: u64 = try cli.argOr(u64, args, 3, default_seed);
+    const filter: []const u8 = try cli.argOr([]const u8, args, 4, "");
     if (args.len > 5 or runs == 0 or games_per_run == 0) {
         std.debug.print("{s}", .{usage});
         return;

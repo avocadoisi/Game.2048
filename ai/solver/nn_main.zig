@@ -3,6 +3,7 @@ const core = @import("core");
 const solver = @import("solver");
 const nn = @import("nn");
 const parallel = @import("parallel");
+const cli = @import("args.zig");
 
 const usage =
     \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate] [seed_ranges|diag] [variant|par] [replay_k] [weights_path] [train_seed] [par]
@@ -46,10 +47,15 @@ const usage =
 
 const default_weights_path = "ai/solver/nn_weights.bin";
 
-/// Positional arg 9, appended after `weights_path` so existing command lines keep their meaning.
-fn parseTrainSeed(args: []const []const u8) !u64 {
-    return if (args.len > 9) try std.fmt.parseInt(u64, args[9], 10) else 1;
-}
+// Positional defaults, one named constant each (`usage` above is the compatibility surface).
+const default_train_games: u32 = 2000;
+const default_eval_games: u32 = 100;
+const default_eval_seed: u64 = 1000;
+const default_learning_rate: f64 = 0.003;
+const default_replay_k: usize = 30;
+const default_seed_ranges: u32 = 1;
+/// Appended after `weights_path` so existing command lines keep their meaning.
+const default_train_seed: u64 = 1;
 
 /// Positional arg 10, appended after `train_seed`: the literal "par" runs the variant of arg 6 in
 /// parallel batches (issue #99). Arg 6 `par` keeps its meaning (base + parallel).
@@ -117,15 +123,15 @@ fn printDiag(diag: *const nn.Diag) void {
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    const train_games: u32 = if (args.len > 1) try std.fmt.parseInt(u32, args[1], 10) else 2000;
-    const eval_games: u32 = if (args.len > 2) try std.fmt.parseInt(u32, args[2], 10) else 100;
-    const eval_seed: u64 = if (args.len > 3) try std.fmt.parseInt(u64, args[3], 10) else 1000;
-    const learning_rate: f64 = if (args.len > 4) try std.fmt.parseFloat(f64, args[4]) else 0.003;
+    const train_games: u32 = try cli.argOr(u32, args, 1, default_train_games);
+    const eval_games: u32 = try cli.argOr(u32, args, 2, default_eval_games);
+    const eval_seed: u64 = try cli.argOr(u64, args, 3, default_eval_seed);
+    const learning_rate: f64 = try cli.argOr(f64, args, 4, default_learning_rate);
     // arg 5 is either the seed-range count or the literal "diag" ("-" = no diag, 1 range)
     const arg5: ?[]const u8 = if (args.len > 5) args[5] else null;
     const want_diag = arg5 != null and std.mem.eql(u8, arg5.?, "diag");
     const no_diag = arg5 != null and std.mem.eql(u8, arg5.?, "-");
-    const seed_ranges: u32 = if (arg5) |a| (if (want_diag or no_diag) 1 else try std.fmt.parseInt(u32, a, 10)) else 1;
+    const seed_ranges: u32 = if (arg5) |a| (if (want_diag or no_diag) 1 else try std.fmt.parseInt(u32, a, 10)) else default_seed_ranges;
     const variant = if (args.len > 6) args[6] else "base";
     // arg 6 `par` means base + parallel (unchanged); arg 10 `par` batches the variant of arg 6
     const par_variant = std.mem.eql(u8, variant, "par");
@@ -133,9 +139,9 @@ pub fn main(init: std.process.Init) !void {
     const use_par = par_variant or par_tail;
     const use_resume = std.mem.eql(u8, variant, "resume");
     const is_mstd = std.mem.eql(u8, variant, "mstd");
-    const replay_k: usize = if (args.len > 7) try std.fmt.parseInt(usize, args[7], 10) else 30;
-    const weights_path = if (args.len > 8) args[8] else default_weights_path;
-    const train_seed = try parseTrainSeed(args);
+    const replay_k: usize = try cli.argOr(usize, args, 7, default_replay_k);
+    const weights_path: []const u8 = try cli.argOr([]const u8, args, 8, default_weights_path);
+    const train_seed: u64 = try cli.argOr(u64, args, 9, default_train_seed);
     var priority: nn.Priority = .{};
     const opts: nn.Options = if (par_variant or use_resume or std.mem.eql(u8, variant, "base"))
         .{}
@@ -311,14 +317,14 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-test "train seed argument is optional and defaults to 1" {
+test "train seed argument (position 9) is optional and defaults to 1" {
     const no_args = [_][]const u8{"nn"};
-    try std.testing.expectEqual(@as(u64, 1), try parseTrainSeed(&no_args));
+    try std.testing.expectEqual(@as(u64, 1), try cli.argOr(u64, &no_args, 9, default_train_seed));
     const nine_args = [_][]const u8{ "nn", "0", "20", "2000", "0.003", "-", "base", "30", "x.bin" };
-    try std.testing.expectEqual(@as(u64, 1), try parseTrainSeed(&nine_args));
+    try std.testing.expectEqual(@as(u64, 1), try cli.argOr(u64, &nine_args, 9, default_train_seed));
     const with_seed = [_][]const u8{ "nn", "0", "20", "2000", "0.003", "-", "base", "30", "x.bin", "3" };
-    try std.testing.expectEqual(@as(u64, 3), try parseTrainSeed(&with_seed));
-    try std.testing.expectError(error.InvalidCharacter, parseTrainSeed(&[_][]const u8{ "nn", "0", "20", "2000", "0.003", "-", "base", "30", "x.bin", "x" }));
+    try std.testing.expectEqual(@as(u64, 3), try cli.argOr(u64, &with_seed, 9, default_train_seed));
+    try std.testing.expectError(error.InvalidCharacter, cli.argOr(u64, &[_][]const u8{ "nn", "0", "20", "2000", "0.003", "-", "base", "30", "x.bin", "x" }, 9, default_train_seed));
 }
 
 /// Test-only replica of the serial training setup in `main` (init + game RNG both from the seed).
@@ -332,7 +338,7 @@ fn trainSeedWeights(seed: u64, games: usize) nn.Net {
 
 test "omitted train seed trains seed 1 and matches the recorded checksum" {
     const no_args = [_][]const u8{"nn"};
-    const net_default = trainSeedWeights(try parseTrainSeed(&no_args), 5);
+    const net_default = trainSeedWeights(try cli.argOr(u64, &no_args, 9, default_train_seed), 5);
     const net_seed1 = trainSeedWeights(1, 5);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&net_seed1), std.mem.asBytes(&net_default));
     try std.testing.expectEqual(@as(u32, 4199351724), std.hash.Crc32.hash(std.mem.asBytes(&net_default)));

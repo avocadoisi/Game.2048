@@ -642,11 +642,7 @@ pub fn playWithStats(net: *const TupleNet, rng: std.Random, mode: Mode, stats: *
         _ = state.move(pick.dir, rng);
         moves += 1;
     }
-    var max_tile: core.Tile = 0;
-    for (state.board) |row| for (row) |value| {
-        max_tile = @max(max_tile, value);
-    };
-    return .{ .score = state.score, .max_tile = max_tile, .moves = moves, .leaves = stats.leaves };
+    return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves, .leaves = stats.leaves };
 }
 
 /// TD(0) on afterstates over one self-play game.
