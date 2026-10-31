@@ -212,43 +212,104 @@ pub fn mergeLine(line: [BoardSize]Tile) MergeResult {
         const exp: u16 = if (value == 0) 0 else @ctz(value);
         key |= exp << @intCast(i * 4);
     }
-    const entry = row_table[key];
-    if (!entry.ok) return mergeLineSlow(line);
+    if (rowOverflows(key)) return mergeLineSlow(line);
+    const bytes = row_table[key];
+    const row: u16 = @as(u16, bytes[0]) | (@as(u16, bytes[1]) << 8);
+    const first: u8 = bytes[2] & 0xf;
+    const second: u8 = bytes[2] >> 4;
     var merged: [BoardSize]Tile = undefined;
     for (&merged, 0..) |*cell, i| {
-        const exp: u4 = @truncate(entry.row >> @intCast(i * 4));
+        const exp: u4 = @truncate(row >> @intCast(i * 4));
         cell.* = if (exp == 0) 0 else @as(Tile, 1) << exp;
     }
-    return .{ .line = merged, .changed = entry.row != key, .score_delta = entry.score };
+    var score_delta: u32 = 0;
+    if (first != 0) score_delta += @as(u32, 1) << @intCast(first);
+    if (second != 0) score_delta += @as(u32, 1) << @intCast(second);
+    return .{ .line = merged, .changed = row != key, .score_delta = score_delta };
 }
 
-const RowEntry = struct {
-    /// Merged line as 4 nibbles of log2 tile values (0 = empty).
-    row: u16,
-    score: u32,
-    /// false when a merge would produce a tile above 32768 (nibble overflow).
-    ok: bool,
+const RowTables = struct {
+    /// rows[key] packs one row into 3 little-endian bytes:
+    /// - bits 0..15: merged line as 4 nibbles of log2 tile values (0 = empty);
+    /// - bits 16..19: exponent of the first merged tile (0 = no merge);
+    /// - bits 20..23: exponent of the second merged tile (0 = no merge).
+    /// A 4-cell row merges at most twice, so the two exponents recover
+    /// `score_delta` exactly as `1 << exp` each.
+    rows: [65536][3]u8,
+    /// Set for keys whose merge produces a tile above 32768: its exponent (16)
+    /// does not fit a nibble, so `mergeLine` takes `mergeLineSlow` for them.
+    overflow: [65536 / 8]u8,
 };
 
 /// row_table[key]: key packs 4 nibbles of log2 tile values, offset 0 in the low nibble.
-const row_table: [65536]RowEntry = blk: {
+const row_table: [65536][3]u8 = row_tables.rows;
+/// row_overflow[key >> 3] bit (key & 7): true for the keys the table cannot hold.
+const row_overflow: [65536 / 8]u8 = row_tables.overflow;
+
+/// The bit `row_overflow` uses for `key`.
+inline fn overflowBit(key: u16) u8 {
+    return @as(u8, 1) << @truncate(key);
+}
+
+inline fn rowOverflows(key: u16) bool {
+    return (row_overflow[key >> 3] & overflowBit(key)) != 0;
+}
+
+const row_tables: RowTables = blk: {
     @setEvalBranchQuota(1_000_000_000);
-    var t: [65536]RowEntry = undefined;
+    var t: RowTables = .{ .rows = std.mem.zeroes([65536][3]u8), .overflow = @splat(0) };
     for (0..65536) |key| {
         var line: [BoardSize]Tile = undefined;
+        var packed_line: [BoardSize]Tile = @splat(0);
+        var count: usize = 0;
         for (&line, 0..) |*cell, i| {
             const exp: u4 = @truncate(key >> @intCast(i * 4));
             cell.* = if (exp == 0) 0 else @as(Tile, 1) << exp;
+            if (cell.* != 0) {
+                packed_line[count] = cell.*;
+                count += 1;
+            }
         }
         const merged = mergeLineSlow(line);
         var row: u16 = 0;
         var ok = true;
         for (merged.line, 0..) |value, i| {
             const exp: u16 = if (value == 0) 0 else @ctz(value);
-            if (exp > 15) ok = false;
-            row |= exp << @intCast(i * 4);
+            if (exp > 15) {
+                ok = false;
+            } else {
+                row |= exp << @intCast(i * 4);
+            }
         }
-        t[key] = .{ .row = row, .score = merged.score_delta, .ok = ok };
+        // Merged exponents in merge order (0 = no merge at that slot).
+        var exps: [2]u8 = .{ 0, 0 };
+        var read: usize = 0;
+        while (read < count) {
+            const value = packed_line[read];
+            if (read + 1 < count and packed_line[read + 1] == value) {
+                const exp: u16 = @ctz(value * 2);
+                if (exp > 15 or exps[exps.len - 1] != 0) {
+                    ok = false;
+                } else if (exps[0] == 0) {
+                    exps[0] = @intCast(exp);
+                } else {
+                    exps[1] = @intCast(exp);
+                }
+                read += 2;
+            } else {
+                read += 1;
+            }
+        }
+        if (ok) {
+            var score: u32 = 0;
+            for (exps) |exp| {
+                if (exp != 0) score += @as(u32, 1) << @intCast(exp);
+            }
+            std.debug.assert(score == merged.score_delta);
+            t.rows[key] = .{ @truncate(row), @truncate(row >> 8), exps[0] | (exps[1] << 4) };
+        } else {
+            t.overflow[key >> 3] |= overflowBit(@intCast(key));
+        }
     }
     break :blk t;
 };
@@ -598,7 +659,7 @@ test "slide merges like move but never spawns" {
     try std.testing.expectEqual(@as(u32, 4), game.score);
 }
 
-test "mergeLine table matches the general path for every power-of-two row" {
+test "mergeLine table matches the general path for every key, overflow rows included" {
     for (0..65536) |key| {
         var line: [BoardSize]Tile = undefined;
         for (&line, 0..) |*cell, i| {
@@ -610,7 +671,20 @@ test "mergeLine table matches the general path for every power-of-two row" {
         try std.testing.expectEqual(slow.line, fast.line);
         try std.testing.expectEqual(slow.changed, fast.changed);
         try std.testing.expectEqual(slow.score_delta, fast.score_delta);
+        // The bitset must hold exactly the keys the 3-byte entry cannot encode:
+        // a merge above 32768 has exponent 16, which is not a nibble.
+        var overflow = false;
+        for (slow.line) |value| {
+            if (value != 0 and @ctz(value) > 15) overflow = true;
+        }
+        try std.testing.expectEqual(overflow, rowOverflows(@intCast(key)));
     }
+}
+
+test "row table is 3 bytes per key plus an 8 KiB overflow bitset" {
+    try std.testing.expectEqual(@as(usize, 65536), row_table.len);
+    try std.testing.expectEqual(@as(usize, 196_608), @sizeOf(@TypeOf(row_table)));
+    try std.testing.expectEqual(@as(usize, 8_192), @sizeOf(@TypeOf(row_overflow)));
 }
 
 test "mergeLine falls back for tiles the table cannot hold" {
