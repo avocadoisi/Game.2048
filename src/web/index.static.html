@@ -30,6 +30,15 @@
   <button id="step">Solver: 1 step</button>
   <button id="auto">Solver: auto</button>
 </p>
+<p>
+  <label>speed <select id="speed">
+    <option value="0">max (no delay)</option>
+    <option value="250">slow (250 ms)</option>
+    <option value="500">slower (500 ms)</option>
+    <option value="1000">1 move/s</option>
+    <option value="2000">1 move per 2 s</option>
+  </select></label>
+</p>
 <p id="policy"></p>
 <script>
 // Static build: everything runs in WebAssembly, there is no server.
@@ -75,12 +84,17 @@ function newGame() {
 // Solver preview: ask the wasm solver for the move, then apply it.
 // The static build has no model picker: one policy, resolved by NAME so that reordering the
 // `Policy` enum cannot silently switch the UI to a different solver (issue #143).
-const SOLVER_NAME = "nn2";
+// nn3 is the strongest policy that fits in the module (native avg score 116,205 vs nn2's 82,772);
+// it costs 4-400 ms per move in V8, which is why the auto play has a speed picker (issue #152).
+const SOLVER_NAME = "nn3";
 const FALLBACK_NAME = "expectimax";
+// nn3 is 3-ply by construction (`nn.bestMove(net, state, .deep3)` ignores `depth`), so this is the
+// depth of the fallback policy only.
 const SOLVER_DEPTH = 2;
 const FRAME_BUDGET_MS = 8;
 let solver = 0;
 let running = false;
+let nextMoveAt = 0;
 
 function solverMove() {
   const dir = w.solve(solver, SOLVER_DEPTH);
@@ -100,13 +114,23 @@ function solveStep() {
 
 function stopAuto() { running = false; document.getElementById("auto").textContent = "Solver: auto"; }
 
-// Auto play always runs at maximum speed: no artificial delay, but at most FRAME_BUDGET_MS of
-// solving per animation frame so the tab keeps painting and the buttons stay clickable.
-function autoLoop() {
+function speedDelay() { return Number(document.getElementById("speed").value); }
+
+// Auto play, one animation frame at a time. At "max" there is no artificial delay, but at most
+// FRAME_BUDGET_MS of solving per frame so the tab keeps painting and the buttons stay clickable.
+// With a delay, one move per frame at most, and the timer restarts after the solve returns, so a
+// slow policy (nn3 is 0.3 s per move early on) is never charged the delay twice.
+function autoLoop(now) {
   if (!running) return;
-  const start = performance.now();
-  while (running && performance.now() - start < FRAME_BUDGET_MS) {
-    if (!solverMove()) { stopAuto(); break; }
+  const delay = speedDelay();
+  if (delay === 0) {
+    const start = performance.now();
+    while (running && performance.now() - start < FRAME_BUDGET_MS) {
+      if (!solverMove()) { stopAuto(); break; }
+    }
+  } else if (now >= nextMoveAt) {
+    if (!solverMove()) stopAuto();
+    nextMoveAt = performance.now() + delay;
   }
   render();
   if (running) requestAnimationFrame(autoLoop);
@@ -123,7 +147,7 @@ function autoLoop() {
   }
   const pick = names.includes(SOLVER_NAME) ? SOLVER_NAME : FALLBACK_NAME;
   solver = names.indexOf(pick);
-  document.getElementById("policy").textContent = `solver: ${pick} (${SOLVER_DEPTH}-ply), always maximum speed`;
+  document.getElementById("policy").textContent = `solver: ${pick}`;
 
   for (const b of document.querySelectorAll("[data-dir]")) {
     b.addEventListener("click", () => move(Number(b.dataset.dir)));
@@ -133,8 +157,9 @@ function autoLoop() {
   document.getElementById("auto").addEventListener("click", () => {
     if (running) return stopAuto();
     running = true;
+    nextMoveAt = 0; // first move on the first frame
     document.getElementById("auto").textContent = "Solver: stop";
-    autoLoop();
+    requestAnimationFrame(autoLoop);
   });
   document.addEventListener("keydown", (e) => {
     if (e.metaKey || e.ctrlKey || e.altKey) return;

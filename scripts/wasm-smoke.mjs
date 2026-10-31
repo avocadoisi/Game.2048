@@ -62,12 +62,12 @@ for (let i = 0; i < algoCount; i++) {
   names.push(new TextDecoder().decode(new Uint8Array(w.memory.buffer, w.algo_name(i), len)));
 }
 if (!names.includes("expectimax")) fail("algo names missing expectimax: " + JSON.stringify(names));
-if (!names.includes("nn2")) fail("algo names missing nn2 (the static page's fixed policy): " + JSON.stringify(names));
+if (!names.includes("nn3")) fail("algo names missing nn3 (the static page's fixed policy): " + JSON.stringify(names));
 
 // A timed search cannot expire on a frozen clock, so `expectimax_id` used to run to id_max_depth and
 // hang this script for minutes (#143, #145). Budget each call so the regression cannot come back
-// silently: one move must stay well under the repo's 20 ms/move browser budget, and `id_min_depth`
-// (depth 2) is what the freestanding build is pinned to.
+// silently. The slowest policy that may legitimately appear here is `nn3` (up to ~0.5 s per move in
+// V8, #152), so the limit is a hang detector, not a speed budget.
 const SOLVE_LIMIT_MS = 1000;
 let slowest = 0;
 
@@ -91,6 +91,6 @@ w.init(777, 0);
 const expectimax = names.indexOf("expectimax");
 if (w.solve(expectimax, 1) < 0) fail("solve(expectimax) returned -1 on a fresh game");
 w.init(777, 0);
-if (w.solve(names.indexOf("nn2"), 2) < 0) fail("solve(nn2, 2) returned -1 on a fresh game");
+if (w.solve(names.indexOf("nn3"), 2) < 0) fail("solve(nn3, 2) returned -1 on a fresh game");
 
 console.log(`OK: ${bytes.length} bytes wasm, ${algoCount} policies (${names.join(", ")}), ${applied} applied moves, slowest solve ${Math.round(slowest)} ms`);

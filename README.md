@@ -1,6 +1,6 @@
 # Game.2048
 
-ブラウザで遊ぶ: **https://avocadoisi.github.io/Game.2048/** （wasm、solver は `nn2` 固定で自動再生）
+ブラウザで遊ぶ: **https://avocadoisi.github.io/Game.2048/** （wasm、solver は `nn3` 固定で自動再生、速度を選べる）
 
 Zig で書いた 2048。ゲームロジックを `2048.core` として切り出し、CLI / HTTP サーバー / WASM / solver AI が同じコアを使う。
 
@@ -23,7 +23,7 @@ zig build run -- help
   `GET /api/solve?depth=2&algo=nn2`、`GET /api/ranking`。solver の自動再生と速度選択ができる
 - 静的配信: `bash scripts/deploy-pages.sh`（ビルド → スモークテスト → `gh-pages` へ push）。
   手元で見るだけなら `zig build wasm -Doptimize=ReleaseFast` のあと `python3 -m http.server 8000 -d zig-out/web`。
-  静的版は方針を選ばせない（`nn2` 2-ply 固定、自動再生は常に最大速度）
+  静的版は方針を選ばせない（`nn3` 3-ply 固定）。自動再生の速度は select で選べる（既定は最速）
 
 ## サイズ
 
@@ -35,7 +35,9 @@ zig build run -- help
 | n-tuple 表 | 64.6 MiB | wasm には入れない（native の API 専用） |
 
 ブラウザへ配るのは HTML と wasm の 2 ファイルだけ。NN 系は重み込みでこの中に収まるので、
-サーバーも外部アセットも無しで `nn2` が 1 手 1.3 ms で動く。
+サーバーも外部アセットも無しで動く。実測（ReleaseFast、V8 上の wasm、1 手あたり）は `nn2` が
+8〜13 ms、`nn3` が序盤 0.3〜0.4 s / 盤面が詰まる終盤 4〜80 ms。`nn3` は 1 手ごとにメイン
+スレッドを掴むので、再生速度の既定は最速（＝解ける速さ）にしてある。
 
 ## コア API
 
