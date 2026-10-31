@@ -33,8 +33,17 @@ Cycle and test discipline: `dev-philosophy`. Order of a change: `dev-workflow`.
 - inject RNG; core never calls a global random source
 - core does not depend on CLI, IO, or allocator-heavy code
 - randomness in tests: `SequenceRng` (scripted) or a fixed-seed `DefaultPrng`
-- one heavy run (`zig build test`, bench, training) at a time, even across subagents — parallel training jobs stall each other (load average is not throughput)
 - `zig build test -Doptimize=ReleaseFast` does not finish: the `nn` test binary alone compiles for 20+ min. Debug is the full-test setting
 - measure a policy with `zig build solve`; `zig build ranking` runs every policy (nnmcts etc.) and takes 10+ min per game
+
+## Parallel implementation, serial measurement
+
+Writing code is parallelisable. Measuring is not.
+
+- parallel OK: several issues at once, each in its own worktree (`worktree: true`), one writer per worktree
+- a subagent may run its own **filtered** Debug tests (`zig build test -Dtest-filter <name>`) and 1-2 game smoke runs
+- serial, one at a time, parent-owned: full `zig build test`, `-Doptimize=ReleaseFast` builds of `nn`/`ranking`, any training run (`zig build nn -- <games> > 0`), `zig build ranking`, `zig build solve`, `zig build wasm`
+- never let two trainings/benches run concurrently, not even across subagents: they stall each other and the wall-clock numbers in `docs/solver-history.md` stop meaning anything (load average is not throughput)
+- so: brief every worker with "no long runs", and run the measurements yourself, serially, after the branches come back
 - `std.testing`: `expectEqual` / `expectEqualStrings` / `expectError`
 - core API names match README "Core API"
