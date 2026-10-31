@@ -56,13 +56,28 @@ zig build ranking -Doptimize=ReleaseFast -- 5 20 1000 nn,nn2          # 末尾�
 
 現状のおおよその強さ（ReleaseFast、評価 seed 9000、100 ゲーム。行ごとに条件が違うので数字は目安）:
 
-| 手法 | avg score | 到達 |
-|---|---:|---|
-| `nn2`（committed weights, 100 ゲーム） | 90,358 | 8192 |
-| `expectimax_id`（2 ms/手, 100 ゲーム） | 75,202 | 8192 |
-| `expectimax_tt`（depth 3, 200 ゲーム） | 52,736 | 8192 |
-| `ntuple` 1-ply（wide 表 10M ゲーム） | 20,014 | 2048 |
-| `expectimax`（depth 2, 既定, 100 ゲーム） | 34,000 | 4096 |
+`localhost:8080` のUIに出す比較表は `zig build ranking` の JSON をそのまま読む。
+表を更新するときは、生成して `src/web/ranking.json` に置き直し、ビルドし直す
+（`src/server.zig` が `@embedFile` しているので、置き換えただけでは古いまま）。
+
+```bash
+zig build ranking -Doptimize=ReleaseFast -- 5 20 1000 > src/web/ranking.json
+```
+
+表は avg score と一緒に速度（games/s と 1 手あたり ms）も出す。速度は同じ実行・同じマシン
+の相対値なので、他の負荷が載っていると絶対値は動く（順位は動きにくい）。
+
+| 手法 | avg score | 到達 | 速度 (games/s) |
+|---|---:|---:|---:|
+| `nn2`（committed weights, 100 ゲーム） | 90,358 | 8192 | 0.42 |
+| `nn`（committed weights, 1-ply + spawn, 100 ゲーム） | 69,717 | 8192 | 4.8 |
+| `expectimax_id`（2 ms/手, 100 ゲーム） | 75,202 | 8192 | — |
+| `expectimax_tt`（depth 3, 200 ゲーム） | 52,736 | 8192 | 1.1 |
+| `ntuple` 1-ply（wide 表 10M ゲーム） | 20,014 | 2048 | — |
+| `expectimax`（depth 2, 既定, 100 ゲーム） | 34,000 | 4096 | 15 |
+
+速度は `zig build ranking` の同じ実行から出した 1 秒あたりのゲーム数（スコアの行とは条件が違う）。
+`nn2` は 1 手 3.2 ms で `expectimax` の 17 倍遅いが、スコアは 2.4 倍。
 
 `nn` / `ntuple` の数値は手作り評価と違い、学習ゲーム数に強く依存する
 （n-tuple の 2-ply は wide 表 10M で 51,951、TD の `nn` は 100k がピークで 400k まで回すと 73,007 に落ちる）。

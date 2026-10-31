@@ -71,8 +71,12 @@ async function call(method, url) {
 fetch("/api/ranking").then((r) => r.json()).then(({ entries, games_per_run, runs }) => {
   // every ranked policy is selectable for the solver
   document.getElementById("algo").innerHTML = entries.map((e) => `<option value="${e.policy}"${e.policy === "expectimax" ? " selected" : ""}>${e.policy}</option>`).join("");
-  const rows = entries.map((e, i) => `<tr><td>${i + 1}</td><td>${e.policy}</td><td>${e.avg_score.toFixed(0)}</td><td>${e.best_tile}</td><td style="text-align:left">${e.description}</td></tr>`).join("");
-  document.getElementById("policies").innerHTML = `<tr><th>#</th><th>policy</th><th>avg score</th><th>best tile</th><th>what it does</th></tr>${rows}<caption>${runs} runs x ${games_per_run} games, fixed seed</caption>`;
+  // games/s and ms/move come from the same run as avg score (`zig build ranking`);
+  // an older ranking.json without them still renders, with "-".
+  const speed = (e) => (typeof e.games_per_sec === "number" ? e.games_per_sec.toFixed(2) : "-");
+  const latency = (e) => (typeof e.latency_ms_per_move === "number" ? e.latency_ms_per_move.toFixed(2) : "-");
+  const rows = entries.map((e, i) => `<tr><td>${i + 1}</td><td>${e.policy}</td><td>${e.avg_score.toFixed(0)}</td><td>${e.best_tile}</td><td>${speed(e)}</td><td>${latency(e)}</td><td style="text-align:left">${e.description}</td></tr>`).join("");
+  document.getElementById("policies").innerHTML = `<tr><th>#</th><th>policy</th><th>avg score</th><th>best tile</th><th>games/s</th><th>ms/move</th><th>what it does</th></tr>${rows}<caption>${runs} runs x ${games_per_run} games, fixed seed — avg score and speed from the same run</caption>`;
 });
 
 for (const b of document.querySelectorAll("[data-dir]")) {
