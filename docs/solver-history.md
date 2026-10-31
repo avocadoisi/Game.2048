@@ -1659,7 +1659,10 @@ int16 に量子化して 64.6 MiB にし、`solver.Policy.ntuple` として API 
 wasm32-freestanding では `std.Io.Threaded` の `getrandom` / `IOV_MAX` 解決に失敗して
 `zig build wasm` が通らなくなっていた（`#104` の PR 以降、誰も wasm をビルドしていなかった）。
 `clockNow` を freestanding 用のスタブ（固定タイムスタンプを返す）に分岐させて修復した。
-その場合 `expectimax_id` は深さ 2 で止まる（時間で深化しない）。
+当初ここには「その場合 `expectimax_id` は深さ 2 で止まる」と書いていたが、これは**間違いだった**。
+スタブは 0 を返すので `elapsedMs()` が常に 0 になり、`while (... elapsedMs(start) < budget_ms)` が
+常に真 → `id_max_depth = 8` まで深化して 1 手 80 s 以上かかっていた（#145）。いまは
+`shouldDeepen()` が「時計が進むターゲット」を条件に入れているので、wasm では `id_min_depth = 2` に固定される。
 
 ### 限界
 

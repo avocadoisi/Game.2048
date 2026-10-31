@@ -64,15 +64,20 @@ for (let i = 0; i < algoCount; i++) {
 if (!names.includes("expectimax")) fail("algo names missing expectimax: " + JSON.stringify(names));
 if (!names.includes("nn2")) fail("algo names missing nn2 (the static page's fixed policy): " + JSON.stringify(names));
 
-// `expectimax_id` deepens against a wall clock that the freestanding build does not have
-// (clockNow returns 0), so it runs to id_max_depth = 8 and takes minutes on a fresh board.
-// The static page never selects it, so skip it here rather than hanging the smoke test (#143).
-const SKIP_SOLVE = new Set(["expectimax_id"]);
+// A timed search cannot expire on a frozen clock, so `expectimax_id` used to run to id_max_depth and
+// hang this script for minutes (#143, #145). Budget each call so the regression cannot come back
+// silently: one move must stay well under the repo's 20 ms/move browser budget, and `id_min_depth`
+// (depth 2) is what the freestanding build is pinned to.
+const SOLVE_LIMIT_MS = 1000;
+let slowest = 0;
 
 for (let algo = 0; algo < algoCount; algo++) {
-  if (SKIP_SOLVE.has(names[algo])) continue;
   w.init(777 + algo, 0);
+  const t0 = performance.now();
   const dir = w.solve(algo, 1);
+  const solveMs = performance.now() - t0;
+  if (solveMs > SOLVE_LIMIT_MS) fail(`solve(${algo}) took ${Math.round(solveMs)} ms (limit ${SOLVE_LIMIT_MS})`);
+  slowest = Math.max(slowest, solveMs);
   if (dir < -1 || dir > 3) fail(`solve(${algo}) returned out-of-range direction ${dir}`);
   if (dir === -1) continue; // no legal move
   const before = snapshot();
@@ -88,4 +93,4 @@ if (w.solve(expectimax, 1) < 0) fail("solve(expectimax) returned -1 on a fresh g
 w.init(777, 0);
 if (w.solve(names.indexOf("nn2"), 2) < 0) fail("solve(nn2, 2) returned -1 on a fresh game");
 
-console.log(`OK: ${bytes.length} bytes wasm, ${algoCount} policies (${names.join(", ")}), ${applied} applied moves`);
+console.log(`OK: ${bytes.length} bytes wasm, ${algoCount} policies (${names.join(", ")}), ${applied} applied moves, slowest solve ${Math.round(slowest)} ms`);

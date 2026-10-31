@@ -721,7 +721,7 @@ pub fn bestMoveID(state: GameState, budget_ms: u32) ?Direction {
     var best = bestMoveTTPruned(state, id_min_depth, prob_cutoff, table);
     id_depth_reached = @max(id_depth_reached, id_min_depth);
     var depth: u8 = id_min_depth;
-    while (best != null and depth < id_max_depth and elapsedMs(start) < budget_ms) {
+    while (best != null and shouldDeepen(depth, budget_ms, clock_available, elapsedMs(start))) {
         const move = bestMoveTTPruned(state, depth + 1, prob_cutoff, table);
         if (move == null) break;
         best = move;
@@ -731,17 +731,26 @@ pub fn bestMoveID(state: GameState, budget_ms: u32) ?Direction {
     return best;
 }
 
+/// Whether iterative deepening may search one more depth. `clock_available` is false where
+/// `clockNow` is the freestanding stub (it returns a fixed timestamp), and a timed loop there could
+/// never expire: with `elapsed_ms` pinned at 0 the search ran to `id_max_depth` and took minutes per
+/// move in the browser (issue #145). Such a target keeps the depth it already has.
+pub fn shouldDeepen(depth: u8, budget_ms: u32, clock_available_: bool, elapsed_ms: i96) bool {
+    return depth < id_max_depth and clock_available_ and elapsed_ms < @as(i96, budget_ms);
+}
+
 /// Zig 0.17 has no `std.time.Instant`; the monotonic clock lives behind `std.Io`. The global
 /// single-threaded instance's `now` only reads the OS clock and touches no shared state.
 /// Freestanding (WASM) has no clock: it returns a fixed timestamp, so a timed search there
 /// degenerates to its minimum depth instead of failing to build.
-const clockNow = if (builtin.target.os.tag == .freestanding) struct {
+const clock_available = builtin.target.os.tag != .freestanding;
+const clockNow = if (clock_available) struct {
     fn now() std.Io.Timestamp {
-        return .{ .nanoseconds = 0 };
+        return std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io());
     }
 }.now else struct {
     fn now() std.Io.Timestamp {
-        return std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io());
+        return .{ .nanoseconds = 0 };
     }
 }.now;
 
@@ -1392,6 +1401,17 @@ test "iterative deepening with a zero budget returns the depth 2 move" {
     var table = freshTable();
     try std.testing.expectEqual(bestMoveTTPruned(state, id_min_depth, prob_cutoff, &table), bestMoveID(state, 0));
     try std.testing.expectEqual(id_min_depth, id_depth_reached);
+}
+
+// The freestanding clock is a fixed timestamp, so `elapsed_ms` never advances there: a timed loop
+// would run to `id_max_depth` and take minutes per move in the browser (issue #145). The loop
+// condition is a pure function so this target can pin the frozen-clock case directly.
+test "iterative deepening never deepens without an advancing clock" {
+    try std.testing.expect(!shouldDeepen(id_min_depth, 1, false, 0)); // frozen clock (WASM)
+    try std.testing.expect(!shouldDeepen(id_min_depth, 10_000, false, 0));
+    try std.testing.expect(shouldDeepen(id_min_depth, 1, true, 0)); // live clock, budget left
+    try std.testing.expect(!shouldDeepen(id_min_depth, 1, true, 1)); // budget spent
+    try std.testing.expect(!shouldDeepen(id_max_depth, 1, true, 0)); // already at the cap
 }
 
 // `src/wasm.zig` builds `algo` from the enum: `algo_name(i)` is `@tagName(field i)` and
