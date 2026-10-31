@@ -105,7 +105,8 @@ pub fn bestMoveW(state: GameState, depth: u8, w: Weights) ?Direction {
 }
 
 /// Move-choosing policies compared in the ranking (`zig build ranking`).
-/// The order is a WASM ABI (`algo` in `src/wasm.zig` is the enum index, see `wasm_policy_count`).
+/// The order is the ranking's display order. The browser build picks its policies by name from
+/// `wasm.policies` (#154), so reordering this enum no longer changes the WASM ABI.
 pub const Policy = enum { random, greedy, expectimax, mcts, beam, expectimax_tt, ga, nn, nn2, nnmcts, nnbeam, expectimax_id, nn3, ntuple };
 
 /// What every layer needs to know about one `Policy`; the name itself is `@tagName`. Keeping it in
@@ -119,8 +120,8 @@ pub const PolicyInfo = struct {
     description: []const u8,
     /// Run by `zig build ranking` without a filter. Off for the heavy / experimental variants.
     ranked: bool = true,
-    /// Needs the 64 MiB n-tuple table file next to the binary. Such a policy must come last, because
-    /// `src/wasm.zig` offers only the policies before it (#129).
+    /// Needs the 64 MiB n-tuple table file next to the binary, so the browser build cannot ship it
+    /// (`wasm.policies` must not list it; `src/wasm.zig` fails the build if it does).
     needs_table: bool = false,
 };
 
@@ -142,23 +143,6 @@ pub const policy_info = [_]PolicyInfo{
     .{ .policy = .ntuple, .depth = 0, .ranked = false, .needs_table = true, .description = "n-tuple 表（量子化した int16、7 パターン）の1手先読み。表は 64 MiB あるので API と CLI 専用" },
 };
 
-/// Number of leading `policy_info` entries that need no data file; `src/wasm.zig`'s `algo_count()`.
-/// Computing it here (instead of a `- 1` in the wasm build) pins "the table policy is last" at
-/// compile time.
-pub const wasm_policy_count: u32 = blk: {
-    var first_table: usize = policy_info.len;
-    for (policy_info, 0..) |info, i| {
-        if (info.needs_table) {
-            first_table = i;
-            break;
-        }
-    }
-    for (policy_info[first_table..]) |info| {
-        if (!info.needs_table) @compileError("a policy that needs the n-tuple table must come last (WASM ABI)");
-    }
-    break :blk @intCast(first_table);
-};
-
 // The table is indexed by `@intFromEnum`, so a missing, out-of-order or unexplained variant is a
 // compile error rather than a runtime surprise.
 comptime {
@@ -166,7 +150,7 @@ comptime {
         @compileError("policy_info must list every Policy variant");
     for (policy_info, 0..) |info, i| {
         if (@intFromEnum(info.policy) != i)
-            @compileError("policy_info must be in Policy order (WASM ABI)");
+            @compileError("policy_info must be in Policy order (indexed by @intFromEnum)");
         if (info.description.len == 0)
             @compileError("policy " ++ @tagName(info.policy) ++ " has no description");
     }
@@ -229,6 +213,15 @@ pub fn ntupleAvailable() bool {
 
 /// Next move for a policy; null when no move changes the board.
 pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Direction {
+    return switch (policy) {
+        inline else => |p| chooseOne(p, state, rng, depth),
+    };
+}
+
+/// `choose` for one compile-time-known policy. Instantiating this per policy is what lets the
+/// browser build link only the policies it ships (`wasm.policies`, #154): a runtime switch over
+/// every variant (which is what `choose` is) drags all of them into the module.
+pub fn chooseOne(comptime policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Direction {
     switch (policy) {
         .random => {
             var legal: [4]Direction = undefined;
@@ -1414,12 +1407,10 @@ test "iterative deepening never deepens without an advancing clock" {
     try std.testing.expect(!shouldDeepen(id_max_depth, 1, true, 0)); // already at the cap
 }
 
-// `src/wasm.zig` builds `algo` from the enum: `algo_name(i)` is `@tagName(field i)` and
-// `algo_count()` is `wasm_policy_count`. Renaming, reordering or inserting a variant therefore
-// silently changes the browser ABI (and the `algo=` values of the HTTP API), so the order is pinned
-// here — `src/wasm.zig` is an executable with no test step, and it derives everything from this
-// enum, so this test is what fails when `Policy` moves (#139).
-test "Policy order is the WASM ABI and the table policy stays last" {
+// The order is the ranking table's order and the `algo=` values of the HTTP API, so it is pinned
+// here — a rename or a reorder silently changes both (#139). The browser build no longer depends on
+// it: it names its policies in `wasm.policies` (#154).
+test "Policy order is the ranking order" {
     const abi = [_][]const u8{
         "random",        "greedy",        "expectimax", "mcts",   "beam",
         "expectimax_tt", "ga",            "nn",         "nn2",    "nnmcts",
@@ -1427,9 +1418,23 @@ test "Policy order is the WASM ABI and the table policy stays last" {
     };
     try std.testing.expectEqual(abi.len, std.enums.values(Policy).len);
     for (std.enums.values(Policy), 0..) |p, i| try std.testing.expectEqualStrings(abi[i], @tagName(p));
-    // the browser build offers every policy up to the one that needs the table file
-    try std.testing.expectEqual(Policy.ntuple, std.enums.values(Policy)[abi.len - 1]);
-    try std.testing.expectEqual(@as(u32, @intCast(abi.len - 1)), wasm_policy_count);
+}
+
+test "choose and chooseOne agree" {
+    const state: GameState = .{ .board = .{
+        .{ 2, 4, 8, 16 },
+        .{ 0, 2, 0, 4 },
+        .{ 0, 0, 8, 0 },
+        .{ 0, 0, 0, 2 },
+    } };
+    inline for ([_]Policy{ .random, .greedy }) |policy| { // inline: `chooseOne` takes the policy comptime
+        var a = std.Random.DefaultPrng.init(31);
+        var b = std.Random.DefaultPrng.init(31);
+        try std.testing.expectEqual(
+            choose(policy, state, a.random(), 2),
+            chooseOne(policy, state, b.random(), 2),
+        );
+    }
 }
 
 test "policy_info covers every variant and the ranking depth of each" {
@@ -1438,9 +1443,9 @@ test "policy_info covers every variant and the ranking depth of each" {
         try std.testing.expectEqual(p, info.policy);
         try std.testing.expect(info.description.len > 0);
     }
-    // only ntuple carries a data-file requirement, and it is the last variant
-    try std.testing.expect(policyInfo(.ntuple).needs_table);
-    try std.testing.expectEqual(@as(u32, @intCast(policy_info.len - 1)), wasm_policy_count);
+    // only ntuple carries a data-file requirement, so it is the only policy the browser cannot ship
+    try std.testing.expectEqual(Policy.ntuple, std.enums.values(Policy)[policy_info.len - 1]);
+    for (policy_info) |info| try std.testing.expectEqual(info.policy == .ntuple, info.needs_table);
 }
 
 test "random policy only picks legal moves" {
