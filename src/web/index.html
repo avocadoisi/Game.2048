@@ -113,6 +113,8 @@ document.getElementById("auto").addEventListener("click", () => {
 });
 document.addEventListener("keydown", (e) => {
   if (e.metaKey || e.ctrlKey || e.altKey) return;
+  // A focused <select> owns its arrow keys; do not turn them into board moves.
+  if (e.target instanceof Element && e.target.closest("select, input, button")) return;
   const dir = CODES[e.code];
   if (dir) { e.preventDefault(); call("POST", "/api/move?dir=" + dir); }
 });
