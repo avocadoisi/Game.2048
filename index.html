@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>2048</title>
+<style>
+  body { font-family: system-ui, sans-serif; text-align: center; background: #faf8ef; color: #776e65; }
+  #grid { display: grid; grid-template-columns: repeat(4, 90px); gap: 10px; background: #bbada0; padding: 10px; width: max-content; margin: 16px auto; border-radius: 6px; }
+  .cell { width: 90px; height: 90px; line-height: 90px; font-size: 28px; font-weight: bold; border-radius: 4px; background: #cdc1b4; }
+  .v2 { background: #eee4da; } .v4 { background: #ede0c8; } .v8 { background: #f2b179; color: #fff; }
+  .v16 { background: #f59563; color: #fff; } .v32 { background: #f67c5f; color: #fff; } .v64 { background: #f65e3b; color: #fff; }
+  .big { background: #edc22e; color: #fff; font-size: 22px; }
+  button { font-size: 16px; padding: 6px 14px; margin: 4px; }
+  #msg { min-height: 1.5em; font-weight: bold; }
+  #policy-desc { font-size: 12px; line-height: 1.4; color: #8f857d; max-width: 34em; margin: 0 auto; }
+</style>
+</head>
+<body>
+<h1>2048</h1>
+<div>score: <span id="score">0</span> — best tile: <span id="best">0</span></div>
+<div id="grid"></div>
+<div id="msg"></div>
+<p>
+  <button data-dir="0">↑ (W)</button><br>
+  <button data-dir="1">← (A)</button>
+  <button data-dir="2">↓ (S)</button>
+  <button data-dir="3">→ (D)</button>
+</p>
+<p>
+  <button id="new">New game</button>
+  <button id="step">Solver: 1 step</button>
+  <button id="auto">Solver: auto</button>
+</p>
+<p>
+  <label>policy <select id="policy"></select></label>
+  <label>speed <select id="speed">
+    <option value="0">max (no delay)</option>
+    <option value="250">slow (250 ms)</option>
+    <option value="500">slower (500 ms)</option>
+  </select></label>
+</p>
+<p id="policy-desc"></p>
+<script>
+// Static build: everything runs in WebAssembly, there is no server.
+// Exports follow src/wasm.zig: move returns 0 no change, 1 moved, 2 game over.
+const CODES = { ArrowUp: 0, KeyW: 0, ArrowLeft: 1, KeyA: 1, ArrowDown: 2, KeyS: 2, ArrowRight: 3, KeyD: 3 };
+const NO_CHANGE = 0, MOVED = 1, GAME_OVER = 2;
+
+let w; // wasm exports
+let gameOver = false;
+
+function render() {
+  const board = new Uint32Array(w.memory.buffer, w.board_ptr(), 16);
+  const grid = document.getElementById("grid");
+  grid.innerHTML = "";
+  for (const v of board) {
+    const c = document.createElement("div");
+    c.className = "cell " + (v === 0 ? "" : v > 64 ? "big" : "v" + v);
+    c.textContent = v === 0 ? "" : v;
+    grid.appendChild(c);
+  }
+  document.getElementById("score").textContent = w.score();
+  document.getElementById("best").textContent = w.best_tile();
+  document.getElementById("msg").textContent = gameOver ? "Game over — press New game" : "";
+}
+
+function move(dir, paint = true) {
+  if (gameOver) return false;
+  const result = w.move(dir);
+  gameOver = result === GAME_OVER;
+  if (result === NO_CHANGE) document.getElementById("msg").textContent = "no change";
+  if (paint) render();
+  return result !== NO_CHANGE;
+}
+
+function newGame() {
+  // crypto seed when available, fixed mix otherwise
+  const seed = crypto.getRandomValues(new Uint32Array(2));
+  w.init(seed[0], seed[1]);
+  gameOver = false;
+  render();
+}
+
+// Solver preview: ask the wasm solver for the move, then apply it.
+// The policy list comes straight from the module (`wasm.policies`): the page offers exactly what
+// was compiled in, so a policy the module does not ship cannot be selected by mistake (#154).
+// Default is nn3 (native avg score 116,205 vs nn2's 82,772) at 4-400 ms per move in V8; nn2 is
+// 9-14 ms, which is why both exist next to the speed picker (issue #152).
+const DEFAULT_POLICY = "nn3";
+const FRAME_BUDGET_MS = 8;
+let running = false;
+let autoFrame = 0; // pending requestAnimationFrame id, 0 when none is queued
+let nextMoveAt = 0;
+
+function policyIndex() { return Number(document.getElementById("policy").value); }
+
+function solverMove() {
+  const dir = w.solve(policyIndex(), 0);
+  if (dir < 0) return false;
+  return move(dir, false);
+}
+
+function solveStep() {
+  const ok = solverMove();
+  render();
+  if (!ok) {
+    stopAuto();
+    document.getElementById("msg").textContent = "solver: no move (game over)";
+  }
+  return ok;
+}
+
+// One loop at a time: the pending frame is cancelled here, so a stop/start pair inside one task
+// cannot leave two loops scheduling themselves. `nextMoveAt = 0` is in the past for every rAF
+// timestamp, so the next start fires its first move on the first frame.
+function stopAuto() {
+  running = false;
+  if (autoFrame) { cancelAnimationFrame(autoFrame); autoFrame = 0; }
+  nextMoveAt = 0;
+  document.getElementById("auto").textContent = "Solver: auto";
+}
+
+function speedDelay() { return Number(document.getElementById("speed").value); }
+
+// Auto play, one animation frame at a time. At "max" there is no artificial delay, but at most
+// FRAME_BUDGET_MS of solving per frame so the tab keeps painting and the buttons stay clickable.
+// With a delay, one move per frame at most, and the timer restarts after the solve returns, so a
+// slow policy (nn3 is 0.3 s per move early on) is never charged the delay twice.
+function autoLoop(now) {
+  if (!running) return;
+  const delay = speedDelay();
+  let moved = false;
+  if (delay === 0) {
+    const start = performance.now();
+    while (running && performance.now() - start < FRAME_BUDGET_MS) {
+      if (!solverMove()) { stopAuto(); break; }
+      moved = true;
+    }
+  } else if (now >= nextMoveAt) {
+    moved = solverMove();
+    if (!moved) stopAuto();
+    nextMoveAt = performance.now() + delay;
+  }
+  // Nothing to paint while waiting out a delay; the last move already rendered the board.
+  if (moved || !running) render();
+  if (running) autoFrame = requestAnimationFrame(autoLoop);
+}
+
+(async () => {
+  const bytes = await (await fetch("game2048.wasm")).arrayBuffer();
+  const { instance } = await WebAssembly.instantiate(bytes, {});
+  w = instance.exports;
+
+  // One entry per policy compiled into this module, with its measured average score.
+  const text = (ptr, len) => new TextDecoder().decode(new Uint8Array(w.memory.buffer, ptr, len));
+  const policies = [];
+  for (let i = 0; i < w.algo_count(); i++) {
+    policies.push({
+      name: text(w.algo_name(i), w.algo_name_len(i)),
+      score: text(w.algo_score(i), w.algo_score_len(i)),
+      speed: text(w.algo_speed(i), w.algo_speed_len(i)),
+    });
+  }
+  const picker = document.getElementById("policy");
+  picker.innerHTML = "";
+  for (const [i, p] of policies.entries()) {
+    const option = document.createElement("option");
+    option.value = String(i);
+    option.textContent = p.name;
+    option.title = p.speed ? `${p.score} / 1 手 ${p.speed}` : p.score;
+    picker.appendChild(option);
+  }
+  const preferred = policies.findIndex((p) => p.name === DEFAULT_POLICY);
+  picker.value = String(preferred >= 0 ? preferred : policies.length - 1);
+  const showPolicy = () => {
+    const p = policies[policyIndex()];
+    if (!p) return void (document.getElementById("policy-desc").textContent = "");
+    // Score first (how strong), then the measured cost per move (how slow) — nothing else.
+    const speed = p.speed ? ` / 1 手 ${p.speed}` : "";
+    document.getElementById("policy-desc").textContent = `${p.name}: ${p.score}${speed}`;
+  };
+  picker.addEventListener("change", showPolicy);
+  showPolicy();
+
+  for (const b of document.querySelectorAll("[data-dir]")) {
+    b.addEventListener("click", () => move(Number(b.dataset.dir)));
+  }
+  document.getElementById("new").addEventListener("click", newGame);
+  document.getElementById("step").addEventListener("click", () => solveStep());
+  document.getElementById("auto").addEventListener("click", () => {
+    if (running) return stopAuto();
+    running = true;
+    document.getElementById("auto").textContent = "Solver: stop";
+    autoFrame = requestAnimationFrame(autoLoop);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    // A focused <select> owns its arrow keys; do not turn them into board moves.
+    if (e.target instanceof Element && e.target.closest("select, input, button")) return;
+    const dir = CODES[e.code];
+    if (dir !== undefined) { e.preventDefault(); move(dir); }
+  });
+
+  newGame();
+})();
+</script>
+</body>
+</html>
