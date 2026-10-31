@@ -13,6 +13,13 @@ pub const Summary = struct {
     total_moves: u64,
     /// Deepest expectimax depth any move of the whole batch finished (`expectimax_id` only, else 0).
     max_depth: u8,
+    /// Games whose final `max_tile` is at or above the tile (counts, not rates); the average score is a
+    /// central measure, so how often a batch actually gets there has to be counted separately (#156).
+    reach_4096: u32,
+    reach_8192: u32,
+    reach_16384: u32,
+    /// Games that ended below 2048, i.e. died early.
+    dead_below_2048: u32,
 
     pub fn gamesPerSec(self: Summary) f64 {
         return @as(f64, @floatFromInt(self.games)) * 1e9 / @as(f64, @floatFromInt(self.elapsed_ns));
@@ -34,7 +41,17 @@ pub const Summary = struct {
     }
 };
 
-const RunResult = struct { score: u64 = 0, moves: u64 = 0, best_tile: u32 = 0, elapsed_ns: i96 = 0, max_depth: u8 = 0 };
+const RunResult = struct {
+    score: u64 = 0,
+    moves: u64 = 0,
+    best_tile: u32 = 0,
+    elapsed_ns: i96 = 0,
+    max_depth: u8 = 0,
+    reach_4096: u32 = 0,
+    reach_8192: u32 = 0,
+    reach_16384: u32 = 0,
+    dead_below_2048: u32 = 0,
+};
 
 /// What a run plays with: a named policy, or custom evaluation weights (`zig build evalab`).
 const Plan = union(enum) { policy: solver.Policy, weights: solver.Weights };
@@ -59,6 +76,10 @@ fn playRun(c: RunCtx, r: usize) RunResult {
         res.moves += result.moves;
         res.best_tile = @max(res.best_tile, result.max_tile);
         res.max_depth = @max(res.max_depth, solver.id_depth_reached);
+        if (result.max_tile >= 4096) res.reach_4096 += 1;
+        if (result.max_tile >= 8192) res.reach_8192 += 1;
+        if (result.max_tile >= 16384) res.reach_16384 += 1;
+        if (result.max_tile < 2048) res.dead_below_2048 += 1;
     }
     res.elapsed_ns = start.durationTo(std.Io.Clock.awake.now(c.io)).toNanoseconds();
     return res;
@@ -84,12 +105,20 @@ fn runPlan(io: std.Io, gpa: std.mem.Allocator, plan: Plan, runs: u32, games_per_
     var best_tile: u32 = 0;
     var serial_elapsed: i96 = 0;
     var max_depth: u8 = 0;
+    var reach_4096: u32 = 0;
+    var reach_8192: u32 = 0;
+    var reach_16384: u32 = 0;
+    var dead_below_2048: u32 = 0;
     for (per_run) |r| {
         total_score += r.score;
         total_moves += r.moves;
         best_tile = @max(best_tile, r.best_tile);
         max_depth = @max(max_depth, r.max_depth);
         serial_elapsed += r.elapsed_ns;
+        reach_4096 += r.reach_4096;
+        reach_8192 += r.reach_8192;
+        reach_16384 += r.reach_16384;
+        dead_below_2048 += r.dead_below_2048;
     }
     const games: u32 = runs * games_per_run;
     const elapsed = start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
@@ -103,6 +132,10 @@ fn runPlan(io: std.Io, gpa: std.mem.Allocator, plan: Plan, runs: u32, games_per_
         .serial_elapsed_ns = serial_elapsed,
         .total_moves = total_moves,
         .max_depth = max_depth,
+        .reach_4096 = reach_4096,
+        .reach_8192 = reach_8192,
+        .reach_16384 = reach_16384,
+        .dead_below_2048 = dead_below_2048,
     };
 }
 
@@ -133,6 +166,10 @@ test "parallel run matches a serial loop over the same 8 games" {
     var total_score: u64 = 0;
     var total_moves: u64 = 0;
     var best: u32 = 0;
+    var reach_4096: u32 = 0;
+    var reach_8192: u32 = 0;
+    var reach_16384: u32 = 0;
+    var dead: u32 = 0;
     for (0..4) |r| {
         var prng = std.Random.DefaultPrng.init(7 + r);
         for (0..2) |_| {
@@ -140,9 +177,17 @@ test "parallel run matches a serial loop over the same 8 games" {
             total_score += res.score;
             total_moves += res.moves;
             best = @max(best, res.max_tile);
+            if (res.max_tile >= 4096) reach_4096 += 1;
+            if (res.max_tile >= 8192) reach_8192 += 1;
+            if (res.max_tile >= 16384) reach_16384 += 1;
+            if (res.max_tile < 2048) dead += 1;
         }
     }
     try std.testing.expectEqual(@as(f64, @floatFromInt(total_score)) / 8, s.avg_score);
     try std.testing.expectEqual(@as(f64, @floatFromInt(total_moves)) / 8, s.avg_moves);
     try std.testing.expectEqual(best, s.best_tile);
+    try std.testing.expectEqual(reach_4096, s.reach_4096);
+    try std.testing.expectEqual(reach_8192, s.reach_8192);
+    try std.testing.expectEqual(reach_16384, s.reach_16384);
+    try std.testing.expectEqual(dead, s.dead_below_2048);
 }
