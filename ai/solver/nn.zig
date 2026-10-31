@@ -847,6 +847,11 @@ pub const Options = struct {
     /// Candidate (#158): self-play move of the per-move path. `greedy1` is the historical 1-ply argmax;
     /// `deep2` plays the eval's 2-ply search (`.deep`: same tie-break, spawns enumerated, no rng use).
     selfplay: SelfPlay = .greedy1,
+    /// Candidate (#159) `dump`: append every afterstate the plain per-move path visits whose max tile
+    /// reached `dump_min_tile` to `dump` (bounded, overflow dropped). The updates are unchanged.
+    dump_record: bool = false,
+    /// Deep-position buffer (#159): written by `dump_record`, read by the variants that train from it.
+    dump: ?*Dump = null,
 };
 
 /// Prioritized replay (issue #34): ring buffer of recent TD updates. After each game, `m` extra updates
@@ -930,6 +935,88 @@ pub const Priority = struct {
 
     fn weight(self: *const Priority, err: f64) f64 {
         return std.math.pow(f64, @abs(err) + err_floor, self.alpha);
+    }
+};
+
+/// Deep-position dump (issue #159): fixed-capacity buffer of afterstates whose max tile reached
+/// `dump_min_tile`. The score does not enter the TD target (reward = score_delta / `reward_scale`),
+/// so training from these positions means the same thing as training from them mid-game.
+///
+/// File layout (all little endian): 8-byte magic `2048-DMP`, u32 entry count, then `count` entries of
+/// 16 bytes — one byte per cell, row-major, holding log2 of the tile (0 = empty, so a 4096 is 12 and
+/// an 8192 is 13). Tiles are powers of two, so the round trip is exact.
+pub const dump_magic = "2048-DMP";
+pub const dump_min_tile: core.Tile = 4096;
+/// 1 MiB of entries: far more deep positions than one training run needs, small enough to heap-allocate.
+pub const dump_cap: usize = 1 << 16;
+pub const dump_header_len = 12;
+pub const dump_entry_len = core.BoardCellCount;
+
+pub const Dump = struct {
+    entries: [dump_cap][dump_entry_len]u8 = undefined,
+    len: usize = 0,
+    /// Deep afterstates seen after the buffer filled. They are discarded, so the dump stays the first
+    /// `dump_cap` ones in training order (no rng involved, hence deterministic).
+    dropped: u64 = 0,
+
+    /// Record `board` when its max tile reached `dump_min_tile`; shallower boards are ignored.
+    pub fn offer(self: *Dump, board: Board) void {
+        if (core.maxTile(board) < dump_min_tile) return;
+        if (self.len == dump_cap) {
+            self.dropped += 1;
+            return;
+        }
+        self.append(board);
+    }
+
+    pub fn append(self: *Dump, board: Board) void {
+        std.debug.assert(self.len < dump_cap);
+        for (0..core.BoardCellCount) |cell| {
+            const value = board[cell / core.BoardSize][cell % core.BoardSize];
+            self.entries[self.len][cell] = if (value == 0) 0 else @intCast(std.math.log2_int(core.Tile, value));
+        }
+        self.len += 1;
+    }
+
+    /// The `index`-th stored afterstate, decoded back to tiles.
+    pub fn boardAt(self: *const Dump, index: usize) Board {
+        var out: Board = undefined;
+        for (0..core.BoardCellCount) |cell| {
+            const level = self.entries[index][cell];
+            out[cell / core.BoardSize][cell % core.BoardSize] = if (level == 0) 0 else @as(core.Tile, 1) << @intCast(level);
+        }
+        return out;
+    }
+
+    fn encodeInto(self: *const Dump, bytes: []u8) void {
+        @memcpy(bytes[0..8], dump_magic);
+        std.mem.writeInt(u32, bytes[8..12], @intCast(self.len), .little);
+        @memcpy(bytes[dump_header_len..], std.mem.sliceAsBytes(self.entries[0..self.len]));
+    }
+
+    pub fn save(self: *const Dump, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
+        const bytes = try gpa.alloc(u8, dump_header_len + self.len * dump_entry_len);
+        defer gpa.free(bytes);
+        self.encodeInto(bytes);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+    }
+
+    pub fn parse(self: *Dump, bytes: []const u8) !void {
+        self.len = 0;
+        self.dropped = 0;
+        if (bytes.len < dump_header_len) return error.DumpTooShort;
+        if (!std.mem.eql(u8, bytes[0..8], dump_magic)) return error.BadDumpMagic;
+        const count = std.mem.readInt(u32, bytes[8..12], .little);
+        if (count > dump_cap) return error.DumpTooLarge;
+        if (bytes.len != dump_header_len + @as(usize, count) * dump_entry_len) return error.WrongDumpFileSize;
+        @memcpy(std.mem.sliceAsBytes(self.entries[0..count]), bytes[dump_header_len..]);
+        self.len = count;
+    }
+
+    pub fn load(self: *Dump, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(dump_header_len + dump_cap * dump_entry_len));
+        defer gpa.free(bytes);
+        try self.parse(bytes);
     }
 };
 
@@ -1121,6 +1208,7 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
     var trace: Net = std.mem.zeroes(Net);
     while (selfplayPick(vfn, state, opts.death, opts.selfplay)) |pick| {
         moves += 1;
+        if (opts.dump_record) if (opts.dump) |buffer| buffer.offer(pick.after);
         if (pending) |p| {
             // `state` is still the post-spawn board the pending step led into (this move has not been
             // applied yet), which is the board the `search2` target evaluates.
@@ -2119,6 +2207,97 @@ test "Diag tile table counts steps and |err| per max tile bucket" {
     try std.testing.expectEqual(@as(u64, 0), diag.stats[2][0].count);
     diag.finish();
     try std.testing.expectEqual(@as(u64, 6), diag.stats[2][0].count);
+}
+
+test "Dump keeps only afterstates at or above dump_min_tile" {
+    var dump: Dump = .{};
+    var shallow: Board = @splat(@splat(0));
+    shallow[0][0] = 2048;
+    var deep: Board = @splat(@splat(0));
+    deep[2][1] = dump_min_tile;
+    dump.offer(shallow);
+    try std.testing.expectEqual(@as(usize, 0), dump.len);
+    dump.offer(deep);
+    try std.testing.expectEqual(@as(usize, 1), dump.len);
+    try std.testing.expectEqual(deep, dump.boardAt(0));
+}
+
+test "Dump writes the header and log2 cells, and load reads them back byte for byte" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/dump.bin", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+
+    var dump: Dump = .{};
+    // board 0: 4096 at (0,0), empty elsewhere except a 2 at (3,3)
+    var first: Board = @splat(@splat(0));
+    first[0][0] = 4096;
+    first[3][3] = 2;
+    // board 1: 8192 at (1,2) and 128 at (2,0)
+    var second: Board = @splat(@splat(0));
+    second[1][2] = 8192;
+    second[2][0] = 128;
+    dump.offer(first);
+    dump.offer(second);
+    try dump.save(io, std.testing.allocator, path);
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqual(dump_header_len + 2 * dump_entry_len, bytes.len);
+    try std.testing.expectEqualStrings(dump_magic, bytes[0..8]);
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, bytes[8..12], .little));
+    // log2 of the tile, row-major: 4096 -> 12 at cell 0, 2 -> 1 at cell 15
+    try std.testing.expectEqual(@as(u8, 12), bytes[dump_header_len + 0]);
+    try std.testing.expectEqual(@as(u8, 0), bytes[dump_header_len + 1]);
+    try std.testing.expectEqual(@as(u8, 1), bytes[dump_header_len + 15]);
+    // 8192 -> 13 at cell 6 (1,2), 128 -> 7 at cell 8 (2,0)
+    try std.testing.expectEqual(@as(u8, 13), bytes[dump_header_len + 16 + 6]);
+    try std.testing.expectEqual(@as(u8, 7), bytes[dump_header_len + 16 + 8]);
+
+    var loaded: Dump = .{};
+    try loaded.load(io, std.testing.allocator, path);
+    try std.testing.expectEqual(@as(usize, 2), loaded.len);
+    try std.testing.expectEqual(@as(u64, 0), loaded.dropped);
+    try std.testing.expectEqual(first, loaded.boardAt(0));
+    try std.testing.expectEqual(second, loaded.boardAt(1));
+}
+
+test "Dump parse rejects a wrong magic and a truncated file" {
+    var dump: Dump = .{};
+    var bytes: [dump_header_len]u8 = @splat(0);
+    @memcpy(bytes[0..8], "2048-XXX");
+    try std.testing.expectError(error.BadDumpMagic, dump.parse(&bytes));
+    @memcpy(bytes[0..8], dump_magic);
+    std.mem.writeInt(u32, bytes[8..12], 1, .little);
+    try std.testing.expectError(error.WrongDumpFileSize, dump.parse(&bytes));
+    try std.testing.expectError(error.DumpTooShort, dump.parse("2048"));
+    std.mem.writeInt(u32, bytes[8..12], @intCast(dump_cap + 1), .little);
+    try std.testing.expectError(error.DumpTooLarge, dump.parse(&bytes));
+}
+
+test "dump_record leaves the weights and the rng consumption unchanged" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var a = Net.init(init_rng.random());
+    var b = a;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    const plain = trainGameOpts(&a, rng_a.random(), 0.003, null, .{});
+    var dump: Dump = .{};
+    var c = b;
+    var rng_c = std.Random.DefaultPrng.init(12);
+    const recorded = trainGameOpts(&b, rng_b.random(), 0.003, null, .{ .dump_record = true, .dump = &dump });
+    const again = trainGameOpts(&c, rng_c.random(), 0.003, null, .{ .dump_record = true, .dump = &dump });
+    try std.testing.expectEqual(plain.score, recorded.score);
+    try std.testing.expectEqual(plain.moves, recorded.moves);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+    // recording is a pure side effect: a second identical game overwrites the same entries in the same order
+    try std.testing.expectEqual(recorded.score, again.score);
+    try std.testing.expectEqual(recorded.moves, again.moves);
+    // a fresh net stays shallow, so most games record nothing; whatever it does record must be deep enough
+    for (0..dump.len) |i| try std.testing.expect(core.maxTile(dump.boardAt(i)) >= dump_min_tile);
 }
 
 test "trainGame with diagnostic gives the same weights and records steps" {

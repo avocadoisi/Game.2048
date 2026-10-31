@@ -6,7 +6,7 @@ const parallel = @import("parallel");
 const cli = @import("args.zig");
 
 const usage =
-    \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate] [seed_ranges|diag] [variant|par] [replay_k] [weights_path] [train_seed] [par]
+    \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate] [seed_ranges|diag] [variant|par] [replay_k] [weights_path] [train_seed] [par|-] [dump_path]
     \\
     \\  train_games   TD(0) self-play games; 0 loads ai/solver/nn_weights.bin (default 2000)
     \\  eval_games    games per seed range per policy, same seeds for every policy (default 100)
@@ -34,6 +34,8 @@ const usage =
     \\              mstd    (#107 MS-TD: one MLP per empty-cell stage (0..2, 3..4, 5..6, 7..8, 9..10,
     \\                       11..12, 13..16 empties); each TD step trains only the stage of the afterstate
     \\                       it reached. Weights go to a staged file (its own magic), so eval needs the same file)
+    \\              dump    (#159: plain per-move training that also stores every afterstate with max tile
+    \\                       >= 4096 into a bounded buffer and writes it to dump_path at the end)
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
     \\                game i uses seed train_seed + i and the batch result is the mean of its games.
     \\                (#99) as arg 10 it batches any stateless variant (base|backward|replay|sym|symlam|
@@ -41,10 +43,12 @@ const usage =
     \\                so replay_k is ignored there but its slot must be filled to reach weights_path.
     \\                Not supported for priority|midgame|midmix (cross-game replay buffer)
     \\                or t2|p2|tp2 (#158: the extra search per move is the whole cost, batching it too
-    \\                would only multiply the work)
+    \\                would only multiply the work). "-" here means the same as leaving it out, which
+    \\                is how dump_path is reached.
     \\  replay_k      afterstates re-trained per game for variant replay (default 30)
     \\  weights_path  file to load (train_games 0) or write (default ai/solver/nn_weights.bin); use a temp path for variant runs
     \\  train_seed    seed for weight init and self-play games (default 1, omitted = same weights as before #56)
+    \\  dump_path     file for the deep-position buffer (#159); required by variant dump, after a "-" par slot (#159)
     \\
     \\Weights are written to `weights_path` only when train_games > 0;
     \\train_games = 0 (eval only) never writes.
@@ -64,9 +68,11 @@ const default_seed_ranges: u32 = 1;
 const default_train_seed: u64 = 1;
 
 /// Positional arg 10, appended after `train_seed`: the literal "par" runs the variant of arg 6 in
-/// parallel batches (issue #99). Arg 6 `par` keeps its meaning (base + parallel).
+/// parallel batches (issue #99). "-" is the explicit "no par" placeholder that opens the dump slots
+/// of #159; any other value is a typo.
 fn parseParFlag(args: []const []const u8) !bool {
     if (args.len <= 10) return false;
+    if (std.mem.eql(u8, args[10], "-")) return false;
     if (!std.mem.eql(u8, args[10], "par")) return error.InvalidParFlag;
     return true;
 }
@@ -178,9 +184,14 @@ pub fn main(init: std.process.Init) !void {
     const use_par = par_variant or par_tail;
     const use_resume = std.mem.eql(u8, variant, "resume");
     const is_mstd = std.mem.eql(u8, variant, "mstd");
+    const is_dump = std.mem.eql(u8, variant, "dump");
     const replay_k: usize = try cli.argOr(usize, args, 7, default_replay_k);
     const weights_path: []const u8 = try cli.argOr([]const u8, args, 8, default_weights_path);
     const train_seed: u64 = try cli.argOr(u64, args, 9, default_train_seed);
+    // Deep-position buffer (#159). Index 10 must say "par" or "-" (see `parseParFlag`); index 11 is the
+    // dump path.
+    const dump_path: ?[]const u8 = if (args.len > 11) args[11] else null;
+    var dump: nn.Dump = .{};
     var priority: nn.Priority = .{};
     const opts: nn.Options = if (par_variant or use_resume or std.mem.eql(u8, variant, "base"))
         .{}
@@ -210,17 +221,23 @@ pub fn main(init: std.process.Init) !void {
         .{ .selfplay = .deep2 }
     else if (std.mem.eql(u8, variant, "tp2"))
         .{ .target = .search2, .selfplay = .deep2 }
+    else if (is_dump)
+        .{ .dump_record = true, .dump = &dump }
     else if (std.mem.eql(u8, variant, "oi") or std.mem.eql(u8, variant, "oi16") or is_mstd)
         .{}
     else {
         std.debug.print("{s}", .{usage});
         return;
     };
-    if (args.len > 11 or eval_games == 0 or seed_ranges == 0) {
+    // `dump` is the shared layout plus one slot: index 11 carries the dump path.
+    const max_args: usize = if (is_dump) 12 else 11;
+    if (args.len > max_args or eval_games == 0 or seed_ranges == 0 or (is_dump and dump_path == null)) {
         std.debug.print("{s}", .{usage});
         return;
     }
-    if (use_par and !parSupported(opts, is_mstd)) {
+    // the priority ring buffer and the dump are cross-game state shared by pointer: batching would
+    // race on them. `mstd` has no batch path either (one staged net is ~1 MB).
+    if (use_par and (!parSupported(opts, is_mstd) or opts.dump_record)) {
         std.debug.print("{s}", .{usage});
         return;
     }
@@ -288,6 +305,11 @@ pub fn main(init: std.process.Init) !void {
             variant_label,
         });
         if (want_diag and !is_mstd) printDiag(&diag);
+        if (is_dump) {
+            const path = dump_path.?;
+            try dump.save(init.io, init.gpa, path);
+            std.debug.print("dump: {d} deep afterstates ({d} dropped) -> {s}\n", .{ dump.len, dump.dropped, path });
+        }
         if (is_mstd) try staged.saveFile(init.io, init.gpa, weights_path) else try nn.save(&net, init.io, weights_path);
     }
 
@@ -454,6 +476,9 @@ test "par flag is off without arg 10 and on with the literal par" {
     try std.testing.expect(try parseParFlag(&eleven_args));
     const typo = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "sym", "30", "x.bin", "3", "pa" };
     try std.testing.expectError(error.InvalidParFlag, parseParFlag(&typo));
+    // "-" is the explicit "no par" placeholder that #159 uses to reach the dump path
+    const dash = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "dump", "30", "x.bin", "3", "-", "x.dmp" };
+    try std.testing.expect(!try parseParFlag(&dash));
 }
 
 test "usage text documents the par flag for stateless variants" {
@@ -462,6 +487,11 @@ test "usage text documents the par flag for stateless variants" {
 
 test "usage text lists the symbatch variant" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "symbatch (#98") != null);
+}
+
+test "usage text lists the dump variant and its dump_path slot" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "dump    (#159") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "[dump_path]") != null);
 }
 
 test "usage text lists the mstd variant" {
