@@ -120,3 +120,9 @@ zig build ga-rl  -- 16 15 8 2 1 500 100                                  # popul
 - TDD: Red → Green → Refactor。`zig build test` が常に緑
 - Deterministic: seed 固定で再現可能にする（時間予算を使う `expectimax_id` だけは例外）
 - 変更は issue → worktree → PR。1 行の docs 修正は main へ直接 commit。手順は global の `dev-workflow` skill（`/skill:dev-workflow`）
+
+## ライセンス
+
+MIT（`LICENSE`）。タイルの配色は Gabriele Cirulli の 2048（MIT）に由来するので、
+その著作権表示を `NOTICE` に置いている。ゲームのルール自体は著作権の対象外で、
+コードはこのリポジトリの独自実装（元祖のコードは使っていない）。
