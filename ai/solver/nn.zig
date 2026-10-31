@@ -852,6 +852,10 @@ pub const Options = struct {
     dump_record: bool = false,
     /// Deep-position buffer (#159): written by `dump_record`, read by the variants that train from it.
     dump: ?*Dump = null,
+    /// Candidate (#159) `ft2`: one extra TD(0) update from a uniformly drawn deep afterstate of `dump`
+    /// per self-play step, so half the update budget stays on the self-play trajectory (uniform over the
+    /// whole game, shallow positions included) and half lands on the deep tail.
+    deep_mix: bool = false,
 };
 
 /// Prioritized replay (issue #34): ring buffer of recent TD updates. After each game, `m` extra updates
@@ -938,6 +942,16 @@ pub const Priority = struct {
     }
 };
 
+/// One TD(0) step on a stored deep afterstate (#159 `ft2`). The board carries no history, so the reward
+/// of the move that led out of it is unknown and the target is the value of its greedy successor (reward 0).
+/// A dead board has no successor, hence no target.
+fn deepStep(net: *Net, rng: std.Random, buffer: *Dump, lr: f64, cache: *Cache) void {
+    const start = GameState{ .board = buffer.draw(rng), .score = 0 };
+    const pick = pickMove(net, start, false) orelse return;
+    _ = forward(net, start.board, cache);
+    train(net, cache, pick.value, lr);
+}
+
 /// Deep-position dump (issue #159): fixed-capacity buffer of afterstates whose max tile reached
 /// `dump_min_tile`. The score does not enter the TD target (reward = score_delta / `reward_scale`),
 /// so training from these positions means the same thing as training from them mid-game.
@@ -958,6 +972,8 @@ pub const Dump = struct {
     /// Deep afterstates seen after the buffer filled. They are discarded, so the dump stays the first
     /// `dump_cap` ones in training order (no rng involved, hence deterministic).
     dropped: u64 = 0,
+    /// Deep afterstates drawn for training (`ft2`, `restart`). Not part of the file.
+    draws: u64 = 0,
 
     /// Record `board` when its max tile reached `dump_min_tile`; shallower boards are ignored.
     pub fn offer(self: *Dump, board: Board) void {
@@ -986,6 +1002,14 @@ pub const Dump = struct {
             out[cell / core.BoardSize][cell % core.BoardSize] = if (level == 0) 0 else @as(core.Tile, 1) << @intCast(level);
         }
         return out;
+    }
+
+    /// Uniform draw of one stored afterstate, counted so the 50/50 mix of `ft2` is observable.
+    /// Uniform on purpose: #33/#34/#56 lost with |TD error| and midgame resampling of existing data.
+    pub fn draw(self: *Dump, rng: std.Random) Board {
+        std.debug.assert(self.len > 0);
+        self.draws += 1;
+        return self.boardAt(rng.uintLessThan(usize, self.len));
     }
 
     fn encodeInto(self: *const Dump, bytes: []u8) void {
@@ -1218,6 +1242,8 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
             trainStep(net, &cache, p.after, target, lr, opts, &trace);
         }
         pending = pick;
+        // `ft2` mixes one deep update into every self-play step: 50% self-play / 50% deep afterstates.
+        if (opts.deep_mix) if (opts.dump) |buffer| if (buffer.len > 0) deepStep(net, rng, buffer, lr, &cache);
         _ = state.move(pick.dir, rng);
     }
     if (pending) |p| {
@@ -2298,6 +2324,38 @@ test "dump_record leaves the weights and the rng consumption unchanged" {
     try std.testing.expectEqual(recorded.moves, again.moves);
     // a fresh net stays shallow, so most games record nothing; whatever it does record must be deep enough
     for (0..dump.len) |i| try std.testing.expect(core.maxTile(dump.boardAt(i)) >= dump_min_tile);
+}
+
+test "ft2 mixes one deep draw per self-play step and is deterministic" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var a = Net.init(init_rng.random());
+    var b = a;
+    var plain_net = a;
+    var dump: Dump = .{};
+    var first: Board = @splat(@splat(0));
+    first[0][0] = dump_min_tile;
+    first[0][1] = 4;
+    var second: Board = @splat(@splat(0));
+    second[2][2] = dump_min_tile * 2;
+    second[3][0] = 2;
+    dump.append(first);
+    dump.append(second);
+
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    var rng_plain = std.Random.DefaultPrng.init(12);
+    const game = trainGameOpts(&a, rng_a.random(), 0.001, null, .{ .deep_mix = true, .dump = &dump });
+    const again = trainGameOpts(&b, rng_b.random(), 0.001, null, .{ .deep_mix = true, .dump = &dump });
+    _ = trainGameOpts(&plain_net, rng_plain.random(), 0.001, null, .{});
+
+    // one deep draw per self-play step, and no draw at all without the dump: 50% self-play / 50% deep
+    try std.testing.expectEqual(@as(u64, game.moves) * 2, dump.draws);
+    // same seed -> same games and byte-identical weights
+    try std.testing.expectEqual(game.moves, again.moves);
+    try std.testing.expectEqual(game.score, again.score);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+    // the deep half is not a no-op: it changes the weights (and with them the rest of the game)
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&a), std.mem.asBytes(&plain_net)));
 }
 
 test "trainGame with diagnostic gives the same weights and records steps" {
