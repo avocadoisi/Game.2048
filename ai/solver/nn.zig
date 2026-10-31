@@ -504,7 +504,8 @@ const Search = struct {
 };
 
 /// `depth.ply` own moves deep: my move -> spawn -> ... -> afterstate value + score_delta/reward_scale.
-/// `ply` 2 is `deep` (full width); `ply` 3 is `deep3`, whose cost only fits with a spawn-probability cut.
+/// `ply` 2 is `deep` (full width); `ply` 3 is `deep3`, whose cost only fits with a spawn-probability cut;
+/// `ply` 4 is `phase_h4` (#171), which only ever runs where the board is nearly full.
 fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, depth: Depth) ?Direction {
     var search: Search = .{ .vfn = vfn, .cache = cache, .cutoff = depth.cutoff, .ply = depth.ply };
     defer stats.* = search.stats;
@@ -588,6 +589,10 @@ pub const Mode = enum {
     phase_h2,
     /// 2-ply only down to 10 empty cells, then 3-ply from 6 and the 1e-4 cut near the end (#157).
     phase_h3,
+    /// 3-ply everywhere, then 4-ply once 2 or fewer empty cells are left (#171): the endgame is where
+    /// the branching factor collapses, so the extra ply is cheap there and it is the ply that decides
+    /// 4096 -> 8192.
+    phase_h4,
 };
 
 /// One row of a phase schedule (#157): a board with at least `min_empty` empty cells searches `ply`
@@ -622,6 +627,13 @@ const phase_schedules = struct {
         .{ .min_empty = 6, .ply = 3, .cutoff = deep3_cutoff },
         .{ .min_empty = 0, .ply = 3, .cutoff = phase_tight_cutoff },
     };
+    /// #171: `deep3` is the baseline and the only row that changes is the very end, so the rows above
+    /// the 3-empty boundary are one row. 4-ply keeps the `deep3` cut because the tree it searches is
+    /// already tiny — at 2 empties it is a handful of spawns, not a midgame branching factor.
+    const phase_h4 = [_]Phase{
+        .{ .min_empty = 3, .ply = 3, .cutoff = deep3_cutoff },
+        .{ .min_empty = 0, .ply = 4, .cutoff = deep3_cutoff },
+    };
 };
 
 /// Rows `mode` searches with, in the order they are matched; empty for the 1-ply modes.
@@ -633,6 +645,7 @@ fn schedule(mode: Mode) []const Phase {
         .phase_h1 => &phase_schedules.phase_h1,
         .phase_h2 => &phase_schedules.phase_h2,
         .phase_h3 => &phase_schedules.phase_h3,
+        .phase_h4 => &phase_schedules.phase_h4,
     };
 }
 
@@ -682,7 +695,7 @@ pub fn bestMoveWithCacheValue(vfn: Value, state: GameState, mode: Mode, stats: *
         .greedy => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
         .chance => chanceMove(vfn, state),
         // every search mode takes its (ply, cutoff) for this board from the phase table (#157)
-        .deep, .deep3, .phase_h1, .phase_h2, .phase_h3 => deepMove(vfn, state, stats, cache, phaseDepth(mode, state.board)),
+        .deep, .deep3, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, phaseDepth(mode, state.board)),
     };
 }
 
@@ -1757,6 +1770,50 @@ test "phase_h2 and phase_h3 equal deep3 on a board with 4 empty cells (#157)" {
     try std.testing.expect(deep3_move != null);
     try std.testing.expectEqual(deep3_move, h2_move);
     try std.testing.expectEqual(deep3_move, h3_move);
+}
+
+test "phase h4 depth 4 only in the last two empty cells (#171)" {
+    // 4-ply from 2 empty cells down; everything above that is the `deep3` baseline
+    for (0..17) |empties| {
+        const depth = phaseDepth(.phase_h4, boardWithEmpties(empties));
+        try std.testing.expectEqual(if (empties <= 2) @as(u8, 4) else @as(u8, 3), depth.ply);
+        try std.testing.expectEqual(deep3_cutoff, depth.cutoff);
+    }
+    // the extra ply is really searched: one more own move and spawn layer than `deep3` costs on the same board
+    var prng = std.Random.DefaultPrng.init(171);
+    const net = Net.init(prng.random());
+    const endgame: GameState = .{ .board = boardWithEmpties(2) };
+    var h4_stats: Stats = .{};
+    var deep3_stats: Stats = .{};
+    const h4_move = bestMoveWithStats(&net, endgame, .phase_h4, &h4_stats);
+    _ = bestMoveWithStats(&net, endgame, .deep3, &deep3_stats);
+    try std.testing.expect(h4_move != null);
+    try std.testing.expect(h4_stats.leaves > deep3_stats.leaves);
+}
+
+test "phase_h4 leaves the earlier schedules alone (#171)" {
+    // the phase table is shared, so adding a row must not move where the existing modes switch
+    for (0..17) |empties| {
+        const board = boardWithEmpties(empties);
+        try std.testing.expectEqual(Depth{ .ply = 2, .cutoff = 0 }, phaseDepth(.deep, board));
+        try std.testing.expectEqual(Depth{ .ply = 3, .cutoff = deep3_cutoff }, phaseDepth(.deep3, board));
+        const h1: Depth = if (empties >= 8) .{ .ply = 2, .cutoff = 0 } else .{ .ply = 3, .cutoff = deep3_cutoff };
+        try std.testing.expectEqual(h1, phaseDepth(.phase_h1, board));
+        const h2: Depth = if (empties >= 8)
+            .{ .ply = 2, .cutoff = 0 }
+        else if (empties >= 5)
+            .{ .ply = 3, .cutoff = deep3_cutoff }
+        else
+            .{ .ply = 3, .cutoff = phase_tight_cutoff };
+        try std.testing.expectEqual(h2, phaseDepth(.phase_h2, board));
+        const h3: Depth = if (empties >= 10)
+            .{ .ply = 2, .cutoff = 0 }
+        else if (empties >= 6)
+            .{ .ply = 3, .cutoff = deep3_cutoff }
+        else
+            .{ .ply = 3, .cutoff = phase_tight_cutoff };
+        try std.testing.expectEqual(h3, phaseDepth(.phase_h3, board));
+    }
 }
 
 test "phase modes are deterministic for a fixed board (#157)" {
