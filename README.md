@@ -21,13 +21,21 @@ zig build run -- help
 - `play`: `w/a/s/d` または `up/left/down/right` で移動、`n` でリセット、`q` で終了
 - `serve`: 矢印キー/WASD で操作。`GET /api/state`、`POST /api/new`、`POST /api/move?dir=left`、
   `GET /api/solve?depth=2&algo=nn2`、`GET /api/ranking`。solver の自動再生と速度選択ができる
-- 静的配信: `bash scripts/deploy-pages.sh` で GitHub Pages へ手動デプロイ（wasm ビルド → スモークテスト → `gh-pages` へ force push）。
-  中身は `zig-out/web/`（`index.html` + `game2048.wasm`、763 KB / gzip 後 280 KiB）だけで、NN 重みは wasm に埋め込み済み、n-tuple 表は含まない。
-  初回だけ `--enable` を付けると Pages を有効化する（**private リポジトリは Pro 以上が必要**）。`--dry-run` でビルドと検証だけ。
-  Pages を使わない場合の手元確認は `zig build wasm -Doptimize=ReleaseFast` のあと
-  確認は `node scripts/wasm-smoke.mjs`、表示は `python3 -m http.server 8000 -d zig-out/web`
-  静的版は**方針を選ばせない**（`nn2` 2-ply 固定、自動再生は常に最大速度）。1 手 1.3 ms、`nn3` は
-  23 ms、`expectimax_id` は freestanding に時計が無く深化が止まらないため、選ばせる意味が無い (#143)
+- 静的配信: `bash scripts/deploy-pages.sh`（ビルド → スモークテスト → `gh-pages` へ push）。
+  手元で見るだけなら `zig build wasm -Doptimize=ReleaseFast` のあと `python3 -m http.server 8000 -d zig-out/web`。
+  静的版は方針を選ばせない（`nn2` 2-ply 固定、自動再生は常に最大速度）
+
+## サイズ
+
+| 何 | 大きさ | 中身 |
+| --- | ---: | --- |
+| `game2048.wasm` | 747 KiB | gzip 282 KiB。ゲーム + solver 13 方針 + NN 重み |
+| 初期メモリ | 2.44 MiB | `memory.grow` なし。スタック 1 MiB、静的データ 1.4 MiB（うち TT 640 KiB） |
+| NN 重み | 148 KB | `@embedFile`。実行時に外部ファイルを取らない |
+| n-tuple 表 | 64.6 MiB | wasm には入れない（native の API 専用） |
+
+ブラウザへ配るのは HTML と wasm の 2 ファイルだけ。NN 系は重み込みでこの中に収まるので、
+サーバーも外部アセットも無しで `nn2` が 1 手 1.3 ms で動く。
 
 ## コア API
 
@@ -130,6 +138,4 @@ zig build ga-rl  -- 16 15 8 2 1 500 100                                  # popul
 
 ## ライセンス
 
-MIT（`LICENSE`）。タイルの配色は Gabriele Cirulli の 2048（MIT）に由来するので、
-その著作権表示を `NOTICE` に置いている。ゲームのルール自体は著作権の対象外で、
-コードはこのリポジトリの独自実装（元祖のコードは使っていない）。
+MIT（`LICENSE`）。タイルの配色は Gabriele Cirulli の 2048（MIT）由来で、著作権表示は `NOTICE` に置いている。
