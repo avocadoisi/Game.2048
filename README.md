@@ -1,5 +1,7 @@
 # Game.2048
 
+ブラウザで遊ぶ: **https://avocadoisi.github.io/Game.2048/** （wasm、solver は `nn2` 固定で自動再生）
+
 Zig で書いた 2048。ゲームロジックを `2048.core` として切り出し、CLI / HTTP サーバー / WASM / solver AI が同じコアを使う。
 
 - Zig **0.17**（`std.Io` / `std.process.Init` 系 API）
