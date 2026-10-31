@@ -53,7 +53,10 @@ if ((run_smoke)); then
 fi
 
 size=$(wc -c <zig-out/web/game2048.wasm | tr -d ' ')
-echo "==> build ok: game2048.wasm ${size} bytes, from ${branch} @ ${commit}"
+# Which policies went in is config (`wasm.policies`), so put it in the log: the deployed page offers
+# exactly these, nothing else (#154).
+policies=$(grep -v '^[[:space:]]*#' wasm.policies | tr -s '[:space:],' ' ' | sed -e 's/^ *//' -e 's/ *$//')
+echo "==> build ok: game2048.wasm ${size} bytes, policies: ${policies}, from ${branch} @ ${commit}"
 
 if ((dry_run)); then
   echo "==> --dry-run: not pushing"

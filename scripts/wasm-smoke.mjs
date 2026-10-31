@@ -52,22 +52,39 @@ if (w.score() < 0) fail("score must not be negative");
 const best = w.best_tile();
 if (best !== Math.max(...snapshot())) fail(`best_tile() = ${best}, board max = ${Math.max(...snapshot())}`);
 
-// Solver: every policy must return a legal direction (or -1), and moving it must work.
+// Solver: every policy must return a legal direction, and moving it must work.
 const algoCount = w.algo_count();
 if (algoCount < 1) fail("algo_count() must be >= 1");
 
+const text = (ptr, len) => new TextDecoder().decode(new Uint8Array(w.memory.buffer, ptr, len));
 const names = [];
-for (let i = 0; i < algoCount; i++) {
-  const len = w.algo_name_len(i);
-  names.push(new TextDecoder().decode(new Uint8Array(w.memory.buffer, w.algo_name(i), len)));
-}
-if (!names.includes("expectimax")) fail("algo names missing expectimax: " + JSON.stringify(names));
-if (!names.includes("nn3")) fail("algo names missing nn3 (the static page's fixed policy): " + JSON.stringify(names));
+for (let i = 0; i < algoCount; i++) names.push(text(w.algo_name(i), w.algo_name_len(i)));
 
-// The page falls back to `expectimax` without a word when its policy name is missing, so bind the
-// two: the shipped HTML and this test must agree on the name.
+// Which policies ship is deploy config, so bind the module to that file (#154): same names, same
+// order, and a description for each — the page renders both and has no list of its own.
+const spec = readFileSync(join(root, "wasm.policies"), "utf8");
+const want = spec
+  .split("\n")
+  .map((line) => line.split("#")[0])
+  .join(" ")
+  .split(/[\s,]+/)
+  .filter(Boolean);
+if (want.length === 0) fail("wasm.policies names no policy");
+if (algoCount !== want.length) {
+  fail(`wasm.policies lists ${want.length} policies (${want.join(", ")}) but the module offers ${algoCount} (${names.join(", ")})`);
+}
+for (const [i, name] of want.entries()) {
+  if (names[i] !== name) fail(`algo ${i} is ${names[i]}, wasm.policies says ${name}`);
+}
+for (let i = 0; i < algoCount; i++) {
+  const desc = text(w.algo_desc(i), w.algo_desc_len(i));
+  if (desc.length < 10) fail(`algo ${names[i]} has no description (${JSON.stringify(desc)})`);
+}
+
+// The page builds its dropdown from the module, so it cannot name a policy that is not compiled in.
 const html = readFileSync(join(root, "zig-out/web/index.html"), "utf8");
-if (!html.includes('const SOLVER_NAME = "nn3"')) fail("zig-out/web/index.html is not built around nn3");
+if (!html.includes("algo_count()")) fail("zig-out/web/index.html does not build its policy list from the module");
+if (html.includes("SOLVER_NAME")) fail("zig-out/web/index.html still hardcodes a policy name");
 
 // A timed search cannot expire on a frozen clock, so `expectimax_id` used to run to id_max_depth and
 // hang this script for minutes (#143, #145). Budget each call so the regression cannot come back
@@ -79,23 +96,17 @@ let slowest = 0;
 for (let algo = 0; algo < algoCount; algo++) {
   w.init(777 + algo, 0);
   const t0 = performance.now();
-  const dir = w.solve(algo, 1);
+  const dir = w.solve(algo, 0);
   const solveMs = performance.now() - t0;
   if (solveMs > SOLVE_LIMIT_MS) fail(`solve(${algo}) took ${Math.round(solveMs)} ms (limit ${SOLVE_LIMIT_MS})`);
   slowest = Math.max(slowest, solveMs);
   if (dir < -1 || dir > 3) fail(`solve(${algo}) returned out-of-range direction ${dir}`);
-  if (dir === -1) continue; // no legal move
+  // A fresh game always has a legal move, so -1 here is a bug, not a dead end.
+  if (dir === -1) fail(`solve(${names[algo]}) returned -1 on a fresh game`);
   const before = snapshot();
   const result = w.move(dir);
   if (result !== 1) fail(`solve(${algo}) returned direction ${dir} but moving it returned ${result}`);
   if (before.join() === snapshot().join()) fail(`solve(${algo}) direction ${dir} did not change the board`);
 }
-
-// A fresh game always has a legal move for the policies the page uses (depth 2).
-w.init(777, 0);
-const expectimax = names.indexOf("expectimax");
-if (w.solve(expectimax, 1) < 0) fail("solve(expectimax) returned -1 on a fresh game");
-w.init(777, 0);
-if (w.solve(names.indexOf("nn3"), 2) < 0) fail("solve(nn3, 2) returned -1 on a fresh game");
 
 console.log(`OK: ${bytes.length} bytes wasm, ${algoCount} policies (${names.join(", ")}), ${applied} applied moves, slowest solve ${Math.round(slowest)} ms`);
