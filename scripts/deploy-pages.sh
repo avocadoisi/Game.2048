@@ -74,13 +74,16 @@ git -C "$tmp" push -q -f "$remote_url" HEAD:gh-pages
 
 if ((enable)); then
   echo "==> enabling Pages (source: gh-pages /)"
+  # 409 means it is already on, which is the normal case after the first deploy. There is no
+  # builds POST: a push to gh-pages triggers the build, and that endpoint answers 204 (empty
+  # body), which `gh` cannot parse as JSON (issue #149).
   gh api -X POST "repos/${repo}/pages" \
-    -f "source[branch]=gh-pages" -f "source[path]=/" >/dev/null || {
-    echo "enabling Pages failed — is the repository public (or the plan Pro+)?" >&2
+    -f "source[branch]=gh-pages" -f "source[path]=/" >/dev/null 2>&1 || true
+  if ! status=$(gh api "repos/${repo}/pages" -q '.status + "  " + .html_url' 2>/dev/null); then
+    echo "Pages is not enabled — is the repository public (or the plan Pro+)?" >&2
     exit 1
-  }
-  gh api -X POST "repos/${repo}/pages/builds" >/dev/null || true
-  echo "==> https://$(echo "$repo" | cut -d/ -f1).github.io/$(echo "$repo" | cut -d/ -f2)/"
+  fi
+  echo "==> Pages: ${status}"
 else
   echo "==> pushed. Enable Pages once with:"
   echo "    gh api -X POST repos/${repo}/pages -f source[branch]=gh-pages -f source[path]=/"
