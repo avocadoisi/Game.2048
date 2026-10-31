@@ -54,16 +54,18 @@ zig build ranking -Doptimize=ReleaseFast -- 5 20 1000                 # 全ポ�
 zig build ranking -Doptimize=ReleaseFast -- 5 20 1000 nn,nn2          # 末尾引数でポリシーを絞る
 ```
 
-現状のおおよその強さ（ReleaseFast、depth 2、seed 7000 前後、20〜50 ゲーム）:
+現状のおおよその強さ（ReleaseFast、評価 seed 9000、100 ゲーム。行ごとに条件が違うので数字は目安）:
 
 | 手法 | avg score | 到達 |
 |---|---:|---|
-| `nn2`（committed weights, ranking seed 1000） | 72,205 | 8192 |
-| `expectimax_id`（1 ms/手, 50 ゲーム） | 69,383 | 8192 |
-| `expectimax_tt`（depth 3, 50 ゲーム） | 51,814 | 8192 |
-| `expectimax`（depth 2, 既定, 20 ゲーム） | 36,410 | 4096 |
+| `nn2`（committed weights, 100 ゲーム） | 90,358 | 8192 |
+| `expectimax_id`（2 ms/手, 100 ゲーム） | 75,202 | 8192 |
+| `expectimax_tt`（depth 3, 200 ゲーム） | 52,736 | 8192 |
+| `ntuple` 1-ply（wide 表 10M ゲーム） | 20,014 | 2048 |
+| `expectimax`（depth 2, 既定, 100 ゲーム） | 34,000 | 4096 |
 
-学習を伸ばすと変わる（TD 学習の `nn` は 40 万ゲームで 2-ply 76,977、n-tuple は wide 表 100 万ゲームで 2-ply 39,344）。
+`nn` / `ntuple` の数値は手作り評価と違い、学習ゲーム数に強く依存する
+（n-tuple の 2-ply は wide 表 10M で 51,951、TD の `nn` は 100k がピークで 400k まで回すと 73,007 に落ちる）。
 
 数字は条件で動く。系譜・却下した案・A/B の履歴は [docs/solver-history.md](docs/solver-history.md)、
 評価関数の比較基盤は [docs/evalab.md](docs/evalab.md) にある。
