@@ -544,15 +544,14 @@ fn search2Value(vfn: Value, state: GameState, cache: *ValueCache) f64 {
     return search.bootValue(state, search2_ply - 1, 1);
 }
 
-/// `pickMoveValue` for the 2-ply self-play policy (#158): candidates are ranked by the eval's `.deep`
-/// value, `reward + Search.chance(afterstate)` — the `1 + search2_ply` own moves deep that `deepMove`
-/// at `ply = search2_ply` scores — so `Pick.value` is that chance value (not `V`), covering
-/// `search2_ply` moves and a reward-bearing leaf below the afterstate. `search2Value` bootstraps the
-/// same tree with its last reward moved into the leaf, so a `search2` target spans `search2_ply`
-/// rewards and V one move past the last of them. Spawns are enumerated, so this draws nothing from
-/// the rng and the spawn sequence of the game is the same as with `greedy1`.
-fn pickSearch2Value(vfn: Value, state: GameState, cache: *ValueCache) ?Pick {
-    var search: Search = .{ .vfn = vfn, .cache = cache };
+/// Self-play move under `Options.teacher` (#167): the mode's own move ranking, `reward +
+/// `Search.chance(afterstate)` at the mode's phase row — the moves `Mode.deep` / `Mode.deep3` pick —
+/// so `Pick.value` is that chance value (not `V`) and `reward + value` is the teacher's q of the move.
+/// `teacherValue` of the board this move is made on is the tree one own move deeper, exactly as
+/// `deepMove` scores the same move. Spawns are enumerated, so this draws nothing from the rng.
+fn pickTeacherValue(vfn: Value, state: GameState, mode: Mode, cache: *ValueCache) ?Pick {
+    const depth = phaseDepth(mode, state.board);
+    var search: Search = .{ .vfn = vfn, .cache = cache, .cutoff = depth.cutoff, .ply = depth.ply };
     var best: ?Pick = null;
     var best_value: f64 = -std.math.inf(f64);
     for ([_]Direction{ .up, .left, .down, .right }) |d| {
@@ -563,7 +562,7 @@ fn pickSearch2Value(vfn: Value, state: GameState, cache: *ValueCache) ?Pick {
             .dir = d,
             .after = next.board,
             .reward = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale,
-            .value = search.chance(next, search2_ply, 1),
+            .value = search.chance(next, depth.ply, 1),
         };
         const value = pick.reward + pick.value;
         if (best == null or value > best_value) {
@@ -572,6 +571,19 @@ fn pickSearch2Value(vfn: Value, state: GameState, cache: *ValueCache) ?Pick {
         }
     }
     return best;
+}
+
+/// `pickMoveValue` for the 2-ply self-play policy (#158): candidates are ranked by the eval's `.deep`
+/// value, `reward + Search.chance(afterstate)` — the `1 + search2_ply` own moves deep that `deepMove`
+/// at `ply = search2_ply` scores — so `Pick.value` is that chance value (not `V`), covering
+/// `search2_ply` moves and a reward-bearing leaf below the afterstate. `search2Value` bootstraps the
+/// same tree with its last reward moved into the leaf, so a `search2` target spans `search2_ply`
+/// rewards and V one move past the last of them. Spawns are enumerated, so this draws nothing from
+/// the rng and the spawn sequence of the game is the same as with `greedy1`.
+/// The `.deep` phase row is `(ply = search2_ply, full width)`, so this is `pickTeacherValue(.., .deep)`:
+/// the `d2` cell of #167 plays exactly this move.
+fn pickSearch2Value(vfn: Value, state: GameState, cache: *ValueCache) ?Pick {
+    return pickTeacherValue(vfn, state, .deep, cache);
 }
 
 pub const Mode = enum {
@@ -860,6 +872,13 @@ pub const Options = struct {
     /// Candidate (#158): self-play move of the per-move path. `greedy1` is the historical 1-ply argmax;
     /// `deep2` plays the eval's 2-ply search (`.deep`: same tie-break, spawns enumerated, no rng use).
     selfplay: SelfPlay = .greedy1,
+    /// Candidate (#167) `d2` / `d3`: distillation. When set, the per-move target is the search value of
+    /// the post-spawn board under this mode (`teacherValue`: the mode's phase row, `ply` own moves and
+    /// the eval's `V` at the leaf) and the self-play move is that same mode's move (`pickTeacherValue`),
+    /// so policy and target look at one tree. `.deep` distils the 2-ply value, `.deep3` the 3-ply one a
+    /// 2-ply eval could not afford at play time. `null` (the default) keeps `target` / `selfplay`; when
+    /// set, both are ignored. Modes with a phase schedule only (`.greedy` / `.chance` have none).
+    teacher: ?Mode = null,
     /// Candidate (#159) `dump`: append every afterstate the plain per-move path visits whose max tile
     /// reached `dump_min_tile` to `dump` (bounded, overflow dropped). The updates are unchanged.
     dump_record: bool = false,
@@ -1255,12 +1274,12 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
     var cache: Cache = .{};
     var moves: u32 = 0;
     var trace: Net = std.mem.zeroes(Net);
-    while (selfplayPick(vfn, state, opts.death, opts.selfplay)) |pick| {
+    while (selfplayPick(vfn, state, opts.death, opts.selfplay, opts.teacher)) |pick| {
         moves += 1;
         if (opts.dump_record) if (opts.dump) |buffer| buffer.offer(pick.after);
         if (pending) |p| {
             // `state` is still the post-spawn board the pending step led into (this move has not been
-            // applied yet), which is the board the `search2` target evaluates.
+            // applied yet), which is the board the `search2` and `teacher` targets evaluate.
             const target = p.reward + tdBootstrap(net, pick, state, opts);
             if (diag) |d| d.push(p.after, @abs(target - p.value), pick.value - p.value);
             if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = pick.after, .terminal = false, .err = @abs(target - p.value) });
@@ -1292,22 +1311,37 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
     return .{ .score = state.score, .moves = moves };
 }
 
-/// One self-play move of the per-move trainer (#158). `greedy1` is the historical 1-ply argmax;
-/// `deep2` plays the eval's 2-ply search. Neither draws from the rng (the search enumerates spawns), so
-/// both policies spawn the same tiles in the same order and differ only in the move they pick.
-fn selfplayPick(vfn: Value, state: GameState, death: bool, selfplay: SelfPlay) ?Pick {
+/// One self-play move of the per-move trainer (#158, #167). `greedy1` is the historical 1-ply argmax;
+/// `deep2` plays the eval's 2-ply search; a `teacher` mode plays that mode's search (see
+/// `pickTeacherValue`). None of them draws from the rng (the search enumerates spawns), so all policies
+/// spawn the same tiles in the same order for the same seed and differ only in the move they pick.
+fn selfplayPick(vfn: Value, state: GameState, death: bool, selfplay: SelfPlay, teacher: ?Mode) ?Pick {
+    if (teacher) |mode| return pickTeacherValue(vfn, state, mode, sharedValueCache());
     return switch (selfplay) {
         .greedy1 => pickMoveValue(vfn, state, death),
         .deep2 => pickSearch2Value(vfn, state, sharedValueCache()),
     };
 }
 
+/// Value of a post-spawn board under a teacher mode (#167): `Search.value(state, ply, 1)` at the mode's
+/// phase row, i.e. `ply` own moves with the eval's `V` at the leaf. For `.deep` (ply 2, full width)
+/// that is the tree `search2Value` bootstraps (`t2`); for `.deep3` (ply 3, its `deep3_cutoff`) it is
+/// the tree `Mode.deep` ranks its moves with, so the target is what the 2-ply play side already
+/// believes the position is worth, one own move deeper than `t2` and cheap enough to train on.
+fn teacherValue(vfn: Value, state: GameState, mode: Mode) f64 {
+    const depth = phaseDepth(mode, state.board);
+    var search: Search = .{ .vfn = vfn, .cache = sharedValueCache(), .cutoff = depth.cutoff, .ply = depth.ply };
+    return search.value(state, depth.ply, 1);
+}
+
 /// Bootstrap of one per-move TD target (#158): the value of what follows the step's reward.
 /// `td1` keeps the historical V of the afterstate the next move reached; `search2` bootstraps
 /// `spawned`, the post-spawn board the step led into, with `search2_ply - 1` searched rewards and V of
 /// the afterstate one move past the last of them (see `search2Value`). With a `deep2` policy `next.value`
-/// is already a search value, so `td1` reads V of the afterstate directly then.
+/// is already a search value, so `td1` reads V of the afterstate directly then. A teacher (#167)
+/// replaces the bootstrap entirely: its own search value of `spawned`, and `target` is ignored.
 fn tdBootstrap(net: *const Net, next: Pick, spawned: GameState, opts: Options) f64 {
+    if (opts.teacher) |mode| return teacherValue(.{ .single = net }, spawned, mode);
     return switch (opts.target) {
         .td1 => if (opts.selfplay == .deep2) valueOf(net, next.after) else next.value,
         .search2 => search2Value(.{ .single = net }, spawned, sharedValueCache()),
@@ -1972,6 +2006,90 @@ test "search2 target does not double count the last reward (#158)" {
         best_after = @max(best_after, valueOf(&weights, moved.board));
     }
     try std.testing.expectEqual(best_after, boot_search.bootValue(state, 0, 1));
+}
+
+test "teacher target equals the mode's search value (#167)" {
+    // the teacher search reads the thread-local cache, so start it cold: a leaf another test left in it
+    // was computed from another net, and the cache is keyed by board only (it changes speed, not values)
+    sharedValueCache().* = .{};
+    const weights = try parse(@embedFile("nn_weights.bin"));
+    const vfn: Value = .{ .single = &weights };
+    const next: Pick = .{ .dir = .left, .after = mid_board.board, .reward = 0, .value = valueOf(&weights, mid_board.board) };
+    const state: GameState = .{ .board = mid_board.board };
+
+    // `.deep` is the (ply 2, full width) row: the tree `search2Value` bootstraps, `Search.value` at 2
+    var deep_cache: ValueCache = .{};
+    var deep_search: Search = .{ .vfn = vfn, .cache = &deep_cache, .cutoff = 0, .ply = 2 };
+    const want_deep = deep_search.value(state, 2, 1);
+    try std.testing.expectEqual(want_deep, tdBootstrap(&weights, next, state, .{ .teacher = .deep }));
+    // one own move deeper than `V` of the afterstate: the teacher target carries a searched reward
+    try std.testing.expect(@abs(want_deep - next.value) > 1e-6);
+
+    // `.deep3` is the (ply 3, `deep3_cutoff`) row, which is the tree `Mode.deep` ranks its moves with
+    var deep3_cache: ValueCache = .{};
+    var deep3_search: Search = .{ .vfn = vfn, .cache = &deep3_cache, .cutoff = deep3_cutoff, .ply = 3 };
+    const want_deep3 = deep3_search.value(state, 3, 1);
+    try std.testing.expectEqual(want_deep3, tdBootstrap(&weights, next, state, .{ .teacher = .deep3 }));
+    try std.testing.expect(std.math.isFinite(want_deep3) and want_deep3 != want_deep);
+
+    // the teacher owns the bootstrap: `target` is not consulted any more (a policy/target mismatch is
+    // exactly the #135 failure this cell exists to avoid)
+    try std.testing.expectEqual(want_deep, tdBootstrap(&weights, next, state, .{ .teacher = .deep, .target = .search2 }));
+    try std.testing.expectEqual(want_deep3, tdBootstrap(&weights, next, state, .{ .teacher = .deep3, .target = .td1 }));
+
+    // no legal move means no search value, whichever teacher asks
+    const dead: GameState = .{ .board = dead_board };
+    try std.testing.expectEqual(@as(f64, 0), tdBootstrap(&weights, next, dead, .{ .teacher = .deep }));
+    try std.testing.expectEqual(@as(f64, 0), tdBootstrap(&weights, next, dead, .{ .teacher = .deep3 }));
+}
+
+/// Board hashes of the first `teacher_trace_moves` moves of a game under `opts`, spawned from one rng
+/// exactly as the per-move trainer does. Equal traces = the same tiles in the same cells in the same
+/// order, so equal spawn sequences.
+const teacher_trace_moves = 6;
+
+fn spawnTrace(net: *const Net, seed: u64, opts: Options) [teacher_trace_moves]u64 {
+    var rng = std.Random.DefaultPrng.init(seed);
+    const random = rng.random();
+    var state = GameState.gameStart(random);
+    var trace: [teacher_trace_moves]u64 = @splat(0);
+    for (&trace) |*hash| {
+        const pick = selfplayPick(.{ .single = net }, state, false, opts.selfplay, opts.teacher) orelse break;
+        _ = state.move(pick.dir, random);
+        hash.* = std.hash.Crc32.hash(std.mem.asBytes(&state.board));
+    }
+    return trace;
+}
+
+/// One game of `opts` from a copy of `net` with lr = 0, so the net (and with it the move the policy
+/// picks) stays fixed: the game then depends only on the policy and the spawns.
+fn frozenGame(net: *const Net, seed: u64, opts: Options) GameResult {
+    var copy = net.*;
+    var rng = std.Random.DefaultPrng.init(seed);
+    return trainGameOpts(&copy, rng.random(), 0, null, opts);
+}
+
+test "teacher self-play matches the deep2 spawn sequence (#167)" {
+    var prng = std.Random.DefaultPrng.init(167);
+    const net = Net.init(prng.random());
+    // `.deep` is `pickSearch2Value`'s own tree (`pickTeacherValue(.., .deep)`), so the teacher policy
+    // makes the `.deep2` policy's moves, and since neither search draws from the rng both runs spawn
+    // the same tiles in the same order for the same seed.
+    try std.testing.expectEqual(
+        spawnTrace(&net, 167, .{ .selfplay = .deep2 }),
+        spawnTrace(&net, 167, .{ .teacher = .deep }),
+    );
+    // same for the whole game: with lr = 0 the net does not move, so the move count and the score have
+    // to agree too — only the target the run computes differs (that is the point of the cell)
+    const deep2 = frozenGame(&net, 167, .{ .selfplay = .deep2 });
+    const teacher = frozenGame(&net, 167, .{ .teacher = .deep });
+    try std.testing.expect(deep2.moves > 0);
+    try std.testing.expectEqual(deep2.moves, teacher.moves);
+    try std.testing.expectEqual(deep2.score, teacher.score);
+    // `.deep3` plays the 3-ply row, so its moves differ from `.deep2`'s, but it spawns from the same rng
+    // draws: the trace is populated and stays within one tile per move
+    const deep3 = spawnTrace(&net, 167, .{ .teacher = .deep3 });
+    try std.testing.expect(deep3[teacher_trace_moves - 1] != 0);
 }
 
 test "value cache returns the forward value and counts leaf evaluations" {

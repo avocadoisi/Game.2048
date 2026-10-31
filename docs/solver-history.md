@@ -2073,3 +2073,38 @@ native ReleaseFast、重みは同梱 `ai/solver/nn_weights.bin`（md5 `f584d9966
   「終盤を深く読むと、8192 に届くかどうかは変わらないが、届いたときの伸びが良くなる」。
 - 8192 到達率を動かすには、**探索の深さではなく評価関数そのもの**を良くする必要がある（この表の
   3 段の差はすべて V の質の差であって、探索の差ではない）。`#167`/`#175` の蒸留が本命。
+## 深い探索を教師にする蒸留（#167）
+
+nn3 = 116,205 / nn2 = 82,772 / nn = 69,717 と、この差の大半は探索が稼いでいる。一方 #135 では、
+評価を自分の 1-ply 方策で fine tuning すると 2-ply の上乗せが消える（1-ply は +24%、2-ply は −8%）と
+分かった。#158 は学習の両側を 2-ply 評価に揃えたが、その延長として**評価そのものに深い探索の値を
+教える**（蒸留）。3-ply で自己対戦し、目標をその探索値にして、遊ぶときは 2-ply の評価 1 枚で済ませる。
+
+- **目標**: `tdBootstrap` が `teacherValue(vfn, spawned, mode)` = `Search.value(spawned, ply, 1)` を
+  返す（`spawned` は指した手の後の spawn 済み盤面、`ply` はモードの位相行の深さ）。`.deep3` は
+  `ply = 3` / `cutoff = 1e-2` なので、`Mode.deep` が手を並べるのに使う値（`reward + chance(A, 2)`、
+  つまり `value(S, 3)`）をそのまま学ぶ。`.deep` は #158 の `search2` と同じ木の `value(S, 2)`。
+- **方策**: `Options.teacher` を立てると自己対戦も同じモードの探索で指す（`pickTeacherValue`:
+  `reward + Search.chance(after, ply, 1)`）。方策と目標が別の木を見ると #135 の再現になるので、
+  両側を同じ木から取る。spawn は列挙するので乱数は消費せず、spawn 列は `base` と同一。
+
+| セル | 教師 | 目標 | 自己対戦 |
+| --- | --- | --- | --- |
+| `d2` | `.deep` | `value(spawned, 2)` | `.deep` の手 |
+| `d3` | `.deep3` | `value(spawned, 3)`（`1e-2` 枝刈り） | `.deep3` の手 |
+
+既定は不変（`Options{}` は `teacher = null`）なので、`base` / `t2` / `p2` / `tp2` の学習と checksum は
+そのまま。
+
+### コスト
+
+3-ply を毎手使うのは native で 15–23 ms/手、2-ply は 1.2 ms/手。学習の間だけ 3-ply を払い、
+遊ぶときは 2-ply の評価 1 枚で済ませるのが狙いなので、`d3` の 1 ゲームは `tp2` の 15 倍前後になる
+（手数 × 1 手あたりの差）。`par` は `d2` / `d3` では弾く（教師探索が実行時間のほぼ全部で、
+バッチにするとスレッド数だけ倍になる）。
+
+### 比較の走らせ方
+
+遊ぶ側は 2-ply（既定の `.deep`）で測る。数字はまだ無い（走らせた人が埋める）。
+
+`zig build nn -Doptimize=ReleaseFast -- <games> <eval> <seed> <lr> <ranges> d3 30 <tmp_weights> 3`
