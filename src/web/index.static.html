@@ -94,6 +94,7 @@ const SOLVER_DEPTH = 2;
 const FRAME_BUDGET_MS = 8;
 let solver = 0;
 let running = false;
+let autoFrame = 0; // pending requestAnimationFrame id, 0 when none is queued
 let nextMoveAt = 0;
 
 function solverMove() {
@@ -112,7 +113,15 @@ function solveStep() {
   return ok;
 }
 
-function stopAuto() { running = false; document.getElementById("auto").textContent = "Solver: auto"; }
+// One loop at a time: the pending frame is cancelled here, so a stop/start pair inside one task
+// cannot leave two loops scheduling themselves. `nextMoveAt = 0` is in the past for every rAF
+// timestamp, so the next start fires its first move on the first frame.
+function stopAuto() {
+  running = false;
+  if (autoFrame) { cancelAnimationFrame(autoFrame); autoFrame = 0; }
+  nextMoveAt = 0;
+  document.getElementById("auto").textContent = "Solver: auto";
+}
 
 function speedDelay() { return Number(document.getElementById("speed").value); }
 
@@ -123,17 +132,21 @@ function speedDelay() { return Number(document.getElementById("speed").value); }
 function autoLoop(now) {
   if (!running) return;
   const delay = speedDelay();
+  let moved = false;
   if (delay === 0) {
     const start = performance.now();
     while (running && performance.now() - start < FRAME_BUDGET_MS) {
       if (!solverMove()) { stopAuto(); break; }
+      moved = true;
     }
   } else if (now >= nextMoveAt) {
-    if (!solverMove()) stopAuto();
+    moved = solverMove();
+    if (!moved) stopAuto();
     nextMoveAt = performance.now() + delay;
   }
-  render();
-  if (running) requestAnimationFrame(autoLoop);
+  // Nothing to paint while waiting out a delay; the last move already rendered the board.
+  if (moved || !running) render();
+  if (running) autoFrame = requestAnimationFrame(autoLoop);
 }
 
 (async () => {
@@ -157,12 +170,13 @@ function autoLoop(now) {
   document.getElementById("auto").addEventListener("click", () => {
     if (running) return stopAuto();
     running = true;
-    nextMoveAt = 0; // first move on the first frame
     document.getElementById("auto").textContent = "Solver: stop";
-    requestAnimationFrame(autoLoop);
+    autoFrame = requestAnimationFrame(autoLoop);
   });
   document.addEventListener("keydown", (e) => {
     if (e.metaKey || e.ctrlKey || e.altKey) return;
+    // A focused <select> owns its arrow keys; do not turn them into board moves.
+    if (e.target instanceof Element && e.target.closest("select, input, button")) return;
     const dir = CODES[e.code];
     if (dir !== undefined) { e.preventDefault(); move(dir); }
   });
