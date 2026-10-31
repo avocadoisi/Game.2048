@@ -29,15 +29,8 @@
   <button id="new">New game</button>
   <button id="step">Solver: 1 step</button>
   <button id="auto">Solver: auto</button>
-  <label>speed <select id="speed">
-    <option value="600">slow (600 ms)</option>
-    <option value="300">normal (300 ms)</option>
-    <option value="150" selected>fast (150 ms)</option>
-    <option value="50">very fast (50 ms)</option>
-    <option value="0">max (no delay)</option>
-  </select></label>
 </p>
-<p><label>algorithm <select id="algo"></select></label></p>
+<p id="policy"></p>
 <script>
 // Static build: everything runs in WebAssembly, there is no server.
 // Exports follow src/wasm.zig: move returns 0 no change, 1 moved, 2 game over.
@@ -62,12 +55,12 @@ function render() {
   document.getElementById("msg").textContent = gameOver ? "Game over — press New game" : "";
 }
 
-function move(dir) {
+function move(dir, paint = true) {
   if (gameOver) return false;
   const result = w.move(dir);
   gameOver = result === GAME_OVER;
   if (result === NO_CHANGE) document.getElementById("msg").textContent = "no change";
-  render();
+  if (paint) render();
   return result !== NO_CHANGE;
 }
 
@@ -80,20 +73,43 @@ function newGame() {
 }
 
 // Solver preview: ask the wasm solver for the move, then apply it.
+// The static build has no model picker: one policy, resolved by NAME so that reordering the
+// `Policy` enum cannot silently switch the UI to a different solver (issue #143).
+const SOLVER_NAME = "nn2";
+const FALLBACK_NAME = "expectimax";
+const SOLVER_DEPTH = 2;
+const FRAME_BUDGET_MS = 8;
+let solver = 0;
 let running = false;
-function solveStep() {
-  const algo = Number(document.getElementById("algo").value);
-  const dir = w.solve(algo, 2);
-  if (dir < 0) { stopAuto(); document.getElementById("msg").textContent = "solver: no move (game over)"; return false; }
-  return move(dir);
+
+function solverMove() {
+  const dir = w.solve(solver, SOLVER_DEPTH);
+  if (dir < 0) return false;
+  return move(dir, false);
 }
-function stopAuto() { running = false; document.getElementById("auto").textContent = "Solver: auto"; }
-function autoLoop() {
-  while (running) {
-    if (!solveStep()) break;
-    const delay = Number(document.getElementById("speed").value);
-    if (delay > 0) { setTimeout(autoLoop, delay); return; }
+
+function solveStep() {
+  const ok = solverMove();
+  render();
+  if (!ok) {
+    stopAuto();
+    document.getElementById("msg").textContent = "solver: no move (game over)";
   }
+  return ok;
+}
+
+function stopAuto() { running = false; document.getElementById("auto").textContent = "Solver: auto"; }
+
+// Auto play always runs at maximum speed: no artificial delay, but at most FRAME_BUDGET_MS of
+// solving per animation frame so the tab keeps painting and the buttons stay clickable.
+function autoLoop() {
+  if (!running) return;
+  const start = performance.now();
+  while (running && performance.now() - start < FRAME_BUDGET_MS) {
+    if (!solverMove()) { stopAuto(); break; }
+  }
+  render();
+  if (running) requestAnimationFrame(autoLoop);
 }
 
 (async () => {
@@ -105,9 +121,9 @@ function autoLoop() {
   for (let i = 0; i < w.algo_count(); i++) {
     names.push(new TextDecoder().decode(new Uint8Array(w.memory.buffer, w.algo_name(i), w.algo_name_len(i))));
   }
-  document.getElementById("algo").innerHTML = names
-    .map((name, i) => `<option value="${i}"${name === "expectimax" ? " selected" : ""}>${name}</option>`)
-    .join("");
+  const pick = names.includes(SOLVER_NAME) ? SOLVER_NAME : FALLBACK_NAME;
+  solver = names.indexOf(pick);
+  document.getElementById("policy").textContent = `solver: ${pick} (${SOLVER_DEPTH}-ply), always maximum speed`;
 
   for (const b of document.querySelectorAll("[data-dir]")) {
     b.addEventListener("click", () => move(Number(b.dataset.dir)));
