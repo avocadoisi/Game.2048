@@ -151,13 +151,13 @@ function autoLoop(now) {
   const { instance } = await WebAssembly.instantiate(bytes, {});
   w = instance.exports;
 
-  // One entry per policy compiled into this module, name and one-line description included.
+  // One entry per policy compiled into this module, with its measured average score.
   const text = (ptr, len) => new TextDecoder().decode(new Uint8Array(w.memory.buffer, ptr, len));
   const policies = [];
   for (let i = 0; i < w.algo_count(); i++) {
     policies.push({
       name: text(w.algo_name(i), w.algo_name_len(i)),
-      desc: text(w.algo_desc(i), w.algo_desc_len(i)),
+      score: text(w.algo_score(i), w.algo_score_len(i)),
     });
   }
   const picker = document.getElementById("policy");
@@ -166,14 +166,14 @@ function autoLoop(now) {
     const option = document.createElement("option");
     option.value = String(i);
     option.textContent = p.name;
-    option.title = p.desc;
+    option.title = p.score;
     picker.appendChild(option);
   }
   const preferred = policies.findIndex((p) => p.name === DEFAULT_POLICY);
   picker.value = String(preferred >= 0 ? preferred : policies.length - 1);
   const showPolicy = () => {
     const p = policies[policyIndex()];
-    document.getElementById("policy-desc").textContent = p ? `${p.name}: ${p.desc}` : "";
+    document.getElementById("policy-desc").textContent = p ? `${p.name}: ${p.score}` : "";
   };
   picker.addEventListener("change", showPolicy);
   showPolicy();

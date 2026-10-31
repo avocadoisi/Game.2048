@@ -98,9 +98,10 @@ if (algoCount !== want.length) {
 for (const [i, name] of want.entries()) {
   if (names[i] !== name) fail(`algo ${i} is ${names[i]}, wasm.policies says ${name}`);
 }
+// The page shows the score, not the implementation notes, so a policy without one renders blank.
 for (let i = 0; i < algoCount; i++) {
-  const desc = text(w.algo_desc(i), w.algo_desc_len(i));
-  if (desc.length < 10) fail(`algo ${names[i]} has no description (${JSON.stringify(desc)})`);
+  const score = text(w.algo_score(i), w.algo_score_len(i));
+  if (!score.trim()) fail(`algo ${names[i]} has no score (${JSON.stringify(score)})`);
 }
 
 // The page builds its dropdown and its descriptions from the module, so it cannot list a policy that
@@ -108,6 +109,7 @@ for (let i = 0; i < algoCount; i++) {
 // page silently falls back to the last entry.
 const html = readFileSync(join(root, "zig-out/web/index.html"), "utf8");
 if (!html.includes("algo_count()")) fail("zig-out/web/index.html does not build its policy list from the module");
+if (!html.includes("algo_score(")) fail("zig-out/web/index.html does not show the module's policy scores");
 const preferred = /const DEFAULT_POLICY = "([a-z0-9_]+)"/.exec(html);
 if (!preferred) fail("zig-out/web/index.html has no DEFAULT_POLICY, so its default policy is unknown");
 if (!want.includes(preferred[1])) {
