@@ -28,6 +28,10 @@ const usage =
     \\                       i.e. what the eval search looks at, instead of V(next afterstate))
     \\              p2      (#158: self-play move = the eval's 2-ply search (deep) instead of the 1-ply argmax)
     \\              tp2     (#158: t2 + p2, both sides aligned with the 2-ply eval)
+    \\              d2      (#167: distillation, 2-ply teacher: the self-play move is the deep search's
+    \\                       and the TD target is the search value of the post-spawn board)
+    \\              d3      (#167: distillation, 3-ply teacher: same, from the deep3 tree (1e-2 spawn cut),
+    \\                       so a 2-ply eval learns what the deeper search thinks the position is worth)
     \\              oi / oi16 (#107: multiply the initial weights by 4 / 16 = optimistic initialization,
     \\                       then train exactly like base; only the init differs, so `par` works)
     \\              resume  (#66: load weights_path and train train_games more games from those weights, plain per-move path)
@@ -48,7 +52,7 @@ const usage =
     \\                so replay_k is ignored there but its slot must be filled to reach weights_path.
     \\                Not supported for priority|midgame|midmix (cross-game replay buffer)
     \\                or t2|p2|tp2 (#158: the extra search per move is the whole cost, batching it too
-    \\                would only multiply the work). "-" here means the same as leaving it out, which
+    \\                would only multiply the work), or d2|d3 (#167: the teacher search is the whole cost). "-" here means the same as leaving it out, which
     \\                is how dump_path is reached.
     \\  replay_k      afterstates re-trained per game for variant replay (default 30)
     \\  weights_path  file to load (train_games 0) or write (default ai/solver/nn_weights.bin); use a temp path for variant runs
@@ -83,10 +87,11 @@ fn parseParFlag(args: []const []const u8) !bool {
 }
 
 /// `par` forks whole games onto threads, so it cannot carry the cross-game priority buffer (shared by
-/// pointer), the staged net (no batch path, one net is ~1 MB), or the #158 2-ply variants (their search
-/// is the whole cost of the run; batching would only multiply it by the thread count).
+/// pointer), the staged net (no batch path, one net is ~1 MB), or the #158 2-ply variants and their #167
+/// teacher cells (their search is the whole cost of the run; batching would only multiply it by the
+/// thread count).
 fn parSupported(opts: nn.Options, is_mstd: bool) bool {
-    return opts.priority == null and !is_mstd and opts.target == .td1 and opts.selfplay == .greedy1;
+    return opts.priority == null and !is_mstd and opts.target == .td1 and opts.selfplay == .greedy1 and opts.teacher == null;
 }
 
 /// Starting net for `main`: `weights_path` when resuming (or eval-only), otherwise a random init
@@ -245,6 +250,10 @@ pub fn main(init: std.process.Init) !void {
         .{ .selfplay = .deep2 }
     else if (std.mem.eql(u8, variant, "tp2"))
         .{ .target = .search2, .selfplay = .deep2 }
+    else if (std.mem.eql(u8, variant, "d2"))
+        .{ .teacher = .deep }
+    else if (std.mem.eql(u8, variant, "d3"))
+        .{ .teacher = .deep3 }
     else if (is_dump)
         .{ .dump_record = true, .dump = &dump }
     else if (is_ft2)
@@ -539,6 +548,11 @@ test "usage text lists the aligned 2-ply variants (#158)" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "tp2     (#158") != null);
 }
 
+test "usage text lists the distillation variants (#167)" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "d2      (#167") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "d3      (#167") != null);
+}
+
 test "par is refused for the priority buffer, the staged net and the 2-ply variants (#158)" {
     var pr: nn.Priority = .{};
     try std.testing.expect(parSupported(.{}, false));
@@ -548,6 +562,9 @@ test "par is refused for the priority buffer, the staged net and the 2-ply varia
     try std.testing.expect(!parSupported(.{ .target = .search2 }, false));
     try std.testing.expect(!parSupported(.{ .selfplay = .deep2 }, false));
     try std.testing.expect(!parSupported(.{ .target = .search2, .selfplay = .deep2 }, false));
+    // #167: the teacher search is the whole cost, so a batch would only multiply it
+    try std.testing.expect(!parSupported(.{ .teacher = .deep }, false));
+    try std.testing.expect(!parSupported(.{ .teacher = .deep3 }, false));
 }
 
 test "mstd starts from the staged weights file on eval and from 7 random nets otherwise" {
