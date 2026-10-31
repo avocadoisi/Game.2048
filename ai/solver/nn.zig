@@ -305,8 +305,16 @@ fn chanceMove(vfn: Value, state: GameState) ?Direction {
 /// Search statistics for one move (issue #69): afterstate evaluations and value-cache hits.
 pub const Stats = struct { leaves: u64 = 0, hits: u64 = 0 };
 
+/// Depth one search runs at: `ply` own moves deep, dropping spawn branches under path probability
+/// `cutoff` (`0` keeps every branch). Part of the value-cache key (#157), because a phase game asks
+/// for the same board at two depths.
+pub const Depth = struct { ply: u8 = 0, cutoff: f64 = 0 };
+
+/// Key depth of the 1-ply lookups (`get` / `getValue`, e.g. the `nnmcts` rollouts), which never search.
+pub const leaf_depth: Depth = .{};
+
 /// Bounded transposition table for afterstate values, direct-mapped and deterministic.
-/// shortcut: 2^13 slots (128 KiB) keyed by the full 64-bit board hash; a collision drops the
+/// shortcut: 2^13 slots (128 KiB) keyed by the board hash and the search depth; a collision drops the
 /// entry (a miss, never a wrong value), so the table only changes speed, not the chosen move.
 pub const ValueCache = struct {
     /// The cache lives on the stack: wasm gets a smaller one (the 8K-entry version overflowed it).
@@ -323,6 +331,16 @@ pub const ValueCache = struct {
         return h;
     }
 
+    /// `keyOf` mixed with the search depth (#157). The stored value is the depth-free leaf value
+    /// today, but a phase game asks for one board at 2-ply and at 3-ply: without the depth in the key
+    /// one entry would stand in for the other, and any depth-dependent leaf or backup would then be
+    /// silently wrong. Both fields are mixed here, so the table keeps one key space.
+    fn keyOfDepth(board: Board, depth: Depth) u64 {
+        var h = keyOf(board);
+        h = (h ^ @as(u64, depth.ply)) *% 0x100000001b3;
+        return (h ^ @as(u64, @bitCast(depth.cutoff))) *% 0x100000001b3;
+    }
+
     /// `forward(net, board)` with memoization; `stats` counts leaf evaluations and hits.
     pub fn get(self: *ValueCache, net: *const Net, board: Board, stats: *Stats) f64 {
         return self.getValue(.{ .single = net }, board, stats);
@@ -330,7 +348,12 @@ pub const ValueCache = struct {
 
     /// `get` for a single or staged value function (#107).
     pub fn getValue(self: *ValueCache, vfn: Value, board: Board, stats: *Stats) f64 {
-        const key = keyOf(board);
+        return self.getValueAtDepth(vfn, board, leaf_depth, stats);
+    }
+
+    /// `getValue` for one search depth: the same board at another (ply, cutoff) is another entry.
+    pub fn getValueAtDepth(self: *ValueCache, vfn: Value, board: Board, depth: Depth, stats: *Stats) f64 {
+        const key = keyOfDepth(board, depth);
         if (key == empty_key) return leafValue(vfn, board, stats);
         const slot: usize = @intCast(key & (capacity - 1));
         if (self.entries[slot].key == key) {
@@ -374,6 +397,13 @@ const Search = struct {
     stats: Stats = .{},
     /// Spawn branches under this path probability are dropped; 0 searches every branch (`.deep`).
     cutoff: f64 = 0,
+    /// Own-move plies this whole search runs at; with `cutoff` it keys every leaf lookup (#157).
+    ply: u8 = 0,
+
+    /// `cache.getValue` at this search's depth: one entry per (board, ply, cutoff).
+    fn leaf(self: *Search, board: Board) f64 {
+        return self.cache.getValueAtDepth(self.vfn, board, .{ .ply = self.ply, .cutoff = self.cutoff }, &self.stats);
+    }
 
     /// Max over legal moves of reward + expected value after the spawn; 0 when no move changes the board.
     fn value(self: *Search, state: GameState, depth: u8, cprob: f64) f64 {
@@ -392,7 +422,7 @@ const Search = struct {
     /// `cprob` is the probability of reaching this node. Kept branches are averaged over their own
     /// mass, so a cut node keeps the scale of a full average instead of shrinking with the dropped ones.
     fn chance(self: *Search, state: GameState, depth: u8, cprob: f64) f64 {
-        if (depth == 0) return self.cache.getValue(self.vfn, state.board, &self.stats);
+        if (depth == 0) return self.leaf(state.board);
         var empties: f64 = 0;
         for (0..core.BoardSize) |r| {
             for (0..core.BoardSize) |c| {
@@ -416,14 +446,14 @@ const Search = struct {
             }
         }
         // every branch cut: the node is already that unlikely, so the afterstate leaf is the answer
-        return if (mass == 0) self.cache.getValue(self.vfn, state.board, &self.stats) else total / mass;
+        return if (mass == 0) self.leaf(state.board) else total / mass;
     }
 };
 
-/// `ply` own moves deep: my move -> spawn -> ... -> afterstate value + score_delta/reward_scale.
+/// `depth.ply` own moves deep: my move -> spawn -> ... -> afterstate value + score_delta/reward_scale.
 /// `ply` 2 is `deep` (full width); `ply` 3 is `deep3`, whose cost only fits with a spawn-probability cut.
-fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, ply: u8, cutoff: f64) ?Direction {
-    var search: Search = .{ .vfn = vfn, .cache = cache, .cutoff = cutoff };
+fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, depth: Depth) ?Direction {
+    var search: Search = .{ .vfn = vfn, .cache = cache, .cutoff = depth.cutoff, .ply = depth.ply };
     defer stats.* = search.stats;
     var best: ?Direction = null;
     var best_value: f64 = -std.math.inf(f64);
@@ -431,7 +461,7 @@ fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, ply
         var next = state;
         const moved = next.slide(d);
         if (!moved.changed) continue;
-        const v = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale + search.chance(next, ply, 1);
+        const v = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale + search.chance(next, depth.ply, 1);
         if (best == null or v > best_value) {
             best = d;
             best_value = v;
@@ -449,7 +479,77 @@ pub const Mode = enum {
     deep,
     /// 3-ply: `deep` plus one more own move and spawn layer, with the probability cut (issue #108).
     deep3,
+    /// 2-ply while the board has 8+ empty cells, then 3-ply with the 1e-2 cut (#157).
+    phase_h1,
+    /// Same start, 3-ply from 5..7 empty cells, and the 1e-4 cut once 4 or fewer are left (#157).
+    phase_h2,
+    /// 2-ply only down to 10 empty cells, then 3-ply from 6 and the 1e-4 cut near the end (#157).
+    phase_h3,
 };
+
+/// One row of a phase schedule (#157): a board with at least `min_empty` empty cells searches `ply`
+/// own moves deep, dropping spawn branches under path probability `cutoff` (`full_width_cutoff` keeps
+/// every branch).
+pub const Phase = struct { min_empty: u8, ply: u8, cutoff: f64 };
+
+/// A row cutoff that keeps every spawn branch: no branch probability ever reaches 1.
+const full_width_cutoff: f64 = 1;
+
+/// Tighter cut for the last rows of `phase_h2` / `phase_h3` (#157): the board is nearly full there, so
+/// the 3-ply tree stays small even with more spawn branches kept.
+const phase_tight_cutoff: f64 = 1e-4;
+
+/// The search depth of every `Mode`, one table (#139 style): rows are in descending `min_empty`, so the
+/// first row the board's empty cells reach is its phase. `deep` and `deep3` are one row each, which is
+/// what keeps their behavior exactly the pre-#157 search.
+const phase_schedules = struct {
+    const deep = [_]Phase{.{ .min_empty = 0, .ply = 2, .cutoff = full_width_cutoff }};
+    const deep3 = [_]Phase{.{ .min_empty = 0, .ply = 3, .cutoff = deep3_cutoff }};
+    const phase_h1 = [_]Phase{
+        .{ .min_empty = 8, .ply = 2, .cutoff = full_width_cutoff },
+        .{ .min_empty = 0, .ply = 3, .cutoff = deep3_cutoff },
+    };
+    const phase_h2 = [_]Phase{
+        .{ .min_empty = 8, .ply = 2, .cutoff = full_width_cutoff },
+        .{ .min_empty = 5, .ply = 3, .cutoff = deep3_cutoff },
+        .{ .min_empty = 0, .ply = 3, .cutoff = phase_tight_cutoff },
+    };
+    const phase_h3 = [_]Phase{
+        .{ .min_empty = 10, .ply = 2, .cutoff = full_width_cutoff },
+        .{ .min_empty = 6, .ply = 3, .cutoff = deep3_cutoff },
+        .{ .min_empty = 0, .ply = 3, .cutoff = phase_tight_cutoff },
+    };
+};
+
+/// Rows `mode` searches with, in the order they are matched; empty for the 1-ply modes.
+fn schedule(mode: Mode) []const Phase {
+    return switch (mode) {
+        .greedy, .chance => &.{},
+        .deep => &phase_schedules.deep,
+        .deep3 => &phase_schedules.deep3,
+        .phase_h1 => &phase_schedules.phase_h1,
+        .phase_h2 => &phase_schedules.phase_h2,
+        .phase_h3 => &phase_schedules.phase_h3,
+    };
+}
+
+/// `Search` runs full width at `cutoff = 0`; the table spells that as `full_width_cutoff` because no
+/// branch probability reaches it. Converted once, where a row becomes a search.
+fn searchCutoff(cutoff: f64) f64 {
+    return if (cutoff >= full_width_cutoff) 0 else cutoff;
+}
+
+/// The row that applies to `board` under the search `mode`, in `Search`'s own units. Rows are in
+/// descending `min_empty` and every schedule ends at 0, so one row always matches.
+fn phaseDepth(mode: Mode, board: Board) Depth {
+    const rows = schedule(mode);
+    std.debug.assert(rows.len != 0);
+    const empties = countEmpty(board);
+    for (rows) |row| {
+        if (empties >= row.min_empty) return .{ .ply = row.ply, .cutoff = searchCutoff(row.cutoff) };
+    }
+    unreachable; // every schedule ends with min_empty = 0
+}
 
 pub fn bestMove(net: *const Net, state: GameState, mode: Mode) ?Direction {
     return bestMoveValue(.{ .single = net }, state, mode);
@@ -478,8 +578,8 @@ pub fn bestMoveWithCacheValue(vfn: Value, state: GameState, mode: Mode, stats: *
     return switch (mode) {
         .greedy => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
         .chance => chanceMove(vfn, state),
-        .deep => deepMove(vfn, state, stats, cache, 2, 0),
-        .deep3 => deepMove(vfn, state, stats, cache, 3, deep3_cutoff),
+        // every search mode takes its (ply, cutoff) for this board from the phase table (#157)
+        .deep, .deep3, .phase_h1, .phase_h2, .phase_h3 => deepMove(vfn, state, stats, cache, phaseDepth(mode, state.board)),
     };
 }
 
@@ -1292,6 +1392,130 @@ test "deep3 keeps the value within 5% of the unpruned 3-ply search" {
     try std.testing.expect(@abs(cut - plain) <= 0.05 * @abs(plain));
 }
 
+/// Modes that pick their own depth from the phase table (#157).
+const phase_modes = [_]Mode{ .phase_h1, .phase_h2, .phase_h3 };
+
+test "phase modes return only legal moves on random boards (#157)" {
+    var prng = std.Random.DefaultPrng.init(157);
+    const net = Net.init(prng.random());
+    const dead: GameState = .{ .board = .{
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+    } };
+    var rng = std.Random.DefaultPrng.init(3);
+    const random = rng.random();
+    var states: [5]GameState = undefined;
+    for (&states) |*state| {
+        state.* = .{};
+        for (0..core.BoardSize) |r| {
+            for (0..core.BoardSize) |c| {
+                if (random.uintLessThan(u8, 4) != 0) continue;
+                state.board[r][c] = @as(core.Tile, 2) << random.uintLessThan(u5, 8);
+            }
+        }
+    }
+    for (phase_modes) |mode| {
+        try std.testing.expectEqual(@as(?Direction, null), bestMove(&net, dead, mode));
+        for (states) |state| {
+            if (bestMove(&net, state, mode)) |d| {
+                var moved = state;
+                try std.testing.expect(moved.slide(d).changed);
+            } else {
+                for ([_]Direction{ .up, .left, .down, .right }) |d| {
+                    var moved = state;
+                    try std.testing.expect(!moved.slide(d).changed);
+                }
+            }
+        }
+    }
+}
+
+test "phase_h1 equals deep once the board has 8 or more empty cells (#157)" {
+    var prng = std.Random.DefaultPrng.init(6);
+    const net = Net.init(prng.random());
+    // 13 empty cells: phase_h1 takes its 2-ply row, and so does phase_h3 (row boundary 10)
+    const open: GameState = .{ .board = sample_board };
+    var deep_stats: Stats = .{};
+    var h1_stats: Stats = .{};
+    var h3_stats: Stats = .{};
+    const deep_move = bestMoveWithStats(&net, open, .deep, &deep_stats);
+    const h1_move = bestMoveWithStats(&net, open, .phase_h1, &h1_stats);
+    const h3_move = bestMoveWithStats(&net, open, .phase_h3, &h3_stats);
+    try std.testing.expect(deep_move != null);
+    try std.testing.expectEqual(deep_move, h1_move);
+    try std.testing.expectEqual(deep_move, h3_move);
+    // same ply and no cut: the same search, not just the same move
+    try std.testing.expectEqual(deep_stats.leaves, h1_stats.leaves);
+    try std.testing.expectEqual(deep_stats.leaves, h3_stats.leaves);
+}
+
+test "phase_h2 and phase_h3 equal deep3 on a board with 4 empty cells (#157)" {
+    const net = try parse(@embedFile("nn_weights.bin"));
+    // 4 empty cells: both cut values keep every spawn branch that matters, so the moves agree
+    var deep3_stats: Stats = .{};
+    var h2_stats: Stats = .{};
+    var h3_stats: Stats = .{};
+    const deep3_move = bestMoveWithStats(&net, late_board, .deep3, &deep3_stats);
+    const h2_move = bestMoveWithStats(&net, late_board, .phase_h2, &h2_stats);
+    const h3_move = bestMoveWithStats(&net, late_board, .phase_h3, &h3_stats);
+    try std.testing.expect(deep3_move != null);
+    try std.testing.expectEqual(deep3_move, h2_move);
+    try std.testing.expectEqual(deep3_move, h3_move);
+}
+
+test "phase modes are deterministic for a fixed board (#157)" {
+    var prng = std.Random.DefaultPrng.init(157);
+    const net = Net.init(prng.random());
+    for (phase_modes) |mode| {
+        var a: Stats = .{};
+        var b: Stats = .{};
+        const first = bestMoveWithStats(&net, mid_board, mode, &a);
+        const second = bestMoveWithStats(&net, mid_board, mode, &b);
+        try std.testing.expect(first != null);
+        try std.testing.expectEqual(first, second);
+        try std.testing.expectEqual(a.leaves, b.leaves);
+        try std.testing.expectEqual(a.hits, b.hits);
+    }
+}
+
+test "value cache keeps one entry per board and search depth (#157)" {
+    var prng = std.Random.DefaultPrng.init(8);
+    const net = Net.init(prng.random());
+    const vfn: Value = .{ .single = &net };
+    const ply2: Depth = .{ .ply = 2, .cutoff = 0 };
+    const ply3: Depth = .{ .ply = 3, .cutoff = deep3_cutoff };
+    var cache: ValueCache = .{};
+    var stats: Stats = .{};
+    var scratch: Cache = .{};
+    const plain = forward(&net, sample_board, &scratch);
+    // the leaf itself is depth-free, so both depths give the same number ...
+    try std.testing.expectEqual(plain, cache.getValueAtDepth(vfn, sample_board, ply2, &stats));
+    try std.testing.expectEqual(plain, cache.getValueAtDepth(vfn, sample_board, ply3, &stats));
+    // ... but the 3-ply lookup is a separate entry: a miss, not a hit on the 2-ply value
+    try std.testing.expectEqual(@as(u64, 2), stats.leaves);
+    try std.testing.expectEqual(@as(u64, 0), stats.hits);
+    _ = cache.getValueAtDepth(vfn, sample_board, ply3, &stats);
+    try std.testing.expectEqual(@as(u64, 2), stats.leaves);
+    try std.testing.expectEqual(@as(u64, 1), stats.hits);
+}
+
+test "a cache warmed at another depth still gives the fresh move (#157)" {
+    var prng = std.Random.DefaultPrng.init(157);
+    const net = Net.init(prng.random());
+    // mid_board has 6 empty cells, so phase_h1 searches 3-ply here while the warm-up searched 2-ply
+    var warm: ValueCache = .{};
+    var warm_stats: Stats = .{};
+    _ = bestMoveWithCache(&net, mid_board, .deep, &warm_stats, &warm);
+    var fresh: ValueCache = .{};
+    var fresh_stats: Stats = .{};
+    const fresh_move = bestMoveWithCache(&net, mid_board, .phase_h1, &fresh_stats, &fresh);
+    const warm_move = bestMoveWithCache(&net, mid_board, .phase_h1, &warm_stats, &warm);
+    try std.testing.expect(fresh_move != null);
+    try std.testing.expectEqual(fresh_move, warm_move);
+}
+
 test "greedy and chance moves are unchanged by the deep mode" {
     var prng = std.Random.DefaultPrng.init(6);
     const net = Net.init(prng.random());
@@ -1358,8 +1582,8 @@ test "value cache slot collision drops the entry, never returns a wrong value (#
     var pair: ?[2]Board = null;
     search: for (0..boards.len) |i| {
         for (i + 1..boards.len) |j| {
-            const ka = ValueCache.keyOf(boards[i]);
-            const kb = ValueCache.keyOf(boards[j]);
+            const ka = ValueCache.keyOfDepth(boards[i], leaf_depth);
+            const kb = ValueCache.keyOfDepth(boards[j], leaf_depth);
             if (ka != kb and (ka & (ValueCache.capacity - 1)) == (kb & (ValueCache.capacity - 1))) {
                 pair = .{ boards[i], boards[j] };
                 break :search;

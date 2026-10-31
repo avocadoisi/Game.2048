@@ -260,6 +260,10 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "nn + 1 spawn lookahead" },
         .{ .name = "nn 2-ply (deep)" },
         .{ .name = "expectimax depth 2" },
+        .{ .name = "nn 3-ply (deep3, #108)" },
+        .{ .name = "nn phase h1 (#157)" },
+        .{ .name = "nn phase h2 (#157)" },
+        .{ .name = "nn phase h3 (#157)" },
     };
     const games = eval_games * seed_ranges;
     // `mstd` evaluates through the staged value, everything else through the single net (#107)
@@ -273,10 +277,15 @@ pub fn main(init: std.process.Init) !void {
                 0 => nn.playValue(c.vfn, prng.random(), .greedy),
                 1 => nn.playValue(c.vfn, prng.random(), .chance),
                 2 => nn.playValue(c.vfn, prng.random(), .deep),
-                else => blk: {
+                3 => blk: {
                     const b = solver.playPolicy(prng.random(), .expectimax, 2);
                     break :blk nn.PlayResult{ .score = b.score, .max_tile = b.max_tile, .moves = b.moves };
                 },
+                // nn3 baseline for the phase rows below (#157): same seeds, so the cost and score compare directly
+                4 => nn.playValue(c.vfn, prng.random(), .deep3),
+                5 => nn.playValue(c.vfn, prng.random(), .phase_h1),
+                6 => nn.playValue(c.vfn, prng.random(), .phase_h2),
+                else => nn.playValue(c.vfn, prng.random(), .phase_h3),
             };
         }
     }.f;
