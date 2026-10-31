@@ -163,8 +163,8 @@ pub fn main(init: std.process.Init) !void {
     try w.print("{{\"seed\":{d},\"runs\":{d},\"games_per_run\":{d},\"entries\":[", .{ seed, runs, games_per_run });
     for (entries[0..selected.len], 0..) |e, i| {
         if (i > 0) try w.writeAll(",");
-        try w.print("{{\"policy\":\"{s}\",\"depth\":{d},\"games\":{d},\"avg_score\":{d:.1},\"avg_moves\":{d:.1},\"best_tile\":{d},\"latency_ms_per_move\":{d:.4},\"games_per_sec\":{d:.2},\"description\":\"{s}\"}}", .{
-            @tagName(e.policy), e.depth, e.summary.games, e.summary.avg_score, e.summary.avg_moves, e.summary.best_tile, e.summary.latencyMsPerMove(), e.summary.gamesPerSec(), describe(e.policy),
+        try w.print("{{\"policy\":\"{s}\",\"depth\":{d},\"games\":{d},\"avg_score\":{d:.1},\"avg_moves\":{d:.1},\"best_tile\":{d},\"reach_4096\":{d},\"reach_8192\":{d},\"reach_16384\":{d},\"dead_below_2048\":{d},\"latency_ms_per_move\":{d:.4},\"games_per_sec\":{d:.2},\"description\":\"{s}\"}}", .{
+            @tagName(e.policy), e.depth, e.summary.games, e.summary.avg_score, e.summary.avg_moves, e.summary.best_tile, e.summary.reach_4096, e.summary.reach_8192, e.summary.reach_16384, e.summary.dead_below_2048, e.summary.latencyMsPerMove(), e.summary.gamesPerSec(), describe(e.policy),
         });
     }
     try w.writeAll("]}\n");

@@ -97,6 +97,13 @@ const Eval = struct {
     total_score: u64 = 0,
     leaves: u64 = 0,
     elapsed_ns: i96 = 0,
+    /// Games whose final `max_tile` is at or above the tile (counts, not rates); the avg score is a
+    /// central measure, so how often a run actually gets there has to be counted separately (#156).
+    reach_4096: u32 = 0,
+    reach_8192: u32 = 0,
+    reach_16384: u32 = 0,
+    /// Games that ended below 2048, i.e. died early.
+    dead_below_2048: u32 = 0,
 };
 
 fn printDiag(diag: *const nn.Diag) void {
@@ -287,6 +294,10 @@ pub fn main(init: std.process.Init) !void {
                 total_moves += res.moves;
                 r.leaves += res.leaves;
                 r.best_tile = @max(r.best_tile, res.max_tile);
+                if (res.max_tile >= 4096) r.reach_4096 += 1;
+                if (res.max_tile >= 8192) r.reach_8192 += 1;
+                if (res.max_tile >= 16384) r.reach_16384 += 1;
+                if (res.max_tile < 2048) r.dead_below_2048 += 1;
             }
             r.range_scores[range] = @as(f64, @floatFromInt(total_score)) / @as(f64, @floatFromInt(eval_games));
         }
@@ -301,7 +312,7 @@ pub fn main(init: std.process.Init) !void {
         const total_moves = r.avg_moves * @as(f64, @floatFromInt(games));
         const ms_per_move = @as(f64, @floatFromInt(r.elapsed_ns)) / 1e6 / @max(total_moves, 1);
         const leaves_per_move = @as(f64, @floatFromInt(r.leaves)) / @max(total_moves, 1);
-        std.debug.print("{s}: avg score={d:.1} ± {d:.1} (stderr over {d} ranges) avg moves={d:.1} best tile={d} elapsed={d:.1} s score/s={d:.1} leaves={d} leaves/move={d:.1} ms/move={d:.2}\n", .{
+        std.debug.print("{s}: avg score={d:.1} ± {d:.1} (stderr over {d} ranges) avg moves={d:.1} best tile={d} elapsed={d:.1} s score/s={d:.1} leaves={d} leaves/move={d:.1} ms/move={d:.2} reach4096={d}/{d} reach8192={d}/{d} reach16384={d}/{d} dead<2048={d}/{d}\n", .{
             r.name,
             st.mean,
             st.stderr,
@@ -313,6 +324,14 @@ pub fn main(init: std.process.Init) !void {
             r.leaves,
             leaves_per_move,
             ms_per_move,
+            r.reach_4096,
+            games,
+            r.reach_8192,
+            games,
+            r.reach_16384,
+            games,
+            r.dead_below_2048,
+            games,
         });
     }
 }
