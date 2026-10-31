@@ -1,6 +1,6 @@
 # Game.2048
 
-ブラウザで遊ぶ: **https://avocadoisi.github.io/Game.2048/** （wasm、solver は `nn3` 固定で自動再生、速度を選べる）
+ブラウザで遊ぶ: **https://avocadoisi.github.io/Game.2048/** （wasm、solver は `nn3` 既定で自動再生、`nn2` も選べる。速度も選べる）
 
 Zig で書いた 2048。ゲームロジックを `2048.core` として切り出し、CLI / HTTP サーバー / WASM / solver AI が同じコアを使う。
 
@@ -23,21 +23,46 @@ zig build run -- help
   `GET /api/solve?depth=2&algo=nn2`、`GET /api/ranking`。solver の自動再生と速度選択ができる
 - 静的配信: `bash scripts/deploy-pages.sh`（ビルド → スモークテスト → `gh-pages` へ push）。
   手元で見るだけなら `zig build wasm -Doptimize=ReleaseFast` のあと `python3 -m http.server 8000 -d zig-out/web`。
-  静的版は方針を選ばせない（`nn3` 3-ply 固定）。自動再生の速度は select で選べる（既定は最速）
+  静的版の方針（既定 `nn3`）と自動再生の速度（既定は最速）は select で選べる。選べる方針は
+  ビルドに同梱したものだけで、その一覧は `wasm.policies` が決める（下記）
 
 ## サイズ
 
 | 何 | 大きさ | 中身 |
 | --- | ---: | --- |
-| `game2048.wasm` | 747 KiB | gzip 282 KiB。ゲーム + solver 13 方針 + NN 重み |
+| `game2048.wasm` | 685 KiB | gzip 264 KiB。ゲーム + 同梱 solver（`wasm.policies`、既定は `nn2` と `nn3`）+ NN 重み |
 | 初期メモリ | 2.44 MiB | `memory.grow` なし。スタック 1 MiB、静的データ 1.4 MiB（うち TT 640 KiB） |
 | NN 重み | 148 KB | `@embedFile`。実行時に外部ファイルを取らない |
+| 行テーブル | 512 KiB | `src/core.zig` の `row_table`（1 行のマージを引く 65,536 エントリ）。wasm の静的データの大半 |
 | n-tuple 表 | 64.6 MiB | wasm には入れない（native の API 専用） |
 
 ブラウザへ配るのは HTML と wasm の 2 ファイルだけ。NN 系は重み込みでこの中に収まるので、
 サーバーも外部アセットも無しで動く。実測（ReleaseFast、V8 上の wasm、1 手あたり）は `nn2` が
 9〜14 ms、`nn3` が序盤 0.3〜0.4 s / 盤面が詰まる終盤 4〜80 ms。`nn3` は 1 手ごとにメイン
 スレッドを掴むので、遅くして眺めたいときだけ速度を選ぶ（既定は遅延なし）。
+
+## 同梱する方針（`wasm.policies`）
+
+ブラウザに配る wasm に入れる solver は**コードではなく設定ファイル** `wasm.policies` が決める
+（1 行 1 名、`#` 以降はコメント）。ページの方針 select はモジュールの `algo_count()` /
+`algo_name()` / `algo_desc()` から組み立てるので、同梱していない方針は選べないし、UI と
+モジュールがずれることもない。未知の名前・重複・n-tuple 表が要る方針（`ntuple`）はビルドエラー。
+ネイティブの CLI / HTTP サーバーはこのファイルを見ず、13 方針すべてを持つ。
+
+既定の同梱は 2 つ:
+
+| 方針 | 1 手（V8） | 説明（`policy_info` の文） |
+| --- | ---: | --- |
+| `nn2` | 9〜14 ms | TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化） |
+| `nn3` | 4〜400 ms | TD学習のMLP価値関数で3手先まで探索する（深い層の出現確率が1e-2未満の枝を落として再正規化）。既定のランキングには入れていない（重い） |
+
+`nn3` は序盤ほど高い（3 手探索の枝が多い）。盤面が詰まると `nn2` と変わらない速さになるので、
+自動再生の既定は `nn3`、速度は遅延なしにしてある。
+
+`scripts/wasm-smoke.mjs`（`deploy-pages.sh` が必ず走らせる）が、この設定とビルドのずれを止める:
+モジュールの一覧が `wasm.policies` と名前も順序も一致すること、各エントリに説明があること、
+ページが `algo_count()` から一覧を作っていること、ページの既定（`DEFAULT_POLICY`）が同梱一覧に
+含まれること、そして各方針の `solve` が 5 秒以内に返ること（返らない方針はハングとして落とす）。
 
 ## コア API
 
@@ -125,6 +150,7 @@ zig build ga-rl  -- 16 15 8 2 1 500 100                                  # popul
 | `src/cli.zig` / `src/render.zig` / `src/main.zig` | 端末プレイとサブコマンドの振り分け |
 | `src/server.zig` / `src/web/` | HTTP サーバー、JSON API、ブラウザ UI |
 | `src/wasm.zig` | WASM の C ABI（ゲーム + solver、`@embedFile` で NN 重みを同梱） |
+| `wasm.policies` | ブラウザ版 wasm に同梱する方針の一覧（ビルド時設定）。編集すると wasm が再ビルドされる |
 | `ai/solver/solver.zig` | expectimax / 評価関数 / 反復深化 |
 | `ai/solver/bench.zig` / `ranking.zig` / `parallel.zig` | ゲーム実行・集計・並列化 |
 | `ai/solver/nn.zig` / `ntuple.zig` | TD(0) の価値関数（MLP / パターン表） |

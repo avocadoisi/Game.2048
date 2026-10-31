@@ -353,6 +353,13 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ntuple", .module = wasm_ntuple_mod },
         },
     });
+    // Which policies the browser module ships is deploy config, not code: the list lives in
+    // `wasm.policies` next to this file and `src/wasm.zig` parses it at compile time (#154).
+    // `@embedFile` makes editing that file rebuild the module, and the parse (with its
+    // "unknown policy" / "needs the n-tuple table" errors) stays in one place.
+    const wasm_options = b.addOptions();
+    wasm_options.addOption([]const u8, "policies", @embedFile("wasm.policies"));
+
     const wasm_exe = b.addExecutable(.{
         .name = "game2048",
         .root_module = b.createModule(.{
@@ -363,6 +370,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "core", .module = wasm_core_mod },
                 .{ .name = "solver", .module = wasm_solver_mod },
+                .{ .name = "options", .module = wasm_options.createModule() },
             },
         }),
     });
