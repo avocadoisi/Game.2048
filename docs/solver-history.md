@@ -1898,8 +1898,11 @@ wasm（ReleaseFast、V8、このマシン）での 1 手あたりの実測。`nn
   実行時の `switch (policy)`（= 従来の `choose`）は全アームをリンクしてしまう。
 - ABI の `algo` は「モジュールに入れた順」の index になった。`Policy` の並びは ABI ではなく
   なり、`wasm_policy_count`（"表が要る方針は最後" を強制する仕掛け）は消した。
-- ページの方針 select は `algo_count()` / `algo_name()` から組み立て、選んだ方針の説明を
-  `algo_desc()`（`policy_info` の1行説明）で select の下に出す。ページが自分で持つ方針名は
+- ページの方針 select は `algo_count()` / `algo_name()` から組み立て、選んだ方針の**測った
+  平均スコアと 1 手の時間**を `algo_score()` / `algo_speed()`（`policy_info` の `score` と
+  `speed`）で select の下に出す。実装の説明（`description`）はページには長すぎるので出さない
+  （#155 の指摘）。`speed` はブラウザ実測（V8 on wasm）で、native の ms/move とは別物なので
+  測っていない方針は空にし、ページはスコアだけを出す。ページが自分で持つ方針名は
   既定を指す `DEFAULT_POLICY = "nn3"` の 1 つだけで、同梱していない方針は選べないし、UI と
   モジュールの一覧はずれない（既定が同梱に無いときだけ最後のエントリに落ちる）。
 - `scripts/wasm-smoke.mjs` は `wasm.policies` を読み、モジュールの一覧が名前も順序も一致する
@@ -1914,7 +1917,7 @@ wasm（ReleaseFast、V8、このマシン）での 1 手あたりの実測。`nn
 | 同梱した方針 | バイト |
 | --- | ---: |
 | 13 方針すべて（#152 まで） | 764,897 |
-| `nn2` + `nn3`（既定） | 701,884 |
+| `nn2` + `nn3`（既定） | 701,728（説明文をページに出さなくして -298 B、`speed` で +142 B） |
 | `nn3` のみ | 701,167 |
 | `nn2` のみ | 701,107 |
 | NN 以外の 8 方針 | 591,768 |

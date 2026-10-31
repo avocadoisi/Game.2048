@@ -151,13 +151,14 @@ function autoLoop(now) {
   const { instance } = await WebAssembly.instantiate(bytes, {});
   w = instance.exports;
 
-  // One entry per policy compiled into this module, name and one-line description included.
+  // One entry per policy compiled into this module, with its measured average score.
   const text = (ptr, len) => new TextDecoder().decode(new Uint8Array(w.memory.buffer, ptr, len));
   const policies = [];
   for (let i = 0; i < w.algo_count(); i++) {
     policies.push({
       name: text(w.algo_name(i), w.algo_name_len(i)),
-      desc: text(w.algo_desc(i), w.algo_desc_len(i)),
+      score: text(w.algo_score(i), w.algo_score_len(i)),
+      speed: text(w.algo_speed(i), w.algo_speed_len(i)),
     });
   }
   const picker = document.getElementById("policy");
@@ -166,14 +167,17 @@ function autoLoop(now) {
     const option = document.createElement("option");
     option.value = String(i);
     option.textContent = p.name;
-    option.title = p.desc;
+    option.title = p.speed ? `${p.score} / 1 手 ${p.speed}` : p.score;
     picker.appendChild(option);
   }
   const preferred = policies.findIndex((p) => p.name === DEFAULT_POLICY);
   picker.value = String(preferred >= 0 ? preferred : policies.length - 1);
   const showPolicy = () => {
     const p = policies[policyIndex()];
-    document.getElementById("policy-desc").textContent = p ? `${p.name}: ${p.desc}` : "";
+    if (!p) return void (document.getElementById("policy-desc").textContent = "");
+    // Score first (how strong), then the measured cost per move (how slow) — nothing else.
+    const speed = p.speed ? ` / 1 手 ${p.speed}` : "";
+    document.getElementById("policy-desc").textContent = `${p.name}: ${p.score}${speed}`;
   };
   picker.addEventListener("change", showPolicy);
   showPolicy();
