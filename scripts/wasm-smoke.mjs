@@ -1,6 +1,7 @@
 // Smoke test for the static WASM build. Run: node scripts/wasm-smoke.mjs
 // Exits non-zero on any failure.
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -52,11 +53,32 @@ if (w.score() < 0) fail("score must not be negative");
 const best = w.best_tile();
 if (best !== Math.max(...snapshot())) fail(`best_tile() = ${best}, board max = ${Math.max(...snapshot())}`);
 
+const text = (ptr, len) => new TextDecoder().decode(new Uint8Array(w.memory.buffer, ptr, len));
+
+// `--solve-one <algo>`: solve a single policy, so the parent can hold a hard deadline over a search
+// that never returns. A JS timer cannot interrupt a blocked wasm call, so the deadline has to come
+// from outside the process (#154 review).
+const childAlgo = process.argv[2] === "--solve-one" ? Number(process.argv[3]) : -1;
+if (childAlgo >= 0) {
+  w.init(777 + childAlgo, 0);
+  const t0 = performance.now();
+  const dir = w.solve(childAlgo, 0);
+  const ms = performance.now() - t0;
+  // A fresh game always has a legal move, so -1 here is a bug, not a dead end.
+  if (dir === -1) fail(`solve(${childAlgo}) returned -1 on a fresh game`);
+  if (dir > 3) fail(`solve(${childAlgo}) returned out-of-range direction ${dir}`);
+  const before = snapshot();
+  const result = w.move(dir);
+  if (result !== 1) fail(`solve(${childAlgo}) returned direction ${dir} but moving it returned ${result}`);
+  if (before.join() === snapshot().join()) fail(`solve(${childAlgo}) direction ${dir} did not change the board`);
+  console.log(`ms=${ms.toFixed(1)}`);
+  process.exit(0);
+}
+
 // Solver: every policy must return a legal direction, and moving it must work.
 const algoCount = w.algo_count();
 if (algoCount < 1) fail("algo_count() must be >= 1");
 
-const text = (ptr, len) => new TextDecoder().decode(new Uint8Array(w.memory.buffer, ptr, len));
 const names = [];
 for (let i = 0; i < algoCount; i++) names.push(text(w.algo_name(i), w.algo_name_len(i)));
 
@@ -81,32 +103,39 @@ for (let i = 0; i < algoCount; i++) {
   if (desc.length < 10) fail(`algo ${names[i]} has no description (${JSON.stringify(desc)})`);
 }
 
-// The page builds its dropdown from the module, so it cannot name a policy that is not compiled in.
+// The page builds its dropdown and its descriptions from the module, so it cannot list a policy that
+// is not compiled in — but it does pick a default by name, and that name must be shipped here or the
+// page silently falls back to the last entry.
 const html = readFileSync(join(root, "zig-out/web/index.html"), "utf8");
 if (!html.includes("algo_count()")) fail("zig-out/web/index.html does not build its policy list from the module");
-if (html.includes("SOLVER_NAME")) fail("zig-out/web/index.html still hardcodes a policy name");
+const preferred = /const DEFAULT_POLICY = "([a-z0-9_]+)"/.exec(html);
+if (!preferred) fail("zig-out/web/index.html has no DEFAULT_POLICY, so its default policy is unknown");
+if (!want.includes(preferred[1])) {
+  fail(`the page defaults to ${preferred[1]}, which wasm.policies does not ship (${want.join(", ")})`);
+}
 
 // A timed search cannot expire on a frozen clock, so `expectimax_id` used to run to id_max_depth and
-// hang this script for minutes (#143, #145). Budget each call so the regression cannot come back
-// silently. The slowest policy that may legitimately appear here is `nn3` (up to ~0.4 s per move in
-// V8, #152), so the limit is a hang detector, not a speed budget.
-const SOLVE_LIMIT_MS = 2000;
+// hang this script for minutes (#143, #145). The old guard was the `depth` argument; now that `solve`
+// runs each policy at its own horizon (#154) nothing inside the process can cut a runaway search
+// short, so every solve runs in a child process that is killed at the deadline. The slowest policy
+// that may legitimately appear is `nn3` (~0.4 s per move in V8, #152), so this is a hang detector,
+// not a speed budget.
+const HANG_LIMIT_MS = 5000;
 let slowest = 0;
 
 for (let algo = 0; algo < algoCount; algo++) {
-  w.init(777 + algo, 0);
-  const t0 = performance.now();
-  const dir = w.solve(algo, 0);
-  const solveMs = performance.now() - t0;
-  if (solveMs > SOLVE_LIMIT_MS) fail(`solve(${algo}) took ${Math.round(solveMs)} ms (limit ${SOLVE_LIMIT_MS})`);
+  const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url), "--solve-one", String(algo)], {
+    encoding: "utf8",
+    timeout: HANG_LIMIT_MS,
+  });
+  if (child.error?.code === "ETIMEDOUT") {
+    fail(`solve(${names[algo]}) did not return within ${HANG_LIMIT_MS} ms and was killed (a policy that never returns)`);
+  }
+  if (child.error) fail(`solve(${names[algo]}) could not run: ${child.error.message}`);
+  if (child.status !== 0) fail(`solve(${names[algo]}) failed: ${(child.stderr || child.stdout).trim()}`);
+  const solveMs = Number(/ms=([\d.]+)/.exec(child.stdout)?.[1]);
+  if (!Number.isFinite(solveMs)) fail(`solve(${algo}) printed no timing: ${JSON.stringify(child.stdout)}`);
   slowest = Math.max(slowest, solveMs);
-  if (dir < -1 || dir > 3) fail(`solve(${algo}) returned out-of-range direction ${dir}`);
-  // A fresh game always has a legal move, so -1 here is a bug, not a dead end.
-  if (dir === -1) fail(`solve(${names[algo]}) returned -1 on a fresh game`);
-  const before = snapshot();
-  const result = w.move(dir);
-  if (result !== 1) fail(`solve(${algo}) returned direction ${dir} but moving it returned ${result}`);
-  if (before.join() === snapshot().join()) fail(`solve(${algo}) direction ${dir} did not change the board`);
 }
 
 console.log(`OK: ${bytes.length} bytes wasm, ${algoCount} policies (${names.join(", ")}), ${applied} applied moves, slowest solve ${Math.round(slowest)} ms`);

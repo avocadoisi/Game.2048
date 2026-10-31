@@ -1879,10 +1879,9 @@ wasm（ReleaseFast、V8、このマシン）での 1 手あたりの実測。`nn
   （nn3 の solve が 0.3 s 固まる間に押されると起きていた）。
 - 速度の `<select>` にフォーカスがあるときは矢印キーを盤面に使わない。以前は select の
   上下キーが `preventDefault` されて手になってしまっていた（サーバー版の `src/web/index.html` も同じ）。
-- `scripts/wasm-smoke.mjs` は「静的版の方針が wasm に載っている」ことを `nn3` の名前で検査する。
-  ページ側は名前が無いと黙って `expectimax` に落ちるので、ビルド済み `zig-out/web/index.html` に
-  `const SOLVER_NAME = "nn3"` があることも見る。`nn3` は 1 手 0.4 s まで許す前提なので、solve の
-  上限（2 s）は速度の予算ではなくハング検出として残す。
+- `scripts/wasm-smoke.mjs` は「静的版の方針が wasm に載っている」ことを検査する。当時は
+  ページ側の定数名 `SOLVER_NAME` を見ていたが、#154 でページは方針名をモジュールから取るように
+  なり、この検査は同梱一覧と既定（`DEFAULT_POLICY`）の突き合わせに置き換わった。
 
 ## 同梱する方針を設定ファイルで決め、nn2 / nn3 の 2 択にした（#154）
 
@@ -1900,12 +1899,15 @@ wasm（ReleaseFast、V8、このマシン）での 1 手あたりの実測。`nn
 - ABI の `algo` は「モジュールに入れた順」の index になった。`Policy` の並びは ABI ではなく
   なり、`wasm_policy_count`（"表が要る方針は最後" を強制する仕掛け）は消した。
 - ページの方針 select は `algo_count()` / `algo_name()` から組み立て、選んだ方針の説明を
-  `algo_desc()`（`policy_info` の1行説明）で select の下に出す。ページ側に方針名の定数は無い
-  ので、同梱していない方針は選べないし、UI とモジュールがずれない。既定は `nn3`。
+  `algo_desc()`（`policy_info` の1行説明）で select の下に出す。ページが自分で持つ方針名は
+  既定を指す `DEFAULT_POLICY = "nn3"` の 1 つだけで、同梱していない方針は選べないし、UI と
+  モジュールの一覧はずれない（既定が同梱に無いときだけ最後のエントリに落ちる）。
 - `scripts/wasm-smoke.mjs` は `wasm.policies` を読み、モジュールの一覧が名前も順序も一致する
-  こと、各エントリに説明があること、ビルド済み HTML が `algo_count()` を使っていること
-  （= 方針名をハードコードしていないこと）を検査する。`scripts/deploy-pages.sh` はデプロイ
-  ログに同梱方針を出す。
+  こと、各エントリに説明があること、ビルド済み HTML が `algo_count()` で一覧を作っていること、
+  その `DEFAULT_POLICY` が同梱一覧に含まれることを検査する（後者が無いと、既定の方針を
+  `wasm.policies` から外したときにページが黙って別の方針になる）。`scripts/deploy-pages.sh` は
+  デプロイログに同梱方針を出す（インラインコメントは落とす。`--skip-smoke` のときは
+  「モジュールと設定ファイルの突き合わせをしていない」と警告する）。
 
 サイズの実測（ReleaseFast、`zig build wasm`、`wc -c`）:
 
@@ -1920,6 +1922,23 @@ wasm（ReleaseFast、V8、このマシン）での 1 手あたりの実測。`nn
 
 - 13 → 2 で 63 KB（8%）しか減らない。`nn2` と `nn3` は同じ net と探索コードを共有していて、
   2 つ目は 700 B しか増えないため。方針を削る効果はここで頭打ちになる。
+### レビューで見つかって直したこと（#154）
+
+- `solve(algo, depth)` の `depth` を捨てていた。同梱が `nn2`/`nn3` の間は害が無い（両方とも
+  深さ固定）が、この機能の売り文句どおり `wasm.policies` に `expectimax` か `ga` を足すと
+  `depth = 0` が `chanceValueW` で `0 - 1` の u8 ラップで 255 手になり、タブも smoke テストも
+  戻ってこない。`depth` を通し、`0` は `policy_info` の既定深さ（`expectimax`/`ga` は 2）を
+  使う、という `expectimax_id` と同じ約束にした。`expectimax` を足したビルドで
+  `solve(0, 0)` が 1 手で返ることを確認済み。
+- パーサが `nn2#コメント` の名前を捨てていた（`#` の分岐が区切りの処理より先にあった）。
+  区切りとコメントの前で必ず名前を確定させ、先頭 BOM も読み飛ばし、`found[32]` の上限も
+  `@compileError` にした。
+- smoke テストの 2 s 上限は呼び出しが返ってからしか見ないので、ハングを検出できなかった
+  （#143/#145 の保護は実は「depth 引数」だった）。方針ごとに `--solve-one` の子プロセスで
+  回し、5 s で `spawnSync` が kill するようにした。
+- `src/wasm.zig` の `depth` ABI 説明と、`expectimax_id` の説明（「既定の40ms」→ 実際は
+  `id_budget_ms`）が実装とずれていたので直した。
+
 - 内訳（既定ビルド）: code 11,787 B / data 689,801 B。data の大半は `src/core.zig` の
   `row_table`（`[65536]RowEntry` = 512 KiB、1 行のマージを引く表）で、NN 重み 148 KB よりも
   大きい。次にサイズを削るならここ（`RowEntry` は 8 B。score を半分にして u32 に詰めれば

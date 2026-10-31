@@ -50,12 +50,16 @@ printf '' > zig-out/web/.nojekyll
 if ((run_smoke)); then
   echo "==> node scripts/wasm-smoke.mjs"
   node scripts/wasm-smoke.mjs
+else
+  # The smoke test is the only thing that checks the module against `wasm.policies`; without it the
+  # log below describes the config file, not necessarily the module being pushed (#154 review).
+  echo "==> --skip-smoke: the module was NOT checked against wasm.policies"
 fi
 
 size=$(wc -c <zig-out/web/game2048.wasm | tr -d ' ')
 # Which policies went in is config (`wasm.policies`), so put it in the log: the deployed page offers
-# exactly these, nothing else (#154).
-policies=$(grep -v '^[[:space:]]*#' wasm.policies | tr -s '[:space:],' ' ' | sed -e 's/^ *//' -e 's/ *$//')
+# exactly these, nothing else (#154). Inline comments (`nn2 # fast`) are stripped here too.
+policies=$(sed -e 's/#.*//' wasm.policies | tr -s '[:space:],' ' ' | sed -e 's/^ *//' -e 's/ *$//')
 echo "==> build ok: game2048.wasm ${size} bytes, policies: ${policies}, from ${branch} @ ${commit}"
 
 if ((dry_run)); then
