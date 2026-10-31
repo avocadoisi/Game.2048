@@ -10,7 +10,7 @@ Cycle and test discipline: `dev-philosophy`. Order of a change: `dev-workflow`.
 
 ## Commands
 
-- `zig build test` — unit tests of 11 targets: core, exe, solver, bench, parallel, nn, nn_main, ntuple, ntuple_main, ga-rl, ranking
+- `zig build test` — unit tests of 15 targets: core, exe, solver, bench, ranking, parallel, evalab, probe, nn, nn_main, ntuple, ntuple_main, ga-rl, tune, cmaes
 - `zig build run` — play · `zig build run -- serve 8080` — HTTP server
 - Zig **0.17** (`build.zig` uses `addPassthruArgs`; `std.Io`). `zig version` before building
 - `nix develop` when zig is not on PATH
@@ -33,6 +33,8 @@ Cycle and test discipline: `dev-philosophy`. Order of a change: `dev-workflow`.
 - inject RNG; core never calls a global random source
 - core does not depend on CLI, IO, or allocator-heavy code
 - randomness in tests: `SequenceRng` (scripted) or a fixed-seed `DefaultPrng`
-- one heavy run (`zig build test`, bench, training) at a time, even across subagents
+- one heavy run (`zig build test`, bench, training) at a time, even across subagents — parallel training jobs stall each other (load average is not throughput)
+- `zig build test -Doptimize=ReleaseFast` does not finish: the `nn` test binary alone compiles for 20+ min. Debug is the full-test setting
+- measure a policy with `zig build solve`; `zig build ranking` runs every policy (nnmcts etc.) and takes 10+ min per game
 - `std.testing`: `expectEqual` / `expectEqualStrings` / `expectError`
 - core API names match README "Core API"
