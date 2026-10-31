@@ -39,6 +39,8 @@ const usage =
     \\              ft2     (#159: fine tuning from dump_path, loaded like resume; every self-play step also
     \\                       trains one uniformly drawn deep afterstate, so 50% of the updates stay on the
     \\                       self-play trajectory (shallow positions included) and 50% land on the deep tail)
+    \\              restart (#159: fine tuning that starts every self-play game on a uniformly drawn deep
+    \\                       afterstate of dump_path plus one fresh spawn; otherwise trains like resume)
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
     \\                game i uses seed train_seed + i and the batch result is the mean of its games.
     \\                (#99) as arg 10 it batches any stateless variant (base|backward|replay|sym|symlam|
@@ -51,7 +53,7 @@ const usage =
     \\  replay_k      afterstates re-trained per game for variant replay (default 30)
     \\  weights_path  file to load (train_games 0) or write (default ai/solver/nn_weights.bin); use a temp path for variant runs
     \\  train_seed    seed for weight init and self-play games (default 1, omitted = same weights as before #56)
-    \\  dump_path     file for the deep-position buffer (#159); required by dump|ft2, after a "-" par slot
+    \\  dump_path     file for the deep-position buffer (#159); required by dump|ft2|restart, after a "-" par slot
     \\
     \\Weights are written to `weights_path` only when train_games > 0;
     \\train_games = 0 (eval only) never writes.
@@ -202,10 +204,11 @@ pub fn main(init: std.process.Init) !void {
     const is_mstd = std.mem.eql(u8, variant, "mstd");
     const is_dump = std.mem.eql(u8, variant, "dump");
     const is_ft2 = std.mem.eql(u8, variant, "ft2");
+    const is_restart = std.mem.eql(u8, variant, "restart");
     // fine tuning variants load weights_path first, like `resume`
-    const use_resume = std.mem.eql(u8, variant, "resume") or is_ft2;
+    const use_resume = std.mem.eql(u8, variant, "resume") or is_ft2 or is_restart;
     // Variants that read dump_path (index 11) instead of only writing it.
-    const uses_dump = is_dump or is_ft2;
+    const uses_dump = is_dump or is_ft2 or is_restart;
     const replay_k: usize = try cli.argOr(usize, args, 7, default_replay_k);
     const weights_path: []const u8 = try cli.argOr([]const u8, args, 8, default_weights_path);
     const train_seed: u64 = try cli.argOr(u64, args, 9, default_train_seed);
@@ -246,6 +249,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .dump_record = true, .dump = &dump }
     else if (is_ft2)
         .{ .deep_mix = true, .dump = &dump }
+    else if (is_restart)
+        .{ .restart = true, .dump = &dump }
     else if (std.mem.eql(u8, variant, "oi") or std.mem.eql(u8, variant, "oi16") or is_mstd)
         .{}
     else {
@@ -258,13 +263,13 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}", .{usage});
         return;
     }
-    // the priority ring buffer, the dump and the deep mix are cross-game state: batching would race
-    // on them. `mstd` has no batch path either (one staged net is ~1 MB).
-    if (use_par and (!parSupported(opts, is_mstd) or opts.dump_record or opts.deep_mix)) {
+    // the priority ring buffer, the dump, the deep mix and the restart buffer are cross-game state:
+    // batching would race on them. `mstd` has no batch path either (one staged net is ~1 MB).
+    if (use_par and (!parSupported(opts, is_mstd) or opts.dump_record or opts.deep_mix or opts.restart)) {
         std.debug.print("{s}", .{usage});
         return;
     }
-    if (is_ft2) loadDump(&dump, init.io, init.gpa, dump_path.?);
+    if (is_ft2 or is_restart) loadDump(&dump, init.io, init.gpa, dump_path.?);
 
     var net: nn.Net = undefined;
     var staged: nn.Staged = undefined;
@@ -511,6 +516,10 @@ test "usage text documents the par flag for stateless variants" {
 
 test "usage text lists the symbatch variant" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "symbatch (#98") != null);
+}
+
+test "usage text lists the restart variant" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "restart (#159") != null);
 }
 
 test "usage text lists the dump variant and its dump_path slot" {

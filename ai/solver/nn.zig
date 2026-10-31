@@ -856,6 +856,9 @@ pub const Options = struct {
     /// per self-play step, so half the update budget stays on the self-play trajectory (uniform over the
     /// whole game, shallow positions included) and half lands on the deep tail.
     deep_mix: bool = false,
+    /// Candidate (#159) `restart`: every game starts on a uniformly drawn deep afterstate of `dump`
+    /// instead of an empty board. Requires `dump`.
+    restart: bool = false,
 };
 
 /// Prioritized replay (issue #34): ring buffer of recent TD updates. After each game, `m` extra updates
@@ -1222,10 +1225,19 @@ fn trainStep(net: *Net, cache: *Cache, after: Board, target: f64, lr: f64, opts:
     }
 }
 
+/// Start of a #159 `restart` game: a stored deep afterstate plus exactly one fresh spawn re-rolled from
+/// `rng` (so the games from one dump differ, and one rng draw per game keeps them reproducible). Score 0:
+/// only score deltas enter the target, and the stored board carries no score.
+fn restartState(rng: std.Random, buffer: *Dump) GameState {
+    var state = GameState{ .board = buffer.draw(rng), .score = 0 };
+    _ = state.spawnRandomTile(rng);
+    return state;
+}
+
 fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
     const pr = opts.priority;
     const vfn: Value = .{ .single = net };
-    var state = GameState.gameStart(rng);
+    var state = if (opts.restart) restartState(rng, opts.dump.?) else GameState.gameStart(rng);
     var pending: ?Pick = null;
     var cache: Cache = .{};
     var moves: u32 = 0;
@@ -2356,6 +2368,54 @@ test "ft2 mixes one deep draw per self-play step and is deterministic" {
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
     // the deep half is not a no-op: it changes the weights (and with them the rest of the game)
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&a), std.mem.asBytes(&plain_net)));
+}
+
+test "restart starts on a stored deep board with one fresh spawn, deterministically" {
+    var dump: Dump = .{};
+    var stored: Board = @splat(@splat(0));
+    stored[0][0] = dump_min_tile;
+    dump.append(stored);
+
+    var rng_a = std.Random.DefaultPrng.init(5);
+    var rng_b = std.Random.DefaultPrng.init(5);
+    const a = restartState(rng_a.random(), &dump);
+    const b = restartState(rng_b.random(), &dump);
+    try std.testing.expectEqual(@as(u32, 0), a.score); // the dump has no score, only deltas matter
+    try std.testing.expectEqual(a.board, b.board); // same seed -> same spawn
+    try std.testing.expectEqual(@as(u64, 2), dump.draws);
+    // exactly one spawn on top of the stored board
+    try std.testing.expectEqual(dump_min_tile, core.maxTile(a.board));
+    var tiles: usize = 0;
+    for (a.board) |row| for (row) |v| {
+        if (v != 0) tiles += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 2), tiles);
+}
+
+test "restart games are deterministic and start from a deep position" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var a = Net.init(init_rng.random());
+    var b = a;
+    var plain_net = a;
+    var dump: Dump = .{};
+    var stored: Board = @splat(@splat(0));
+    stored[0][0] = dump_min_tile;
+    stored[0][1] = 128;
+    dump.append(stored);
+
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    var rng_plain = std.Random.DefaultPrng.init(12);
+    const game = trainGameOpts(&a, rng_a.random(), 0.001, null, .{ .restart = true, .dump = &dump });
+    const again = trainGameOpts(&b, rng_b.random(), 0.001, null, .{ .restart = true, .dump = &dump });
+    const plain = trainGameOpts(&plain_net, rng_plain.random(), 0.001, null, .{});
+
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+    try std.testing.expectEqual(game.moves, again.moves);
+    try std.testing.expectEqual(game.score, again.score);
+    // the restart half is a different trajectory: it starts from a 4096 board, not from two random tiles
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&a), std.mem.asBytes(&plain_net)));
+    try std.testing.expect(game.moves < plain.moves);
 }
 
 test "trainGame with diagnostic gives the same weights and records steps" {
