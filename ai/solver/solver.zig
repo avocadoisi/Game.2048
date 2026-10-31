@@ -138,7 +138,7 @@ pub const policy_info = [_]PolicyInfo{
     .{ .policy = .nn2, .depth = 2, .description = "TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）" },
     .{ .policy = .nnmcts, .depth = 0, .description = "UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）" },
     .{ .policy = .nnbeam, .depth = 0, .description = "NNの盤面価値を葉にしたビーム探索。幅8・3手先で、ply間のspawnを2回サンプリングする（固定seedで再現）" },
-    .{ .policy = .expectimax_id, .depth = 0, .ranked = false, .description = "時間予算付きの反復深化 + 確率枝刈り（#104）。depth 2から1ずつ深くし、予算内に終わった最後の深さの手を選ぶ。予算はdepth引数（ms、0なら既定の40ms）" },
+    .{ .policy = .expectimax_id, .depth = 0, .ranked = false, .description = "時間予算付きの反復深化 + 確率枝刈り（#104）。depth 2から1ずつ深くし、予算内に終わった最後の深さの手を選ぶ。予算はdepth引数（ms、0なら既定値）" },
     .{ .policy = .nn3, .depth = 0, .ranked = false, .description = "TD学習のMLP価値関数で3手先まで探索する（深い層の出現確率が1e-2未満の枝を落として再正規化）。既定のランキングには入れていない（重い）" },
     .{ .policy = .ntuple, .depth = 0, .ranked = false, .needs_table = true, .description = "n-tuple 表（量子化した int16、7 パターン）の1手先読み。表は 64 MiB あるので API と CLI 専用" },
 };

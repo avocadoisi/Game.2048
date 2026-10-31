@@ -9,7 +9,8 @@
 //!                             dir: 0 up, 1 left, 2 down, 3 right
 //! - `solve(algo, depth) -> i32` direction as above, -1 when no legal move
 //!                             `algo` indexes the module's policy list, in the order
-//!                             `wasm.policies` names them (see `algo_name`)
+//!                             `wasm.policies` names them (see `algo_name`); `depth` 0 means
+//!                             "the policy's own horizon" (`policy_info`)
 //! - `board_ptr() -> *const u32` 16 row-major tile values (0 = empty)
 //! - `score() -> u32`, `best_tile() -> u32`
 //! - `algo_count() -> u32`, `algo_name(i) -> *const u8` (NUL-terminated),
@@ -29,20 +30,19 @@ var prng: std.Random.DefaultPrng = undefined;
 /// dropdown from `algo_count`/`algo_name`, so the module and the UI cannot disagree.
 const policies: []const solver.Policy = blk: {
     @setEvalBranchQuota(200_000); // stringToEnum builds a comptime string map per name
+    // Some editors write a BOM; it is not part of the first name.
+    const spec = if (std.mem.startsWith(u8, options.policies, "\xEF\xBB\xBF")) options.policies[3..] else options.policies;
     var found: [32]solver.Policy = undefined;
     var n: usize = 0;
     var start: usize = 0;
     var i: usize = 0;
-    while (i <= options.policies.len) : (i += 1) {
-        const ch: u8 = if (i == options.policies.len) '\n' else options.policies[i];
-        if (ch == '#') { // comment runs to the end of the line
-            while (i < options.policies.len and options.policies[i] != '\n') : (i += 1) {}
-            start = i + 1;
-            continue;
-        }
-        if (ch != ' ' and ch != '\t' and ch != '\r' and ch != '\n' and ch != ',') continue;
+    while (i <= spec.len) : (i += 1) {
+        const ch: u8 = if (i == spec.len) '\n' else spec[i];
+        const comment = ch == '#';
+        if (!comment and ch != ' ' and ch != '\t' and ch != '\r' and ch != '\n' and ch != ',') continue;
+        // A name ends at a separator *or* at the start of a comment (`nn2#note` still ships nn2).
         if (i > start) {
-            const name = options.policies[start..i];
+            const name = spec[start..i];
             const policy = std.meta.stringToEnum(solver.Policy, name) orelse
                 @compileError("wasm.policies: unknown policy `" ++ name ++ "`");
             if (solver.policyInfo(policy).needs_table)
@@ -50,10 +50,15 @@ const policies: []const solver.Policy = blk: {
             for (found[0..n]) |seen| {
                 if (seen == policy) @compileError("wasm.policies: `" ++ name ++ "` is listed twice");
             }
+            if (n == found.len) @compileError("wasm.policies: too many policies (max 32)");
             found[n] = policy;
             n += 1;
         }
         start = i + 1;
+        if (comment) { // runs to the end of the line
+            while (i < spec.len and spec[i] != '\n') : (i += 1) {}
+            start = i + 1;
+        }
     }
     if (n == 0) @compileError("wasm.policies must name at least one policy");
     const list = found[0..n].*;
@@ -66,6 +71,17 @@ const descriptions: []const []const u8 = blk: {
     var out: [policies.len][]const u8 = undefined;
     for (policies, 0..) |policy, i| out[i] = solver.policyInfo(policy).description;
     const list = out; // a const copy, so the block returns a static array rather than a comptime var
+    break :blk &list;
+};
+
+/// Default horizon per shipped policy: `solve`'s `depth == 0` means "the policy's own horizon",
+/// the same convention `expectimax_id` uses for its time budget. Without it a depth-dependent
+/// policy added to `wasm.policies` (`expectimax`, `ga`) would be searched at depth 0, which wraps
+/// to 255 plies and freezes the tab (#154 review).
+const depths: []const u8 = blk: {
+    var out: [policies.len]u8 = undefined;
+    for (policies, 0..) |policy, i| out[i] = solver.policyInfo(policy).depth;
+    const list = out;
     break :blk &list;
 };
 
@@ -95,18 +111,21 @@ export fn move(dir: u32) u32 {
 /// Each arm calls `solver.chooseOne` with a constant policy, which is what keeps the unshipped
 /// policies out of the module: a runtime `switch (policy)` inside `solver.choose` would link them
 /// all. `inline` over the index range lets the linker drop the rest.
-fn chooseAt(algo: u32, rng: std.Random) ?core.Direction {
+fn chooseAt(algo: u32, rng: std.Random, depth: u32) ?core.Direction {
     switch (algo) {
-        inline 0...policies.len - 1 => |i| return solver.chooseOne(policies[i], state, rng, 0),
+        inline 0...policies.len - 1 => |i| {
+            // `depth` 0 = the policy's own horizon (nn2/nn3 ignore it: `nn.bestMove` is fixed-horizon)
+            return solver.chooseOne(policies[i], state, rng, if (depth == 0) depths[i] else @intCast(depth));
+        },
         else => return null,
     }
 }
 
-/// `depth` is part of the ABI but unused by the shipped policies: nn2 and nn3 are fixed-horizon by
-/// construction (`nn.bestMove` picks 2-ply or 3-ply), the way `policy_info` records depth 0 for them.
+/// `depth` is the horizon in plies; 0 = the policy's own default (`policy_info`). The page passes 0
+/// and the shipped policies (nn2, nn3) ignore the value entirely — it exists for the policies that
+/// take a horizon (`expectimax`, `ga`), which a deploy can add through `wasm.policies`.
 export fn solve(algo: u32, depth: u32) i32 {
-    _ = depth;
-    const dir = chooseAt(algo, prng.random()) orelse return -1;
+    const dir = chooseAt(algo, prng.random(), @min(depth, 255)) orelse return -1;
     return @intFromEnum(dir);
 }
 
