@@ -734,6 +734,20 @@ pub fn distBucket(moves_left: usize) usize {
     return if (moves_left < 10) 0 else if (moves_left < 30) 1 else 2;
 }
 
+/// Max-tile buckets of the deep-position diagnostic (issue #159): <=256, 512, 1024, 2048, 4096, 8192+.
+/// The tail beyond 4096 is where the value error is concentrated (#28/#32), so the table has to show
+/// how many training steps ever reach it.
+pub const tile_buckets = 6;
+
+pub fn tileBucket(max_tile: core.Tile) usize {
+    if (max_tile <= 256) return 0;
+    if (max_tile <= 512) return 1;
+    if (max_tile <= 1024) return 2;
+    if (max_tile <= 2048) return 3;
+    if (max_tile <= 4096) return 4;
+    return 5;
+}
+
 /// Per-bucket sums over the training steps: TD error |target - V(s)| and value change V(s_{t+1}) - V(s_t).
 pub const Diag = struct {
     pub const Stat = struct { count: u64 = 0, abs_err: f64 = 0, drop: f64 = 0 };
@@ -742,6 +756,8 @@ pub const Diag = struct {
     const window = 30;
 
     stats: [3][3]Stat = @splat(@splat(.{})),
+    /// Steps and |TD error| by max tile (#159). No window: the bucket of an afterstate is known at once.
+    tiles: [tile_buckets]Stat = @splat(.{}),
     ring: [window]Pending = undefined,
     pushed: usize = 0,
 
@@ -752,8 +768,13 @@ pub const Diag = struct {
         s.drop += drop;
     }
 
-    /// Record one training step of the current game. Steps older than the window are at least 30 moves from the end.
-    pub fn push(self: *Diag, empties: usize, err: f64, drop: f64) void {
+    /// Record one training step of the current game (the afterstate it trained). Steps older than the
+    /// window are at least 30 moves from the end.
+    pub fn push(self: *Diag, after: Board, err: f64, drop: f64) void {
+        const empties = countEmpty(after);
+        const tile = &self.tiles[tileBucket(core.maxTile(after))];
+        tile.count += 1;
+        tile.abs_err += err;
         if (self.pushed >= window) {
             const old = self.ring[self.pushed % window];
             self.add(old.empties, window, old.err, old.drop);
@@ -826,6 +847,18 @@ pub const Options = struct {
     /// Candidate (#158): self-play move of the per-move path. `greedy1` is the historical 1-ply argmax;
     /// `deep2` plays the eval's 2-ply search (`.deep`: same tie-break, spawns enumerated, no rng use).
     selfplay: SelfPlay = .greedy1,
+    /// Candidate (#159) `dump`: append every afterstate the plain per-move path visits whose max tile
+    /// reached `dump_min_tile` to `dump` (bounded, overflow dropped). The updates are unchanged.
+    dump_record: bool = false,
+    /// Deep-position buffer (#159): written by `dump_record`, read by the variants that train from it.
+    dump: ?*Dump = null,
+    /// Candidate (#159) `ft2`: one extra TD(0) update from a uniformly drawn deep afterstate of `dump`
+    /// per self-play step, so half the update budget stays on the self-play trajectory (uniform over the
+    /// whole game, shallow positions included) and half lands on the deep tail.
+    deep_mix: bool = false,
+    /// Candidate (#159) `restart`: every game starts on a uniformly drawn deep afterstate of `dump`
+    /// instead of an empty board. Requires `dump`.
+    restart: bool = false,
 };
 
 /// Prioritized replay (issue #34): ring buffer of recent TD updates. After each game, `m` extra updates
@@ -909,6 +942,108 @@ pub const Priority = struct {
 
     fn weight(self: *const Priority, err: f64) f64 {
         return std.math.pow(f64, @abs(err) + err_floor, self.alpha);
+    }
+};
+
+/// One TD(0) step on a stored deep afterstate (#159 `ft2`). The board carries no history, so the reward
+/// of the move that led out of it is unknown and the target is the value of its greedy successor (reward 0).
+/// A dead board has no successor, hence no target.
+fn deepStep(net: *Net, rng: std.Random, buffer: *Dump, lr: f64, cache: *Cache) void {
+    const start = GameState{ .board = buffer.draw(rng), .score = 0 };
+    const pick = pickMove(net, start, false) orelse return;
+    _ = forward(net, start.board, cache);
+    train(net, cache, pick.value, lr);
+}
+
+/// Deep-position dump (issue #159): fixed-capacity buffer of afterstates whose max tile reached
+/// `dump_min_tile`. The score does not enter the TD target (reward = score_delta / `reward_scale`),
+/// so training from these positions means the same thing as training from them mid-game.
+///
+/// File layout (all little endian): 8-byte magic `2048-DMP`, u32 entry count, then `count` entries of
+/// 16 bytes — one byte per cell, row-major, holding log2 of the tile (0 = empty, so a 4096 is 12 and
+/// an 8192 is 13). Tiles are powers of two, so the round trip is exact.
+pub const dump_magic = "2048-DMP";
+pub const dump_min_tile: core.Tile = 4096;
+/// 1 MiB of entries: far more deep positions than one training run needs, small enough to heap-allocate.
+pub const dump_cap: usize = 1 << 16;
+pub const dump_header_len = 12;
+pub const dump_entry_len = core.BoardCellCount;
+
+pub const Dump = struct {
+    entries: [dump_cap][dump_entry_len]u8 = undefined,
+    len: usize = 0,
+    /// Deep afterstates seen after the buffer filled. They are discarded, so the dump stays the first
+    /// `dump_cap` ones in training order (no rng involved, hence deterministic).
+    dropped: u64 = 0,
+    /// Deep afterstates drawn for training (`ft2`, `restart`). Not part of the file.
+    draws: u64 = 0,
+
+    /// Record `board` when its max tile reached `dump_min_tile`; shallower boards are ignored.
+    pub fn offer(self: *Dump, board: Board) void {
+        if (core.maxTile(board) < dump_min_tile) return;
+        if (self.len == dump_cap) {
+            self.dropped += 1;
+            return;
+        }
+        self.append(board);
+    }
+
+    pub fn append(self: *Dump, board: Board) void {
+        std.debug.assert(self.len < dump_cap);
+        for (0..core.BoardCellCount) |cell| {
+            const value = board[cell / core.BoardSize][cell % core.BoardSize];
+            self.entries[self.len][cell] = if (value == 0) 0 else @intCast(std.math.log2_int(core.Tile, value));
+        }
+        self.len += 1;
+    }
+
+    /// The `index`-th stored afterstate, decoded back to tiles.
+    pub fn boardAt(self: *const Dump, index: usize) Board {
+        var out: Board = undefined;
+        for (0..core.BoardCellCount) |cell| {
+            const level = self.entries[index][cell];
+            out[cell / core.BoardSize][cell % core.BoardSize] = if (level == 0) 0 else @as(core.Tile, 1) << @intCast(level);
+        }
+        return out;
+    }
+
+    /// Uniform draw of one stored afterstate, counted so the 50/50 mix of `ft2` is observable.
+    /// Uniform on purpose: #33/#34/#56 lost with |TD error| and midgame resampling of existing data.
+    pub fn draw(self: *Dump, rng: std.Random) Board {
+        std.debug.assert(self.len > 0);
+        self.draws += 1;
+        return self.boardAt(rng.uintLessThan(usize, self.len));
+    }
+
+    fn encodeInto(self: *const Dump, bytes: []u8) void {
+        @memcpy(bytes[0..8], dump_magic);
+        std.mem.writeInt(u32, bytes[8..12], @intCast(self.len), .little);
+        @memcpy(bytes[dump_header_len..], std.mem.sliceAsBytes(self.entries[0..self.len]));
+    }
+
+    pub fn save(self: *const Dump, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
+        const bytes = try gpa.alloc(u8, dump_header_len + self.len * dump_entry_len);
+        defer gpa.free(bytes);
+        self.encodeInto(bytes);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+    }
+
+    pub fn parse(self: *Dump, bytes: []const u8) !void {
+        self.len = 0;
+        self.dropped = 0;
+        if (bytes.len < dump_header_len) return error.DumpTooShort;
+        if (!std.mem.eql(u8, bytes[0..8], dump_magic)) return error.BadDumpMagic;
+        const count = std.mem.readInt(u32, bytes[8..12], .little);
+        if (count > dump_cap) return error.DumpTooLarge;
+        if (bytes.len != dump_header_len + @as(usize, count) * dump_entry_len) return error.WrongDumpFileSize;
+        @memcpy(std.mem.sliceAsBytes(self.entries[0..count]), bytes[dump_header_len..]);
+        self.len = count;
+    }
+
+    pub fn load(self: *Dump, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(dump_header_len + dump_cap * dump_entry_len));
+        defer gpa.free(bytes);
+        try self.parse(bytes);
     }
 };
 
@@ -1090,29 +1225,41 @@ fn trainStep(net: *Net, cache: *Cache, after: Board, target: f64, lr: f64, opts:
     }
 }
 
+/// Start of a #159 `restart` game: a stored deep afterstate plus exactly one fresh spawn re-rolled from
+/// `rng` (so the games from one dump differ, and one rng draw per game keeps them reproducible). Score 0:
+/// only score deltas enter the target, and the stored board carries no score.
+fn restartState(rng: std.Random, buffer: *Dump) GameState {
+    var state = GameState{ .board = buffer.draw(rng), .score = 0 };
+    _ = state.spawnRandomTile(rng);
+    return state;
+}
+
 fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
     const pr = opts.priority;
     const vfn: Value = .{ .single = net };
-    var state = GameState.gameStart(rng);
+    var state = if (opts.restart) restartState(rng, opts.dump.?) else GameState.gameStart(rng);
     var pending: ?Pick = null;
     var cache: Cache = .{};
     var moves: u32 = 0;
     var trace: Net = std.mem.zeroes(Net);
     while (selfplayPick(vfn, state, opts.death, opts.selfplay)) |pick| {
         moves += 1;
+        if (opts.dump_record) if (opts.dump) |buffer| buffer.offer(pick.after);
         if (pending) |p| {
             // `state` is still the post-spawn board the pending step led into (this move has not been
             // applied yet), which is the board the `search2` target evaluates.
             const target = p.reward + tdBootstrap(net, pick, state, opts);
-            if (diag) |d| d.push(countEmpty(p.after), @abs(target - p.value), pick.value - p.value);
+            if (diag) |d| d.push(p.after, @abs(target - p.value), pick.value - p.value);
             if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = pick.after, .terminal = false, .err = @abs(target - p.value) });
             trainStep(net, &cache, p.after, target, lr, opts, &trace);
         }
         pending = pick;
+        // `ft2` mixes one deep update into every self-play step: 50% self-play / 50% deep afterstates.
+        if (opts.deep_mix) if (opts.dump) |buffer| if (buffer.len > 0) deepStep(net, rng, buffer, lr, &cache);
         _ = state.move(pick.dir, rng);
     }
     if (pending) |p| {
-        if (diag) |d| d.push(countEmpty(p.after), @abs(p.reward - p.value), -p.value);
+        if (diag) |d| d.push(p.after, @abs(p.reward - p.value), -p.value);
         if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = p.after, .terminal = true, .err = @abs(p.reward - p.value) });
         trainStep(net, &cache, p.after, p.reward, lr, opts, &trace);
     }
@@ -1222,6 +1369,10 @@ fn mergeDiag(dst: *Diag, src: *const Diag) void {
         dst.stats[e][k].abs_err += src.stats[e][k].abs_err;
         dst.stats[e][k].drop += src.stats[e][k].drop;
     };
+    for (0..tile_buckets) |t| {
+        dst.tiles[t].count += src.tiles[t].count;
+        dst.tiles[t].abs_err += src.tiles[t].abs_err;
+    }
 }
 
 /// Runs `games` (<= max_threads) self-play games in parallel from the same starting net, then sets
@@ -2049,12 +2200,222 @@ test "Diag.add accumulates count, abs error and signed drop per bucket" {
 test "Diag push and finish bucket each step by moves to game over" {
     var diag: Diag = .{};
     // 35 steps in one game: step i has 34 - i moves left
-    for (0..35) |_| diag.push(0, 1.0, 0);
+    for (0..35) |_| diag.push(boardWithEmpties(0), 1.0, 0);
     diag.finish();
     try std.testing.expectEqual(@as(u64, 10), diag.stats[0][0].count);
     try std.testing.expectEqual(@as(u64, 20), diag.stats[0][1].count);
     try std.testing.expectEqual(@as(u64, 5), diag.stats[0][2].count);
     try std.testing.expectApproxEqAbs(@as(f64, 35), diag.stats[0][0].abs_err + diag.stats[0][1].abs_err + diag.stats[0][2].abs_err, 1e-12);
+}
+
+test "tileBucket splits the max tile into <=256, 512, 1024, 2048, 4096 and 8192+" {
+    try std.testing.expectEqual(@as(usize, 0), tileBucket(0));
+    try std.testing.expectEqual(@as(usize, 0), tileBucket(256));
+    try std.testing.expectEqual(@as(usize, 1), tileBucket(512));
+    try std.testing.expectEqual(@as(usize, 2), tileBucket(1024));
+    try std.testing.expectEqual(@as(usize, 3), tileBucket(2048));
+    try std.testing.expectEqual(@as(usize, 4), tileBucket(4096));
+    try std.testing.expectEqual(@as(usize, 5), tileBucket(8192));
+    try std.testing.expectEqual(@as(usize, 5), tileBucket(65536));
+}
+
+test "Diag tile table counts steps and |err| per max tile bucket" {
+    var diag: Diag = .{};
+    var small: Board = @splat(@splat(0));
+    small[0][0] = 256;
+    var mid: Board = @splat(@splat(0));
+    mid[3][2] = 4096;
+    var deep: Board = @splat(@splat(0));
+    deep[1][1] = 8192;
+    // hand-computed: two steps at 256 (errors 0.5 + 0.25), one at 4096 (1.0), three at 8192+ (0.1 + 0.2 + 0.3)
+    diag.push(small, 0.5, 0);
+    diag.push(small, 0.25, 0);
+    diag.push(mid, 1.0, 0);
+    diag.push(deep, 0.1, 0);
+    diag.push(deep, 0.2, 0);
+    diag.push(deep, 0.3, 0);
+    try std.testing.expectEqual(@as(u64, 2), diag.tiles[0].count);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), diag.tiles[0].abs_err, 1e-12);
+    try std.testing.expectEqual(@as(u64, 0), diag.tiles[3].count);
+    try std.testing.expectEqual(@as(u64, 1), diag.tiles[4].count);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), diag.tiles[4].abs_err, 1e-12);
+    try std.testing.expectEqual(@as(u64, 3), diag.tiles[5].count);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.6), diag.tiles[5].abs_err, 1e-12);
+    // the empty-cell table still sees the same six steps (15 empties each, no finish yet)
+    try std.testing.expectEqual(@as(u64, 0), diag.stats[2][0].count);
+    diag.finish();
+    try std.testing.expectEqual(@as(u64, 6), diag.stats[2][0].count);
+}
+
+test "Dump keeps only afterstates at or above dump_min_tile" {
+    var dump: Dump = .{};
+    var shallow: Board = @splat(@splat(0));
+    shallow[0][0] = 2048;
+    var deep: Board = @splat(@splat(0));
+    deep[2][1] = dump_min_tile;
+    dump.offer(shallow);
+    try std.testing.expectEqual(@as(usize, 0), dump.len);
+    dump.offer(deep);
+    try std.testing.expectEqual(@as(usize, 1), dump.len);
+    try std.testing.expectEqual(deep, dump.boardAt(0));
+}
+
+test "Dump writes the header and log2 cells, and load reads them back byte for byte" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/dump.bin", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+
+    var dump: Dump = .{};
+    // board 0: 4096 at (0,0), empty elsewhere except a 2 at (3,3)
+    var first: Board = @splat(@splat(0));
+    first[0][0] = 4096;
+    first[3][3] = 2;
+    // board 1: 8192 at (1,2) and 128 at (2,0)
+    var second: Board = @splat(@splat(0));
+    second[1][2] = 8192;
+    second[2][0] = 128;
+    dump.offer(first);
+    dump.offer(second);
+    try dump.save(io, std.testing.allocator, path);
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqual(dump_header_len + 2 * dump_entry_len, bytes.len);
+    try std.testing.expectEqualStrings(dump_magic, bytes[0..8]);
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, bytes[8..12], .little));
+    // log2 of the tile, row-major: 4096 -> 12 at cell 0, 2 -> 1 at cell 15
+    try std.testing.expectEqual(@as(u8, 12), bytes[dump_header_len + 0]);
+    try std.testing.expectEqual(@as(u8, 0), bytes[dump_header_len + 1]);
+    try std.testing.expectEqual(@as(u8, 1), bytes[dump_header_len + 15]);
+    // 8192 -> 13 at cell 6 (1,2), 128 -> 7 at cell 8 (2,0)
+    try std.testing.expectEqual(@as(u8, 13), bytes[dump_header_len + 16 + 6]);
+    try std.testing.expectEqual(@as(u8, 7), bytes[dump_header_len + 16 + 8]);
+
+    var loaded: Dump = .{};
+    try loaded.load(io, std.testing.allocator, path);
+    try std.testing.expectEqual(@as(usize, 2), loaded.len);
+    try std.testing.expectEqual(@as(u64, 0), loaded.dropped);
+    try std.testing.expectEqual(first, loaded.boardAt(0));
+    try std.testing.expectEqual(second, loaded.boardAt(1));
+}
+
+test "Dump parse rejects a wrong magic and a truncated file" {
+    var dump: Dump = .{};
+    var bytes: [dump_header_len]u8 = @splat(0);
+    @memcpy(bytes[0..8], "2048-XXX");
+    try std.testing.expectError(error.BadDumpMagic, dump.parse(&bytes));
+    @memcpy(bytes[0..8], dump_magic);
+    std.mem.writeInt(u32, bytes[8..12], 1, .little);
+    try std.testing.expectError(error.WrongDumpFileSize, dump.parse(&bytes));
+    try std.testing.expectError(error.DumpTooShort, dump.parse("2048"));
+    std.mem.writeInt(u32, bytes[8..12], @intCast(dump_cap + 1), .little);
+    try std.testing.expectError(error.DumpTooLarge, dump.parse(&bytes));
+}
+
+test "dump_record leaves the weights and the rng consumption unchanged" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var a = Net.init(init_rng.random());
+    var b = a;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    const plain = trainGameOpts(&a, rng_a.random(), 0.003, null, .{});
+    var dump: Dump = .{};
+    var c = b;
+    var rng_c = std.Random.DefaultPrng.init(12);
+    const recorded = trainGameOpts(&b, rng_b.random(), 0.003, null, .{ .dump_record = true, .dump = &dump });
+    const again = trainGameOpts(&c, rng_c.random(), 0.003, null, .{ .dump_record = true, .dump = &dump });
+    try std.testing.expectEqual(plain.score, recorded.score);
+    try std.testing.expectEqual(plain.moves, recorded.moves);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+    // recording is a pure side effect: a second identical game overwrites the same entries in the same order
+    try std.testing.expectEqual(recorded.score, again.score);
+    try std.testing.expectEqual(recorded.moves, again.moves);
+    // a fresh net stays shallow, so most games record nothing; whatever it does record must be deep enough
+    for (0..dump.len) |i| try std.testing.expect(core.maxTile(dump.boardAt(i)) >= dump_min_tile);
+}
+
+test "ft2 mixes one deep draw per self-play step and is deterministic" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var a = Net.init(init_rng.random());
+    var b = a;
+    var plain_net = a;
+    var dump: Dump = .{};
+    var first: Board = @splat(@splat(0));
+    first[0][0] = dump_min_tile;
+    first[0][1] = 4;
+    var second: Board = @splat(@splat(0));
+    second[2][2] = dump_min_tile * 2;
+    second[3][0] = 2;
+    dump.append(first);
+    dump.append(second);
+
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    var rng_plain = std.Random.DefaultPrng.init(12);
+    const game = trainGameOpts(&a, rng_a.random(), 0.001, null, .{ .deep_mix = true, .dump = &dump });
+    const again = trainGameOpts(&b, rng_b.random(), 0.001, null, .{ .deep_mix = true, .dump = &dump });
+    _ = trainGameOpts(&plain_net, rng_plain.random(), 0.001, null, .{});
+
+    // one deep draw per self-play step, and no draw at all without the dump: 50% self-play / 50% deep
+    try std.testing.expectEqual(@as(u64, game.moves) * 2, dump.draws);
+    // same seed -> same games and byte-identical weights
+    try std.testing.expectEqual(game.moves, again.moves);
+    try std.testing.expectEqual(game.score, again.score);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+    // the deep half is not a no-op: it changes the weights (and with them the rest of the game)
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&a), std.mem.asBytes(&plain_net)));
+}
+
+test "restart starts on a stored deep board with one fresh spawn, deterministically" {
+    var dump: Dump = .{};
+    var stored: Board = @splat(@splat(0));
+    stored[0][0] = dump_min_tile;
+    dump.append(stored);
+
+    var rng_a = std.Random.DefaultPrng.init(5);
+    var rng_b = std.Random.DefaultPrng.init(5);
+    const a = restartState(rng_a.random(), &dump);
+    const b = restartState(rng_b.random(), &dump);
+    try std.testing.expectEqual(@as(u32, 0), a.score); // the dump has no score, only deltas matter
+    try std.testing.expectEqual(a.board, b.board); // same seed -> same spawn
+    try std.testing.expectEqual(@as(u64, 2), dump.draws);
+    // exactly one spawn on top of the stored board
+    try std.testing.expectEqual(dump_min_tile, core.maxTile(a.board));
+    var tiles: usize = 0;
+    for (a.board) |row| for (row) |v| {
+        if (v != 0) tiles += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 2), tiles);
+}
+
+test "restart games are deterministic and start from a deep position" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var a = Net.init(init_rng.random());
+    var b = a;
+    var plain_net = a;
+    var dump: Dump = .{};
+    var stored: Board = @splat(@splat(0));
+    stored[0][0] = dump_min_tile;
+    stored[0][1] = 128;
+    dump.append(stored);
+
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    var rng_plain = std.Random.DefaultPrng.init(12);
+    const game = trainGameOpts(&a, rng_a.random(), 0.001, null, .{ .restart = true, .dump = &dump });
+    const again = trainGameOpts(&b, rng_b.random(), 0.001, null, .{ .restart = true, .dump = &dump });
+    const plain = trainGameOpts(&plain_net, rng_plain.random(), 0.001, null, .{});
+
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+    try std.testing.expectEqual(game.moves, again.moves);
+    try std.testing.expectEqual(game.score, again.score);
+    // the restart half is a different trajectory: it starts from a 4096 board, not from two random tiles
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&a), std.mem.asBytes(&plain_net)));
+    try std.testing.expect(game.moves < plain.moves);
 }
 
 test "trainGame with diagnostic gives the same weights and records steps" {
