@@ -19,7 +19,10 @@ zig build run -- help
 - `play`: `w/a/s/d` または `up/left/down/right` で移動、`n` でリセット、`q` で終了
 - `serve`: 矢印キー/WASD で操作。`GET /api/state`、`POST /api/new`、`POST /api/move?dir=left`、
   `GET /api/solve?depth=2&algo=nn2`、`GET /api/ranking`。solver の自動再生と速度選択ができる
-- 静的配信: `zig build wasm -Doptimize=ReleaseFast` → `zig-out/web/`（`index.html` + `game2048.wasm`、ReleaseFast で gzip 後 280 KiB）。
+- 静的配信: `bash scripts/deploy-pages.sh` で GitHub Pages へ手動デプロイ（wasm ビルド → スモークテスト → `gh-pages` へ force push）。
+  中身は `zig-out/web/`（`index.html` + `game2048.wasm`、763 KB / gzip 後 280 KiB）だけで、NN 重みは wasm に埋め込み済み、n-tuple 表は含まない。
+  初回だけ `--enable` を付けると Pages を有効化する（**private リポジトリは Pro 以上が必要**）。`--dry-run` でビルドと検証だけ。
+  Pages を使わない場合の手元確認は `zig build wasm -Doptimize=ReleaseFast` のあと
   確認は `node scripts/wasm-smoke.mjs`、表示は `python3 -m http.server 8000 -d zig-out/web`
   静的版は**方針を選ばせない**（`nn2` 2-ply 固定、自動再生は常に最大速度）。1 手 1.3 ms、`nn3` は
   23 ms、`expectimax_id` は freestanding に時計が無く深化が止まらないため、選ばせる意味が無い (#143)
