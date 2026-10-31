@@ -237,7 +237,8 @@ pub fn transformBoard(k: usize, board: Board) Board {
     return out;
 }
 
-/// Afterstate chosen by the 1-ply policy, with its scaled reward and value estimate.
+/// Afterstate chosen by the self-play policy, with its scaled reward and the value that policy assigned
+/// to `after`: `V(after)` for the 1-ply policy, the 2-ply search value of the afterstate for `deep2`.
 const Pick = struct {
     dir: Direction,
     after: Board,
@@ -405,6 +406,58 @@ const Search = struct {
         return self.cache.getValueAtDepth(self.vfn, board, .{ .ply = self.ply, .cutoff = self.cutoff }, &self.stats);
     }
 
+    /// `value` with the leaf one own move further out and no reward at it: `bootValue(S, 0)` is the
+    /// best afterstate value one move from `S`, and every level above adds one reward plus the spawn
+    /// average below it, `bootValue(S, r) = max_d (score_delta / reward_scale +
+    /// E_spawn[bootValue(S', r - 1)])`. So `bootValue(S, r)` is `r` rewards and the value of the
+    /// afterstate `r + 1` moves ahead: exactly one move past the last reward it summed. A leaf taken
+    /// at the last reward's afterstate (what `value` does) would count that reward twice (#158).
+    fn bootValue(self: *Search, state: GameState, rewards: u8, cprob: f64) f64 {
+        var best: f64 = -std.math.inf(f64);
+        for ([_]Direction{ .up, .left, .down, .right }) |d| {
+            var next = state;
+            const moved = next.slide(d);
+            if (!moved.changed) continue;
+            const v = if (rewards == 0)
+                self.leaf(next.board)
+            else
+                @as(f64, @floatFromInt(moved.score_delta)) / reward_scale + self.bootChance(next, rewards - 1, cprob);
+            best = @max(best, v);
+        }
+        return if (best == -std.math.inf(f64)) 0 else best;
+    }
+
+    /// Chance node of `bootValue`: `chance`'s spawn width, branch cut and mass renormalization, one
+    /// reward count shallower. With nothing to spawn the search keeps moving at the same count; a node
+    /// whose every branch is cut does the same, because the afterstate leaf here would be the one the
+    /// last reward already reached.
+    fn bootChance(self: *Search, state: GameState, rewards: u8, cprob: f64) f64 {
+        var empties: f64 = 0;
+        for (0..core.BoardSize) |r| {
+            for (0..core.BoardSize) |c| {
+                if (state.board[r][c] == 0) empties += 1;
+            }
+        }
+        if (empties == 0) return self.bootValue(state, rewards, cprob);
+        var total: f64 = 0;
+        var mass: f64 = 0;
+        for (0..core.BoardSize) |r| {
+            for (0..core.BoardSize) |c| {
+                if (state.board[r][c] != 0) continue;
+                for ([_]struct { value: core.Tile, p: f64 }{ .{ .value = 2, .p = 0.9 }, .{ .value = 4, .p = 0.1 } }) |spawn| {
+                    const p = cprob * spawn.p;
+                    // the spawn layer right above the leaves stays full width, as in `chance`
+                    if (rewards > 0 and p / empties < self.cutoff) continue;
+                    var child = state;
+                    child.board[r][c] = spawn.value;
+                    total += p * self.bootValue(child, rewards, p);
+                    mass += p;
+                }
+            }
+        }
+        return if (mass == 0) self.bootValue(state, rewards, cprob) else total / mass;
+    }
+
     /// Max over legal moves of reward + expected value after the spawn; 0 when no move changes the board.
     fn value(self: *Search, state: GameState, depth: u8, cprob: f64) f64 {
         var best: f64 = -std.math.inf(f64);
@@ -465,6 +518,56 @@ fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, dep
         if (best == null or v > best_value) {
             best = d;
             best_value = v;
+        }
+    }
+    return best;
+}
+
+/// Lookahead of the #158 2-ply training variants: `search2_ply` own moves below the board being
+/// valued, with a spawn layer before each of them — the tree `Mode.deep` visits at this ply.
+const search2_ply: u8 = 2;
+
+/// Bootstrap of the `search2` TD target (#158) of a post-spawn board: the `.deep` tree's shape with
+/// its last reward moved into the leaf, `search2_ply - 1` searched rewards and then `V` of the
+/// afterstate one own move past the last of them.
+///
+/// The per-move target is `r_t + bootValue(S_{t+1}, search2_ply - 1)` = `r_t + r_{t+1} + V(A_{t+2})`:
+/// the reward of the step being trained plus the searched reward `r_{t+1}` and the value of the
+/// afterstate both moves led to, whose own reward `r_{t+2}` is inside `V` and nowhere else.
+/// `Search.value` at the same count instead returns `search2_ply` rewards plus `V` of the afterstate
+/// the *last* reward reached, so that last reward lands in the target twice and the fixed point of
+/// the `search2` target sits ~1.5x above the true value on a 1-reward-per-move chain.
+fn search2Value(vfn: Value, state: GameState, cache: *ValueCache) f64 {
+    // The leaf sits one own move deeper than `value` at the same reward count: key it as such.
+    var search: Search = .{ .vfn = vfn, .cache = cache, .ply = search2_ply + 1 };
+    return search.bootValue(state, search2_ply - 1, 1);
+}
+
+/// `pickMoveValue` for the 2-ply self-play policy (#158): candidates are ranked by the eval's `.deep`
+/// value, `reward + Search.chance(afterstate)` — the `1 + search2_ply` own moves deep that `deepMove`
+/// at `ply = search2_ply` scores — so `Pick.value` is that chance value (not `V`), covering
+/// `search2_ply` moves and a reward-bearing leaf below the afterstate. `search2Value` bootstraps the
+/// same tree with its last reward moved into the leaf, so a `search2` target spans `search2_ply`
+/// rewards and V one move past the last of them. Spawns are enumerated, so this draws nothing from
+/// the rng and the spawn sequence of the game is the same as with `greedy1`.
+fn pickSearch2Value(vfn: Value, state: GameState, cache: *ValueCache) ?Pick {
+    var search: Search = .{ .vfn = vfn, .cache = cache };
+    var best: ?Pick = null;
+    var best_value: f64 = -std.math.inf(f64);
+    for ([_]Direction{ .up, .left, .down, .right }) |d| {
+        var next = state;
+        const moved = next.slide(d);
+        if (!moved.changed) continue;
+        const pick: Pick = .{
+            .dir = d,
+            .after = next.board,
+            .reward = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale,
+            .value = search.chance(next, search2_ply, 1),
+        };
+        const value = pick.reward + pick.value;
+        if (best == null or value > best_value) {
+            best = pick;
+            best_value = value;
         }
     }
     return best;
@@ -676,6 +779,12 @@ pub fn countEmpty(board: Board) usize {
     return core.countEmpty(board);
 }
 
+/// TD target of the per-move trainer (#158); see `Options.target`.
+pub const Target = enum { td1, search2 };
+
+/// Self-play policy of the per-move trainer (#158); see `Options.selfplay`.
+pub const SelfPlay = enum { greedy1, deep2 };
+
 /// Opt-in training variants (issue #33). Default `.{}` is the plain per-move TD(0) of `trainGame`.
 pub const Options = struct {
     /// Candidate A: no per-move update during the game; afterwards train every stored afterstate from last to first.
@@ -708,6 +817,15 @@ pub const Options = struct {
     /// Candidate (#84): fixed n-step TD on the afterstate chain; 0 = off. Standalone: when set it owns the
     /// game loop and the other options are ignored. 1 is TD(0), larger n propagates rewards faster.
     nstep: usize = 0,
+    /// Candidate (#158): TD target of the per-move path (`trainGamePerMove`, the default). `td1` is the
+    /// historical reward + V(next afterstate). `search2` keeps the eval's `.deep` tree (the same spawn
+    /// layers) with `search2_ply - 1` searched rewards and then V of the afterstate one move past the
+    /// last of them, so no reward is in the target twice (see `search2Value`). The
+    /// `backward`/`death`/`nstep` paths keep the 1-ply policy.
+    target: Target = .td1,
+    /// Candidate (#158): self-play move of the per-move path. `greedy1` is the historical 1-ply argmax;
+    /// `deep2` plays the eval's 2-ply search (`.deep`: same tie-break, spawns enumerated, no rng use).
+    selfplay: SelfPlay = .greedy1,
 };
 
 /// Prioritized replay (issue #34): ring buffer of recent TD updates. After each game, `m` extra updates
@@ -974,15 +1092,18 @@ fn trainStep(net: *Net, cache: *Cache, after: Board, target: f64, lr: f64, opts:
 
 fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
     const pr = opts.priority;
+    const vfn: Value = .{ .single = net };
     var state = GameState.gameStart(rng);
     var pending: ?Pick = null;
     var cache: Cache = .{};
     var moves: u32 = 0;
     var trace: Net = std.mem.zeroes(Net);
-    while (pickMove(net, state, opts.death)) |pick| {
+    while (selfplayPick(vfn, state, opts.death, opts.selfplay)) |pick| {
         moves += 1;
         if (pending) |p| {
-            const target = p.reward + pick.value;
+            // `state` is still the post-spawn board the pending step led into (this move has not been
+            // applied yet), which is the board the `search2` target evaluates.
+            const target = p.reward + tdBootstrap(net, pick, state, opts);
             if (diag) |d| d.push(countEmpty(p.after), @abs(target - p.value), pick.value - p.value);
             if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = pick.after, .terminal = false, .err = @abs(target - p.value) });
             trainStep(net, &cache, p.after, target, lr, opts, &trace);
@@ -1009,6 +1130,28 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
     };
     if (diag) |d| d.finish();
     return .{ .score = state.score, .moves = moves };
+}
+
+/// One self-play move of the per-move trainer (#158). `greedy1` is the historical 1-ply argmax;
+/// `deep2` plays the eval's 2-ply search. Neither draws from the rng (the search enumerates spawns), so
+/// both policies spawn the same tiles in the same order and differ only in the move they pick.
+fn selfplayPick(vfn: Value, state: GameState, death: bool, selfplay: SelfPlay) ?Pick {
+    return switch (selfplay) {
+        .greedy1 => pickMoveValue(vfn, state, death),
+        .deep2 => pickSearch2Value(vfn, state, sharedValueCache()),
+    };
+}
+
+/// Bootstrap of one per-move TD target (#158): the value of what follows the step's reward.
+/// `td1` keeps the historical V of the afterstate the next move reached; `search2` bootstraps
+/// `spawned`, the post-spawn board the step led into, with `search2_ply - 1` searched rewards and V of
+/// the afterstate one move past the last of them (see `search2Value`). With a `deep2` policy `next.value`
+/// is already a search value, so `td1` reads V of the afterstate directly then.
+fn tdBootstrap(net: *const Net, next: Pick, spawned: GameState, opts: Options) f64 {
+    return switch (opts.target) {
+        .td1 => if (opts.selfplay == .deep2) valueOf(net, next.after) else next.value,
+        .search2 => search2Value(.{ .single = net }, spawned, sharedValueCache()),
+    };
 }
 
 /// Online n-step TD (issue #84) on the same 1-ply self-play policy as `trainGamePerMove`: each step enters
@@ -1524,6 +1667,105 @@ test "greedy and chance moves are unchanged by the deep mode" {
     try std.testing.expectEqual(@as(?Direction, .left), bestMove(&net, mid_board, .chance));
 }
 
+/// Full board without any legal move: the 2-ply search has nothing to score.
+const dead_board: Board = .{
+    .{ 2, 4, 2, 4 },
+    .{ 4, 2, 4, 2 },
+    .{ 2, 4, 2, 4 },
+    .{ 4, 2, 4, 2 },
+};
+
+test "deep2 self-play picks the eval's 2-ply move, legally and deterministically (#158)" {
+    var prng = std.Random.DefaultPrng.init(6);
+    const net = Net.init(prng.random());
+    var cache_a: ValueCache = .{};
+    var cache_b: ValueCache = .{};
+    try std.testing.expectEqual(@as(?Pick, null), pickSearch2Value(.{ .single = &net }, .{ .board = dead_board }, &cache_a));
+
+    const first = pickSearch2Value(.{ .single = &net }, mid_board, &cache_a).?;
+    const second = pickSearch2Value(.{ .single = &net }, mid_board, &cache_b).?;
+    try std.testing.expectEqual(first.dir, second.dir);
+    try std.testing.expectEqual(first.after, second.after);
+    try std.testing.expectEqual(first.reward, second.reward);
+    var moved = mid_board;
+    try std.testing.expect(moved.slide(first.dir).changed);
+    try std.testing.expectEqual(first.after, moved.board);
+    // the self-play policy and the eval policy must look at the same tree, otherwise #158 compares apples to oranges
+    try std.testing.expectEqual(@as(?Direction, first.dir), bestMove(&net, mid_board, .deep));
+}
+
+/// Post-spawn board: the spawn left a 2 next to a 2, so the next move merges 4 points. A 1-ply value
+/// function sees nothing of it, the 2-ply search does.
+const post_spawn_board: Board = .{
+    .{ 2, 2, 4, 8 },
+    .{ 4, 8, 16, 32 },
+    .{ 8, 16, 32, 64 },
+    .{ 16, 32, 64, 128 },
+};
+
+test "search2 bootstraps from the post-spawn board, td1 from V of the next afterstate (#158)" {
+    // zero net: V is 0 everywhere, so the td1 bootstrap cannot see a single future reward
+    const net = std.mem.zeroes(Net);
+    const next: Pick = .{ .dir = .left, .after = post_spawn_board, .reward = 0, .value = 0 };
+    const spawned: GameState = .{ .board = post_spawn_board };
+    const td1 = tdBootstrap(&net, next, spawned, .{ .target = .td1 });
+    const search2 = tdBootstrap(&net, next, spawned, .{ .target = .search2 });
+    try std.testing.expectEqual(@as(f64, 0), td1);
+    // merging the 2s is 4 points / reward_scale, and the 2-ply search starts on this post-spawn board
+    try std.testing.expect(search2 >= 4 / reward_scale);
+    // same target on a board with no legal move stays 0: the bootstrap is the search of the given board
+    const dead_spawned: GameState = .{ .board = dead_board };
+    try std.testing.expectEqual(@as(f64, 0), tdBootstrap(&net, next, dead_spawned, .{ .target = .search2 }));
+    // with the committed weights the two targets also differ on a midgame board
+    const weights = try parse(@embedFile("nn_weights.bin"));
+    const trained_next: Pick = .{ .dir = .left, .after = mid_board.board, .reward = 0, .value = valueOf(&weights, mid_board.board) };
+    const boot1 = tdBootstrap(&weights, trained_next, mid_board, .{ .target = .td1 });
+    const boot2 = tdBootstrap(&weights, trained_next, mid_board, .{ .target = .search2 });
+    try std.testing.expectEqual(trained_next.value, boot1);
+    try std.testing.expect(@abs(boot2 - boot1) > 1e-6);
+}
+
+test "search2 target does not double count the last reward (#158)" {
+    // Constant value function (a bias only, every weight 0): every afterstate is worth `v`, so the
+    // search collapses to the rewards it sums plus one `v` and the expected target is handwritten.
+    // Local caches: the shared one is keyed by board alone, and this test brings its own net.
+    var net = std.mem.zeroes(Net);
+    const v: f64 = 0.25;
+    net.b3 = v;
+    const vfn: Value = .{ .single = &net };
+    // `post_spawn_board` is full, so nothing spawns before its first move: left and right both merge
+    // the 2s for 4 points, up and down do not change the board. That is r_t = 4 / reward_scale, and
+    // the bootstrap must be that one reward plus V of the afterstate one move past it, r_t + V(A_{t+1}).
+    const spawned: GameState = .{ .board = post_spawn_board };
+    const r_t = 4 / reward_scale;
+    var cache: ValueCache = .{};
+    const boot = search2Value(vfn, spawned, &cache);
+    try std.testing.expectApproxEqAbs(r_t + v, boot, 1e-12);
+    // the target of the step is the pending reward in front of it, r_{t-1} + [r_t + V(A_{t+1})]
+    const r_prev = 1 / reward_scale;
+    try std.testing.expectApproxEqAbs(r_prev + (r_t + v), r_prev + boot, 1e-12);
+    // the pre-fix bootstrap, `Search.value` at the same count, also sums one reward whose afterstate
+    // the leaf's V already holds: `V(A_{t+1})` would count r_{t+1} twice. The excess is exactly that
+    // extra reward, here the best second move, 8 points (the 4s of `post_spawn_board` merged).
+    var old_cache: ValueCache = .{};
+    var search: Search = .{ .vfn = vfn, .cache = &old_cache };
+    const double_counted = search.value(spawned, search2_ply, 1);
+    try std.testing.expectApproxEqAbs(8 / reward_scale, double_counted - boot, 1e-12);
+
+    // zero rewards is the leaf: the best V one move away, with no reward added at it
+    const weights = try parse(@embedFile("nn_weights.bin"));
+    var weight_cache: ValueCache = .{};
+    var boot_search: Search = .{ .vfn = .{ .single = &weights }, .cache = &weight_cache };
+    const state: GameState = .{ .board = mid_board.board };
+    var best_after: f64 = -std.math.inf(f64);
+    for ([_]Direction{ .up, .left, .down, .right }) |d| {
+        var moved = state;
+        if (!moved.slide(d).changed) continue;
+        best_after = @max(best_after, valueOf(&weights, moved.board));
+    }
+    try std.testing.expectEqual(best_after, boot_search.bootValue(state, 0, 1));
+}
+
 test "value cache returns the forward value and counts leaf evaluations" {
     var prng = std.Random.DefaultPrng.init(8);
     const net = Net.init(prng.random());
@@ -1849,6 +2091,42 @@ test "trainGameOpts with default options equals trainGame" {
     _ = trainGame(&a, rng_a.random(), 0.003, null);
     _ = trainGameOpts(&b, rng_b.random(), 0.003, null, .{});
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+}
+
+test "td1 + greedy1 is the default self-play path, bit for bit (#158)" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var base = Net.init(init_rng.random());
+    var default_opts = base;
+    var explicit = base;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    var rng_c = std.Random.DefaultPrng.init(12);
+    const plain = trainGame(&base, rng_a.random(), 0.003, null);
+    const with_default = trainGameOpts(&default_opts, rng_b.random(), 0.003, null, .{}).score;
+    const with_td1 = trainGameOpts(&explicit, rng_c.random(), 0.003, null, .{ .target = .td1, .selfplay = .greedy1 }).score;
+    try std.testing.expectEqual(plain, with_default);
+    try std.testing.expectEqual(plain, with_td1);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&base), std.mem.asBytes(&default_opts));
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&base), std.mem.asBytes(&explicit));
+}
+
+test "search2, deep2 and tp2 train one game without NaN (#158)" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    const init = Net.init(init_rng.random());
+    const variants = [_]Options{
+        .{ .target = .search2 },
+        .{ .selfplay = .deep2 },
+        .{ .target = .search2, .selfplay = .deep2 },
+    };
+    for (variants) |opts| {
+        var net = init;
+        var rng = std.Random.DefaultPrng.init(12);
+        const result = trainGameOpts(&net, rng.random(), 0.003, null, opts);
+        try std.testing.expect(result.score > 0);
+        for (flat(&net)) |w| try std.testing.expect(std.math.isFinite(w));
+        // the variant has to actually move the weights, otherwise it silently fell back to the default path
+        try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&net), std.mem.asBytes(&init)));
+    }
 }
 
 test "n-step window closes the oldest step with n rewards plus the closing value" {
