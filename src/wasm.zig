@@ -16,6 +16,7 @@
 //! - `algo_count() -> u32`, `algo_name(i) -> *const u8` (NUL-terminated),
 //!   `algo_name_len(i) -> u32`, and the same pair for the one-line description the page shows:
 //!   `algo_score(i)`, `algo_score_len(i)`: the policy's measured average score, for the page
+//!   `algo_speed(i)`, `algo_speed_len(i)`: its cost per move in the browser ("" when unmeasured)
 
 const std = @import("std");
 const core = @import("core");
@@ -65,12 +66,19 @@ const policies: []const solver.Policy = blk: {
     break :blk &list;
 };
 
-/// Scores of the shipped policies only, resolved through `policyInfo` at compile time so the
-/// strings of the policies that are *not* shipped stay out of the module.
+/// Scores and browser speeds of the shipped policies only, resolved through `policyInfo` at compile
+/// time so the strings of the policies that are *not* shipped stay out of the module.
 const scores: []const []const u8 = blk: {
     var out: [policies.len][]const u8 = undefined;
     for (policies, 0..) |policy, i| out[i] = solver.policyInfo(policy).score;
     const list = out; // a const copy, so the block returns a static array rather than a comptime var
+    break :blk &list;
+};
+
+const speeds: []const []const u8 = blk: {
+    var out: [policies.len][]const u8 = undefined;
+    for (policies, 0..) |policy, i| out[i] = solver.policyInfo(policy).speed;
+    const list = out;
     break :blk &list;
 };
 
@@ -172,4 +180,15 @@ export fn algo_score(algo: u32) [*]const u8 {
 export fn algo_score_len(algo: u32) u32 {
     if (algo >= policies.len) return 0;
     return scores[algo].len;
+}
+
+/// Cost per move measured in the browser; empty when unknown, and the page then shows only the score.
+export fn algo_speed(algo: u32) [*]const u8 {
+    if (algo >= policies.len) return "";
+    return speeds[algo].ptr;
+}
+
+export fn algo_speed_len(algo: u32) u32 {
+    if (algo >= policies.len) return 0;
+    return speeds[algo].len;
 }

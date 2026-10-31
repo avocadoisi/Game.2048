@@ -158,6 +158,7 @@ function autoLoop(now) {
     policies.push({
       name: text(w.algo_name(i), w.algo_name_len(i)),
       score: text(w.algo_score(i), w.algo_score_len(i)),
+      speed: text(w.algo_speed(i), w.algo_speed_len(i)),
     });
   }
   const picker = document.getElementById("policy");
@@ -166,14 +167,17 @@ function autoLoop(now) {
     const option = document.createElement("option");
     option.value = String(i);
     option.textContent = p.name;
-    option.title = p.score;
+    option.title = p.speed ? `${p.score} / 1 手 ${p.speed}` : p.score;
     picker.appendChild(option);
   }
   const preferred = policies.findIndex((p) => p.name === DEFAULT_POLICY);
   picker.value = String(preferred >= 0 ? preferred : policies.length - 1);
   const showPolicy = () => {
     const p = policies[policyIndex()];
-    document.getElementById("policy-desc").textContent = p ? `${p.name}: ${p.score}` : "";
+    if (!p) return void (document.getElementById("policy-desc").textContent = "");
+    // Score first (how strong), then the measured cost per move (how slow) — nothing else.
+    const speed = p.speed ? ` / 1 手 ${p.speed}` : "";
+    document.getElementById("policy-desc").textContent = `${p.name}: ${p.score}${speed}`;
   };
   picker.addEventListener("change", showPolicy);
   showPolicy();
