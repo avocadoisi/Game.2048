@@ -40,6 +40,11 @@ Cycle and test discipline: `dev-philosophy`. Order of a change: `dev-workflow`.
 
 Writing code is parallelisable. Measuring is not.
 
+**Training is serial, always — one `zig build nn` at a time, even when the user asks for parallel work.**
+Only implementation, review and exploration may run in parallel. Measured: five `dson` lanes started
+together ran at 1.0-1.35 ms/move each, the same run alone is 0.5 ms/move; the wall clock and the
+`ms/move` columns both become meaningless. If the CPU looks idle, add *code* work, not another training.
+
 - parallel OK: several issues at once, each in its own worktree (`worktree: true`), one writer per worktree
 - a subagent may run its own **filtered** Debug tests (`zig build test -Dtest-filter <name>`) and 1-2 game smoke runs
 - serial, one at a time, parent-owned: full `zig build test`, `-Doptimize=ReleaseFast` builds of `nn`/`ranking`, any training run (`zig build nn -- <games> > 0`), `zig build ranking`, `zig build solve`, `zig build wasm`
