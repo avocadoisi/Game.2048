@@ -207,9 +207,11 @@ pub const Staged = struct {
 
     fn parseStaged(self: *Staged, bytes: []const u8) !void {
         if (bytes.len != staged_file_len) return error.WrongWeightFileSize;
-        if (!std.mem.eql(u8, bytes[0..8], staged_file_magic)) return error.BadWeightMagic;
-        if (std.mem.readInt(u32, bytes[8..12], .little) != file_version) return error.UnsupportedWeightVersion;
-        if (std.mem.readInt(u32, bytes[12..16], .little) != endian_marker) return error.WrongWeightEndianness;
+        try checkVersionedHeader(bytes, staged_file_magic, file_version, .{
+            .magic = error.BadWeightMagic,
+            .version = error.UnsupportedWeightVersion,
+            .endian = error.WrongWeightEndianness,
+        });
         for (0..stage_count) |k| self.nets[k] = readWeights(bytes[header_len + k * @sizeOf(Net) ..][0..@sizeOf(Net)]);
     }
 };
@@ -1620,7 +1622,7 @@ pub const Dump = struct {
         self.len = 0;
         self.dropped = 0;
         if (bytes.len < dump_header_len) return error.DumpTooShort;
-        if (!std.mem.eql(u8, bytes[0..8], dump_magic)) return error.BadDumpMagic;
+        try checkMagic(bytes, dump_magic, error.BadDumpMagic);
         const count = std.mem.readInt(u32, bytes[8..12], .little);
         if (count > dump_cap) return error.DumpTooLarge;
         if (bytes.len != dump_header_len + @as(usize, count) * dump_entry_len) return error.WrongDumpFileSize;
@@ -1702,7 +1704,7 @@ pub const Teachers = struct {
         self.len = 0;
         self.draws = 0;
         if (bytes.len < teacher_header_len) return error.TeacherTooShort;
-        if (!std.mem.eql(u8, bytes[0..8], teacher_magic)) return error.BadTeacherMagic;
+        try checkMagic(bytes, teacher_magic, error.BadTeacherMagic);
         const count = std.mem.readInt(u32, bytes[8..12], .little);
         if (count > teacher_cap) return error.TeacherTooLarge;
         if (bytes.len != teacher_header_len + @as(usize, count) * teacher_entry_len) return error.WrongTeacherFileSize;
@@ -2152,6 +2154,24 @@ pub const file_magic = "2048-NN\x00";
 pub const file_version: u32 = 1;
 const endian_marker: u32 = 0x01020304;
 const header_len = 16;
+
+/// The caller's own error names for the three header words, so `error.BadWeightMagic` and
+/// `error.BadQuantMagic` stay distinct while the check itself is written once (#141).
+const HeaderErrors = struct { magic: anyerror, version: anyerror, endian: anyerror };
+
+/// `bytes` starts with the 8-byte `magic` or else `err` — all `Dump` and `Teachers` need.
+fn checkMagic(bytes: []const u8, magic: []const u8, err: anyerror) !void {
+    if (!std.mem.eql(u8, bytes[0..8], magic)) return err;
+}
+
+/// The header every weight file shares (little endian): 8-byte magic, u32 version, u32 endianness
+/// marker. `errs` names the three failures so each format keeps its own error values.
+fn checkVersionedHeader(bytes: []const u8, magic: []const u8, version: u32, errs: HeaderErrors) !void {
+    try checkMagic(bytes, magic, errs.magic);
+    if (std.mem.readInt(u32, bytes[8..12], .little) != version) return errs.version;
+    if (std.mem.readInt(u32, bytes[12..16], .little) != endian_marker) return errs.endian;
+}
+
 pub const file_len = header_len + @sizeOf(Net);
 
 /// Staged weight file (#107): the same header with its own 8-byte magic and `stage_count` weight blocks.
@@ -2188,9 +2208,11 @@ pub threadlocal var parse_count: usize = 0;
 pub fn parse(bytes: []const u8) !Net {
     parse_count += 1;
     if (bytes.len != file_len) return error.WrongWeightFileSize;
-    if (!std.mem.eql(u8, bytes[0..8], file_magic)) return error.BadWeightMagic;
-    if (std.mem.readInt(u32, bytes[8..12], .little) != file_version) return error.UnsupportedWeightVersion;
-    if (std.mem.readInt(u32, bytes[12..16], .little) != endian_marker) return error.WrongWeightEndianness;
+    try checkVersionedHeader(bytes, file_magic, file_version, .{
+        .magic = error.BadWeightMagic,
+        .version = error.UnsupportedWeightVersion,
+        .endian = error.WrongWeightEndianness,
+    });
     return readWeights(bytes[header_len..]);
 }
 
@@ -2380,9 +2402,11 @@ pub fn encodeQuantized(q: *const Quantized) [quant_file_len]u8 {
 
 pub fn parseQuantized(bytes: []const u8) !Quantized {
     if (bytes.len != quant_file_len) return error.WrongQuantFileSize;
-    if (!std.mem.eql(u8, bytes[0..8], quant_magic)) return error.BadQuantMagic;
-    if (std.mem.readInt(u32, bytes[8..12], .little) != quant_version) return error.UnsupportedQuantVersion;
-    if (std.mem.readInt(u32, bytes[12..16], .little) != endian_marker) return error.WrongQuantEndianness;
+    try checkVersionedHeader(bytes, quant_magic, quant_version, .{
+        .magic = error.BadQuantMagic,
+        .version = error.UnsupportedQuantVersion,
+        .endian = error.WrongQuantEndianness,
+    });
     var q = Quantized{};
     var pos: usize = 16;
     for (&q.steps) |*step| {
@@ -3323,12 +3347,6 @@ pub fn meanStderr(xs: []const f64) MeanErr {
     return .{ .mean = mean, .stderr = @sqrt(ss / (n - 1) / n) };
 }
 
-/// Score per CPU second; 0 when no time elapsed (avoids division by zero).
-pub fn scorePerSecond(total_score: f64, elapsed_ns: i96) f64 {
-    if (elapsed_ns <= 0) return 0;
-    return total_score / (@as(f64, @floatFromInt(elapsed_ns)) / 1e9);
-}
-
 test "meanStderr gives mean and sample standard error" {
     const xs = [_]f64{ 2, 4, 4, 4, 5, 5, 7, 9 };
     const r = meanStderr(&xs);
@@ -3378,15 +3396,6 @@ test "meanStderr of one value has zero stderr" {
     const r = meanStderr(&[_]f64{3});
     try std.testing.expectApproxEqAbs(@as(f64, 3), r.mean, 1e-12);
     try std.testing.expectEqual(@as(f64, 0), r.stderr);
-}
-
-test "scorePerSecond divides total score by elapsed seconds" {
-    // 3000 points in 1.5 s is 2000 points per second
-    try std.testing.expectApproxEqAbs(@as(f64, 2000), scorePerSecond(3000, 1_500_000_000), 1e-9);
-}
-
-test "scorePerSecond of zero elapsed time is zero" {
-    try std.testing.expectEqual(@as(f64, 0), scorePerSecond(3000, 0));
 }
 
 test "weight file header round trips" {
@@ -4670,7 +4679,6 @@ test "bestMove and play accept the staged value" {
     const result = playValue(value, rng.random(), .greedy);
     try std.testing.expect(result.moves > 0);
 }
-
 
 /// One recorded game's tape, at the size a 2048 game needs (`Spawn` is 1 byte).
 const tape_capacity = 8192;

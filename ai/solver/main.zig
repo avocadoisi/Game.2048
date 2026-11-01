@@ -35,6 +35,6 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("speed: {d:.2} games/s, {d:.0} moves/s, elapsed {d:.1} s\n", .{
         s.gamesPerSec(),
         s.movesPerSec(),
-        @as(f64, @floatFromInt(s.elapsed_ns)) / 1e9,
+        s.elapsedSec(),
     });
 }

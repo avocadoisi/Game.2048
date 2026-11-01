@@ -4,6 +4,7 @@ const solver = @import("solver");
 const ntuple = @import("ntuple");
 const parallel = @import("parallel");
 const cli = @import("args.zig");
+const bench = @import("bench.zig");
 
 const usage =
     \\usage: ntuple [train_games] [eval_games] [eval_seed] [learning_rate] [variant] [table_path] [train_seed]
@@ -57,11 +58,6 @@ fn meanStderr(xs: []const f64) MeanErr {
     var ss: f64 = 0;
     for (xs) |x| ss += (x - mean) * (x - mean);
     return .{ .mean = mean, .stderr = @sqrt(ss / (n - 1) / n) };
-}
-
-fn scorePerSecond(total_score: f64, elapsed_ns: i96) f64 {
-    if (elapsed_ns <= 0) return 0;
-    return total_score / (@as(f64, @floatFromInt(elapsed_ns)) / 1e9);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -180,22 +176,15 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("eval: games={d}/range ranges={d} seeds={d}..{d}\n", .{ eval_games, seed_ranges, eval_seed, last_seed });
     for (results) |r| {
         const st = meanStderr(r.range_scores);
-        const total_moves = r.avg_moves * @as(f64, @floatFromInt(games));
-        const ms_per_move = @as(f64, @floatFromInt(r.elapsed_ns)) / 1e6 / @max(total_moves, 1);
-        const leaves_per_move = @as(f64, @floatFromInt(r.leaves)) / @max(total_moves, 1);
-        std.debug.print("{s}: avg score={d:.1} ± {d:.1} (stderr over {d} ranges) avg moves={d:.1} best tile={d} elapsed={d:.1} s score/s={d:.1} leaves={d} leaves/move={d:.1} ms/move={d:.2}\n", .{
-            r.name,
-            st.mean,
-            st.stderr,
-            seed_ranges,
-            r.avg_moves,
-            r.best_tile,
-            @as(f64, @floatFromInt(r.elapsed_ns)) / 1e9,
-            scorePerSecond(@floatFromInt(r.total_score), r.elapsed_ns),
-            r.leaves,
-            leaves_per_move,
-            ms_per_move,
-        });
+        // Same row as `zig build nn`: `avg_score` holds the mean over seed ranges (#141).
+        bench.printEvalRow(r.name, st.stderr, seed_ranges, .{
+            .games = games,
+            .avg_score = st.mean,
+            .avg_moves = r.avg_moves,
+            .best_tile = r.best_tile,
+            .elapsed_ns = r.elapsed_ns,
+        }, r.total_score, r.leaves);
+        std.debug.print("\n", .{});
     }
 }
 
