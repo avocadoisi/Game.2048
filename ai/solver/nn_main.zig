@@ -54,7 +54,7 @@ const usage =
     \\              restart (#159: fine tuning that starts every self-play game on a uniformly drawn deep
     \\                       afterstate of dump_path plus one fresh spawn; otherwise trains like resume)
     \\  pairw         (#210) paired comparison of two weight files: A = weights_path with `deep`,
-    \\                B = the path at index 12 with `deep`, same spawn tape per game
+    \\                B = the path after the `-` par slot with `deep`, same spawn tape per game
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
     \\                game i uses seed train_seed + i and the batch result is the mean of its games.
     \\                (#99) as arg 10 it batches any stateless variant (base|backward|replay|sym|symlam|
@@ -357,7 +357,7 @@ pub fn main(init: std.process.Init) !void {
     };
     // `dump` is the shared layout plus one slot: index 11 carries the dump path.
     // `par` runs may carry the #137 batch_scale at index 12, after the `-` dump slot.
-    const max_args: usize = if (is_dist or is_dson) 14 else if (uses_dump) 12 else if (use_par) 13 else 11;
+    const max_args: usize = if (is_dist or is_dson) 14 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw) 12 else 11;
     if (args.len > max_args or eval_games == 0 or seed_ranges == 0 or (uses_dump and dump_path == null)) {
         std.debug.print("{s}", .{usage});
         return;
@@ -518,11 +518,12 @@ pub fn main(init: std.process.Init) !void {
     // (#210) A second net, so `pairw` can put a candidate file against the reference on the same spawns.
     var net_b: nn.Net = undefined;
     const pair_b_value: nn.Value = if (is_pairw) blk: {
-        if (args.len <= 12) {
-            std.debug.print("pairw needs the second weights path at index 12\n{s}", .{usage});
+        // The second path sits in the dump slot (index 11): `pairw` has no dump to read.
+        if (args.len <= 11) {
+            std.debug.print("pairw needs the second weights path after the `-` par slot\n{s}", .{usage});
             return;
         }
-        try nn.load(&net_b, init.io, init.gpa, args[12]);
+        try nn.load(&net_b, init.io, init.gpa, args[11]);
         break :blk .{ .single = &net_b };
     } else eval_value;
     if (is_pair or is_pairw) {
