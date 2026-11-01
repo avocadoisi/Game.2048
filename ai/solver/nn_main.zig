@@ -32,6 +32,13 @@ const usage =
     \\                       and the TD target is the search value of the post-spawn board)
     \\              d3      (#167: distillation, 3-ply teacher: same, from the deep3 tree (1e-2 spawn cut),
     \\                       so a 2-ply eval learns what the deeper search thinks the position is worth)
+    \\              dumpp2  (#175: `dump` from 2-ply self-play, i.e. the boards the 2-ply eval visits)
+    \\              tch     (#175: teacher pass over a #159 dump: one spawn per stored afterstate, deep3 value,
+    \\                       written to <dump_path>.tch; train_games is ignored and nothing is trained)
+    \\              dist    (#175: offline distillation: base's per-move TD plus one regression step per step
+    \\                       on a uniformly drawn teacher pair from <dump_path>.tch, so 50/50 the update)
+    \\              dson    (#175: the teacher regression only: no self-play TD, so nothing but the deep
+    \\                       positions trains the net, which shares its parameters with the early game)
     \\              oi / oi16 (#107: multiply the initial weights by 4 / 16 = optimistic initialization,
     \\                       then train exactly like base; only the init differs, so `par` works)
     \\              resume  (#66: load weights_path and train train_games more games from those weights, plain per-move path)
@@ -101,7 +108,27 @@ fn parseParFlag(args: []const []const u8) !bool {
 /// teacher cells (their search is the whole cost of the run; batching would only multiply it by the
 /// thread count).
 fn parSupported(opts: nn.Options, is_mstd: bool) bool {
-    return opts.priority == null and !is_mstd and opts.target == .td1 and opts.selfplay == .greedy1 and opts.teacher == null;
+    return opts.priority == null and !is_mstd and opts.target == .td1 and opts.selfplay == .greedy1 and
+        opts.teacher == null and opts.distill == null;
+}
+
+/// Loads the #175 teacher file (`tch` output) for `dist`. A missing, foreign or empty file is a
+/// command-line error (usage + exit 1), never a silent fallback to plain self-play.
+fn loadTeachers(buffer: *nn.Teachers, io: std.Io, gpa: std.mem.Allocator, path: []const u8) void {
+    buffer.load(io, gpa, path) catch |err| {
+        std.debug.print("error: cannot read teacher file {s}: {s}\n{s}", .{ path, @errorName(err), usage });
+        std.process.exit(1);
+    };
+    if (buffer.len == 0) {
+        std.debug.print("error: teacher file {s} holds no samples\n{s}", .{ path, usage });
+        std.process.exit(1);
+    }
+    std.debug.print("teacher file {s}: {d} samples\n", .{ path, buffer.len });
+}
+
+/// Whether arg 6 (`variant`) is the `death` reward. Only used to reject `dist` + `death`.
+fn wantsDeath(args: []const []const u8) !bool {
+    return args.len > 6 and std.mem.eql(u8, args[6], "death");
 }
 
 /// Starting net for `main`: `weights_path` when resuming (or eval-only), otherwise a random init
@@ -220,15 +247,21 @@ pub fn main(init: std.process.Init) !void {
     const par_tail = try parseParFlag(args);
     const use_par = par_variant or par_tail;
     const is_mstd = std.mem.eql(u8, variant, "mstd");
-    const is_dump = std.mem.eql(u8, variant, "dump");
+    // `dumpp2` records the same buffer as `dump`, but from 2-ply self-play boards: the distribution the
+    // 2-ply eval actually visits, which is what the teacher regression is supposed to fix (#175).
+    const is_dumpp2 = std.mem.eql(u8, variant, "dumpp2");
+    const is_dump = std.mem.eql(u8, variant, "dump") or is_dumpp2;
     const is_ft2 = std.mem.eql(u8, variant, "ft2");
     const is_restart = std.mem.eql(u8, variant, "restart");
     // Paired comparison (#168): two policies play the same spawn tape.
     const is_pair = std.mem.eql(u8, variant, "pair");
+    const is_tch = std.mem.eql(u8, variant, "tch");
+    const is_dist = std.mem.eql(u8, variant, "dist");
+    const is_dson = std.mem.eql(u8, variant, "dson");
     // #159 variants train from the net in weights_path (the deep positions come from that net), like `resume`
-    const use_resume = std.mem.eql(u8, variant, "resume") or is_dump or is_ft2 or is_restart;
+    const use_resume = std.mem.eql(u8, variant, "resume") or is_dump or is_ft2 or is_restart or is_dist or is_dson or is_tch;
     // Variants that take dump_path at index 11: `dump` writes it, `ft2` and `restart` read it.
-    const uses_dump = is_dump or is_ft2 or is_restart;
+    const uses_dump = is_dump or is_ft2 or is_restart or is_tch or is_dist or is_dson;
     const replay_k: usize = try cli.argOr(usize, args, 7, default_replay_k);
     const weights_path: []const u8 = try cli.argOr([]const u8, args, 8, default_weights_path);
     const train_seed: u64 = try cli.argOr(u64, args, 9, default_train_seed);
@@ -236,10 +269,13 @@ pub fn main(init: std.process.Init) !void {
     // dump path.
     const dump_path: ?[]const u8 = if (args.len > 11) args[11] else null;
     var dump: nn.Dump = .{};
+    var teachers: nn.Teachers = .{};
     var priority: nn.Priority = .{};
     // (#137) `par` merges whole-game deltas into one step; arg 12 scales that step (1 = historical mean).
     const batch_scale: f64 = if (use_par) try parseBatchScale(args) else 1.0;
-    const opts: nn.Options = if (par_variant or use_resume or is_pair or std.mem.eql(u8, variant, "base"))
+    // `use_resume` only decides whether `weights_path` is loaded; the variant still has to reach `opts`
+    // (before, `dump`/`ft2`/`restart`/`dist` fell into this first branch and their options were dropped).
+    const opts: nn.Options = if (par_variant or is_pair or std.mem.eql(u8, variant, "base") or std.mem.eql(u8, variant, "resume") or is_tch)
         .{ .batch_scale = batch_scale }
     else if (std.mem.eql(u8, variant, "backward"))
         .{ .backward = true }
@@ -272,11 +308,19 @@ pub fn main(init: std.process.Init) !void {
     else if (std.mem.eql(u8, variant, "d3"))
         .{ .teacher = .deep3 }
     else if (is_dump)
-        .{ .dump_record = true, .dump = &dump }
+        .{
+            .dump_record = true,
+            .dump = &dump,
+            .selfplay = if (is_dumpp2) .deep2 else .greedy1,
+        }
     else if (is_ft2)
         .{ .deep_mix = true, .dump = &dump }
     else if (is_restart)
         .{ .restart = true, .dump = &dump }
+    else if (is_dist)
+        .{ .distill = &teachers }
+    else if (is_dson)
+        .{ .distill = &teachers, .distill_only = true }
     else if (std.mem.eql(u8, variant, "oi") or std.mem.eql(u8, variant, "oi16") or is_mstd)
         .{}
     else {
@@ -292,11 +336,19 @@ pub fn main(init: std.process.Init) !void {
     }
     // the priority ring buffer, the dump, the deep mix and the restart buffer are cross-game state:
     // batching would race on them. `mstd` has no batch path either (one staged net is ~1 MB).
-    if (use_par and (!parSupported(opts, is_mstd) or opts.dump_record or opts.deep_mix or opts.restart)) {
+    if (use_par and (!parSupported(opts, is_mstd) or opts.dump_record or opts.deep_mix or opts.restart or opts.distill != null)) {
         std.debug.print("{s}", .{usage});
         return;
     }
-    if (is_ft2 or is_restart) loadDump(&dump, init.io, init.gpa, dump_path.?);
+    // `dist` has no replay / death / restart / dump half to combine with: refuse instead of ignoring.
+    // `dist` keeps the plain TD half (so replay applies to it); `dson` has no TD half, so a replay
+    // buffer would be dropped on the floor.
+    if ((is_dson and replay_k > 0) or ((is_dist or is_dson) and (try wantsDeath(args) or is_restart or is_dump))) {
+        std.debug.print("{s}", .{usage});
+        return;
+    }
+    if (is_ft2 or is_restart or is_tch) loadDump(&dump, init.io, init.gpa, dump_path.?);
+    if (is_dist or is_dson) loadTeachers(&teachers, init.io, init.gpa, dump_path.?);
 
     var net: nn.Net = undefined;
     var staged: nn.Staged = undefined;
@@ -308,6 +360,22 @@ pub fn main(init: std.process.Init) !void {
     // Optimistic initialization (#107) only rescales the random init, so it stays out of `nn.Options`.
     if (std.mem.eql(u8, variant, "oi")) nn.scaleInit(&net, 4)
     else if (std.mem.eql(u8, variant, "oi16")) nn.scaleInit(&net, 16);
+    if (is_tch) {
+        // #175 teacher pass: price every stored deep afterstate once, write `<dump_path>.tch`, train nothing.
+        var rng = std.Random.DefaultPrng.init(train_seed);
+        const start = std.Io.Clock.awake.now(init.io);
+        nn.computeTeachers(&net, &teachers, &dump, rng.random(), .deep3);
+        const path = try std.fmt.allocPrint(init.arena.allocator(), "{s}.tch", .{dump_path.?});
+        try teachers.save(init.io, init.gpa, path);
+        const elapsed = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
+        std.debug.print("teacher pass: {d} samples in {d:.1} s ({d:.1} ms/sample) -> {s}\n", .{
+            teachers.len,
+            @as(f64, @floatFromInt(elapsed)) / 1e9,
+            @as(f64, @floatFromInt(elapsed)) / 1e6 / @max(@as(f64, @floatFromInt(teachers.len)), 1),
+            path,
+        });
+        return;
+    }
     if (train_games > 0) {
         var rng = std.Random.DefaultPrng.init(train_seed);
         const start = std.Io.Clock.awake.now(init.io);
@@ -361,6 +429,7 @@ pub fn main(init: std.process.Init) !void {
             variant_label,
         });
         if (want_diag and !is_mstd) printDiag(&diag);
+        if (is_dist or is_dson) std.debug.print("distill: {d} teacher samples, {d} regression steps\n", .{ teachers.len, teachers.draws });
         if (is_dump) {
             const path = dump_path.?;
             try dump.save(init.io, init.gpa, path);
