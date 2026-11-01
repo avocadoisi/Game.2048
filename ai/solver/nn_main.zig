@@ -387,7 +387,7 @@ pub fn main(init: std.process.Init) !void {
     };
     // Rows are all on by default; a measurement run edits this line down to the two it needs
     // (0 = 1-ply, 2 = 2-ply) instead of paying for the 3-ply rows twice over.
-    var row_selection: [all_rows.len]bool = @splat(true);
+    const row_selection: [all_rows.len]bool = @splat(true);
     var results_buf: [all_rows.len]Eval = undefined;
     var result_count: usize = 0;
     for (all_rows, 0..) |row, k| {
