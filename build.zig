@@ -232,6 +232,24 @@ pub fn build(b: *std.Build) void {
     const nn_step = b.step("nn", "Train the value MLP (TD(0) self-play) and evaluate it against expectimax depth 2");
     nn_step.dependOn(&nn_cmd.step);
 
+    // The int16 file is a shipping artefact: write it where you like, do not commit it (#170).
+    const nn_quant_exe = b.addExecutable(.{
+        .name = "nn-quant",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("ai/solver/nn_quant.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "nn", .module = nn_mod },
+            },
+        }),
+    });
+    const nn_quant_cmd = b.addRunArtifact(nn_quant_exe);
+    nn_quant_cmd.addPassthruArgs();
+    const nn_quant_step = b.step("nn-quant", "Quantize the value net to int16 and measure the error (#170)");
+    nn_quant_step.dependOn(&nn_quant_cmd.step);
+
     const ntuple_tests = b.addTest(.{ .filters = test_filters, .root_module = ntuple_mod });
     const run_ntuple_tests = b.addRunArtifact(ntuple_tests);
 

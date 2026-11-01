@@ -141,6 +141,7 @@ zig build tune   -Doptimize=ReleaseFast                                  # CMA-E
 zig build probe                                                          # 学習型評価の盤面選好を測る
 zig build nn     -Doptimize=ReleaseFast -- 20000 100 2000 0.003 - base 30 /tmp/n.bin 1 par
 zig build ntuple -Doptimize=ReleaseFast -- 200 20 2000 0.01 base /tmp/t.bin 1
+zig build nn-quant -- ai/solver/nn_weights.bin /tmp/nn_weights_q.bin  # f32 -> int16 の変換と一致率 (#170)
 zig build ga-rl  -- 16 15 8 2 1 500 100                                  # population generations games depth seed holdout_seed holdout_games
 ```
 
