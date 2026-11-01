@@ -4,6 +4,7 @@ const solver = @import("solver");
 const nn = @import("nn");
 const parallel = @import("parallel");
 const cli = @import("args.zig");
+const bench = @import("bench.zig");
 
 const usage =
     \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate] [seed_ranges|diag] [variant|par] [replay_k] [weights_path] [train_seed] [par|-] [dump_path]
@@ -581,30 +582,20 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("eval: games={d}/range ranges={d} seeds={d}..{d}\n", .{ eval_games, seed_ranges, eval_seed, last_seed });
     for (results) |r| {
         const st = nn.meanStderr(r.range_scores);
-        const total_moves = r.avg_moves * @as(f64, @floatFromInt(games));
-        const ms_per_move = @as(f64, @floatFromInt(r.elapsed_ns)) / 1e6 / @max(total_moves, 1);
-        const leaves_per_move = @as(f64, @floatFromInt(r.leaves)) / @max(total_moves, 1);
-        std.debug.print("{s}: avg score={d:.1} ± {d:.1} (stderr over {d} ranges) avg moves={d:.1} best tile={d} elapsed={d:.1} s score/s={d:.1} leaves={d} leaves/move={d:.1} ms/move={d:.2} reach4096={d}/{d} reach8192={d}/{d} reach16384={d}/{d} dead<2048={d}/{d}\n", .{
-            r.name,
-            st.mean,
-            st.stderr,
-            seed_ranges,
-            r.avg_moves,
-            r.best_tile,
-            @as(f64, @floatFromInt(r.elapsed_ns)) / 1e9,
-            nn.scorePerSecond(@floatFromInt(r.total_score), r.elapsed_ns),
-            r.leaves,
-            leaves_per_move,
-            ms_per_move,
-            r.reach_4096,
-            games,
-            r.reach_8192,
-            games,
-            r.reach_16384,
-            games,
-            r.dead_below_2048,
-            games,
-        });
+        // `avg score` is the mean over seed ranges (not the pooled average), which is exactly what
+        // `avg_score` of the shared row holds. The reach counts are this runner's own tail (#141).
+        bench.printEvalRow(r.name, st.stderr, seed_ranges, .{
+            .games = games,
+            .avg_score = st.mean,
+            .avg_moves = r.avg_moves,
+            .best_tile = r.best_tile,
+            .elapsed_ns = r.elapsed_ns,
+            .reach_4096 = r.reach_4096,
+            .reach_8192 = r.reach_8192,
+            .reach_16384 = r.reach_16384,
+            .dead_below_2048 = r.dead_below_2048,
+        }, r.total_score, r.leaves);
+        std.debug.print(" reach4096={d}/{d} reach8192={d}/{d} reach16384={d}/{d} dead<2048={d}/{d}\n", .{ r.reach_4096, games, r.reach_8192, games, r.reach_16384, games, r.dead_below_2048, games });
     }
 }
 
