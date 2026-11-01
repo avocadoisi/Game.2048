@@ -282,7 +282,7 @@ pub fn main(init: std.process.Init) !void {
     };
     // `dump` is the shared layout plus one slot: index 11 carries the dump path.
     // `par` runs may carry the #137 batch_scale at index 12, after the `-` dump slot.
-    const max_args: usize = if (uses_dump or use_par) 12 else 11;
+    const max_args: usize = if (uses_dump) 12 else if (use_par) 13 else 11;
     if (args.len > max_args or eval_games == 0 or seed_ranges == 0 or (uses_dump and dump_path == null)) {
         std.debug.print("{s}", .{usage});
         return;
