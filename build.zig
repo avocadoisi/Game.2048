@@ -387,6 +387,15 @@ pub fn build(b: *std.Build) void {
     wasm_step.dependOn(&install_wasm.step);
     wasm_step.dependOn(&install_static_html.step);
 
+    // Per-target test steps: `zig build test` compiles all 15 targets in Debug (5-10 min), which is
+    // too slow to verify one module and makes an agent look hung. These build one target only.
+    b.step("test-nn", "Run the nn unit tests only").dependOn(&run_nn_tests.step);
+    b.step("test-nn-main", "Run the nn CLI unit tests only").dependOn(&run_nn_main_tests.step);
+    b.step("test-core", "Run the core unit tests only").dependOn(&run_core_tests.step);
+    b.step("test-solver", "Run the solver unit tests only").dependOn(&run_solver_tests.step);
+    b.step("test-bench", "Run the bench unit tests only").dependOn(&run_bench_tests.step);
+    b.step("test-ranking", "Run the ranking unit tests only").dependOn(&run_ranking_tests.step);
+
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_exe_tests.step);
