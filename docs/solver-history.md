@@ -2173,3 +2173,25 @@ wasm の data セクション 689,801 B のうち 512 KiB は `src/core.zig` の
 
 - data セクションは 689,801 B → 370,313 B（-319,488 B、-31%）になる計算（実測はせず表の
   サイズからの差分）。wasm 全体でも同じだけ減る見込み。
+
+## 共通乱数のペア比較（#168）
+
+`nn 2-ply` と `nn 3-ply` を別々に走らせると、同じ設定でも 20 局で ±5,000 のばらつきが出る
+（seed ごとのゲームの展開が全く違うため）。そこで**片方のゲームの出現列をテープに記録し、
+もう片方に同じ列を食わせる**（common random numbers）。差の分散は個別の分散よりずっと小さく、
+少ない局数で方針の優劣を判定できる。
+
+- `nn.Spawn`（packed struct: cell 8 bit + 指数 8 bit）と `nn.Tape`（`Recording = enum { record, replay }`）
+- `nn.playTapedValue(vfn, rng, mode, tape)` / `nn.playTapedWithStatsValue(...)` — record は
+  平文の対局と同じ 2 回の rng draw（セル → 値）を行って記録し、replay は記録を置くだけ（rng を引かない）。
+  方針が分岐して記録セルが埋まっていれば最初の空きセルに置き、テープが尽きたら通常の抽選に戻る
+  （ゲームは合法に終わる）。record で遊んだ結果は平文の `playValue` と盤面まで一致する。
+- `nn.pairStats(diffs)` → `PairSummary { games, mean, stderr, better, worse }`
+- `zig build nn -Doptimize=ReleaseFast -- 0 10 9000 0.003 1 pair 30 ai/solver/nn_weights.bin 1`
+  で `deep`(A) と `deep3`(B) のペア比較を 1 局ずつ表示し、最後に平均差 ± stderr を出す。
+
+テープは「出現列を共有する」ので、A と B の**同じ局面から違う手を選んだ後**は盤面が分岐し、
+以降の出現位置は記録と食い違う（空きセルへ置き直す）。分岐前の比較が最も鋭く、終盤は
+別ゲームに近づく。それでも「同じ初期局面・同じ序盤」を共有する効果が大きく、独立 2 本より
+はるかに安定する。
+
