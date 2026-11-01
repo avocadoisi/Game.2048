@@ -40,6 +40,16 @@ Cycle and test discipline: `dev-philosophy`. Order of a change: `dev-workflow`.
 
 Writing code is parallelisable. Measuring is not.
 
+** Efficient training (measured): one process, 8 threads. Training itself is single-threaded, so a
+plain `zig build nn` uses ~1/8 of the machine. The `par` flag (argument 10) batches min(cpus, 8) games
+through `nn.trainBatchOpts` and is **3.5x faster** on this box (2,000 games: 31.8 s serial vs 9.1 s par,
+same seed): `zig build nn -Doptimize=ReleaseFast -- 5000 20 9000 0.0003 1 resume 30 /tmp/w.bin 1 par`.
+Always train with `replay_k=30` and `par`; `par` cannot carry the priority buffer's pointer state is
+fine, but it is refused for `mstd`, the #158 2-ply variants, `dist`/`dson` and `dump`/`ft2`/`restart`.
+Fine-tuning without the replay buffer is what destroys the shipped net (5,000 games at lr 3e-5:
+73,100 without replay vs 93,318 with `replay_k=30`, baseline 79,657 on 20 games) — never fine-tune
+without it.
+
 **Training is serial, always — one `zig build nn` at a time, even when the user asks for parallel work.**
 Only implementation, review and exploration may run in parallel. Measured: five `dson` lanes started
 together ran at 1.0-1.35 ms/move each, the same run alone is 0.5 ms/move; the wall clock and the
