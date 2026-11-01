@@ -455,6 +455,9 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "nn 2-ply + mass cutoff (#182)", .policy = 9 },
         // #178: the .deep row with every search leaf averaged over the 8 dihedral transforms.
         .{ .name = "nn 2-ply + sym leaf (#178)", .policy = 10 },
+        // #183: iterative deepening from the .deep row, stopping at a leaf-evaluation budget instead of
+        // a fixed ply, so a position it can afford searches deeper than 2 and still costs the same.
+        .{ .name = "nn iterative deepening (#183)", .policy = 11 },
     };
     // Rows are all on by default; a measurement run edits this line down to the two it needs
     // (0 = 1-ply, 2 = 2-ply) instead of paying for the 3-ply rows twice over.
@@ -518,6 +521,8 @@ pub fn main(init: std.process.Init) !void {
                 9 => nn.playValue(c.vfn, prng.random(), .deep_mass),
                 // #178: the .deep row with every search leaf averaged over the 8 dihedral transforms
                 10 => nn.playValueOpts(c.vfn, prng.random(), .deep, .{ .sym_leaf = true }),
+                // #183: iterative deepening from `.deep`, 200k leaf evaluations per move
+                11 => nn.playValueOpts(c.vfn, prng.random(), .deep, .{ .id_budget = 200_000 }),
                 else => unreachable,
             };
         }
