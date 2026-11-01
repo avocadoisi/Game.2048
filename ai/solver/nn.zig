@@ -828,10 +828,10 @@ pub const Tape = struct {
                 // ran out of tape (the replayed game is longer than the recorded one): draw as usual
                 // so the game still ends legally; the pair was on the same stream up to here
                 if (self.cursor >= self.len) return state.spawnRandomTile(rng);
-                const spawn = self.spawns[self.cursor];
+                const recorded = self.spawns[self.cursor];
                 self.cursor += 1;
-                const value = spawn.tile();
-                var pos = spawn.position();
+                const value = recorded.tile();
+                var pos = recorded.position();
                 // the two policies diverged, so the recorded cell can already be taken: keep the
                 // recorded value and take the first empty cell instead
                 if (state.board[pos.row][pos.col] != 0) {

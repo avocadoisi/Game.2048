@@ -210,6 +210,8 @@ pub fn main(init: std.process.Init) !void {
     const is_dump = std.mem.eql(u8, variant, "dump");
     const is_ft2 = std.mem.eql(u8, variant, "ft2");
     const is_restart = std.mem.eql(u8, variant, "restart");
+    // Paired comparison (#168): two policies play the same spawn tape.
+    const is_pair = std.mem.eql(u8, variant, "pair");
     // #159 variants train from the net in weights_path (the deep positions come from that net), like `resume`
     const use_resume = std.mem.eql(u8, variant, "resume") or is_dump or is_ft2 or is_restart;
     // Variants that take dump_path at index 11: `dump` writes it, `ft2` and `restart` read it.
@@ -222,7 +224,7 @@ pub fn main(init: std.process.Init) !void {
     const dump_path: ?[]const u8 = if (args.len > 11) args[11] else null;
     var dump: nn.Dump = .{};
     var priority: nn.Priority = .{};
-    const opts: nn.Options = if (par_variant or use_resume or std.mem.eql(u8, variant, "base"))
+    const opts: nn.Options = if (par_variant or use_resume or is_pair or std.mem.eql(u8, variant, "base"))
         .{}
     else if (std.mem.eql(u8, variant, "backward"))
         .{ .backward = true }
@@ -365,6 +367,31 @@ pub fn main(init: std.process.Init) !void {
     const games = eval_games * seed_ranges;
     // `mstd` evaluates through the staged value, everything else through the single net (#107)
     const eval_value: nn.Value = if (is_mstd) .{ .staged = &staged } else .{ .single = &net };
+
+    // Paired comparison (#168): play one game with A (`deep`), then replay the same spawns with B
+    // (`deep3`), so both see identical tiles. The per-game difference has much less noise than two
+    // independent runs. Opt-in with variant `pair` (train_games 0, eval as usual).
+    if (is_pair) {
+        const pair_games = eval_games * seed_ranges;
+        const spawns = try init.gpa.alloc(nn.Spawn, 20_000);
+        defer init.gpa.free(spawns);
+        const diffs = try init.gpa.alloc(f64, pair_games);
+        defer init.gpa.free(diffs);
+        var pair_rng = std.Random.DefaultPrng.init(eval_seed);
+        const start_pair = std.Io.Clock.awake.now(init.io);
+        for (0..pair_games) |i| {
+            var tape = nn.Tape.initRecord(spawns);
+            const a = nn.playTapedValue(eval_value, pair_rng.random(), .deep, &tape);
+            var replay = nn.Tape.initReplay(spawns[0..tape.len]);
+            const b = nn.playTapedValue(eval_value, pair_rng.random(), .deep3, &replay);
+            diffs[i] = @as(f64, @floatFromInt(b.score)) - @as(f64, @floatFromInt(a.score));
+            std.debug.print("pair {d}: deep={d} ({d}) deep3={d} ({d}) diff={d:.0}\n", .{ i, a.score, a.moves, b.score, b.moves, diffs[i] });
+        }
+        const st = nn.pairStats(diffs);
+        const elapsed = start_pair.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
+        std.debug.print("pair deep (A) vs deep3 (B): games={d} mean diff={d:.1} ± {d:.1} (stderr) better={d} worse={d} elapsed={d:.1} s\n", .{ st.games, st.mean, st.stderr, st.better, st.worse, @as(f64, @floatFromInt(elapsed)) / 1e9 });
+        return;
+    }
     const EvalCtx = struct { vfn: nn.Value, policy: usize, eval_seed: u64 };
     // Game i uses seed eval_seed + i (= eval_seed + range*eval_games + g); games run in parallel.
     const playGame = struct {
