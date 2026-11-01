@@ -468,6 +468,9 @@ pub fn main(init: std.process.Init) !void {
         // net's own gap is within 0.05 (NN values are score deltas / reward_scale, so 50 points of
         // one-move score); the snake score enters at half its `reward_scale` units.
         .{ .name = "nn 2-ply + rerank (#189)", .policy = 12 },
+        // #187: the .deep row with every chance node scored 30% by its CVaR below the lower 25%
+        // quantile, so a move that is usually good but sometimes losing ranks below a stable one.
+        .{ .name = "nn 2-ply + downside risk (#187)", .policy = 13 },
     };
     // Rows are all on by default; a measurement run edits this line down to the two it needs
     // (0 = 1-ply, 2 = 2-ply) instead of paying for the 3-ply rows twice over.
@@ -538,6 +541,8 @@ pub fn main(init: std.process.Init) !void {
                 11 => nn.playValueOpts(c.vfn, prng.random(), .deep, .{ .id_budget = 200_000 }),
                 // #189: .deep with the top two moves reranked by the snake heuristic on near ties
                 12 => nn.playValueOpts(c.vfn, prng.random(), .deep, .{ .rerank = rerank }),
+                // #187: the .deep row with the chance nodes moved 30% toward their CVaR
+                13 => nn.playValueOpts(c.vfn, prng.random(), .deep, .{ .risk_weight = 0.3 }),
                 else => unreachable,
             };
         }

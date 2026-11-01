@@ -314,7 +314,7 @@ pub const Stats = struct { leaves: u64 = 0, hits: u64 = 0 };
 /// `cutoff` (`0` keeps every branch) and dropping the lowest-probability branches up to a share
 /// `mass_cutoff` of each chance node's mass (#182, `0` keeps every branch). Part of the value-cache
 /// key (#157), because a phase game asks for the same board at two depths.
-pub const Depth = struct { ply: u8 = 0, cutoff: f64 = 0, mass_cutoff: f64 = 0 };
+pub const Depth = struct { ply: u8 = 0, cutoff: f64 = 0, mass_cutoff: f64 = 0, risk_weight: f64 = 0 };
 
 /// Key depth of the 1-ply lookups (`get` / `getValue`, e.g. the `nnmcts` rollouts), which never search.
 pub const leaf_depth: Depth = .{};
@@ -430,6 +430,49 @@ const ChanceBranch = struct { r: usize, c: usize, tile: core.Tile, p: f64 };
 /// A full board's worth of branches: at most one spawn pair per cell.
 const max_chance_branches = core.BoardSize * core.BoardSize * spawn_tiles.len;
 
+/// The tail of the downside-risk mix (#187): a chance node's CVaR is the probability-weighted mean
+/// of its branches below this lower quantile of the node's mass.
+const risk_alpha: f64 = 0.25;
+
+/// The CVaR of one chance node (#187): the probability-weighted mean of the branches below the node's
+/// lower `alpha` quantile, so a node that is mostly good but sometimes ruinous scores worse than one
+/// that is always equally good. `values` and `probs` are the kept branches of the node in board order;
+/// ties keep that order, so the result is deterministic and the search stays tie-break stable.
+/// The smallest branch is always in the tail, even when it alone carries more than `alpha` of the mass,
+/// so the tail is never empty and `alpha <= 1` always describes a whole branch.
+fn downsideRisk(values: []const f64, probs: []const f64, alpha: f64) f64 {
+    std.debug.assert(values.len == probs.len and values.len > 0);
+    // insertion sort of the indices by value, stable: the board-order tie-break of the mass cut
+    var order: [max_chance_branches]usize = undefined;
+    for (0..values.len) |i| {
+        var j = i;
+        while (j > 0 and values[order[j - 1]] > values[i]) : (j -= 1) order[j] = order[j - 1];
+        order[j] = i;
+    }
+    var all_p: f64 = 0;
+    for (probs) |p| all_p += p;
+    const tail_mass = alpha * all_p;
+    var tail_p: f64 = 0;
+    var tail_v: f64 = 0;
+    for (order[0..values.len]) |i| {
+        // the first branch is always taken; after that the tail stops before the branch that would
+        // cross the quantile, so the mean is over branches that are wholly below it
+        if (tail_p > 0 and tail_p + probs[i] > tail_mass) break;
+        tail_v += values[i] * probs[i];
+        tail_p += probs[i];
+    }
+    return tail_v / tail_p;
+}
+
+/// The #187 score of a chance node: its probability-weighted `mean` moved toward the node's CVaR by
+/// `risk_weight` (`0` = the plain mean, the pre-#187 value, with no tail work at all; `1` = CVaR
+/// alone). Because the tail mean of the lowest branches never exceeds the mean over all of them,
+/// `risk_weight` in `0..1` only ever lowers a node's score and never reorders it above its own mean.
+fn riskScore(mean: f64, values: []const f64, probs: []const f64, risk_weight: f64) f64 {
+    if (risk_weight == 0) return mean;
+    return (1 - risk_weight) * mean + risk_weight * downsideRisk(values, probs, risk_alpha);
+}
+
 /// Marks the branches `mass_cutoff` drops (#182) and returns the share of the node's mass they carry:
 /// the lowest `p` first, dropped while their cumulative share stays within `mass_cutoff`; a branch that
 /// would push it over stays. Equal probabilities keep `branches` order, and the heaviest branch is never
@@ -467,6 +510,10 @@ const Search = struct {
     /// Chance nodes may drop their lowest-probability branches while the dropped share of the node's
     /// mass stays within this value (#182); 0 searches every branch, as `cutoff = 0` did.
     mass_cutoff: f64 = 0,
+    /// #187: how far a chance node's score moves from its mean toward its CVaR. `0` (the default)
+    /// returns `total / mass` exactly as before, bit for bit; `1` scores the node by its CVaR alone.
+    /// Only the aggregation at chance nodes changes, never a leaf, so it is not part of the cache key.
+    risk_weight: f64 = 0,
     /// Own-move plies this whole search runs at; with `cutoff` it keys every leaf lookup (#157).
     ply: u8 = 0,
     /// #178: average every leaf over the 8 dihedral transforms instead of one forward pass.
@@ -591,18 +638,27 @@ const Search = struct {
         // the mass cut drops the smallest branches first, the fixed cut its usual depth > 1 way
         var dropped: [max_chance_branches]bool = @splat(false);
         _ = massCutMask(branches[0..count], self.mass_cutoff, &dropped);
-        // pass 2: the kept branches
+        // pass 2: the kept branches, with their values kept for the #187 tail (cheap: at most
+        // `max_chance_branches` of them, and only read when `risk_weight` is nonzero)
         var total: f64 = 0;
         var mass: f64 = 0;
+        var kept_values: [max_chance_branches]f64 = undefined;
+        var kept_probs: [max_chance_branches]f64 = undefined;
+        var kept: usize = 0;
         for (branches[0..count], 0..) |branch, i| {
             if (dropped[i] or (depth > 1 and branch.p / empties < self.cutoff)) continue;
             var child = state;
             child.board[branch.r][branch.c] = branch.tile;
-            total += branch.p * self.value(child, depth, branch.p);
+            const v = self.value(child, depth, branch.p);
+            total += branch.p * v;
             mass += branch.p;
+            kept_values[kept] = v;
+            kept_probs[kept] = branch.p;
+            kept += 1;
         }
         // every branch cut: the node is already that unlikely, so the afterstate leaf is the answer
-        return if (mass == 0) self.leaf(state.board) else total / mass;
+        if (mass == 0) return self.leaf(state.board);
+        return riskScore(total / mass, kept_values[0..kept], kept_probs[0..kept], self.risk_weight);
     }
 };
 
@@ -671,15 +727,15 @@ fn rerankScore(r: Rerank, state: GameState, d: Direction) f64 {
 /// `depth.ply` own moves deep: my move -> spawn -> ... -> afterstate value + score_delta/reward_scale.
 /// `ply` 2 is `deep` (full width); `ply` 3 is `deep3`, whose cost only fits with a spawn-probability cut;
 /// `ply` 4 is `phase_h4` (#171), which only ever runs where the board is nearly full.
-fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, depth: Depth, sym_leaf: bool, rerank: ?Rerank) ?Direction {
-    var search = newSearch(vfn, cache, depth, sym_leaf);
+fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, depth: Depth, sym_leaf: bool, rerank: ?Rerank, risk_weight: f64) ?Direction {
+    var search = newSearch(vfn, cache, depth, sym_leaf, risk_weight);
     defer stats.* = search.stats;
     return rootMove(&search, state, dir_order, rerank).dir;
 }
 
 /// A `Search` over the depth row `depth` (#183 factored this out of `deepMove` so the iterative
 /// deepening can rebuild the same search at another ply).
-fn newSearch(vfn: Value, cache: *ValueCache, depth: Depth, sym_leaf: bool) Search {
+fn newSearch(vfn: Value, cache: *ValueCache, depth: Depth, sym_leaf: bool, risk_weight: f64) Search {
     return .{
         .vfn = vfn,
         .cache = cache,
@@ -687,6 +743,8 @@ fn newSearch(vfn: Value, cache: *ValueCache, depth: Depth, sym_leaf: bool) Searc
         .mass_cutoff = depth.mass_cutoff,
         .ply = depth.ply,
         .sym_leaf = sym_leaf,
+        // a phase row may carry its own #187 weight; the caller's option is the one every other row uses
+        .risk_weight = if (depth.risk_weight != 0) depth.risk_weight else risk_weight,
     };
 }
 
@@ -714,7 +772,7 @@ pub const IdMove = struct {
 /// same tree one spawn layer out, not a different width. The previous iteration's root move goes first
 /// in the next iteration's move order, so with a budget that runs out mid-iteration the deeper tree is
 /// explored from its most promising branch outward.
-fn deepMoveId(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, start: Depth, budget: usize, sym_leaf: bool, rerank: ?Rerank) IdMove {
+fn deepMoveId(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, start: Depth, budget: usize, sym_leaf: bool, rerank: ?Rerank, risk_weight: f64) IdMove {
     var order = dir_order;
     var spent: u64 = 0;
     var hits: u64 = 0;
@@ -722,7 +780,7 @@ fn deepMoveId(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, s
     var best_ply: u8 = 0;
     var ply: u8 = @max(start.ply, 2);
     while (ply <= max_id_ply) : (ply += 1) {
-        var search = newSearch(vfn, cache, .{ .ply = ply, .cutoff = start.cutoff, .mass_cutoff = start.mass_cutoff }, sym_leaf);
+        var search = newSearch(vfn, cache, .{ .ply = ply, .cutoff = start.cutoff, .mass_cutoff = start.mass_cutoff }, sym_leaf, risk_weight);
         // what this iteration may still spend: the budget minus every iteration before it
         search.nodes_left = budget -| @as(usize, @intCast(spent));
         const root = rootMove(&search, state, order, rerank);
@@ -856,7 +914,7 @@ pub const Mode = enum {
 /// own moves deep, dropping spawn branches under path probability `cutoff` (`full_width_cutoff` keeps
 /// every branch) and dropping the lowest-probability branches up to `mass_cutoff` of a chance node's
 /// mass (#182, 0 keeps every branch).
-pub const Phase = struct { min_empty: u8, ply: u8, cutoff: f64, mass_cutoff: f64 = 0 };
+pub const Phase = struct { min_empty: u8, ply: u8, cutoff: f64, mass_cutoff: f64 = 0, risk_weight: f64 = 0 };
 
 /// A row cutoff that keeps every spawn branch: no branch probability ever reaches 1.
 const full_width_cutoff: f64 = 1;
@@ -936,6 +994,7 @@ fn phaseDepth(mode: Mode, board: Board) Depth {
             .ply = row.ply,
             .cutoff = searchCutoff(row.cutoff),
             .mass_cutoff = searchMassCutoff(row.mass_cutoff),
+            .risk_weight = row.risk_weight,
         };
     }
     unreachable; // every schedule ends with min_empty = 0
@@ -977,7 +1036,7 @@ pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stat
     if (opts.id_budget) |budget| {
         const dir = switch (mode) {
             .greedy, .chance => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
-            .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMoveId(vfn, state, stats, cache, phaseDepth(mode, state.board), budget, opts.sym_leaf, opts.rerank).dir,
+            .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMoveId(vfn, state, stats, cache, phaseDepth(mode, state.board), budget, opts.sym_leaf, opts.rerank, opts.risk_weight).dir,
         };
         // a budget too small for one full iteration still has to answer with a legal move
         return dir orelse firstLegalMove(state);
@@ -986,7 +1045,7 @@ pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stat
         .greedy => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
         .chance => chanceMove(vfn, state),
         // every search mode takes its (ply, cutoff, mass cutoff) for this board from the phase table (#157)
-        .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, phaseDepth(mode, state.board), opts.sym_leaf, opts.rerank),
+        .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, phaseDepth(mode, state.board), opts.sym_leaf, opts.rerank, opts.risk_weight),
     };
 }
 
@@ -1353,6 +1412,11 @@ pub const Options = struct {
     /// Candidate (#189): heterogeneous rerank of the 2-ply search's top two moves by a cheap foreign
     /// evaluator when the net's own gap is within `Rerank.margin`; null = the plain argmax.
     rerank: ?Rerank = null,
+    /// Candidate (#187): how far every chance node's score moves from its mean toward its CVaR, so a
+    /// move that is usually good but sometimes losing ranks below one that is always equally good.
+    /// `0` (the default) is the plain expectation, bit for bit as before; `1` is the CVaR alone. A
+    /// phase row with a nonzero `Phase.risk_weight` overrides it for that row.
+    risk_weight: f64 = 0,
     /// Candidate (#175) `dist`: teacher pairs from `computeTeachers`. Every self-play step also takes one
     /// regression step on a uniformly drawn pair, so 1/2 of the updates are distillation.
     distill: ?*Teachers = null,
@@ -2644,6 +2708,100 @@ test "mass cutoff 0.5 drops the low-probability tail of one chance node (#182)" 
 
 /// Modes that pick their own depth from the phase table (#157).
 const phase_modes = [_]Mode{ .phase_h1, .phase_h2, .phase_h3 };
+
+test "risk weight 0 is the plain expectation, bit for bit (#187)" {
+    var prng = std.Random.DefaultPrng.init(187);
+    const net = Net.init(prng.random());
+    const vfn: Value = .{ .single = &net };
+    // every existing phase row carries no risk weight, so the phase table is unchanged
+    for ([_]Mode{ .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 }) |mode| {
+        try std.testing.expectEqual(@as(f64, 0), phaseDepth(mode, mid_board.board).risk_weight);
+    }
+    var plain_cache: ValueCache = .{};
+    var plain: Search = .{ .vfn = vfn, .cache = &plain_cache, .ply = 2 };
+    var zero_cache: ValueCache = .{};
+    var zero: Search = .{ .vfn = vfn, .cache = &zero_cache, .ply = 2, .risk_weight = 0 };
+    try std.testing.expectEqual(plain.value(mid_board, 2, 1), zero.value(mid_board, 2, 1));
+    // and `chance` at weight 0 is the branch mean recomputed here in the old way, with no tail term
+    const chance_value = zero.chance(mid_board, 2, 1);
+    var total: f64 = 0;
+    var mass: f64 = 0;
+    for (0..core.BoardSize) |r| {
+        for (0..core.BoardSize) |c| {
+            if (mid_board.board[r][c] != 0) continue;
+            for (spawn_tiles) |spawn| {
+                var child = mid_board;
+                child.board[r][c] = spawn.value;
+                total += spawn.p * plain.value(child, 2, spawn.p);
+                mass += spawn.p;
+            }
+        }
+    }
+    try std.testing.expectEqual(total / mass, chance_value);
+    try std.testing.expectEqual(total / mass, riskScore(total / mass, &.{ 0, 1 }, &.{ 0.5, 0.5 }, 0));
+    // the chosen move is the same as well, not just the value
+    var off_stats: Stats = .{};
+    var off_cache: ValueCache = .{};
+    var default_stats: Stats = .{};
+    var default_cache: ValueCache = .{};
+    try std.testing.expectEqual(
+        bestMoveWithCacheValueOpts(vfn, mid_board, .deep, &default_stats, &default_cache, .{}),
+        bestMoveWithCacheValueOpts(vfn, mid_board, .deep, &off_stats, &off_cache, .{ .risk_weight = 0 }),
+    );
+}
+
+test "risk weight 1 scores a chance node by its CVaR, below its mean (#187)" {
+    var prng = std.Random.DefaultPrng.init(1870);
+    const net = Net.init(prng.random());
+    const vfn: Value = .{ .single = &net };
+    var mean_cache: ValueCache = .{};
+    var mean: Search = .{ .vfn = vfn, .cache = &mean_cache, .ply = 2 };
+    var cvar_cache: ValueCache = .{};
+    var cvar: Search = .{ .vfn = vfn, .cache = &cvar_cache, .ply = 2, .risk_weight = 1 };
+    const m = mean.value(mid_board, 2, 1);
+    const c = cvar.value(mid_board, 2, 1);
+    // the tail mean of a node never beats the node's mean, so CVaR-only scoring can only lower it
+    try std.testing.expect(c <= m);
+    try std.testing.expect(c < m);
+    // per node: the CVaR of a spread node sits strictly below its mean, and equals it when flat
+    const even = [_]f64{ 2, 2, 2 };
+    const even_p = [_]f64{ 0.9, 0.05, 0.05 };
+    try std.testing.expectEqual(@as(f64, 2), downsideRisk(&even, &even_p, risk_alpha));
+    const spread = [_]f64{ 0, 10 };
+    const spread_p = [_]f64{ 0.9, 0.1 };
+    try std.testing.expect(downsideRisk(&spread, &spread_p, risk_alpha) < riskScore(1, &spread, &spread_p, 0));
+}
+
+test "risk weight picks the lower-variance move at equal expectation (#187)" {
+    // two moves of the same expectation: `narrow` always scores 1, `wide` scores 0 nine times out of
+    // ten and 10 on the 4 spawn, so its 90% branch is the whole lower tail
+    const narrow_v = [_]f64{ 1, 1 };
+    const narrow_p = [_]f64{ 0.9, 0.1 };
+    const wide_v = [_]f64{ 0, 10 };
+    const wide_p = [_]f64{ 0.9, 0.1 };
+    var narrow_total: f64 = 0;
+    for (narrow_v, narrow_p) |v, p| narrow_total += v * p;
+    var wide_total: f64 = 0;
+    for (wide_v, wide_p) |v, p| wide_total += v * p;
+    try std.testing.expectApproxEqAbs(narrow_total, wide_total, 1e-12);
+    // at weight 0 the two tie: the plain expectation cannot tell them apart
+    const narrow_mean = narrow_total;
+    const wide_mean = wide_total;
+    try std.testing.expectEqual(narrow_mean, riskScore(narrow_mean, &narrow_v, &narrow_p, 0));
+    try std.testing.expectApproxEqAbs(
+        riskScore(narrow_mean, &narrow_v, &narrow_p, 0),
+        riskScore(wide_mean, &wide_v, &wide_p, 0),
+        1e-12,
+    );
+    // above 0 the wide move's tail (0) scores it below the flat one, which has no tail below its mean
+    const narrow = riskScore(narrow_mean, &narrow_v, &narrow_p, 0.3);
+    const wide = riskScore(wide_mean, &wide_v, &wide_p, 0.3);
+    try std.testing.expect(narrow > wide);
+    // the tail is the lowest `risk_alpha` of the mass: one of four equal branches is 25%
+    const quartile_v = [_]f64{ 3, 1, 4, 2 };
+    const quartile_p = [_]f64{ 0.25, 0.25, 0.25, 0.25 };
+    try std.testing.expectEqual(@as(f64, 1), downsideRisk(&quartile_v, &quartile_p, risk_alpha));
+}
 
 test "phase modes return only legal moves on random boards (#157)" {
     var prng = std.Random.DefaultPrng.init(157);
@@ -4156,7 +4314,7 @@ test "id_budget adopts a monotonically deeper ply as the budget grows (#183)" {
     for ([_]usize{ 0, 200, 2_000, 20_000 }) |budget| {
         var stats: Stats = .{};
         var cache: ValueCache = .{};
-        const got = deepMoveId(vfn, mid_board, &stats, &cache, phaseDepth(.deep, mid_board.board), budget, false, null);
+        const got = deepMoveId(vfn, mid_board, &stats, &cache, phaseDepth(.deep, mid_board.board), budget, false, null, 0);
         try std.testing.expect(got.ply >= previous);
         try std.testing.expectEqual(got.leaves, stats.leaves);
         previous = got.ply;
