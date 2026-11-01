@@ -347,6 +347,15 @@ pub const ValueCache = struct {
         return (h ^ @as(u64, @bitCast(depth.mass_cutoff))) *% 0x100000001b3;
     }
 
+    /// `keyOfDepth` mixed with the #178 leaf flag. The false case keeps the old key bit for bit, so a
+    /// cache behaves exactly as before; the true case is a bijection of the key, which adds no new
+    /// collision risk (a collision would be a miss, never a wrong value).
+    fn keyOfDepthSym(board: Board, depth: Depth, sym_leaf: bool) u64 {
+        const key = keyOfDepth(board, depth);
+        if (key == empty_key or !sym_leaf) return key;
+        return (key ^ 1) *% 0x100000001b3;
+    }
+
     /// `forward(net, board)` with memoization; `stats` counts leaf evaluations and hits.
     pub fn get(self: *ValueCache, net: *const Net, board: Board, stats: *Stats) f64 {
         return self.getValue(.{ .single = net }, board, stats);
@@ -359,23 +368,35 @@ pub const ValueCache = struct {
 
     /// `getValue` for one search depth: the same board at another (ply, cutoff) is another entry.
     pub fn getValueAtDepth(self: *ValueCache, vfn: Value, board: Board, depth: Depth, stats: *Stats) f64 {
-        const key = keyOfDepth(board, depth);
-        if (key == empty_key) return leafValue(vfn, board, stats);
+        return self.getValueAtDepthSym(vfn, board, depth, false, stats);
+    }
+
+    /// `getValueAtDepth` with the #178 leaf flag: a symmetrically averaged leaf is another value, so
+    /// it gets its own key instead of sharing the entry of the single-forward one.
+    pub fn getValueAtDepthSym(self: *ValueCache, vfn: Value, board: Board, depth: Depth, sym_leaf: bool, stats: *Stats) f64 {
+        const key = keyOfDepthSym(board, depth, sym_leaf);
+        if (key == empty_key) return leafValueSym(vfn, board, sym_leaf, stats);
         const slot: usize = @intCast(key & (capacity - 1));
         if (self.entries[slot].key == key) {
             stats.hits += 1;
             return self.entries[slot].value;
         }
-        const value_ = leafValue(vfn, board, stats);
+        const value_ = leafValueSym(vfn, board, sym_leaf, stats);
         self.entries[slot] = .{ .key = key, .value = value_ };
         return value_;
     }
 };
 
-fn leafValue(vfn: Value, board: Board, stats: *Stats) f64 {
+/// The #178 leaf: `sym_leaf = false` is the single forward pass as before; `true` averages the value
+/// over the 8 dihedral transforms (`symmetryMap`), so one leaf costs `symmetry_count` forward passes
+/// instead of one.
+fn leafValueSym(vfn: Value, board: Board, sym_leaf: bool, stats: *Stats) f64 {
     var cache: Cache = .{};
     stats.leaves += 1;
-    return valueAt(vfn, board, &cache);
+    if (!sym_leaf) return valueAt(vfn, board, &cache);
+    var total: f64 = 0;
+    for (0..symmetry_count) |k| total += valueAt(vfn, transformBoard(k, board), &cache);
+    return total / @as(f64, @floatFromInt(symmetry_count));
 }
 
 /// Per-thread cache reused across moves (issue #88). A value is a pure function of the board and
@@ -444,14 +465,16 @@ const Search = struct {
     mass_cutoff: f64 = 0,
     /// Own-move plies this whole search runs at; with `cutoff` it keys every leaf lookup (#157).
     ply: u8 = 0,
+    /// #178: average every leaf over the 8 dihedral transforms instead of one forward pass.
+    sym_leaf: bool = false,
 
-    /// `cache.getValue` at this search's depth: one entry per (board, ply, cutoff).
+    /// `cache.getValue` at this search's depth: one entry per (board, ply, cutoff, sym_leaf).
     fn leaf(self: *Search, board: Board) f64 {
-        return self.cache.getValueAtDepth(self.vfn, board, .{
+        return self.cache.getValueAtDepthSym(self.vfn, board, .{
             .ply = self.ply,
             .cutoff = self.cutoff,
             .mass_cutoff = self.mass_cutoff,
-        }, &self.stats);
+        }, self.sym_leaf, &self.stats);
     }
 
     /// `value` with the leaf one own move further out and no reward at it: `bootValue(S, 0)` is the
@@ -567,13 +590,14 @@ const Search = struct {
 /// `depth.ply` own moves deep: my move -> spawn -> ... -> afterstate value + score_delta/reward_scale.
 /// `ply` 2 is `deep` (full width); `ply` 3 is `deep3`, whose cost only fits with a spawn-probability cut;
 /// `ply` 4 is `phase_h4` (#171), which only ever runs where the board is nearly full.
-fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, depth: Depth) ?Direction {
+fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, depth: Depth, sym_leaf: bool) ?Direction {
     var search: Search = .{
         .vfn = vfn,
         .cache = cache,
         .cutoff = depth.cutoff,
         .mass_cutoff = depth.mass_cutoff,
         .ply = depth.ply,
+        .sym_leaf = sym_leaf,
     };
     defer stats.* = search.stats;
     var best: ?Direction = null;
@@ -605,9 +629,9 @@ const search2_ply: u8 = 2;
 /// `Search.value` at the same count instead returns `search2_ply` rewards plus `V` of the afterstate
 /// the *last* reward reached, so that last reward lands in the target twice and the fixed point of
 /// the `search2` target sits ~1.5x above the true value on a 1-reward-per-move chain.
-fn search2Value(vfn: Value, state: GameState, cache: *ValueCache) f64 {
+fn search2Value(vfn: Value, state: GameState, cache: *ValueCache, sym_leaf: bool) f64 {
     // The leaf sits one own move deeper than `value` at the same reward count: key it as such.
-    var search: Search = .{ .vfn = vfn, .cache = cache, .ply = search2_ply + 1 };
+    var search: Search = .{ .vfn = vfn, .cache = cache, .ply = search2_ply + 1, .sym_leaf = sym_leaf };
     return search.bootValue(state, search2_ply - 1, 1);
 }
 
@@ -616,7 +640,7 @@ fn search2Value(vfn: Value, state: GameState, cache: *ValueCache) f64 {
 /// so `Pick.value` is that chance value (not `V`) and `reward + value` is the teacher's q of the move.
 /// `teacherValue` of the board this move is made on is the tree one own move deeper, exactly as
 /// `deepMove` scores the same move. Spawns are enumerated, so this draws nothing from the rng.
-fn pickTeacherValue(vfn: Value, state: GameState, mode: Mode, cache: *ValueCache) ?Pick {
+fn pickTeacherValue(vfn: Value, state: GameState, mode: Mode, cache: *ValueCache, sym_leaf: bool) ?Pick {
     const depth = phaseDepth(mode, state.board);
     var search: Search = .{
         .vfn = vfn,
@@ -624,6 +648,7 @@ fn pickTeacherValue(vfn: Value, state: GameState, mode: Mode, cache: *ValueCache
         .cutoff = depth.cutoff,
         .mass_cutoff = depth.mass_cutoff,
         .ply = depth.ply,
+        .sym_leaf = sym_leaf,
     };
     var best: ?Pick = null;
     var best_value: f64 = -std.math.inf(f64);
@@ -655,8 +680,8 @@ fn pickTeacherValue(vfn: Value, state: GameState, mode: Mode, cache: *ValueCache
 /// the rng and the spawn sequence of the game is the same as with `greedy1`.
 /// The `.deep` phase row is `(ply = search2_ply, full width)`, so this is `pickTeacherValue(.., .deep)`:
 /// the `d2` cell of #167 plays exactly this move.
-fn pickSearch2Value(vfn: Value, state: GameState, cache: *ValueCache) ?Pick {
-    return pickTeacherValue(vfn, state, .deep, cache);
+fn pickSearch2Value(vfn: Value, state: GameState, cache: *ValueCache, sym_leaf: bool) ?Pick {
+    return pickTeacherValue(vfn, state, .deep, cache, sym_leaf);
 }
 
 pub const Mode = enum {
@@ -796,11 +821,16 @@ pub fn bestMoveWithCache(net: *const Net, state: GameState, mode: Mode, stats: *
 }
 
 pub fn bestMoveWithCacheValue(vfn: Value, state: GameState, mode: Mode, stats: *Stats, cache: *ValueCache) ?Direction {
+    return bestMoveWithCacheValueOpts(vfn, state, mode, stats, cache, .{});
+}
+
+/// `bestMoveWithCacheValue` with the search options (#178): `sym_leaf` averages every leaf.
+pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stats: *Stats, cache: *ValueCache, opts: Options) ?Direction {
     return switch (mode) {
         .greedy => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
         .chance => chanceMove(vfn, state),
         // every search mode takes its (ply, cutoff, mass cutoff) for this board from the phase table (#157)
-        .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, phaseDepth(mode, state.board)),
+        .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, phaseDepth(mode, state.board), opts.sym_leaf),
     };
 }
 
@@ -822,8 +852,14 @@ pub fn play(net: *const Net, rng: std.Random, mode: Mode) PlayResult {
 
 /// `play` for a single or staged value function (#107).
 pub fn playValue(vfn: Value, rng: std.Random, mode: Mode) PlayResult {
+    return playValueOpts(vfn, rng, mode, .{});
+}
+
+/// `playValue` with the search options (#178): `sym_leaf` averages every search leaf over the 8
+/// dihedral transforms. Modes without a search (`.greedy`, `.chance`) are unchanged.
+pub fn playValueOpts(vfn: Value, rng: std.Random, mode: Mode, opts: Options) PlayResult {
     var stats: Stats = .{};
-    return playWithStatsValue(vfn, rng, mode, &stats);
+    return playWithOptsValue(vfn, rng, mode, &stats, opts);
 }
 
 pub fn playWithStats(net: *const Net, rng: std.Random, mode: Mode, stats: *Stats) PlayResult {
@@ -831,13 +867,18 @@ pub fn playWithStats(net: *const Net, rng: std.Random, mode: Mode, stats: *Stats
 }
 
 pub fn playWithStatsValue(vfn: Value, rng: std.Random, mode: Mode, stats: *Stats) PlayResult {
+    return playWithOptsValue(vfn, rng, mode, stats, .{});
+}
+
+/// `playWithStatsValue` with the search options (#178).
+pub fn playWithOptsValue(vfn: Value, rng: std.Random, mode: Mode, stats: *Stats, opts: Options) PlayResult {
     var state = GameState.gameStart(rng);
     var moves: u32 = 0;
     var move_stats: Stats = .{};
     var cache: ValueCache = .{}; // one workspace for the whole game (issue #88)
     while (true) {
         move_stats = .{};
-        const dir = bestMoveWithCacheValue(vfn, state, mode, &move_stats, &cache) orelse break;
+        const dir = bestMoveWithCacheValueOpts(vfn, state, mode, &move_stats, &cache, opts) orelse break;
         stats.leaves += move_stats.leaves;
         stats.hits += move_stats.hits;
         _ = state.move(dir, rng);
@@ -1142,6 +1183,11 @@ pub const Options = struct {
     /// Candidate (#159) `restart`: every game starts on a uniformly drawn deep afterstate of `dump`
     /// instead of an empty board. Requires `dump`.
     restart: bool = false,
+    /// Candidate (#178): average every search leaf (`Search.leaf`) over the 8 dihedral transforms of
+    /// the board instead of one forward pass, so the evaluation noise drops at 8x the leaf cost. The
+    /// 1-ply modes (`.greedy` / `.chance`) have no `Search` and are unchanged, as is the default
+    /// (`false`), which keeps the single forward pass bit for bit.
+    sym_leaf: bool = false,
 };
 
 /// Prioritized replay (issue #34): ring buffer of recent TD updates. After each game, `m` extra updates
@@ -1525,7 +1571,7 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
     var cache: Cache = .{};
     var moves: u32 = 0;
     var trace: Net = std.mem.zeroes(Net);
-    while (selfplayPick(vfn, state, opts.death, opts.selfplay, opts.teacher)) |pick| {
+    while (selfplayPick(vfn, state, opts.death, opts.selfplay, opts.teacher, opts.sym_leaf)) |pick| {
         moves += 1;
         if (opts.dump_record) if (opts.dump) |buffer| buffer.offer(pick.after);
         if (pending) |p| {
@@ -1566,11 +1612,11 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
 /// `deep2` plays the eval's 2-ply search; a `teacher` mode plays that mode's search (see
 /// `pickTeacherValue`). None of them draws from the rng (the search enumerates spawns), so all policies
 /// spawn the same tiles in the same order for the same seed and differ only in the move they pick.
-fn selfplayPick(vfn: Value, state: GameState, death: bool, selfplay: SelfPlay, teacher: ?Mode) ?Pick {
-    if (teacher) |mode| return pickTeacherValue(vfn, state, mode, sharedValueCache());
+fn selfplayPick(vfn: Value, state: GameState, death: bool, selfplay: SelfPlay, teacher: ?Mode, sym_leaf: bool) ?Pick {
+    if (teacher) |mode| return pickTeacherValue(vfn, state, mode, sharedValueCache(), sym_leaf);
     return switch (selfplay) {
         .greedy1 => pickMoveValue(vfn, state, death),
-        .deep2 => pickSearch2Value(vfn, state, sharedValueCache()),
+        .deep2 => pickSearch2Value(vfn, state, sharedValueCache(), sym_leaf),
     };
 }
 
@@ -1579,7 +1625,7 @@ fn selfplayPick(vfn: Value, state: GameState, death: bool, selfplay: SelfPlay, t
 /// that is the tree `search2Value` bootstraps (`t2`); for `.deep3` (ply 3, its `deep3_cutoff`) it is
 /// the tree `Mode.deep` ranks its moves with, so the target is what the 2-ply play side already
 /// believes the position is worth, one own move deeper than `t2` and cheap enough to train on.
-fn teacherValue(vfn: Value, state: GameState, mode: Mode) f64 {
+fn teacherValue(vfn: Value, state: GameState, mode: Mode, sym_leaf: bool) f64 {
     const depth = phaseDepth(mode, state.board);
     var search: Search = .{
         .vfn = vfn,
@@ -1587,6 +1633,7 @@ fn teacherValue(vfn: Value, state: GameState, mode: Mode) f64 {
         .cutoff = depth.cutoff,
         .mass_cutoff = depth.mass_cutoff,
         .ply = depth.ply,
+        .sym_leaf = sym_leaf,
     };
     return search.value(state, depth.ply, 1);
 }
@@ -1598,10 +1645,10 @@ fn teacherValue(vfn: Value, state: GameState, mode: Mode) f64 {
 /// is already a search value, so `td1` reads V of the afterstate directly then. A teacher (#167)
 /// replaces the bootstrap entirely: its own search value of `spawned`, and `target` is ignored.
 fn tdBootstrap(net: *const Net, next: Pick, spawned: GameState, opts: Options) f64 {
-    if (opts.teacher) |mode| return teacherValue(.{ .single = net }, spawned, mode);
+    if (opts.teacher) |mode| return teacherValue(.{ .single = net }, spawned, mode, opts.sym_leaf);
     return switch (opts.target) {
         .td1 => if (opts.selfplay == .deep2) valueOf(net, next.after) else next.value,
-        .search2 => search2Value(.{ .single = net }, spawned, sharedValueCache()),
+        .search2 => search2Value(.{ .single = net }, spawned, sharedValueCache(), opts.sym_leaf),
     };
 }
 
@@ -2250,10 +2297,10 @@ test "deep2 self-play picks the eval's 2-ply move, legally and deterministically
     const net = Net.init(prng.random());
     var cache_a: ValueCache = .{};
     var cache_b: ValueCache = .{};
-    try std.testing.expectEqual(@as(?Pick, null), pickSearch2Value(.{ .single = &net }, .{ .board = dead_board }, &cache_a));
+    try std.testing.expectEqual(@as(?Pick, null), pickSearch2Value(.{ .single = &net }, .{ .board = dead_board }, &cache_a, false));
 
-    const first = pickSearch2Value(.{ .single = &net }, mid_board, &cache_a).?;
-    const second = pickSearch2Value(.{ .single = &net }, mid_board, &cache_b).?;
+    const first = pickSearch2Value(.{ .single = &net }, mid_board, &cache_a, false).?;
+    const second = pickSearch2Value(.{ .single = &net }, mid_board, &cache_b, false).?;
     try std.testing.expectEqual(first.dir, second.dir);
     try std.testing.expectEqual(first.after, second.after);
     try std.testing.expectEqual(first.reward, second.reward);
@@ -2309,7 +2356,7 @@ test "search2 target does not double count the last reward (#158)" {
     const spawned: GameState = .{ .board = post_spawn_board };
     const r_t = 4 / reward_scale;
     var cache: ValueCache = .{};
-    const boot = search2Value(vfn, spawned, &cache);
+    const boot = search2Value(vfn, spawned, &cache, false);
     try std.testing.expectApproxEqAbs(r_t + v, boot, 1e-12);
     // the target of the step is the pending reward in front of it, r_{t-1} + [r_t + V(A_{t+1})]
     const r_prev = 1 / reward_scale;
@@ -2382,7 +2429,7 @@ fn spawnTrace(net: *const Net, seed: u64, opts: Options) [teacher_trace_moves]u6
     var state = GameState.gameStart(random);
     var trace: [teacher_trace_moves]u64 = @splat(0);
     for (&trace) |*hash| {
-        const pick = selfplayPick(.{ .single = net }, state, false, opts.selfplay, opts.teacher) orelse break;
+        const pick = selfplayPick(.{ .single = net }, state, false, opts.selfplay, opts.teacher, opts.sym_leaf) orelse break;
         _ = state.move(pick.dir, random);
         hash.* = std.hash.Crc32.hash(std.mem.asBytes(&state.board));
     }
@@ -3354,6 +3401,71 @@ test "symmetry=false and lambda=0 reproduce the recorded checksum (5 games, seed
     var rng = std.Random.DefaultPrng.init(12);
     for (0..5) |_| _ = trainGameOpts(&net, rng.random(), 0.003, null, .{ .symmetry = false, .lambda = 0 });
     try std.testing.expectEqual(@as(u32, 1621370333), std.hash.Crc32.hash(std.mem.asBytes(&net)));
+}
+
+test "sym_leaf=false keeps the single-forward leaf and its own cache entry (#178)" {
+    var prng = std.Random.DefaultPrng.init(178);
+    const net = Net.init(prng.random());
+    var scratch: Cache = .{};
+    const plain = forward(&net, sample_board, &scratch);
+    var cache: ValueCache = .{};
+    // the default search is the pre-#178 one: one forward pass, the same value as before
+    var search: Search = .{ .vfn = .{ .single = &net }, .cache = &cache, .ply = 2 };
+    try std.testing.expectEqual(plain, search.leaf(sample_board));
+    try std.testing.expectEqual(@as(u64, 1), search.stats.leaves);
+    // the averaged leaf is another value: a miss, not a hit on the single-forward entry
+    search.sym_leaf = true;
+    _ = search.leaf(sample_board);
+    try std.testing.expectEqual(@as(u64, 2), search.stats.leaves);
+    try std.testing.expectEqual(@as(u64, 0), search.stats.hits);
+    // and the plain entry is still returned as a hit
+    search.sym_leaf = false;
+    try std.testing.expectEqual(plain, search.leaf(sample_board));
+    try std.testing.expectEqual(@as(u64, 2), search.stats.leaves);
+    try std.testing.expectEqual(@as(u64, 1), search.stats.hits);
+    // the option-carrying entry points default to the same move as the pre-#178 ones
+    var stats_a: Stats = .{};
+    var stats_b: Stats = .{};
+    var cache_a: ValueCache = .{};
+    var cache_b: ValueCache = .{};
+    const plain_move = bestMoveWithCache(&net, mid_board, .deep, &stats_a, &cache_a);
+    const opts_move = bestMoveWithCacheValueOpts(.{ .single = &net }, mid_board, .deep, &stats_b, &cache_b, .{});
+    try std.testing.expectEqual(plain_move, opts_move);
+    try std.testing.expectEqual(stats_a.leaves, stats_b.leaves);
+}
+
+test "sym_leaf averages the 8 dihedral transforms of the leaf (#178)" {
+    var prng = std.Random.DefaultPrng.init(1178);
+    const net = Net.init(prng.random());
+    var cache: ValueCache = .{};
+    var search: Search = .{ .vfn = .{ .single = &net }, .cache = &cache, .ply = 2, .sym_leaf = true };
+    const got = search.leaf(mid_board.board);
+    // expected: the 8 transformed boards, forwarded one by one
+    var total: f64 = 0;
+    for (0..symmetry_count) |k| {
+        var c: Cache = .{};
+        total += forward(&net, transformBoard(k, mid_board.board), &c);
+    }
+    try std.testing.expectApproxEqAbs(total / @as(f64, @floatFromInt(symmetry_count)), got, 1e-12);
+    // one leaf, not eight: the averaging is inside the leaf counter
+    try std.testing.expectEqual(@as(u64, 1), search.stats.leaves);
+}
+
+test "sym_leaf of a dihedrally symmetric board equals one forward (#178)" {
+    var prng = std.Random.DefaultPrng.init(2178);
+    const net = Net.init(prng.random());
+    // constant on each D4 orbit (corners, edges, inner 2x2), so all 8 transforms leave it alone
+    const symmetric: Board = .{
+        .{ 2, 4, 4, 2 },
+        .{ 4, 8, 8, 4 },
+        .{ 4, 8, 8, 4 },
+        .{ 2, 4, 4, 2 },
+    };
+    for (0..symmetry_count) |k| try std.testing.expectEqual(symmetric, transformBoard(k, symmetric));
+    var cache: ValueCache = .{};
+    var search: Search = .{ .vfn = .{ .single = &net }, .cache = &cache, .ply = 2, .sym_leaf = true };
+    var scratch: Cache = .{};
+    try std.testing.expectApproxEqAbs(forward(&net, symmetric, &scratch), search.leaf(symmetric), 1e-12);
 }
 
 test "TD(lambda) trace on a two-step sequence applies the eligibility-weighted update" {
