@@ -53,6 +53,8 @@ const usage =
     \\                       self-play trajectory (shallow positions included) and 50% land on the deep tail)
     \\              restart (#159: fine tuning that starts every self-play game on a uniformly drawn deep
     \\                       afterstate of dump_path plus one fresh spawn; otherwise trains like resume)
+    \\  pairw         (#210) paired comparison of two weight files: A = weights_path with `deep`,
+    \\                B = the path at index 12 with `deep`, same spawn tape per game
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
     \\                game i uses seed train_seed + i and the batch result is the mean of its games.
     \\                (#99) as arg 10 it batches any stateless variant (base|backward|replay|sym|symlam|
@@ -276,6 +278,9 @@ pub fn main(init: std.process.Init) !void {
     const is_restart = std.mem.eql(u8, variant, "restart");
     // Paired comparison (#168): two policies play the same spawn tape.
     const is_pair = std.mem.eql(u8, variant, "pair");
+    // Paired comparison of two weight files (#210): A = weights_path, B = the file at index 12, both with
+    // the same policy, so a candidate net is judged against the shipped one on identical spawns.
+    const is_pairw = std.mem.eql(u8, variant, "pairw");
     const is_tch = std.mem.eql(u8, variant, "tch");
     const is_dist = std.mem.eql(u8, variant, "dist");
     const is_dson = std.mem.eql(u8, variant, "dson");
@@ -298,7 +303,7 @@ pub fn main(init: std.process.Init) !void {
     const batch_scale: f64 = if (use_par) try parseBatchScale(args) else 1.0;
     // `use_resume` only decides whether `weights_path` is loaded; the variant still has to reach `opts`
     // (before, `dump`/`ft2`/`restart`/`dist` fell into this first branch and their options were dropped).
-    const opts: nn.Options = if (par_variant or is_pair or std.mem.eql(u8, variant, "base") or std.mem.eql(u8, variant, "resume") or is_tch)
+    const opts: nn.Options = if (par_variant or is_pair or is_pairw or std.mem.eql(u8, variant, "base") or std.mem.eql(u8, variant, "resume") or is_tch)
         .{ .batch_scale = batch_scale }
     else if (std.mem.eql(u8, variant, "backward"))
         .{ .backward = true }
@@ -510,7 +515,17 @@ pub fn main(init: std.process.Init) !void {
     // Paired comparison (#168): play one game with A (`deep`), then replay the same spawns with B
     // (`deep3`), so both see identical tiles. The per-game difference has much less noise than two
     // independent runs. Opt-in with variant `pair` (train_games 0, eval as usual).
-    if (is_pair) {
+    // (#210) A second net, so `pairw` can put a candidate file against the reference on the same spawns.
+    var net_b: nn.Net = undefined;
+    const pair_b_value: nn.Value = if (is_pairw) blk: {
+        if (args.len <= 12) {
+            std.debug.print("pairw needs the second weights path at index 12\n{s}", .{usage});
+            return;
+        }
+        try nn.load(&net_b, init.io, init.gpa, args[12]);
+        break :blk .{ .single = &net_b };
+    } else eval_value;
+    if (is_pair or is_pairw) {
         const pair_games = eval_games * seed_ranges;
         const spawns = try init.gpa.alloc(nn.Spawn, 20_000);
         defer init.gpa.free(spawns);
@@ -522,13 +537,16 @@ pub fn main(init: std.process.Init) !void {
             var tape = nn.Tape.initRecord(spawns);
             const a = nn.playTapedValue(eval_value, pair_rng.random(), .deep, &tape);
             var replay = nn.Tape.initReplay(spawns[0..tape.len]);
-            const b = nn.playTapedValue(eval_value, pair_rng.random(), .deep3, &replay);
+            const b = if (is_pairw)
+                nn.playTapedValue(pair_b_value, pair_rng.random(), .deep, &replay)
+            else
+                nn.playTapedValue(eval_value, pair_rng.random(), .deep3, &replay);
             diffs[i] = @as(f64, @floatFromInt(b.score)) - @as(f64, @floatFromInt(a.score));
-            std.debug.print("pair {d}: deep={d} ({d}) deep3={d} ({d}) diff={d:.0}\n", .{ i, a.score, a.moves, b.score, b.moves, diffs[i] });
+            std.debug.print("pair {d}: A={d} ({d}) B={d} ({d}) diff={d:.0}\n", .{ i, a.score, a.moves, b.score, b.moves, diffs[i] });
         }
         const st = nn.pairStats(diffs);
         const elapsed = start_pair.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
-        std.debug.print("pair deep (A) vs deep3 (B): games={d} mean diff={d:.1} ± {d:.1} (stderr) better={d} worse={d} elapsed={d:.1} s\n", .{ st.games, st.mean, st.stderr, st.better, st.worse, @as(f64, @floatFromInt(elapsed)) / 1e9 });
+        std.debug.print("pair A vs B: games={d} mean diff={d:.1} ± {d:.1} (stderr) better={d} worse={d} elapsed={d:.1} s\n", .{ st.games, st.mean, st.stderr, st.better, st.worse, @as(f64, @floatFromInt(elapsed)) / 1e9 });
         return;
     }
     const EvalCtx = struct { vfn: nn.Value, policy: usize, eval_seed: u64 };
