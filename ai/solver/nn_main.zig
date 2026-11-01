@@ -112,6 +112,12 @@ fn parSupported(opts: nn.Options, is_mstd: bool) bool {
         opts.teacher == null and opts.distill == null;
 }
 
+/// Foreign rerank score of the #189 eval row: the snake heuristic of `solver.evaluate` (the #117
+/// `baseline` weights), divided by `nn.reward_scale` so it is on the NN value scale.
+fn snakeScore(board: core.Board) f64 {
+    return solver.evaluate(board) / nn.reward_scale;
+}
+
 /// Loads the #175 teacher file (`tch` output) for `dist`. A missing, foreign or empty file is a
 /// command-line error (usage + exit 1), never a silent fallback to plain self-play.
 fn loadTeachers(buffer: *nn.Teachers, io: std.Io, gpa: std.mem.Allocator, path: []const u8) void {
@@ -458,6 +464,10 @@ pub fn main(init: std.process.Init) !void {
         // #183: iterative deepening from the .deep row, stopping at a leaf-evaluation budget instead of
         // a fixed ply, so a position it can afford searches deeper than 2 and still costs the same.
         .{ .name = "nn iterative deepening (#183)", .policy = 11 },
+        // #189: the .deep row, reranked between the top two moves by the snake heuristic when the
+        // net's own gap is within 0.05 (NN values are score deltas / reward_scale, so 50 points of
+        // one-move score); the snake score enters at half its `reward_scale` units.
+        .{ .name = "nn 2-ply + rerank (#189)", .policy = 12 },
     };
     // Rows are all on by default; a measurement run edits this line down to the two it needs
     // (0 = 1-ply, 2 = 2-ply) instead of paying for the 3-ply rows twice over.
@@ -499,6 +509,9 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     const EvalCtx = struct { vfn: nn.Value, policy: usize, eval_seed: u64 };
+    // #189 policy 11: the snake heuristic (#117 `baseline` weights) as the foreign rerank score,
+    // divided by `reward_scale` so it lands on the NN value scale.
+    const rerank: nn.Rerank = .{ .margin = 0.05, .weight = 0.5, .score = &snakeScore };
     // Game i uses seed eval_seed + i (= eval_seed + range*eval_games + g); games run in parallel.
     const playGame = struct {
         fn f(c: EvalCtx, i: usize) nn.PlayResult {
@@ -523,6 +536,8 @@ pub fn main(init: std.process.Init) !void {
                 10 => nn.playValueOpts(c.vfn, prng.random(), .deep, .{ .sym_leaf = true }),
                 // #183: iterative deepening from `.deep`, 200k leaf evaluations per move
                 11 => nn.playValueOpts(c.vfn, prng.random(), .deep, .{ .id_budget = 200_000 }),
+                // #189: .deep with the top two moves reranked by the snake heuristic on near ties
+                12 => nn.playValueOpts(c.vfn, prng.random(), .deep, .{ .rerank = rerank }),
                 else => unreachable,
             };
         }

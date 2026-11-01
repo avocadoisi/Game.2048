@@ -617,27 +617,64 @@ const RootBest = struct { dir: ?Direction = null, value: f64 = -std.math.inf(f64
 /// is the fixed one except in iterative deepening (#183), where the previous iteration's best move
 /// goes first; moving a later direction earlier only breaks ties differently if the two scores are
 /// bit-identical, which can only happen on a symmetric board.
-fn rootMove(search: *Search, state: GameState, order: [4]Direction) RootBest {
+fn rootMove(search: *Search, state: GameState, order: [4]Direction, rerank: ?Rerank) RootBest {
     var best: RootBest = .{};
+    var second: RootBest = .{};
     for (order) |d| {
         var next = state;
         const moved = next.slide(d);
         if (!moved.changed) continue;
         const v = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale + search.chance(next, search.ply, 1);
-        if (best.dir == null or v > best.value) best = .{ .dir = d, .value = v };
+        if (best.dir == null or v > best.value) {
+            second = best;
+            best = .{ .dir = d, .value = v };
+        } else if (second.dir == null or v > second.value) {
+            second = .{ .dir = d, .value = v };
+        }
         // #183: out of budget, so this root's score is garbage — stop before spending another branch
         if (search.out_of_budget) return best;
     }
+    // #189: only a near tie is worth a second opinion, and only a nonzero weight can change the pick.
+    if (rerank) |r| {
+        if (best.dir != null and second.dir != null and r.weight != 0 and best.value - second.value <= r.margin) {
+            const best_other = rerankScore(r, state, best.dir.?);
+            const second_other = rerankScore(r, state, second.dir.?);
+            if (second.value + r.weight * second_other > best.value + r.weight * best_other) return second;
+        }
+    }
     return best;
+}
+
+/// Opt-in heterogeneous rerank of the top two moves (#189). The 2-ply search still scores every
+/// legal move with the net; if the gap between its best and its second move is within `margin`, only
+/// those two are re-scored with a cheap foreign evaluator and the move with the larger
+/// `nn + weight * other` wins. `null` (the default) or `weight = 0` keeps the plain argmax.
+pub const Rerank = struct {
+    /// Largest NN-value gap (best - second) that still triggers the rerank. NN values are score
+    /// deltas over `reward_scale`, so 0.05 is 50 points of one-move score.
+    margin: f64,
+    /// Weight of the foreign score in the combined value `nn + weight * other`. 0 = never changes
+    /// the pick, whatever the margin.
+    weight: f64,
+    /// Foreign evaluator of an afterstate board, already on the NN value scale (a
+    /// `solver.evaluate` score divided by `reward_scale`).
+    score: *const fn (Board) f64,
+};
+
+/// `Rerank.score` of a move: the foreign evaluator on the afterstate the move leads to.
+fn rerankScore(r: Rerank, state: GameState, d: Direction) f64 {
+    var next = state;
+    _ = next.slide(d);
+    return r.score(next.board);
 }
 
 /// `depth.ply` own moves deep: my move -> spawn -> ... -> afterstate value + score_delta/reward_scale.
 /// `ply` 2 is `deep` (full width); `ply` 3 is `deep3`, whose cost only fits with a spawn-probability cut;
 /// `ply` 4 is `phase_h4` (#171), which only ever runs where the board is nearly full.
-fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, depth: Depth, sym_leaf: bool) ?Direction {
+fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, depth: Depth, sym_leaf: bool, rerank: ?Rerank) ?Direction {
     var search = newSearch(vfn, cache, depth, sym_leaf);
     defer stats.* = search.stats;
-    return rootMove(&search, state, dir_order).dir;
+    return rootMove(&search, state, dir_order, rerank).dir;
 }
 
 /// A `Search` over the depth row `depth` (#183 factored this out of `deepMove` so the iterative
@@ -677,7 +714,7 @@ pub const IdMove = struct {
 /// same tree one spawn layer out, not a different width. The previous iteration's root move goes first
 /// in the next iteration's move order, so with a budget that runs out mid-iteration the deeper tree is
 /// explored from its most promising branch outward.
-fn deepMoveId(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, start: Depth, budget: usize, sym_leaf: bool) IdMove {
+fn deepMoveId(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, start: Depth, budget: usize, sym_leaf: bool, rerank: ?Rerank) IdMove {
     var order = dir_order;
     var spent: u64 = 0;
     var hits: u64 = 0;
@@ -688,7 +725,7 @@ fn deepMoveId(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, s
         var search = newSearch(vfn, cache, .{ .ply = ply, .cutoff = start.cutoff, .mass_cutoff = start.mass_cutoff }, sym_leaf);
         // what this iteration may still spend: the budget minus every iteration before it
         search.nodes_left = budget -| @as(usize, @intCast(spent));
-        const root = rootMove(&search, state, order);
+        const root = rootMove(&search, state, order, rerank);
         spent += search.stats.leaves;
         hits += search.stats.hits;
         // a partial iteration (or a dead board) keeps the previous iteration's move
@@ -933,13 +970,14 @@ pub fn bestMoveWithCacheValue(vfn: Value, state: GameState, mode: Mode, stats: *
 
 /// `bestMoveWithCacheValue` with the search options (#178): `sym_leaf` averages every leaf, and
 /// `id_budget` (#183) swaps the fixed-depth search for a node-budgeted iterative deepening.
+/// `rerank` (#189) re-scores the top two moves of a near tie with a foreign evaluator.
 pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stats: *Stats, cache: *ValueCache, opts: Options) ?Direction {
     // #183: a node budget means iterative deepening. `mode` only sets the first iteration's depth (its
     // phase row, so `.deep` starts at ply 2 and `.deep3` at ply 3) and the spawn cut every ply keeps.
     if (opts.id_budget) |budget| {
         const dir = switch (mode) {
             .greedy, .chance => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
-            .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMoveId(vfn, state, stats, cache, phaseDepth(mode, state.board), budget, opts.sym_leaf).dir,
+            .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMoveId(vfn, state, stats, cache, phaseDepth(mode, state.board), budget, opts.sym_leaf, opts.rerank).dir,
         };
         // a budget too small for one full iteration still has to answer with a legal move
         return dir orelse firstLegalMove(state);
@@ -948,7 +986,7 @@ pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stat
         .greedy => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
         .chance => chanceMove(vfn, state),
         // every search mode takes its (ply, cutoff, mass cutoff) for this board from the phase table (#157)
-        .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, phaseDepth(mode, state.board), opts.sym_leaf),
+        .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, phaseDepth(mode, state.board), opts.sym_leaf, opts.rerank),
     };
 }
 
@@ -1312,6 +1350,9 @@ pub const Options = struct {
     /// The budget is what makes the search's cost predictable: wall clock is not used, so the same
     /// board and budget always pick the same move.
     id_budget: ?usize = null,
+    /// Candidate (#189): heterogeneous rerank of the 2-ply search's top two moves by a cheap foreign
+    /// evaluator when the net's own gap is within `Rerank.margin`; null = the plain argmax.
+    rerank: ?Rerank = null,
     /// Candidate (#175) `dist`: teacher pairs from `computeTeachers`. Every self-play step also takes one
     /// regression step on a uniformly drawn pair, so 1/2 of the updates are distillation.
     distill: ?*Teachers = null,
@@ -4115,7 +4156,7 @@ test "id_budget adopts a monotonically deeper ply as the budget grows (#183)" {
     for ([_]usize{ 0, 200, 2_000, 20_000 }) |budget| {
         var stats: Stats = .{};
         var cache: ValueCache = .{};
-        const got = deepMoveId(vfn, mid_board, &stats, &cache, phaseDepth(.deep, mid_board.board), budget, false);
+        const got = deepMoveId(vfn, mid_board, &stats, &cache, phaseDepth(.deep, mid_board.board), budget, false, null);
         try std.testing.expect(got.ply >= previous);
         try std.testing.expectEqual(got.leaves, stats.leaves);
         previous = got.ply;
@@ -4602,4 +4643,108 @@ test "dist takes one regression step per self-play step on average (#175)" {
     _ = trainGameOpts(&plain, rng_c.random(), 0.001, null, .{});
     try std.testing.expectEqual(game.moves * 2, buffer.draws);
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&a), std.mem.asBytes(&plain)));
+}
+
+/// #189 test scorers: +1 for an afterstate that kept a tile in the top-left cell (the `left` move of
+/// `post_spawn_board`), 0 otherwise.
+fn rerankPrefersLeft(board: Board) f64 {
+    return if (board[0][0] != 0) 1 else 0;
+}
+
+/// #189 test scorer: +1 for an afterstate whose top-left cell is empty (the `right` move).
+fn rerankPrefersRight(board: Board) f64 {
+    return if (board[0][0] == 0) 1 else 0;
+}
+
+test "rerank = null keeps the plain 2-ply argmax (#189)" {
+    const net = try parse(@embedFile("nn_weights.bin"));
+    const vfn: Value = .{ .single = &net };
+    var plain_stats: Stats = .{};
+    var plain_cache: ValueCache = .{};
+    const plain = bestMoveWithCacheValueOpts(vfn, mid_board, .deep, &plain_stats, &plain_cache, .{});
+    try std.testing.expect(plain != null);
+    // the explicit null and the plain default are the same move, with the same search work
+    var null_stats: Stats = .{};
+    var null_cache: ValueCache = .{};
+    const nulled = bestMoveWithCacheValueOpts(vfn, mid_board, .deep, &null_stats, &null_cache, .{ .rerank = null });
+    try std.testing.expectEqual(plain, nulled);
+    try std.testing.expectEqual(plain_stats.leaves, null_stats.leaves);
+    try std.testing.expectEqual(bestMove(&net, mid_board, .deep), nulled);
+}
+
+test "rerank with margin 0 and weight 0 keeps the plain 2-ply argmax (#189)" {
+    const net = try parse(@embedFile("nn_weights.bin"));
+    const vfn: Value = .{ .single = &net };
+    var plain_stats: Stats = .{};
+    var plain_cache: ValueCache = .{};
+    const plain = bestMoveWithCacheValueOpts(vfn, mid_board, .deep, &plain_stats, &plain_cache, .{});
+    // margin 0 is only the exact tie, weight 0 is inert: neither may change the move
+    var zero_stats: Stats = .{};
+    var zero_cache: ValueCache = .{};
+    const zero = bestMoveWithCacheValueOpts(vfn, mid_board, .deep, &zero_stats, &zero_cache, .{
+        .rerank = .{ .margin = 0, .weight = 0, .score = &rerankPrefersRight },
+    });
+    try std.testing.expectEqual(plain, zero);
+    // a margin that covers every move is still inert while the weight is 0
+    var wide_stats: Stats = .{};
+    var wide_cache: ValueCache = .{};
+    const wide = bestMoveWithCacheValueOpts(vfn, mid_board, .deep, &wide_stats, &wide_cache, .{
+        .rerank = .{ .margin = 1e9, .weight = 0, .score = &rerankPrefersRight },
+    });
+    try std.testing.expectEqual(plain, wide);
+    // and no extra search work: the rerank re-scores afterstates, it never touches the tree
+    try std.testing.expectEqual(plain_stats.leaves, wide_stats.leaves);
+}
+
+test "rerank flips a near tie when the foreign score prefers the second move (#189)" {
+    // zero net: every afterstate is worth 0, so the 2-ply value of a move is its reward plus the
+    // rewards of the tree below it. `post_spawn_board` is full and its `left` and `right` afterstates
+    // are mirror images, so the two values tie (up to float noise) — a gap far inside any margin.
+    const net = std.mem.zeroes(Net);
+    const vfn: Value = .{ .single = &net };
+    const state: GameState = .{ .board = post_spawn_board };
+    var gap_cache: ValueCache = .{};
+    var gap_search: Search = .{ .vfn = vfn, .cache = &gap_cache, .ply = 2 };
+    var left_state = state;
+    const left_moved = left_state.slide(.left);
+    var right_state = state;
+    const right_moved = right_state.slide(.right);
+    try std.testing.expect(left_moved.changed and right_moved.changed);
+    const left_value = @as(f64, @floatFromInt(left_moved.score_delta)) / reward_scale + gap_search.chance(left_state, 2, 1);
+    const right_value = @as(f64, @floatFromInt(right_moved.score_delta)) / reward_scale + gap_search.chance(right_state, 2, 1);
+    const margin: f64 = 0.05;
+    try std.testing.expect(@abs(left_value - right_value) <= margin);
+
+    // the plain search picks one of the two; the rerank then lets the foreign score decide, so each
+    // scorer wins its own move and the two reranks disagree (the NN alone cannot)
+    var base_cache: ValueCache = .{};
+    var base_stats: Stats = .{};
+    const base = bestMoveWithCacheValueOpts(vfn, state, .deep, &base_stats, &base_cache, .{});
+    try std.testing.expect(base == .left or base == .right);
+    var left_cache: ValueCache = .{};
+    var left_stats: Stats = .{};
+    const flipped_left = bestMoveWithCacheValueOpts(vfn, state, .deep, &left_stats, &left_cache, .{
+        .rerank = .{ .margin = margin, .weight = 1, .score = &rerankPrefersLeft },
+    });
+    var right_cache: ValueCache = .{};
+    var right_stats: Stats = .{};
+    const flipped_right = bestMoveWithCacheValueOpts(vfn, state, .deep, &right_stats, &right_cache, .{
+        .rerank = .{ .margin = margin, .weight = 1, .score = &rerankPrefersRight },
+    });
+    try std.testing.expectEqual(@as(?Direction, .left), flipped_left);
+    try std.testing.expectEqual(@as(?Direction, .right), flipped_right);
+    // a margin strictly below the gap never reranks: the plain pick survives both scorers
+    const tight_margin = @abs(left_value - right_value) - 1;
+    var tight_left_cache: ValueCache = .{};
+    var tight_left_stats: Stats = .{};
+    const tight_left = bestMoveWithCacheValueOpts(vfn, state, .deep, &tight_left_stats, &tight_left_cache, .{
+        .rerank = .{ .margin = tight_margin, .weight = 1, .score = &rerankPrefersLeft },
+    });
+    var tight_right_cache: ValueCache = .{};
+    var tight_right_stats: Stats = .{};
+    const tight_right = bestMoveWithCacheValueOpts(vfn, state, .deep, &tight_right_stats, &tight_right_cache, .{
+        .rerank = .{ .margin = tight_margin, .weight = 1, .score = &rerankPrefersRight },
+    });
+    try std.testing.expectEqual(base, tight_left);
+    try std.testing.expectEqual(base, tight_right);
 }
