@@ -361,6 +361,9 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "nn phase h2 (#157)" },
         .{ .name = "nn phase h3 (#157)" },
         .{ .name = "nn phase h4 (#171)" },
+        // #182: the same 2-ply tree as `nn 2-ply (deep)`, minus each chance node's lowest-probability
+        // spawn branches up to 5% of its mass. Last row because `playGame` indexes by position.
+        .{ .name = "nn 2-ply + mass cutoff (#182)" },
     };
     const games = eval_games * seed_ranges;
     // `mstd` evaluates through the staged value, everything else through the single net (#107)
@@ -383,7 +386,9 @@ pub fn main(init: std.process.Init) !void {
                 5 => nn.playValue(c.vfn, prng.random(), .phase_h1),
                 6 => nn.playValue(c.vfn, prng.random(), .phase_h2),
                 7 => nn.playValue(c.vfn, prng.random(), .phase_h3),
-                else => nn.playValue(c.vfn, prng.random(), .phase_h4),
+                8 => nn.playValue(c.vfn, prng.random(), .phase_h4),
+                // #182: the rows are indexed by position, so the new mass-cutoff row goes last
+                else => nn.playValue(c.vfn, prng.random(), .deep_mass),
             };
         }
     }.f;
