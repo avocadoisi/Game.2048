@@ -1191,6 +1191,11 @@ pub const Options = struct {
     /// Candidate (#175) `dist`: teacher pairs from `computeTeachers`. Every self-play step also takes one
     /// regression step on a uniformly drawn pair, so 1/2 of the updates are distillation.
     distill: ?*Teachers = null,
+    /// Candidate (#175) `dson`: the teacher regression only, with the self-play TD update switched off.
+    /// The 50/50 mix is not for value quality: it exists so the shallow half of the game (which the deep
+    /// buffer never covers) keeps being trained. `dson` answers the other half of that question — whether
+    /// the teacher regression alone is stable, given that the parameters are shared with the early game.
+    distill_only: bool = false,
 };
 
 /// Prioritized replay (issue #34): ring buffer of recent TD updates. After each game, `m` extra updates
@@ -1373,7 +1378,7 @@ pub const Dump = struct {
     }
 
     pub fn load(self: *Dump, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(dump_header_len + dump_cap * dump_entry_len));
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(dump_header_len + dump_cap * dump_entry_len + 1));
         defer gpa.free(bytes);
         try self.parse(bytes);
     }
@@ -1459,24 +1464,32 @@ pub const Teachers = struct {
     }
 
     pub fn load(self: *Teachers, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(teacher_header_len + teacher_cap * teacher_entry_len));
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(teacher_header_len + teacher_cap * teacher_entry_len + 1));
         defer gpa.free(bytes);
         try self.parse(bytes);
     }
 };
 
 /// One teacher pass over `dump` (#175): each stored afterstate is completed with one uniformly drawn
-/// spawn (so the sample is a post-spawn board, the domain `V` is defined on) and priced with
-/// `teacherValue` at `mode` (the caller uses `.deep3`). One spawn per position on purpose: the stored
-/// target is then a one-sample estimate of the spawn expectation, which is all a single regression step
-/// on a single board can express anyway. The spawns come from `rng`, so the pass is reproducible.
+/// spawn and priced with `teacherValue` at `mode` (the caller uses `.deep3`). One spawn per position on
+/// purpose: the stored target is then a one-sample estimate of the spawn expectation, which is all a
+/// single regression step on a single board can express anyway. The spawns come from `rng`, so the pass
+/// is reproducible.
+///
+/// The sample's input is the dump's **afterstate**, not the post-spawn board: every consumer of `V`
+/// (the policy at `pickMove`, the search leaf, the `td1` bootstrap) feeds it an afterstate, and the
+/// `d3` variant pairs `A_t` with `r_t + deep3(S_{t+1})`. Using the post-spawn board as the input while
+/// the target prices the same post-spawn board shifts the input distribution by one tile and puts
+/// label noise between the two halves of the update (the TD half says `V(A) = r + V(A')` for the same
+/// board contents), so the spawn stays in the target's search and out of the input.
 pub fn computeTeachers(net: *const Net, buffer: *Teachers, dump: *const Dump, rng: std.Random, mode: Mode) void {
     buffer.len = 0;
     const vfn: Value = .{ .single = net };
     for (0..dump.len) |i| {
         var state = GameState{ .board = dump.boardAt(i), .score = 0 };
         _ = state.spawnRandomTile(rng);
-        buffer.append(state.board, teacherValue(vfn, state, mode, false));
+        // the input is the stored afterstate, exactly what every V consumer evaluates (#177 P1)
+        buffer.append(dump.boardAt(i), teacherValue(vfn, state, mode, false));
     }
 }
 
@@ -1689,12 +1702,14 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
         moves += 1;
         if (opts.dump_record) if (opts.dump) |buffer| buffer.offer(pick.after);
         if (pending) |p| {
-            // `state` is still the post-spawn board the pending step led into (this move has not been
-            // applied yet), which is the board the `search2` and `teacher` targets evaluate.
-            const target = p.reward + tdBootstrap(net, pick, state, opts);
-            if (diag) |d| d.push(p.after, @abs(target - p.value), pick.value - p.value);
-            if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = pick.after, .terminal = false, .err = @abs(target - p.value) });
-            trainStep(net, &cache, p.after, target, lr, opts, &trace);
+            if (!opts.distill_only) {
+                // `state` is still the post-spawn board the pending step led into (this move has not been
+                // applied yet), which is the board the `search2` and `teacher` targets evaluate.
+                const target = p.reward + tdBootstrap(net, pick, state, opts);
+                if (diag) |d| d.push(p.after, @abs(target - p.value), pick.value - p.value);
+                if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = pick.after, .terminal = false, .err = @abs(target - p.value) });
+                trainStep(net, &cache, p.after, target, lr, opts, &trace);
+            }
         }
         pending = pick;
         // `ft2` mixes one deep update into every self-play step: 50% self-play / 50% deep afterstates.
@@ -1703,9 +1718,11 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
         _ = state.move(pick.dir, rng);
     }
     if (pending) |p| {
-        if (diag) |d| d.push(p.after, @abs(p.reward - p.value), -p.value);
-        if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = p.after, .terminal = true, .err = @abs(p.reward - p.value) });
-        trainStep(net, &cache, p.after, p.reward, lr, opts, &trace);
+        if (!opts.distill_only) {
+            if (diag) |d| d.push(p.after, @abs(p.reward - p.value), -p.value);
+            if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = p.after, .terminal = true, .err = @abs(p.reward - p.value) });
+            trainStep(net, &cache, p.after, p.reward, lr, opts, &trace);
+        }
     }
     if (pr) |b| for (0..b.m) |_| {
         const e = &b.items[if (opts.midmix)
@@ -4009,12 +4026,18 @@ test "computeTeachers prices each stored afterstate with one spawn (#175)" {
     var buffer: Teachers = .{};
     computeTeachers(&net, &buffer, &dump, pass_a.random(), .deep3);
     try std.testing.expectEqual(@as(usize, 1), buffer.len);
-    // one spawn landed, so the board has one more tile than the stored afterstate
-    var tiles: usize = 0;
-    for (buffer.boardAt(0)) |row| for (row) |cell| {
-        if (cell != 0) tiles += 1;
-    };
-    try std.testing.expectEqual(@as(usize, 3), tiles);
+    // the sample's input is the stored afterstate itself: `V` is only ever consumed on afterstates, so
+    // the spawn belongs to the target's search and not to the board the gradient sees
+    try std.testing.expectEqual(deep, buffer.boardAt(0));
+    // ... and the target is priced one spawn deeper than the input board
+    var priced = GameState{ .board = deep, .score = 0 };
+    var pass_c = std.Random.DefaultPrng.init(73);
+    _ = priced.spawnRandomTile(pass_c.random());
+    try std.testing.expectApproxEqAbs(
+        teacherValue(.{ .single = &net }, priced, .deep3, false),
+        buffer.targetAt(0),
+        1e-6,
+    );
     // the same seed reproduces the same pass
     var again: Teachers = .{};
     var pass_b = std.Random.DefaultPrng.init(73);
@@ -4044,7 +4067,11 @@ test "dist takes one regression step per self-play step on average (#175)" {
     // the mix is observable and is not the plain path: draws > 0 and the net moved
     try std.testing.expect(buffer.draws > 0);
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&net), std.mem.asBytes(&a)));
-    // without the buffer the path is the plain one
+    // one regression step per move, and the drawn board is the afterstate the dump stored (not the
+    // post-spawn completion), so `dist` labels `V` on the same domain the policy and the TD half use
+    try std.testing.expectEqual(game.moves * 2, buffer.draws);
+    // without the buffer the path is the plain one (the games differ: `dist` draws one extra rng value
+    // per move for the teacher step, so only the net is comparable, not the move count)
     var plain = net;
     var rng_c = std.Random.DefaultPrng.init(11);
     _ = trainGameOpts(&plain, rng_c.random(), 0.001, null, .{});
