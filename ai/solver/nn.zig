@@ -470,15 +470,11 @@ const Search = struct {
 
     /// `cache.getValue` at this search's depth: one entry per (board, ply, cutoff, sym_leaf).
     fn leaf(self: *Search, board: Board) f64 {
-<<<<<<< HEAD
-        return self.cache.getValueAtDepth(self.vfn, board, .{
+        return self.cache.getValueAtDepthSym(self.vfn, board, .{
             .ply = self.ply,
             .cutoff = self.cutoff,
             .mass_cutoff = self.mass_cutoff,
-        }, &self.stats);
-=======
-        return self.cache.getValueAtDepthSym(self.vfn, board, .{ .ply = self.ply, .cutoff = self.cutoff }, self.sym_leaf, &self.stats);
->>>>>>> 49ba2b9 (nn: 8 対称の葉評価を sym_leaf で足す (#178))
+        }, self.sym_leaf, &self.stats);
     }
 
     /// `value` with the leaf one own move further out and no reward at it: `bootValue(S, 0)` is the
@@ -594,19 +590,15 @@ const Search = struct {
 /// `depth.ply` own moves deep: my move -> spawn -> ... -> afterstate value + score_delta/reward_scale.
 /// `ply` 2 is `deep` (full width); `ply` 3 is `deep3`, whose cost only fits with a spawn-probability cut;
 /// `ply` 4 is `phase_h4` (#171), which only ever runs where the board is nearly full.
-<<<<<<< HEAD
-fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, depth: Depth) ?Direction {
+fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, depth: Depth, sym_leaf: bool) ?Direction {
     var search: Search = .{
         .vfn = vfn,
         .cache = cache,
         .cutoff = depth.cutoff,
         .mass_cutoff = depth.mass_cutoff,
         .ply = depth.ply,
+        .sym_leaf = sym_leaf,
     };
-=======
-fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, depth: Depth, sym_leaf: bool) ?Direction {
-    var search: Search = .{ .vfn = vfn, .cache = cache, .cutoff = depth.cutoff, .ply = depth.ply, .sym_leaf = sym_leaf };
->>>>>>> 49ba2b9 (nn: 8 対称の葉評価を sym_leaf で足す (#178))
     defer stats.* = search.stats;
     var best: ?Direction = null;
     var best_value: f64 = -std.math.inf(f64);
@@ -650,17 +642,14 @@ fn search2Value(vfn: Value, state: GameState, cache: *ValueCache, sym_leaf: bool
 /// `deepMove` scores the same move. Spawns are enumerated, so this draws nothing from the rng.
 fn pickTeacherValue(vfn: Value, state: GameState, mode: Mode, cache: *ValueCache, sym_leaf: bool) ?Pick {
     const depth = phaseDepth(mode, state.board);
-<<<<<<< HEAD
     var search: Search = .{
         .vfn = vfn,
         .cache = cache,
         .cutoff = depth.cutoff,
         .mass_cutoff = depth.mass_cutoff,
         .ply = depth.ply,
+        .sym_leaf = sym_leaf,
     };
-=======
-    var search: Search = .{ .vfn = vfn, .cache = cache, .cutoff = depth.cutoff, .ply = depth.ply, .sym_leaf = sym_leaf };
->>>>>>> 49ba2b9 (nn: 8 対称の葉評価を sym_leaf で足す (#178))
     var best: ?Pick = null;
     var best_value: f64 = -std.math.inf(f64);
     for ([_]Direction{ .up, .left, .down, .right }) |d| {
@@ -840,13 +829,8 @@ pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stat
     return switch (mode) {
         .greedy => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
         .chance => chanceMove(vfn, state),
-<<<<<<< HEAD
         // every search mode takes its (ply, cutoff, mass cutoff) for this board from the phase table (#157)
-        .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, phaseDepth(mode, state.board)),
-=======
-        // every search mode takes its (ply, cutoff) for this board from the phase table (#157)
-        .deep, .deep3, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, phaseDepth(mode, state.board), opts.sym_leaf),
->>>>>>> 49ba2b9 (nn: 8 対称の葉評価を sym_leaf で足す (#178))
+        .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, phaseDepth(mode, state.board), opts.sym_leaf),
     };
 }
 
@@ -1643,17 +1627,14 @@ fn selfplayPick(vfn: Value, state: GameState, death: bool, selfplay: SelfPlay, t
 /// believes the position is worth, one own move deeper than `t2` and cheap enough to train on.
 fn teacherValue(vfn: Value, state: GameState, mode: Mode, sym_leaf: bool) f64 {
     const depth = phaseDepth(mode, state.board);
-<<<<<<< HEAD
     var search: Search = .{
         .vfn = vfn,
         .cache = sharedValueCache(),
         .cutoff = depth.cutoff,
         .mass_cutoff = depth.mass_cutoff,
         .ply = depth.ply,
+        .sym_leaf = sym_leaf,
     };
-=======
-    var search: Search = .{ .vfn = vfn, .cache = sharedValueCache(), .cutoff = depth.cutoff, .ply = depth.ply, .sym_leaf = sym_leaf };
->>>>>>> 49ba2b9 (nn: 8 対称の葉評価を sym_leaf で足す (#178))
     return search.value(state, depth.ply, 1);
 }
 
