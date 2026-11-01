@@ -58,6 +58,8 @@ const usage =
     \\  weights_path  file to load (train_games 0) or write (default ai/solver/nn_weights.bin); use a temp path for variant runs
     \\  train_seed    seed for weight init and self-play games (default 1, omitted = same weights as before #56)
     \\  dump_path     file for the deep-position buffer (#159); required by dump|ft2|restart, after a "-" par slot
+    \\  batch_scale   (#137) multiplier on the merged batch delta for `par` runs (default 1 = mean;
+    \\                `8` = linear scaling rule, `2.8284` = sqrt). Sits after the "-" par dump slot
     \\
     \\Weights are written to `weights_path` only when train_games > 0;
     \\train_games = 0 (eval only) never writes.
@@ -79,6 +81,14 @@ const default_train_seed: u64 = 1;
 /// Positional arg 10, appended after `train_seed`: the literal "par" runs the variant of arg 6 in
 /// parallel batches (issue #99). "-" is the explicit "no par" placeholder that opens the dump slots
 /// of #159; any other value is a typo.
+/// (#137) Batch delta multiplier for `par` runs, arg 12 (after the `par` slot and its `-` dump slot).
+/// Omitted = 1.0, which is the historical "mean of the per-game deltas" step.
+fn parseBatchScale(args: []const []const u8) !f64 {
+    if (args.len <= 12) return 1.0;
+    if (std.mem.eql(u8, args[12], "-")) return 1.0;
+    return std.fmt.parseFloat(f64, args[12]) catch error.InvalidBatchScale;
+}
+
 fn parseParFlag(args: []const []const u8) !bool {
     if (args.len <= 10) return false;
     if (std.mem.eql(u8, args[10], "-")) return false;
@@ -224,8 +234,10 @@ pub fn main(init: std.process.Init) !void {
     const dump_path: ?[]const u8 = if (args.len > 11) args[11] else null;
     var dump: nn.Dump = .{};
     var priority: nn.Priority = .{};
+    // (#137) `par` merges whole-game deltas into one step; arg 12 scales that step (1 = historical mean).
+    const batch_scale: f64 = if (use_par) try parseBatchScale(args) else 1.0;
     const opts: nn.Options = if (par_variant or use_resume or is_pair or std.mem.eql(u8, variant, "base"))
-        .{}
+        .{ .batch_scale = batch_scale }
     else if (std.mem.eql(u8, variant, "backward"))
         .{ .backward = true }
     else if (std.mem.eql(u8, variant, "replay"))

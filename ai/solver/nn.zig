@@ -1103,6 +1103,11 @@ pub const Options = struct {
     death: bool = false,
     /// Candidate (#72): TD(lambda) with accumulating eligibility traces over the parameters; 0 = TD(0).
     lambda: f64 = 0,
+    /// (#137) Multiplier on the merged batch delta in `trainBatchOpts`. One batch applies a single
+    /// SGD step built from `games` per-game deltas, so the mean is `1/games` of the work a serial run
+    /// spends on the same number of games; `batch_scale` recovers it (`games` = the linear scaling
+    /// rule, `sqrt(games)` = the noise-only correction). 1.0 keeps the historical behaviour.
+    batch_scale: f64 = 1.0,
     /// Candidate (#98): true batch symmetry augmentation — one averaged step per afterstate, where all 8
     /// transformed gradients come from one net snapshot (unlike `symmetry`, which steps 8 times sequentially).
     sym_batch: bool = false,
@@ -1706,7 +1711,8 @@ pub fn trainBatchOpts(net: *Net, seed: u64, first_game: usize, games: usize, lr:
         for (out_w, after, start_w) |*o, v, s| o.* += v - s;
     }
     const n: f64 = @floatFromInt(games);
-    for (out_w, start_w) |*o, s| o.* = s + o.* / n;
+    const scale = opts.batch_scale / n;
+    for (out_w, start_w) |*o, s| o.* = s + o.* * scale;
     if (diag) |d| for (units[0..games]) |u| mergeDiag(d, &u.diag);
     return units[games - 1].score;
 }
@@ -3228,6 +3234,42 @@ test "parallel training batch matches a serial run of the same game seeds" {
     var par = base;
     _ = trainBatch(&par, 77, 0, games, 0.001, null);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&serial), std.mem.asBytes(&par));
+}
+
+test "batch_scale multiplies the merged delta so a batch does the work of its games (#137)" {
+    const games = 4;
+    var init_rng = std.Random.DefaultPrng.init(77);
+    var base = Net.init(init_rng.random());
+
+    // Same reconstruction as the plain batch test: the merged delta is the mean of the per-game
+    // deltas, so `batch_scale = games` turns one batch step into the sum, which is what
+    // `games` serial games' worth of update is (the linear scaling rule).
+    var units: [games]Net = undefined;
+    for (&units, 0..) |*u, i| {
+        u.* = base;
+        var rng = std.Random.DefaultPrng.init(77 + i);
+        _ = trainGame(u, rng.random(), 0.001, null);
+    }
+    const flat_len = @sizeOf(Net) / @sizeOf(f64);
+    var sums: [flat_len]f64 = @splat(0);
+    const start = flat(&base);
+    for (&units) |*u| {
+        for (flat(u), start, 0..) |v, s, k| sums[k] += v - s;
+    }
+
+    var scaled_serial = base;
+    for (flat(&scaled_serial), start, sums) |*w, s, sum| w.* = s + sum;
+
+    var par = base;
+    _ = trainBatchOpts(&par, 77, 0, games, 0.001, null, .{ .batch_scale = @floatFromInt(games) });
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&scaled_serial), std.mem.asBytes(&par));
+
+    // 1.0 stays the historical mean (the plain batch test above pins the bytes).
+    var unscaled = base;
+    _ = trainBatchOpts(&unscaled, 77, 0, games, 0.001, null, .{ .batch_scale = 1.0 });
+    var mean_serial = base;
+    for (flat(&mean_serial), start, sums) |*w, s, sum| w.* = s + sum / games;
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&mean_serial), std.mem.asBytes(&unscaled));
 }
 
 test "parallel training batch with variant opts matches a serial run of the same game seeds" {
