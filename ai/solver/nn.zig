@@ -471,9 +471,20 @@ const Search = struct {
     ply: u8 = 0,
     /// #178: average every leaf over the 8 dihedral transforms instead of one forward pass.
     sym_leaf: bool = false,
+    /// #183: `leaf` calls this search may still make (cache hits count too). Unbounded by default, so
+    /// every pre-#183 tree is searched exactly as before; the iterative deepening sets it per iteration.
+    nodes_left: usize = std.math.maxInt(usize),
+    /// #183: a `leaf` found `nodes_left == 0`. The tree above it is incomplete, so its value is
+    /// meaningless and whoever set the budget throws the whole iteration away.
+    out_of_budget: bool = false,
 
     /// `cache.getValue` at this search's depth: one entry per (board, ply, cutoff, sym_leaf).
     fn leaf(self: *Search, board: Board) f64 {
+        if (self.nodes_left == 0) {
+            self.out_of_budget = true;
+            return 0;
+        }
+        self.nodes_left -= 1;
         return self.cache.getValueAtDepthSym(self.vfn, board, .{
             .ply = self.ply,
             .cutoff = self.cutoff,
@@ -488,6 +499,7 @@ const Search = struct {
     /// afterstate `r + 1` moves ahead: exactly one move past the last reward it summed. A leaf taken
     /// at the last reward's afterstate (what `value` does) would count that reward twice (#158).
     fn bootValue(self: *Search, state: GameState, rewards: u8, cprob: f64) f64 {
+        if (self.out_of_budget) return 0; // #183: the caller discards this iteration
         var best: f64 = -std.math.inf(f64);
         for ([_]Direction{ .up, .left, .down, .right }) |d| {
             var next = state;
@@ -507,6 +519,7 @@ const Search = struct {
     /// whose every branch is cut does the same, because the afterstate leaf here would be the one the
     /// last reward already reached.
     fn bootChance(self: *Search, state: GameState, rewards: u8, cprob: f64) f64 {
+        if (self.out_of_budget) return 0; // #183
         var empties: f64 = 0;
         for (0..core.BoardSize) |r| {
             for (0..core.BoardSize) |c| {
@@ -535,6 +548,7 @@ const Search = struct {
 
     /// Max over legal moves of reward + expected value after the spawn; 0 when no move changes the board.
     fn value(self: *Search, state: GameState, depth: u8, cprob: f64) f64 {
+        if (self.out_of_budget) return 0; // #183: the caller discards this iteration
         var best: f64 = -std.math.inf(f64);
         for ([_]Direction{ .up, .left, .down, .right }) |d| {
             var next = state;
@@ -553,6 +567,7 @@ const Search = struct {
     /// the fixed `cutoff` and the mass `mass_cutoff` both keep.
     fn chance(self: *Search, state: GameState, depth: u8, cprob: f64) f64 {
         if (depth == 0) return self.leaf(state.board);
+        if (self.out_of_budget) return 0; // #183: the caller discards this iteration
         var empties: f64 = 0;
         for (0..core.BoardSize) |r| {
             for (0..core.BoardSize) |c| {
@@ -591,11 +606,44 @@ const Search = struct {
     }
 };
 
+/// The fixed root move order of every pre-#183 search: the tie-break of `deepMove` is "first move in
+/// this order with a strictly larger value".
+const dir_order = [4]Direction{ .up, .left, .down, .right };
+
+/// One root's best move and its score (reward + `Search.chance`), `dir = null` on a dead board.
+const RootBest = struct { dir: ?Direction = null, value: f64 = -std.math.inf(f64) };
+
+/// The root layer of `deepMove`: max over `order` of reward + expected value after the spawn. `order`
+/// is the fixed one except in iterative deepening (#183), where the previous iteration's best move
+/// goes first; moving a later direction earlier only breaks ties differently if the two scores are
+/// bit-identical, which can only happen on a symmetric board.
+fn rootMove(search: *Search, state: GameState, order: [4]Direction) RootBest {
+    var best: RootBest = .{};
+    for (order) |d| {
+        var next = state;
+        const moved = next.slide(d);
+        if (!moved.changed) continue;
+        const v = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale + search.chance(next, search.ply, 1);
+        if (best.dir == null or v > best.value) best = .{ .dir = d, .value = v };
+        // #183: out of budget, so this root's score is garbage — stop before spending another branch
+        if (search.out_of_budget) return best;
+    }
+    return best;
+}
+
 /// `depth.ply` own moves deep: my move -> spawn -> ... -> afterstate value + score_delta/reward_scale.
 /// `ply` 2 is `deep` (full width); `ply` 3 is `deep3`, whose cost only fits with a spawn-probability cut;
 /// `ply` 4 is `phase_h4` (#171), which only ever runs where the board is nearly full.
 fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, depth: Depth, sym_leaf: bool) ?Direction {
-    var search: Search = .{
+    var search = newSearch(vfn, cache, depth, sym_leaf);
+    defer stats.* = search.stats;
+    return rootMove(&search, state, dir_order).dir;
+}
+
+/// A `Search` over the depth row `depth` (#183 factored this out of `deepMove` so the iterative
+/// deepening can rebuild the same search at another ply).
+fn newSearch(vfn: Value, cache: *ValueCache, depth: Depth, sym_leaf: bool) Search {
+    return .{
         .vfn = vfn,
         .cache = cache,
         .cutoff = depth.cutoff,
@@ -603,20 +651,75 @@ fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, dep
         .ply = depth.ply,
         .sym_leaf = sym_leaf,
     };
-    defer stats.* = search.stats;
+}
+
+/// Highest ply an iterative deepening iteration may reach. The budget normally stops it long before;
+/// the cap only keeps a huge budget from running away into a tree no cache can hold.
+const max_id_ply: u8 = 6;
+
+/// Result of `deepMoveId` (#183).
+pub const IdMove = struct {
+    /// The move of the deepest *completed* iteration; `null` only when no iteration completed (a budget
+    /// too small for one full 2-ply tree, e.g. 0), in which case the caller falls back to a legal move.
+    dir: ?Direction,
+    /// Ply of the deepest completed iteration, 0 when none completed.
+    ply: u8,
+    /// Leaf evaluations spent over every iteration, the discarded partial one included.
+    leaves: u64,
+};
+
+/// Iterative deepening over the ply (#183): search the start depth, then one ply deeper, and keep the
+/// best move of the last iteration that finished, which is what makes a truncated iteration harmless
+/// (a partial tree is never adopted). The budget is leaf evaluations, never wall clock, so the same
+/// board and budget always give the same move.
+///
+/// The start row's `cutoff` / `mass_cutoff` apply to every iteration: the deeper iterations are the
+/// same tree one spawn layer out, not a different width. The previous iteration's root move goes first
+/// in the next iteration's move order, so with a budget that runs out mid-iteration the deeper tree is
+/// explored from its most promising branch outward.
+fn deepMoveId(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, start: Depth, budget: usize, sym_leaf: bool) IdMove {
+    var order = dir_order;
+    var spent: u64 = 0;
+    var hits: u64 = 0;
     var best: ?Direction = null;
-    var best_value: f64 = -std.math.inf(f64);
-    for ([_]Direction{ .up, .left, .down, .right }) |d| {
-        var next = state;
-        const moved = next.slide(d);
-        if (!moved.changed) continue;
-        const v = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale + search.chance(next, depth.ply, 1);
-        if (best == null or v > best_value) {
-            best = d;
-            best_value = v;
+    var best_ply: u8 = 0;
+    var ply: u8 = @max(start.ply, 2);
+    while (ply <= max_id_ply) : (ply += 1) {
+        var search = newSearch(vfn, cache, .{ .ply = ply, .cutoff = start.cutoff, .mass_cutoff = start.mass_cutoff }, sym_leaf);
+        // what this iteration may still spend: the budget minus every iteration before it
+        search.nodes_left = budget -| @as(usize, @intCast(spent));
+        const root = rootMove(&search, state, order);
+        spent += search.stats.leaves;
+        hits += search.stats.hits;
+        // a partial iteration (or a dead board) keeps the previous iteration's move
+        if (search.out_of_budget or root.dir == null) break;
+        best = root.dir;
+        best_ply = ply;
+        // move ordering: the completed iteration's best move first, the rest of the order as it was
+        const first = root.dir.?;
+        var next_order = order;
+        next_order[0] = first;
+        var at: usize = 1;
+        for (order) |d| {
+            if (d == first) continue;
+            next_order[at] = d;
+            at += 1;
         }
+        order = next_order;
     }
-    return best;
+    stats.leaves += spent;
+    stats.hits += hits;
+    return .{ .dir = best, .ply = best_ply, .leaves = spent };
+}
+
+/// #183: the last-resort move when no iteration completed (budget 0 included): the first legal
+/// direction in the fixed order, which needs no leaf evaluation at all.
+fn firstLegalMove(state: GameState) ?Direction {
+    for (dir_order) |d| {
+        var next = state;
+        if (next.slide(d).changed) return d;
+    }
+    return null;
 }
 
 /// Lookahead of the #158 2-ply training variants: `search2_ply` own moves below the board being
@@ -828,8 +931,19 @@ pub fn bestMoveWithCacheValue(vfn: Value, state: GameState, mode: Mode, stats: *
     return bestMoveWithCacheValueOpts(vfn, state, mode, stats, cache, .{});
 }
 
-/// `bestMoveWithCacheValue` with the search options (#178): `sym_leaf` averages every leaf.
+/// `bestMoveWithCacheValue` with the search options (#178): `sym_leaf` averages every leaf, and
+/// `id_budget` (#183) swaps the fixed-depth search for a node-budgeted iterative deepening.
 pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stats: *Stats, cache: *ValueCache, opts: Options) ?Direction {
+    // #183: a node budget means iterative deepening. `mode` only sets the first iteration's depth (its
+    // phase row, so `.deep` starts at ply 2 and `.deep3` at ply 3) and the spawn cut every ply keeps.
+    if (opts.id_budget) |budget| {
+        const dir = switch (mode) {
+            .greedy, .chance => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
+            .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMoveId(vfn, state, stats, cache, phaseDepth(mode, state.board), budget, opts.sym_leaf).dir,
+        };
+        // a budget too small for one full iteration still has to answer with a legal move
+        return dir orelse firstLegalMove(state);
+    }
     return switch (mode) {
         .greedy => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
         .chance => chanceMove(vfn, state),
@@ -1192,6 +1306,12 @@ pub const Options = struct {
     /// 1-ply modes (`.greedy` / `.chance`) have no `Search` and are unchanged, as is the default
     /// (`false`), which keeps the single forward pass bit for bit.
     sym_leaf: bool = false,
+    /// Candidate (#183): leaf-evaluation budget of an iterative deepening search, `null` = off. When
+    /// set, `bestMoveWithCacheValueOpts` searches depth 2, 3, ... and keeps the best move of the last
+    /// iteration that finished inside the budget (`mode` only sets the first depth and the spawn cut).
+    /// The budget is what makes the search's cost predictable: wall clock is not used, so the same
+    /// board and budget always pick the same move.
+    id_budget: ?usize = null,
     /// Candidate (#175) `dist`: teacher pairs from `computeTeachers`. Every self-play step also takes one
     /// regression step on a uniformly drawn pair, so 1/2 of the updates are distillation.
     distill: ?*Teachers = null,
@@ -3922,6 +4042,87 @@ test "sym_leaf of a dihedrally symmetric board equals one forward (#178)" {
     var search: Search = .{ .vfn = .{ .single = &net }, .cache = &cache, .ply = 2, .sym_leaf = true };
     var scratch: Cache = .{};
     try std.testing.expectApproxEqAbs(forward(&net, symmetric, &scratch), search.leaf(symmetric), 1e-12);
+}
+
+/// #183: one short game under an `id_budget`, with its move sequence and its leaf count. The value
+/// cache lives for the whole game, exactly as in `playWithOptsValue`.
+const IdGame = struct {
+    moves: [64]Direction = undefined,
+    len: usize = 0,
+    leaves: u64 = 0,
+};
+
+fn playIdGame(vfn: Value, seed: u64, budget: usize, max_moves: usize) IdGame {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+    var state = GameState.gameStart(rng);
+    var cache: ValueCache = .{};
+    var out: IdGame = .{};
+    while (out.len < max_moves) {
+        var stats: Stats = .{};
+        const dir = bestMoveWithCacheValueOpts(vfn, state, .deep, &stats, &cache, .{ .id_budget = budget }) orelse break;
+        out.moves[out.len] = dir;
+        out.len += 1;
+        out.leaves += stats.leaves;
+        _ = state.move(dir, rng);
+    }
+    return out;
+}
+
+test "id_budget picks the same moves at the same seed and budget (#183)" {
+    var prng = std.Random.DefaultPrng.init(1183);
+    const net = Net.init(prng.random());
+    const vfn: Value = .{ .single = &net };
+    // same seed, same budget, twice: the move order and the leaf counts match exactly (no wall clock,
+    // no rng inside the search)
+    const a = playIdGame(vfn, 183, 5_000, 6);
+    const b = playIdGame(vfn, 183, 5_000, 6);
+    try std.testing.expect(a.len > 0);
+    try std.testing.expectEqualSlices(Direction, a.moves[0..a.len], b.moves[0..b.len]);
+    try std.testing.expectEqual(a.leaves, b.leaves);
+}
+
+test "id_budget 0 still returns a legal move (#183)" {
+    var prng = std.Random.DefaultPrng.init(2183);
+    const net = Net.init(prng.random());
+    const vfn: Value = .{ .single = &net };
+    var stats: Stats = .{};
+    var cache: ValueCache = .{};
+    const dir = bestMoveWithCacheValueOpts(vfn, mid_board, .deep, &stats, &cache, .{ .id_budget = 0 }) orelse
+        return error.TestUnexpectedResult;
+    // the fallback spends nothing and the move is legal
+    try std.testing.expectEqual(@as(u64, 0), stats.leaves);
+    var next = mid_board;
+    try std.testing.expect(next.slide(dir).changed);
+    // and a dead board still answers null, budget or not
+    const dead: GameState = .{ .board = .{
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+    } };
+    var dead_cache: ValueCache = .{};
+    try std.testing.expectEqual(@as(?Direction, null), bestMoveWithCacheValueOpts(vfn, dead, .deep, &stats, &dead_cache, .{ .id_budget = 0 }));
+}
+
+test "id_budget adopts a monotonically deeper ply as the budget grows (#183)" {
+    var prng = std.Random.DefaultPrng.init(3183);
+    const net = Net.init(prng.random());
+    const vfn: Value = .{ .single = &net };
+    var previous: u8 = 0;
+    var deepest: u8 = 0;
+    // a fresh cache per budget: what a budget buys must not depend on an earlier run's entries
+    for ([_]usize{ 0, 200, 2_000, 20_000 }) |budget| {
+        var stats: Stats = .{};
+        var cache: ValueCache = .{};
+        const got = deepMoveId(vfn, mid_board, &stats, &cache, phaseDepth(.deep, mid_board.board), budget, false);
+        try std.testing.expect(got.ply >= previous);
+        try std.testing.expectEqual(got.leaves, stats.leaves);
+        previous = got.ply;
+        deepest = @max(deepest, got.ply);
+    }
+    // 20k leaves is more than one 2-ply tree here, so at least one iteration completed
+    try std.testing.expect(deepest >= 2);
 }
 
 test "TD(lambda) trace on a two-step sequence applies the eligibility-weighted update" {
