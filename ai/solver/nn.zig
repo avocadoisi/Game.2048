@@ -307,9 +307,10 @@ fn chanceMove(vfn: Value, state: GameState) ?Direction {
 pub const Stats = struct { leaves: u64 = 0, hits: u64 = 0 };
 
 /// Depth one search runs at: `ply` own moves deep, dropping spawn branches under path probability
-/// `cutoff` (`0` keeps every branch). Part of the value-cache key (#157), because a phase game asks
-/// for the same board at two depths.
-pub const Depth = struct { ply: u8 = 0, cutoff: f64 = 0 };
+/// `cutoff` (`0` keeps every branch) and dropping the lowest-probability branches up to a share
+/// `mass_cutoff` of each chance node's mass (#182, `0` keeps every branch). Part of the value-cache
+/// key (#157), because a phase game asks for the same board at two depths.
+pub const Depth = struct { ply: u8 = 0, cutoff: f64 = 0, mass_cutoff: f64 = 0 };
 
 /// Key depth of the 1-ply lookups (`get` / `getValue`, e.g. the `nnmcts` rollouts), which never search.
 pub const leaf_depth: Depth = .{};
@@ -339,7 +340,11 @@ pub const ValueCache = struct {
     fn keyOfDepth(board: Board, depth: Depth) u64 {
         var h = keyOf(board);
         h = (h ^ @as(u64, depth.ply)) *% 0x100000001b3;
-        return (h ^ @as(u64, @bitCast(depth.cutoff))) *% 0x100000001b3;
+        h = (h ^ @as(u64, @bitCast(depth.cutoff))) *% 0x100000001b3;
+        // the mass cut (#182) changes the value too, so it is part of the key as well; a zero mass
+        // cut does not mix, which keeps every pre-#182 key (and the recorded golden values) as is
+        if (depth.mass_cutoff == 0) return h;
+        return (h ^ @as(u64, @bitCast(depth.mass_cutoff))) *% 0x100000001b3;
     }
 
     /// `forward(net, board)` with memoization; `stats` counts leaf evaluations and hits.
@@ -390,6 +395,42 @@ pub fn sharedValueCache() *ValueCache {
 /// 0 disables the cut (that is `.deep`).
 const deep3_cutoff: f64 = 1e-2;
 
+/// The two spawns of one empty cell, with their probabilities.
+const spawn_tiles = [_]struct { value: core.Tile, p: f64 }{ .{ .value = 2, .p = 0.9 }, .{ .value = 4, .p = 0.1 } };
+
+/// One spawn branch of a chance node (#182): where the tile lands, what it is, and its probability
+/// `cprob * spawn.p`. Collected in board order, which is also the tie-break of the mass cut.
+const ChanceBranch = struct { r: usize, c: usize, tile: core.Tile, p: f64 };
+
+/// A full board's worth of branches: at most one spawn pair per cell.
+const max_chance_branches = core.BoardSize * core.BoardSize * spawn_tiles.len;
+
+/// Marks the branches `mass_cutoff` drops (#182) and returns the share of the node's mass they carry:
+/// the lowest `p` first, dropped while their cumulative share stays within `mass_cutoff`; a branch that
+/// would push it over stays. Equal probabilities keep `branches` order, and the heaviest branch is never
+/// dropped, so `mass_cutoff` below 1 always keeps at least one branch. `0` (and the full-width
+/// spelling 1) drops nothing.
+fn massCutMask(branches: []const ChanceBranch, mass_cutoff: f64, dropped: *[max_chance_branches]bool) f64 {
+    if (mass_cutoff <= 0 or mass_cutoff >= full_width_cutoff or branches.len < 2) return 0;
+    var all_p: f64 = 0;
+    for (branches) |b| all_p += b.p;
+    const limit = mass_cutoff * all_p;
+    // insertion sort of the indices by `p`, stable, so equal probabilities stay in board order
+    var order: [max_chance_branches]usize = undefined;
+    for (0..branches.len) |i| {
+        var j = i;
+        while (j > 0 and branches[order[j - 1]].p > branches[i].p) : (j -= 1) order[j] = order[j - 1];
+        order[j] = i;
+    }
+    var dropped_p: f64 = 0;
+    for (order[0..branches.len]) |i| {
+        if (dropped_p + branches[i].p > limit) break;
+        dropped[i] = true;
+        dropped_p += branches[i].p;
+    }
+    return dropped_p / all_p;
+}
+
 /// Depth-limited expectimax: our moves and every spawn (2 at 0.9, 4 at 0.1), no RNG.
 /// The caller owns the value cache so a game can reuse one workspace for all of its moves.
 const Search = struct {
@@ -398,12 +439,19 @@ const Search = struct {
     stats: Stats = .{},
     /// Spawn branches under this path probability are dropped; 0 searches every branch (`.deep`).
     cutoff: f64 = 0,
+    /// Chance nodes may drop their lowest-probability branches while the dropped share of the node's
+    /// mass stays within this value (#182); 0 searches every branch, as `cutoff = 0` did.
+    mass_cutoff: f64 = 0,
     /// Own-move plies this whole search runs at; with `cutoff` it keys every leaf lookup (#157).
     ply: u8 = 0,
 
     /// `cache.getValue` at this search's depth: one entry per (board, ply, cutoff).
     fn leaf(self: *Search, board: Board) f64 {
-        return self.cache.getValueAtDepth(self.vfn, board, .{ .ply = self.ply, .cutoff = self.cutoff }, &self.stats);
+        return self.cache.getValueAtDepth(self.vfn, board, .{
+            .ply = self.ply,
+            .cutoff = self.cutoff,
+            .mass_cutoff = self.mass_cutoff,
+        }, &self.stats);
     }
 
     /// `value` with the leaf one own move further out and no reward at it: `bootValue(S, 0)` is the
@@ -474,6 +522,8 @@ const Search = struct {
     /// Expected value of a post-move board after spawning; depth 0 is the value leaf (the afterstate itself).
     /// `cprob` is the probability of reaching this node. Kept branches are averaged over their own
     /// mass, so a cut node keeps the scale of a full average instead of shrinking with the dropped ones.
+    /// Two passes (#182): the first collects every branch's probability, the second evaluates the ones
+    /// the fixed `cutoff` and the mass `mass_cutoff` both keep.
     fn chance(self: *Search, state: GameState, depth: u8, cprob: f64) f64 {
         if (depth == 0) return self.leaf(state.board);
         var empties: f64 = 0;
@@ -483,20 +533,31 @@ const Search = struct {
             }
         }
         if (empties == 0) return self.value(state, depth, cprob);
-        var total: f64 = 0;
-        var mass: f64 = 0;
+        // pass 1: every branch of this node, in board order (the tie-break of the mass cut)
+        var branches: [max_chance_branches]ChanceBranch = undefined;
+        var count: usize = 0;
         for (0..core.BoardSize) |r| {
             for (0..core.BoardSize) |c| {
                 if (state.board[r][c] != 0) continue;
-                for ([_]struct { value: core.Tile, p: f64 }{ .{ .value = 2, .p = 0.9 }, .{ .value = 4, .p = 0.1 } }) |spawn| {
-                    const p = cprob * spawn.p;
-                    if (depth > 1 and p / empties < self.cutoff) continue;
-                    var child = state;
-                    child.board[r][c] = spawn.value;
-                    total += p * self.value(child, depth, p);
-                    mass += p;
+                for (spawn_tiles) |spawn| {
+                    branches[count] = .{ .r = r, .c = c, .tile = spawn.value, .p = cprob * spawn.p };
+                    count += 1;
                 }
             }
+        }
+        std.debug.assert(count <= max_chance_branches);
+        // the mass cut drops the smallest branches first, the fixed cut its usual depth > 1 way
+        var dropped: [max_chance_branches]bool = @splat(false);
+        _ = massCutMask(branches[0..count], self.mass_cutoff, &dropped);
+        // pass 2: the kept branches
+        var total: f64 = 0;
+        var mass: f64 = 0;
+        for (branches[0..count], 0..) |branch, i| {
+            if (dropped[i] or (depth > 1 and branch.p / empties < self.cutoff)) continue;
+            var child = state;
+            child.board[branch.r][branch.c] = branch.tile;
+            total += branch.p * self.value(child, depth, branch.p);
+            mass += branch.p;
         }
         // every branch cut: the node is already that unlikely, so the afterstate leaf is the answer
         return if (mass == 0) self.leaf(state.board) else total / mass;
@@ -507,7 +568,13 @@ const Search = struct {
 /// `ply` 2 is `deep` (full width); `ply` 3 is `deep3`, whose cost only fits with a spawn-probability cut;
 /// `ply` 4 is `phase_h4` (#171), which only ever runs where the board is nearly full.
 fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, depth: Depth) ?Direction {
-    var search: Search = .{ .vfn = vfn, .cache = cache, .cutoff = depth.cutoff, .ply = depth.ply };
+    var search: Search = .{
+        .vfn = vfn,
+        .cache = cache,
+        .cutoff = depth.cutoff,
+        .mass_cutoff = depth.mass_cutoff,
+        .ply = depth.ply,
+    };
     defer stats.* = search.stats;
     var best: ?Direction = null;
     var best_value: f64 = -std.math.inf(f64);
@@ -551,7 +618,13 @@ fn search2Value(vfn: Value, state: GameState, cache: *ValueCache) f64 {
 /// `deepMove` scores the same move. Spawns are enumerated, so this draws nothing from the rng.
 fn pickTeacherValue(vfn: Value, state: GameState, mode: Mode, cache: *ValueCache) ?Pick {
     const depth = phaseDepth(mode, state.board);
-    var search: Search = .{ .vfn = vfn, .cache = cache, .cutoff = depth.cutoff, .ply = depth.ply };
+    var search: Search = .{
+        .vfn = vfn,
+        .cache = cache,
+        .cutoff = depth.cutoff,
+        .mass_cutoff = depth.mass_cutoff,
+        .ply = depth.ply,
+    };
     var best: ?Pick = null;
     var best_value: f64 = -std.math.inf(f64);
     for ([_]Direction{ .up, .left, .down, .right }) |d| {
@@ -595,6 +668,9 @@ pub const Mode = enum {
     deep,
     /// 3-ply: `deep` plus one more own move and spawn layer, with the probability cut (issue #108).
     deep3,
+    /// 2-ply with the cumulative-mass cut of #182 instead of the fixed probability cut: the same tree as
+    /// `deep`, minus the lowest-probability spawn branches up to `mass2_ply_cutoff` of each node's mass.
+    deep_mass,
     /// 2-ply while the board has 8+ empty cells, then 3-ply with the 1e-2 cut (#157).
     phase_h1,
     /// Same start, 3-ply from 5..7 empty cells, and the 1e-4 cut once 4 or fewer are left (#157).
@@ -609,8 +685,9 @@ pub const Mode = enum {
 
 /// One row of a phase schedule (#157): a board with at least `min_empty` empty cells searches `ply`
 /// own moves deep, dropping spawn branches under path probability `cutoff` (`full_width_cutoff` keeps
-/// every branch).
-pub const Phase = struct { min_empty: u8, ply: u8, cutoff: f64 };
+/// every branch) and dropping the lowest-probability branches up to `mass_cutoff` of a chance node's
+/// mass (#182, 0 keeps every branch).
+pub const Phase = struct { min_empty: u8, ply: u8, cutoff: f64, mass_cutoff: f64 = 0 };
 
 /// A row cutoff that keeps every spawn branch: no branch probability ever reaches 1.
 const full_width_cutoff: f64 = 1;
@@ -619,12 +696,18 @@ const full_width_cutoff: f64 = 1;
 /// the 3-ply tree stays small even with more spawn branches kept.
 const phase_tight_cutoff: f64 = 1e-4;
 
+/// The mass cut of the `deep_mass` row (#182): 5% of every chance node's mass may be dropped, which is
+/// the low-probability tail (the 4s under a wide board) rather than a fixed probability floor.
+const mass2_ply_cutoff: f64 = 0.05;
+
 /// The search depth of every `Mode`, one table (#139 style): rows are in descending `min_empty`, so the
 /// first row the board's empty cells reach is its phase. `deep` and `deep3` are one row each, which is
 /// what keeps their behavior exactly the pre-#157 search.
 const phase_schedules = struct {
     const deep = [_]Phase{.{ .min_empty = 0, .ply = 2, .cutoff = full_width_cutoff }};
     const deep3 = [_]Phase{.{ .min_empty = 0, .ply = 3, .cutoff = deep3_cutoff }};
+    /// #182: one row, the `deep` tree with the cumulative-mass cut
+    const deep_mass = [_]Phase{.{ .min_empty = 0, .ply = 2, .cutoff = full_width_cutoff, .mass_cutoff = mass2_ply_cutoff }};
     const phase_h1 = [_]Phase{
         .{ .min_empty = 8, .ply = 2, .cutoff = full_width_cutoff },
         .{ .min_empty = 0, .ply = 3, .cutoff = deep3_cutoff },
@@ -654,6 +737,7 @@ fn schedule(mode: Mode) []const Phase {
         .greedy, .chance => &.{},
         .deep => &phase_schedules.deep,
         .deep3 => &phase_schedules.deep3,
+        .deep_mass => &phase_schedules.deep_mass,
         .phase_h1 => &phase_schedules.phase_h1,
         .phase_h2 => &phase_schedules.phase_h2,
         .phase_h3 => &phase_schedules.phase_h3,
@@ -667,6 +751,11 @@ fn searchCutoff(cutoff: f64) f64 {
     return if (cutoff >= full_width_cutoff) 0 else cutoff;
 }
 
+/// `searchCutoff` for the mass cut (#182): `0` and its full-width spelling 1 both mean keep everything.
+fn searchMassCutoff(mass_cutoff: f64) f64 {
+    return if (mass_cutoff >= full_width_cutoff) 0 else mass_cutoff;
+}
+
 /// The row that applies to `board` under the search `mode`, in `Search`'s own units. Rows are in
 /// descending `min_empty` and every schedule ends at 0, so one row always matches.
 fn phaseDepth(mode: Mode, board: Board) Depth {
@@ -674,7 +763,11 @@ fn phaseDepth(mode: Mode, board: Board) Depth {
     std.debug.assert(rows.len != 0);
     const empties = countEmpty(board);
     for (rows) |row| {
-        if (empties >= row.min_empty) return .{ .ply = row.ply, .cutoff = searchCutoff(row.cutoff) };
+        if (empties >= row.min_empty) return .{
+            .ply = row.ply,
+            .cutoff = searchCutoff(row.cutoff),
+            .mass_cutoff = searchMassCutoff(row.mass_cutoff),
+        };
     }
     unreachable; // every schedule ends with min_empty = 0
 }
@@ -706,8 +799,8 @@ pub fn bestMoveWithCacheValue(vfn: Value, state: GameState, mode: Mode, stats: *
     return switch (mode) {
         .greedy => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
         .chance => chanceMove(vfn, state),
-        // every search mode takes its (ply, cutoff) for this board from the phase table (#157)
-        .deep, .deep3, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, phaseDepth(mode, state.board)),
+        // every search mode takes its (ply, cutoff, mass cutoff) for this board from the phase table (#157)
+        .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, phaseDepth(mode, state.board)),
     };
 }
 
@@ -1330,7 +1423,13 @@ fn selfplayPick(vfn: Value, state: GameState, death: bool, selfplay: SelfPlay, t
 /// believes the position is worth, one own move deeper than `t2` and cheap enough to train on.
 fn teacherValue(vfn: Value, state: GameState, mode: Mode) f64 {
     const depth = phaseDepth(mode, state.board);
-    var search: Search = .{ .vfn = vfn, .cache = sharedValueCache(), .cutoff = depth.cutoff, .ply = depth.ply };
+    var search: Search = .{
+        .vfn = vfn,
+        .cache = sharedValueCache(),
+        .cutoff = depth.cutoff,
+        .mass_cutoff = depth.mass_cutoff,
+        .ply = depth.ply,
+    };
     return search.value(state, depth.ply, 1);
 }
 
@@ -1731,6 +1830,76 @@ test "deep3 keeps the value within 5% of the unpruned 3-ply search" {
     const plain = full.value(late_board, 3, 1);
     const cut = pruned.value(late_board, 3, 1);
     try std.testing.expect(@abs(cut - plain) <= 0.05 * @abs(plain));
+}
+
+test "mass cutoff is off at 0 and full width at 1 (#182)" {
+    var prng = std.Random.DefaultPrng.init(182);
+    const net = Net.init(prng.random());
+    const vfn: Value = .{ .single = &net };
+    // (a) the phase rows carry no mass cut, so `.deep` / `.deep3` search what they searched before
+    for ([_]Mode{ .deep, .deep3, .phase_h1, .phase_h2, .phase_h3, .phase_h4 }) |mode| {
+        try std.testing.expectEqual(@as(f64, 0), phaseDepth(mode, mid_board.board).mass_cutoff);
+    }
+    var plain_cache: ValueCache = .{};
+    var plain: Search = .{ .vfn = vfn, .cache = &plain_cache, .cutoff = deep3_cutoff, .ply = 3 };
+    var zero_cache: ValueCache = .{};
+    var zero: Search = .{ .vfn = vfn, .cache = &zero_cache, .cutoff = deep3_cutoff, .mass_cutoff = 0, .ply = 3 };
+    try std.testing.expectEqual(plain.value(mid_board, 3, 1), zero.value(mid_board, 3, 1));
+    // (b) `mass_cutoff = 1` is the full-width spelling (as `full_width_cutoff` is for `cutoff`) and
+    // every branch is evaluated, so the value is the `mass_cutoff = 0` one
+    try std.testing.expectEqual(@as(f64, 0), searchMassCutoff(1));
+    var full_cache: ValueCache = .{};
+    var full: Search = .{ .vfn = vfn, .cache = &full_cache, .mass_cutoff = 1, .ply = 2 };
+    var off_cache: ValueCache = .{};
+    var off: Search = .{ .vfn = vfn, .cache = &off_cache, .ply = 2 };
+    try std.testing.expectEqual(off.value(mid_board, 2, 1), full.value(mid_board, 2, 1));
+}
+
+test "mass cutoff 0.5 drops the low-probability tail of one chance node (#182)" {
+    // `late_board` has 4 empty cells, so its chance node has 8 branches of `0.9/4` and `0.1/4`
+    var branches: [max_chance_branches]ChanceBranch = undefined;
+    var count: usize = 0;
+    for (0..core.BoardSize) |r| {
+        for (0..core.BoardSize) |c| {
+            if (late_board.board[r][c] != 0) continue;
+            for (spawn_tiles) |spawn| {
+                branches[count] = .{ .r = r, .c = c, .tile = spawn.value, .p = spawn.p };
+                count += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 8), count);
+    var dropped: [max_chance_branches]bool = @splat(false);
+    const share = massCutMask(branches[0..count], 0.5, &dropped);
+    // the node's total is 4.0, so the limit is 2.0: the four 4s (0.1 each) go first, then one 2 (0.9)
+    // still fits at 1.3 and the second one would not (2.2 > 2.0)
+    try std.testing.expect(share > 0);
+    try std.testing.expect(share <= 0.5);
+    try std.testing.expectApproxEqAbs(0.325, share, 1e-12);
+    var kept_fours: usize = 0;
+    var kept_twos: usize = 0;
+    var dropped_twos: usize = 0;
+    for (branches[0..count], 0..) |b, i| {
+        if (dropped[i]) {
+            if (b.tile == 4) continue;
+            dropped_twos += 1;
+            // the dropped 2 is the first one in board order: the tie-break of equal probabilities
+            try std.testing.expectEqual(@as(usize, 0), i);
+        } else if (b.tile == 4) kept_fours += 1 else kept_twos += 1;
+    }
+    // the whole `0.1` tail goes before any `0.9` one, and then exactly one `0.9` fits in the budget
+    try std.testing.expectEqual(@as(usize, 0), kept_fours);
+    try std.testing.expectEqual(@as(usize, 1), dropped_twos);
+    try std.testing.expectEqual(@as(usize, 3), kept_twos);
+    // the same cut really moves the searched value: the value leaves drop the whole 4 spawn
+    var prng = std.Random.DefaultPrng.init(182);
+    const net = Net.init(prng.random());
+    const vfn: Value = .{ .single = &net };
+    var off_cache: ValueCache = .{};
+    var off: Search = .{ .vfn = vfn, .cache = &off_cache, .ply = 1 };
+    var cut_cache: ValueCache = .{};
+    var cut: Search = .{ .vfn = vfn, .cache = &cut_cache, .mass_cutoff = 0.5, .ply = 1 };
+    try std.testing.expect(off.chance(late_board, 1, 1) != cut.chance(late_board, 1, 1));
 }
 
 /// Modes that pick their own depth from the phase table (#157).
