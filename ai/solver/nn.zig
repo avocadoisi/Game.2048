@@ -667,7 +667,13 @@ const Search = struct {
 const dir_order = [4]Direction{ .up, .left, .down, .right };
 
 /// One root's best move and its score (reward + `Search.chance`), `dir = null` on a dead board.
-const RootBest = struct { dir: ?Direction = null, value: f64 = -std.math.inf(f64) };
+const RootBest = struct {
+    dir: ?Direction = null,
+    value: f64 = -std.math.inf(f64),
+    /// The runner-up, which only `Rerank` (#189) and the tie-margin deepening (#188) read.
+    second_dir: ?Direction = null,
+    second_value: f64 = -std.math.inf(f64),
+};
 
 /// The root layer of `deepMove`: max over `order` of reward + expected value after the spawn. `order`
 /// is the fixed one except in iterative deepening (#183), where the previous iteration's best move
@@ -690,6 +696,8 @@ fn rootMove(search: *Search, state: GameState, order: [4]Direction, rerank: ?Rer
         // #183: out of budget, so this root's score is garbage — stop before spending another branch
         if (search.out_of_budget) return best;
     }
+    best.second_dir = second.dir;
+    best.second_value = second.value;
     // #189: only a near tie is worth a second opinion, and only a nonzero weight can change the pick.
     if (rerank) |r| {
         if (best.dir != null and second.dir != null and r.weight != 0 and best.value - second.value <= r.margin) {
@@ -772,7 +780,7 @@ pub const IdMove = struct {
 /// same tree one spawn layer out, not a different width. The previous iteration's root move goes first
 /// in the next iteration's move order, so with a budget that runs out mid-iteration the deeper tree is
 /// explored from its most promising branch outward.
-fn deepMoveId(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, start: Depth, budget: usize, sym_leaf: bool, rerank: ?Rerank, risk_weight: f64) IdMove {
+fn deepMoveId(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, start: Depth, budget: usize, sym_leaf: bool, rerank: ?Rerank, risk_weight: f64, margin: ?f64) IdMove {
     var order = dir_order;
     var spent: u64 = 0;
     var hits: u64 = 0;
@@ -788,8 +796,17 @@ fn deepMoveId(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, s
         hits += search.stats.hits;
         // a partial iteration (or a dead board) keeps the previous iteration's move
         if (search.out_of_budget or root.dir == null) break;
+        // #188: with a tie margin, only the first iteration's near tie justifies a deeper tree. A root
+        // move that is already clearly better than its runner-up gains nothing from the extra ply, so
+        // the search stops here and returns it (its value does not enter the comparison, only the gap).
+        const first_iteration = best == null;
         best = root.dir;
         best_ply = ply;
+        if (first_iteration) {
+            if (margin) |m| {
+                if (root.second_dir == null or root.value - root.second_value > m) break;
+            }
+        }
         // move ordering: the completed iteration's best move first, the rest of the order as it was
         const first = root.dir.?;
         var next_order = order;
@@ -1036,7 +1053,7 @@ pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stat
     if (opts.id_budget) |budget| {
         const dir = switch (mode) {
             .greedy, .chance => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
-            .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMoveId(vfn, state, stats, cache, phaseDepth(mode, state.board), budget, opts.sym_leaf, opts.rerank, opts.risk_weight).dir,
+            .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMoveId(vfn, state, stats, cache, phaseDepth(mode, state.board), budget, opts.sym_leaf, opts.rerank, opts.risk_weight, opts.id_margin).dir,
         };
         // a budget too small for one full iteration still has to answer with a legal move
         return dir orelse firstLegalMove(state);
@@ -1409,6 +1426,11 @@ pub const Options = struct {
     /// The budget is what makes the search's cost predictable: wall clock is not used, so the same
     /// board and budget always pick the same move.
     id_budget: ?usize = null,
+    /// Candidate (#188): with `id_budget`, deepen only while the start depth's best move beats its
+    /// runner-up by at most this NN-value gap (score deltas over `reward_scale`, so 0.05 = 50 points of
+    /// one-move score). A root move that is already clearly better stops the deepening after its first
+    /// iteration, which is where most of the budget saving comes from. `null` = always deepen.
+    id_margin: ?f64 = null,
     /// Candidate (#189): heterogeneous rerank of the 2-ply search's top two moves by a cheap foreign
     /// evaluator when the net's own gap is within `Rerank.margin`; null = the plain argmax.
     rerank: ?Rerank = null,
@@ -4314,7 +4336,7 @@ test "id_budget adopts a monotonically deeper ply as the budget grows (#183)" {
     for ([_]usize{ 0, 200, 2_000, 20_000 }) |budget| {
         var stats: Stats = .{};
         var cache: ValueCache = .{};
-        const got = deepMoveId(vfn, mid_board, &stats, &cache, phaseDepth(.deep, mid_board.board), budget, false, null, 0);
+        const got = deepMoveId(vfn, mid_board, &stats, &cache, phaseDepth(.deep, mid_board.board), budget, false, null, 0, null);
         try std.testing.expect(got.ply >= previous);
         try std.testing.expectEqual(got.leaves, stats.leaves);
         previous = got.ply;
@@ -4322,6 +4344,39 @@ test "id_budget adopts a monotonically deeper ply as the budget grows (#183)" {
     }
     // 20k leaves is more than one 2-ply tree here, so at least one iteration completed
     try std.testing.expect(deepest >= 2);
+}
+
+test "id_margin stops the deepening when the start depth's move is not a near tie (#188)" {
+    var prng = std.Random.DefaultPrng.init(3191);
+    const net = Net.init(prng.random());
+    const vfn: Value = .{ .single = &net };
+    // a huge budget and a zero margin: any positive gap at ply 2 ends the search at ply 2
+    var tight_stats: Stats = .{};
+    var tight_cache: ValueCache = .{};
+    const tight = deepMoveId(vfn, mid_board, &tight_stats, &tight_cache, phaseDepth(.deep, mid_board.board), 5_000_000, false, null, 0, 0);
+    // without the margin the same budget goes deeper, so the cut is what saved the leaves
+    var open_stats: Stats = .{};
+    var open_cache: ValueCache = .{};
+    const open = deepMoveId(vfn, mid_board, &open_stats, &open_cache, phaseDepth(.deep, mid_board.board), 5_000_000, false, null, 0, null);
+    try std.testing.expect(tight.ply == 2);
+    try std.testing.expect(open.ply > tight.ply);
+    try std.testing.expect(tight.leaves < open.leaves);
+}
+
+test "id_margin = null and a wide margin keep every iteration (#188)" {
+    var prng = std.Random.DefaultPrng.init(3193);
+    const net = Net.init(prng.random());
+    const vfn: Value = .{ .single = &net };
+    var plain_stats: Stats = .{};
+    var plain_cache: ValueCache = .{};
+    const plain = deepMoveId(vfn, mid_board, &plain_stats, &plain_cache, phaseDepth(.deep, mid_board.board), 200_000, false, null, 0, null);
+    // a margin no root gap can exceed never triggers the cut, so the search is the same one
+    var wide_stats: Stats = .{};
+    var wide_cache: ValueCache = .{};
+    const wide = deepMoveId(vfn, mid_board, &wide_stats, &wide_cache, phaseDepth(.deep, mid_board.board), 200_000, false, null, 0, 1e9);
+    try std.testing.expectEqual(plain.dir, wide.dir);
+    try std.testing.expectEqual(plain.ply, wide.ply);
+    try std.testing.expectEqual(plain.leaves, wide.leaves);
 }
 
 test "TD(lambda) trace on a two-step sequence applies the eligibility-weighted update" {

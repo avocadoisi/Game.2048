@@ -471,6 +471,9 @@ pub fn main(init: std.process.Init) !void {
         // #187: the .deep row with every chance node scored 30% by its CVaR below the lower 25%
         // quantile, so a move that is usually good but sometimes losing ranks below a stable one.
         .{ .name = "nn 2-ply + downside risk (#187)", .policy = 13 },
+        // #188: the #183 budget, but a root move that already beats its runner-up by more than 0.05
+        // ends the deepening after the first iteration, so only near-tie positions pay for a deeper tree.
+        .{ .name = "nn deepening on near ties (#188)", .policy = 14 },
     };
     // Rows are all on by default; a measurement run edits this line down to the two it needs
     // (0 = 1-ply, 2 = 2-ply) instead of paying for the 3-ply rows twice over.
@@ -543,6 +546,8 @@ pub fn main(init: std.process.Init) !void {
                 12 => nn.playValueOpts(c.vfn, prng.random(), .deep, .{ .rerank = rerank }),
                 // #187: the .deep row with the chance nodes moved 30% toward their CVaR
                 13 => nn.playValueOpts(c.vfn, prng.random(), .deep, .{ .risk_weight = 0.3 }),
+                // #188: deepen (#183) only when the 2-ply root move is within 0.05 of its runner-up
+                14 => nn.playValueOpts(c.vfn, prng.random(), .deep, .{ .id_budget = 200_000, .id_margin = 0.05 }),
                 else => unreachable,
             };
         }
