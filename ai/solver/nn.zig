@@ -1444,6 +1444,13 @@ pub const Options = struct {
     /// Candidate (#175) `dist`: teacher pairs from `computeTeachers`. Every self-play step also takes one
     /// regression step on a uniformly drawn pair, so 1/2 of the updates are distillation.
     distill: ?*Teachers = null,
+    /// Candidate (#206) how many self-play steps run between two teacher regressions (`1` = every step,
+    /// the historical `#175` behavior; `8` puts 1 teacher update in 9). The decay that `#175` showed is
+    /// caused by the teacher signal drowning the shallow game, so the mix is the knob to sweep.
+    distill_every: u32 = 1,
+    /// Candidate (#206) learning rate of the teacher regression alone; `0` uses the TD rate. A teacher
+    /// update that is 10x smaller cannot drag the shared parameters away as fast.
+    distill_lr: f64 = 0,
     /// Candidate (#175) `dson`: the teacher regression only, with the self-play TD update switched off.
     /// The 50/50 mix is not for value quality: it exists so the shallow half of the game (which the deep
     /// buffer never covers) keeps being trained. `dson` answers the other half of that question — whether
@@ -1949,6 +1956,7 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
     var state = if (opts.restart) restartState(rng, opts.dump.?) else GameState.gameStart(rng);
     var pending: ?Pick = null;
     var cache: Cache = .{};
+    var dist_tick: u32 = 0;
     var moves: u32 = 0;
     var trace: Net = std.mem.zeroes(Net);
     while (selfplayPick(vfn, state, opts.death, opts.selfplay, opts.teacher, opts.sym_leaf)) |pick| {
@@ -1967,7 +1975,14 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
         pending = pick;
         // `ft2` mixes one deep update into every self-play step: 50% self-play / 50% deep afterstates.
         if (opts.deep_mix) if (opts.dump) |buffer| if (buffer.len > 0) deepStep(net, rng, buffer, lr, &cache);
-        if (opts.distill) |buffer| if (buffer.len > 0) distStep(net, rng, buffer, lr, &cache);
+        // `#206`: the teacher regression only every `distill_every` steps and at its own rate, so the
+        // shallow half of the game keeps the parameters it learned.
+        if (opts.distill) |buffer| if (buffer.len > 0) {
+            dist_tick += 1;
+            if (dist_tick % @max(opts.distill_every, 1) == 0) {
+                distStep(net, rng, buffer, if (opts.distill_lr > 0) opts.distill_lr else lr, &cache);
+            }
+        };
         _ = state.move(pick.dir, rng);
     }
     if (pending) |p| {
@@ -4864,6 +4879,40 @@ test "dist takes one regression step per self-play step on average (#175)" {
     _ = trainGameOpts(&plain, rng_c.random(), 0.001, null, .{});
     try std.testing.expectEqual(game.moves * 2, buffer.draws);
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&a), std.mem.asBytes(&plain)));
+}
+
+test "distill_every thins the teacher mix and distill_lr does not change the TD half (#206)" {
+    var prng = std.Random.DefaultPrng.init(98);
+    const rng = prng.random();
+    const net = Net.init(rng);
+    var board: Board = @splat(@splat(0));
+    board[0][0] = 4096;
+    // `distill_every = 4`: one regression per four self-play steps, so the draws are about moves/4
+    var thinned: Teachers = .{};
+    thinned.append(board, 2.0);
+    var thinned_net = net;
+    var rng_a = std.Random.DefaultPrng.init(11);
+    const thinned_game = trainGameOpts(&thinned_net, rng_a.random(), 0.001, null, .{ .distill = &thinned, .distill_every = 4 });
+    try std.testing.expect(thinned.draws > 0);
+    try std.testing.expect(thinned.draws <= thinned_game.moves);
+    // every = 1 is the dense mix, so the same game draws strictly more teacher steps than every = 4
+    var dense: Teachers = .{};
+    dense.append(board, 2.0);
+    var dense_net = net;
+    var rng_b = std.Random.DefaultPrng.init(11);
+    const dense_game = trainGameOpts(&dense_net, rng_b.random(), 0.001, null, .{ .distill = &dense, .distill_every = 1 });
+    try std.testing.expectEqual(dense_game.moves, dense.draws);
+    try std.testing.expect(dense.draws > thinned.draws);
+    // `distill_lr` only rescales the teacher step: with a teacher buffer that is never drawn the TD half
+    // is bit-identical (the rate is read only inside `distStep`)
+    var empty: Teachers = .{};
+    var a = net;
+    var b = net;
+    var rng_c = std.Random.DefaultPrng.init(11);
+    var rng_d = std.Random.DefaultPrng.init(11);
+    _ = trainGameOpts(&a, rng_c.random(), 0.001, null, .{ .distill = &empty });
+    _ = trainGameOpts(&b, rng_d.random(), 0.001, null, .{ .distill = &empty, .distill_lr = 1e-5 });
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
 }
 
 /// #189 test scorers: +1 for an afterstate that kept a tile in the top-left cell (the `left` move of

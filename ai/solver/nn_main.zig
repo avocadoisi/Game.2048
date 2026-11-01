@@ -97,6 +97,20 @@ fn parseBatchScale(args: []const []const u8) !f64 {
     return std.fmt.parseFloat(f64, args[12]) catch error.InvalidBatchScale;
 }
 
+/// (#206) `dist` / `dson` take the teacher mix after the dump path: arg 12 is `distill_every`
+/// (1 = every step) and arg 13 is the divisior applied to the TD rate for teacher updates (0 = same).
+fn parseDistillMix(args: []const []const u8) !nn.Options {
+    var opts: nn.Options = .{};
+    if (args.len > 12 and !std.mem.eql(u8, args[12], "-")) {
+        opts.distill_every = std.fmt.parseInt(u32, args[12], 10) catch return error.InvalidDistillEvery;
+    }
+    if (args.len > 13 and !std.mem.eql(u8, args[13], "-")) {
+        const div = std.fmt.parseFloat(f64, args[13]) catch return error.InvalidDistillLr;
+        opts.distill_lr = if (div > 0) 1 / div else 0;
+    }
+    return opts;
+}
+
 fn parseParFlag(args: []const []const u8) !bool {
     if (args.len <= 10) return false;
     if (std.mem.eql(u8, args[10], "-")) return false;
@@ -265,6 +279,8 @@ pub fn main(init: std.process.Init) !void {
     const is_tch = std.mem.eql(u8, variant, "tch");
     const is_dist = std.mem.eql(u8, variant, "dist");
     const is_dson = std.mem.eql(u8, variant, "dson");
+    // (#206) the teacher mix: `distill_every` (arg 12) and the rate divisor (arg 13).
+    const dist_mix: nn.Options = if (is_dist or is_dson) try parseDistillMix(args) else .{};
     // #159 variants train from the net in weights_path (the deep positions come from that net), like `resume`
     const use_resume = std.mem.eql(u8, variant, "resume") or is_dump or is_ft2 or is_restart or is_dist or is_dson or is_tch;
     // Variants that take dump_path at index 11: `dump` writes it, `ft2` and `restart` read it.
@@ -325,9 +341,9 @@ pub fn main(init: std.process.Init) !void {
     else if (is_restart)
         .{ .restart = true, .dump = &dump }
     else if (is_dist)
-        .{ .distill = &teachers }
+        .{ .distill = &teachers, .distill_every = dist_mix.distill_every, .distill_lr = dist_mix.distill_lr }
     else if (is_dson)
-        .{ .distill = &teachers, .distill_only = true }
+        .{ .distill = &teachers, .distill_only = true, .distill_every = dist_mix.distill_every, .distill_lr = dist_mix.distill_lr }
     else if (std.mem.eql(u8, variant, "oi") or std.mem.eql(u8, variant, "oi16") or is_mstd)
         .{}
     else {
@@ -336,7 +352,7 @@ pub fn main(init: std.process.Init) !void {
     };
     // `dump` is the shared layout plus one slot: index 11 carries the dump path.
     // `par` runs may carry the #137 batch_scale at index 12, after the `-` dump slot.
-    const max_args: usize = if (uses_dump) 12 else if (use_par) 13 else 11;
+    const max_args: usize = if (is_dist or is_dson) 14 else if (uses_dump) 12 else if (use_par) 13 else 11;
     if (args.len > max_args or eval_games == 0 or seed_ranges == 0 or (uses_dump and dump_path == null)) {
         std.debug.print("{s}", .{usage});
         return;
