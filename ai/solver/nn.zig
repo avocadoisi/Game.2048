@@ -717,6 +717,9 @@ pub const PlayResult = struct {
     moves: u32,
     /// `forward` leaf evaluations summed over the game (0 for modes that do not search).
     leaves: u64 = 0,
+    /// The board the game ended on (the tape replay test compares it, #168). Zero for callers that
+    /// build a `PlayResult` without playing (the expectimax row of `nn_main`).
+    board: Board = std.mem.zeroes(Board),
 };
 
 /// Play one game to game over with the network policy.
@@ -747,7 +750,157 @@ pub fn playWithStatsValue(vfn: Value, rng: std.Random, mode: Mode, stats: *Stats
         _ = state.move(dir, rng);
         moves += 1;
     }
-    return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves, .leaves = stats.leaves };
+    return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves, .leaves = stats.leaves, .board = state.board };
+}
+
+/// One spawn of a game (#168): the cell the tile landed in and which of the two values it had. Packed
+/// into 5 bits, so one game's whole spawn sequence is a few KB of `Tape`.
+pub const Spawn = packed struct {
+    /// `row * 4 + col` of the cell the tile appeared in.
+    cell: u4,
+    /// 1 for the 1-in-10 draw that spawns a 4, 0 for a 2.
+    four: u1,
+
+    pub fn tile(self: Spawn) core.Tile {
+        return if (self.four == 1) 4 else 2;
+    }
+
+    pub fn position(self: Spawn) core.Position {
+        return .{ .row = self.cell / core.BoardSize, .col = self.cell % core.BoardSize };
+    }
+
+    pub fn at(pos: core.Position, value: core.Tile) Spawn {
+        std.debug.assert(value == 2 or value == 4);
+        return .{ .cell = @intCast(pos.row * core.BoardSize + pos.col), .four = @intFromBool(value == 4) };
+    }
+};
+
+/// Spawn tape for common random numbers (#168): one game's spawn sequence, recorded while policy A
+/// plays and replayed while policy B plays the same game. Spawn luck alone is worth ±5,000 points
+/// between two seeds (`docs/solver-history.md`, #159), so two policies compared on the same tapes
+/// leave only their own difference in the paired statistics.
+pub const Tape = struct {
+    pub const Recording = enum { record, replay };
+
+    mode: Recording,
+    /// Record: room for the game's spawns, `len` entries are written. Replay: the recorded sequence,
+    /// `len` = `spawns.len`.
+    spawns: []Spawn,
+    len: usize = 0,
+    cursor: usize = 0,
+
+    pub fn initRecord(spawns: []Spawn) Tape {
+        return .{ .mode = .record, .spawns = spawns };
+    }
+
+    pub fn initReplay(spawns: []Spawn) Tape {
+        return .{ .mode = .replay, .spawns = spawns, .len = spawns.len };
+    }
+
+    /// Spawn one tile the way `GameState.spawnRandomTile` does, through the tape. Record mode draws
+    /// exactly the two rng values the plain path draws (cell, then value, in that order) and stores
+    /// them, so a game played with a recording tape is byte for byte the game `playValue` plays.
+    /// Replay mode places the recorded tile instead and draws nothing. Returns false when the board
+    /// is full, like `spawnRandomTile`.
+    fn spawn(self: *Tape, state: *GameState, rng: std.Random) bool {
+        switch (self.mode) {
+            .record => {
+                var empties: [core.BoardCellCount]core.Position = undefined;
+                var empty_count: usize = 0;
+                for (0..core.BoardSize) |row| for (0..core.BoardSize) |col| {
+                    if (state.board[row][col] == 0) {
+                        empties[empty_count] = .{ .row = row, .col = col };
+                        empty_count += 1;
+                    }
+                };
+                if (empty_count == 0) return false;
+                const pos = empties[rng.uintLessThan(usize, empty_count)];
+                const value: core.Tile = if (rng.uintLessThan(u8, 10) == 0) 4 else 2;
+                // a full buffer only stops the recording; the game keeps consuming the same rng draws
+                if (self.len < self.spawns.len) {
+                    self.spawns[self.len] = Spawn.at(pos, value);
+                    self.len += 1;
+                }
+                state.board[pos.row][pos.col] = value;
+                return true;
+            },
+            .replay => {
+                // ran out of tape (the replayed game is longer than the recorded one): draw as usual
+                // so the game still ends legally; the pair was on the same stream up to here
+                if (self.cursor >= self.len) return state.spawnRandomTile(rng);
+                const spawn = self.spawns[self.cursor];
+                self.cursor += 1;
+                const value = spawn.tile();
+                var pos = spawn.position();
+                // the two policies diverged, so the recorded cell can already be taken: keep the
+                // recorded value and take the first empty cell instead
+                if (state.board[pos.row][pos.col] != 0) {
+                    pos = outer: for (0..core.BoardSize) |row| {
+                        for (0..core.BoardSize) |col| {
+                            if (state.board[row][col] == 0) break :outer .{ .row = row, .col = col };
+                        }
+                    } else return false;
+                }
+                state.board[pos.row][pos.col] = value;
+                return true;
+            },
+        }
+    }
+};
+
+/// `playValue` with a spawn tape (#168). Record mode observes the game `playValue` plays with the same
+/// rng; replay mode takes the spawns from the tape, so two policies can be compared on one sequence.
+pub fn playTapedValue(vfn: Value, rng: std.Random, mode: Mode, tape: *Tape) PlayResult {
+    var stats: Stats = .{};
+    return playTapedWithStatsValue(vfn, rng, mode, tape, &stats);
+}
+
+/// `playTapedValue` plus search counters. The tape owns the spawns of the whole game, the two start
+/// tiles included, and `GameState.move` is spelled out (slide, then a taped spawn) so that record
+/// mode consumes the rng in exactly the order `move` does.
+pub fn playTapedWithStatsValue(vfn: Value, rng: std.Random, mode: Mode, tape: *Tape, stats: *Stats) PlayResult {
+    var state = GameState.initEmpty();
+    _ = tape.spawn(&state, rng);
+    _ = tape.spawn(&state, rng);
+    var moves: u32 = 0;
+    var move_stats: Stats = .{};
+    var cache: ValueCache = .{};
+    while (true) {
+        move_stats = .{};
+        const dir = bestMoveWithCacheValue(vfn, state, mode, &move_stats, &cache) orelse break;
+        stats.leaves += move_stats.leaves;
+        stats.hits += move_stats.hits;
+        const result = state.slide(dir);
+        if (result.changed) _ = tape.spawn(&state, rng);
+        moves += 1;
+    }
+    return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves, .leaves = stats.leaves, .board = state.board };
+}
+
+/// Paired comparison of two policies on the same spawn tape (#168): `diffs[i]` is `score_b - score_a`
+/// of game `i`, summarized as mean ± standard error over the games themselves (not over seed ranges,
+/// which would make a single range's stderr 0 and hide the pairing).
+pub const PairSummary = struct {
+    games: usize = 0,
+    mean: f64 = 0,
+    stderr: f64 = 0,
+    /// Games where B scored above A, and games where it scored below A (ties in neither).
+    better: usize = 0,
+    worse: usize = 0,
+};
+
+/// Aggregate the per-game score differences of a paired run; the mean is the paired effect and the
+/// standard error is its uncertainty (the paired design shrinks it, which is the point of #168).
+pub fn pairStats(diffs: []const f64) PairSummary {
+    var out: PairSummary = .{ .games = diffs.len };
+    if (diffs.len == 0) return out;
+    const st = meanStderr(diffs);
+    out.mean = st.mean;
+    out.stderr = st.stderr;
+    for (diffs) |d| {
+        if (d > 0) out.better += 1 else if (d < 0) out.worse += 1;
+    }
+    return out;
 }
 
 /// Buckets for the training diagnostic (issue #32): empty cells 0..3, 4..7, 8+; moves left 0..9, 10..29, 30+.
@@ -3284,3 +3437,72 @@ test "bestMove and play accept the staged value" {
     try std.testing.expect(result.moves > 0);
 }
 
+
+/// One recorded game's tape, at the size a 2048 game needs (`Spawn` is 1 byte).
+const tape_capacity = 8192;
+
+test "spawn tape records and replays the same game" {
+    var prng = std.Random.DefaultPrng.init(37);
+    const net = Net.init(prng.random());
+    const value: Value = .{ .single = &net };
+
+    // recording does not change the game: same score, moves and final board as `playValue`
+    var buf: [tape_capacity]Spawn = undefined;
+    var rec_rng = std.Random.DefaultPrng.init(1234);
+    var tape = Tape.initRecord(&buf);
+    const recorded = playTapedValue(value, rec_rng.random(), .greedy, &tape);
+    var plain_rng = std.Random.DefaultPrng.init(1234);
+    const plain = playValue(value, plain_rng.random(), .greedy);
+    try std.testing.expectEqual(plain, recorded);
+    // one spawn per move plus the two start tiles (one less when the board fills on the last move)
+    try std.testing.expect(tape.len <= plain.moves + 2 and tape.len >= plain.moves + 1);
+
+    // and a replay from a *different* rng seed is the same game: the tape, not the rng, drives the spawns
+    var replay_rng = std.Random.DefaultPrng.init(99);
+    var replay_tape = Tape.initReplay(buf[0..tape.len]);
+    const replayed = playTapedValue(value, replay_rng.random(), .greedy, &replay_tape);
+    try std.testing.expectEqual(recorded.score, replayed.score);
+    try std.testing.expectEqual(recorded.moves, replayed.moves);
+    try std.testing.expectEqual(recorded.board, replayed.board);
+    try std.testing.expectEqual(tape.len, replay_tape.cursor);
+}
+
+test "spawn tape with no room at all still plays the plain game" {
+    var prng = std.Random.DefaultPrng.init(41);
+    const net = Net.init(prng.random());
+    const value: Value = .{ .single = &net };
+
+    // a zero-length record tape observes nothing, so the game must be the one `playValue` plays
+    var empty: [0]Spawn = .{};
+    var tape = Tape.initRecord(&empty);
+    var rng = std.Random.DefaultPrng.init(77);
+    const taped = playTapedValue(value, rng.random(), .greedy, &tape);
+    var plain_rng = std.Random.DefaultPrng.init(77);
+    const plain = playValue(value, plain_rng.random(), .greedy);
+    try std.testing.expectEqual(plain, taped);
+    try std.testing.expectEqual(@as(usize, 0), tape.len);
+}
+
+test "pairStats gives the paired mean and standard error over games" {
+    const diffs = [_]f64{ 100, 200, 300 };
+    const r = pairStats(&diffs);
+    try std.testing.expectEqual(@as(usize, 3), r.games);
+    try std.testing.expectApproxEqAbs(@as(f64, 200), r.mean, 1e-12);
+    // sample variance 10,000 over 3 games: stderr = sqrt(10,000 / 3)
+    try std.testing.expectApproxEqAbs(@sqrt(10000.0 / 3.0), r.stderr, 1e-12);
+    try std.testing.expectEqual(@as(usize, 3), r.better);
+    try std.testing.expectEqual(@as(usize, 0), r.worse);
+
+    // signs: B wins on one game, loses on two, ties on one and does not count it
+    const signed = [_]f64{ -5000, 2500, -1000, 0 };
+    const s = pairStats(&signed);
+    try std.testing.expectApproxEqAbs(@as(f64, -875), s.mean, 1e-12);
+    try std.testing.expectEqual(@as(usize, 1), s.better);
+    try std.testing.expectEqual(@as(usize, 2), s.worse);
+
+    // an empty run has no statistics and must not divide by zero
+    const none = pairStats(&.{});
+    try std.testing.expectEqual(@as(usize, 0), none.games);
+    try std.testing.expectEqual(@as(f64, 0), none.mean);
+    try std.testing.expectEqual(@as(f64, 0), none.stderr);
+}
