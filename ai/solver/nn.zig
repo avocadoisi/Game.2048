@@ -2,6 +2,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const core = @import("core");
 const parallel = @import("parallel");
+/// Hidden layer widths (#205). Compile-time because the net is an `extern struct` whose layout is the
+/// weights file; `zig build nn -Dh1=… -Dh2=…` gives a capacity sweep without three edited copies.
+const width = @import("nn_width");
 
 const Board = core.Board;
 const Direction = core.Direction;
@@ -10,8 +13,8 @@ const GameState = core.GameState;
 /// Cell encoding: log2 tile level (0 = empty), one-hot per cell. Tiles >= 2^15 share the top level.
 pub const levels = 16;
 pub const input_count = core.BoardCellCount * levels;
-pub const h1_size = 64;
-pub const h2_size = 32;
+pub const h1_size: u32 = width.h1;
+pub const h2_size: u32 = width.h2;
 /// Score deltas are divided by this before they enter the value target, so values stay near unit scale.
 pub const reward_scale: f64 = 1000;
 

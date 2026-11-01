@@ -10,6 +10,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Width of the value MLP (#205): the hidden layers are compile-time sized, so a capacity sweep is a
+    // build option instead of three edited copies (`zig build nn -Dh1=32 -Dh2=16`).
+    const width_opts = b.addOptions();
+    width_opts.addOption(u32, "h1", b.option(u32, "h1", "hidden layer 1 width (default 64)") orelse 64);
+    width_opts.addOption(u32, "h2", b.option(u32, "h2", "hidden layer 2 width (default 32)") orelse 32);
+
     const parallel_mod = b.addModule("parallel", .{
         .root_source_file = b.path("ai/solver/parallel.zig"),
         .target = target,
@@ -23,6 +29,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core", .module = core_mod },
             .{ .name = "parallel", .module = parallel_mod },
+            .{ .name = "nn_width", .module = width_opts.createModule() },
         },
     });
 
@@ -351,6 +358,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core", .module = wasm_core_mod },
             .{ .name = "parallel", .module = wasm_parallel_mod },
+            .{ .name = "nn_width", .module = width_opts.createModule() },
         },
     });
     const wasm_ntuple_mod = b.addModule("ntuple-wasm", .{
