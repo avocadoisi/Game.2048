@@ -130,6 +130,9 @@ fn startStaged(staged: *nn.Staged, io: std.Io, gpa: std.mem.Allocator, train_gam
 
 const Eval = struct {
     name: []const u8,
+    /// Which entry of the `playGame` switch this row runs. Set from the row table below so a
+    /// measurement run can pick a subset (see `selectedRows`) instead of paying for all nine.
+    policy: usize = 0,
     range_scores: []f64 = &.{},
     avg_moves: f64 = 0,
     best_tile: core.Tile = 0,
@@ -366,20 +369,33 @@ pub fn main(init: std.process.Init) !void {
         if (is_mstd) try staged.saveFile(init.io, init.gpa, weights_path) else try nn.save(&net, init.io, weights_path);
     }
 
-    var results = [_]Eval{
-        .{ .name = "nn 1-ply" },
-        .{ .name = "nn + 1 spawn lookahead" },
-        .{ .name = "nn 2-ply (deep)" },
-        .{ .name = "expectimax depth 2" },
-        .{ .name = "nn 3-ply (deep3, #108)" },
-        .{ .name = "nn phase h1 (#157)" },
-        .{ .name = "nn phase h2 (#157)" },
-        .{ .name = "nn phase h3 (#157)" },
-        .{ .name = "nn phase h4 (#171)" },
+    // Every row the binary knows about. A measurement run edits `row_selection` down to the rows it
+    // needs (e.g. policy 0 and 2) instead of paying for the 3-ply rows twice over.
+    const all_rows = [_]struct { name: []const u8, policy: usize }{
+        .{ .name = "nn 1-ply", .policy = 0 },
+        .{ .name = "nn + 1 spawn lookahead", .policy = 1 },
+        .{ .name = "nn 2-ply (deep)", .policy = 2 },
+        .{ .name = "expectimax depth 2", .policy = 3 },
+        .{ .name = "nn 3-ply (deep3, #108)", .policy = 4 },
+        .{ .name = "nn phase h1 (#157)", .policy = 5 },
+        .{ .name = "nn phase h2 (#157)", .policy = 6 },
+        .{ .name = "nn phase h3 (#157)", .policy = 7 },
+        .{ .name = "nn phase h4 (#171)", .policy = 8 },
         // #182: the same 2-ply tree as `nn 2-ply (deep)`, minus each chance node's lowest-probability
         // spawn branches up to 5% of its mass. Last row because `playGame` indexes by position.
-        .{ .name = "nn 2-ply + mass cutoff (#182)" },
+        .{ .name = "nn 2-ply + mass cutoff (#182)", .policy = 9 },
     };
+    // Rows are all on by default; a measurement run edits this line down to the two it needs
+    // (0 = 1-ply, 2 = 2-ply) instead of paying for the 3-ply rows twice over.
+    var row_selection: [all_rows.len]bool = @splat(true);
+    var results_buf: [all_rows.len]Eval = undefined;
+    var result_count: usize = 0;
+    for (all_rows, 0..) |row, k| {
+        if (!row_selection[k]) continue;
+        results_buf[result_count] = .{ .name = row.name, .policy = row.policy };
+        result_count += 1;
+    }
+    const results = results_buf[0..result_count];
     const games = eval_games * seed_ranges;
     // `mstd` evaluates through the staged value, everything else through the single net (#107)
     const eval_value: nn.Value = if (is_mstd) .{ .staged = &staged } else .{ .single = &net };
@@ -427,16 +443,17 @@ pub fn main(init: std.process.Init) !void {
                 6 => nn.playValue(c.vfn, prng.random(), .phase_h2),
                 7 => nn.playValue(c.vfn, prng.random(), .phase_h3),
                 8 => nn.playValue(c.vfn, prng.random(), .phase_h4),
-                // #182: the rows are indexed by position, so the new mass-cutoff row goes last
-                else => nn.playValue(c.vfn, prng.random(), .deep_mass),
+                // #182: the same 2-ply tree with the low-probability chance branches cut
+                9 => nn.playValue(c.vfn, prng.random(), .deep_mass),
+                else => unreachable,
             };
         }
     }.f;
-    for (&results, 0..) |*r, idx| {
+    for (results) |*r| {
         r.range_scores = try init.arena.allocator().alloc(f64, seed_ranges);
         const res_all = try init.arena.allocator().alloc(nn.PlayResult, games);
         const start = std.Io.Clock.awake.now(init.io);
-        parallel.map(nn.PlayResult, res_all, EvalCtx{ .vfn = eval_value, .policy = idx, .eval_seed = eval_seed }, playGame);
+        parallel.map(nn.PlayResult, res_all, EvalCtx{ .vfn = eval_value, .policy = r.policy, .eval_seed = eval_seed }, playGame);
         var total_moves: u64 = 0;
         for (0..seed_ranges) |range| {
             var total_score: u64 = 0;
