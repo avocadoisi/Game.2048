@@ -86,9 +86,12 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
+    // Run steps depend on their own executable only. Depending on `b.getInstallStep()` made
+    // `zig build nn -- 2000 ...` recompile every other artifact first (game-2048, solve, ranking,
+    // ...) because the install step pulls all of them; a one-minute training run paid a full
+    // ReleaseFast rebuild of the whole set. `zig build` (the default step) still installs everything.
     // forwards `zig build run -- <args>` to the app (replaces removed `b.args`)
     run_cmd.addPassthruArgs();
-    run_cmd.step.dependOn(b.getInstallStep());
 
     const run_step = b.step("run", "Run the CLI app");
     run_step.dependOn(&run_cmd.step);
@@ -135,7 +138,6 @@ pub fn build(b: *std.Build) void {
     });
     const solve_cmd = b.addRunArtifact(solve_exe);
     solve_cmd.addPassthruArgs();
-    solve_cmd.step.dependOn(b.getInstallStep());
 
     const solve_step = b.step("solve", "Run the solver and report game statistics");
     solve_step.dependOn(&solve_cmd.step);
@@ -154,7 +156,6 @@ pub fn build(b: *std.Build) void {
     });
     const ranking_cmd = b.addRunArtifact(ranking_exe);
     ranking_cmd.addPassthruArgs();
-    ranking_cmd.step.dependOn(b.getInstallStep());
 
     const ranking_tests = b.addTest(.{ .filters = test_filters,
         .root_module = ranking_exe.root_module,
@@ -180,7 +181,6 @@ pub fn build(b: *std.Build) void {
     });
     const evalab_cmd = b.addRunArtifact(evalab_exe);
     evalab_cmd.addPassthruArgs();
-    evalab_cmd.step.dependOn(b.getInstallStep());
 
     const evalab_tests = b.addTest(.{ .filters = test_filters, .root_module = evalab_exe.root_module });
     const run_evalab_tests = b.addRunArtifact(evalab_tests);
@@ -204,7 +204,6 @@ pub fn build(b: *std.Build) void {
     });
     const probe_cmd = b.addRunArtifact(probe_exe);
     probe_cmd.addPassthruArgs();
-    probe_cmd.step.dependOn(b.getInstallStep());
 
     const probe_tests = b.addTest(.{ .filters = test_filters, .root_module = probe_exe.root_module });
     const run_probe_tests = b.addRunArtifact(probe_tests);
@@ -231,7 +230,6 @@ pub fn build(b: *std.Build) void {
     });
     const nn_cmd = b.addRunArtifact(nn_exe);
     nn_cmd.addPassthruArgs();
-    nn_cmd.step.dependOn(b.getInstallStep());
 
     const nn_main_tests = b.addTest(.{ .filters = test_filters, .root_module = nn_exe.root_module });
     const run_nn_main_tests = b.addRunArtifact(nn_main_tests);
@@ -276,7 +274,6 @@ pub fn build(b: *std.Build) void {
     });
     const ntuple_cmd = b.addRunArtifact(ntuple_exe);
     ntuple_cmd.addPassthruArgs();
-    ntuple_cmd.step.dependOn(b.getInstallStep());
 
     const ntuple_main_tests = b.addTest(.{ .filters = test_filters, .root_module = ntuple_exe.root_module });
     const run_ntuple_main_tests = b.addRunArtifact(ntuple_main_tests);
@@ -298,7 +295,6 @@ pub fn build(b: *std.Build) void {
     });
     const ga_cmd = b.addRunArtifact(ga_exe);
     ga_cmd.addPassthruArgs();
-    ga_cmd.step.dependOn(b.getInstallStep());
 
     const ga_step = b.step("ga-rl", "Evolve evaluation weights with a GA and compare on holdout seeds");
     ga_step.dependOn(&ga_cmd.step);
@@ -322,7 +318,6 @@ pub fn build(b: *std.Build) void {
     });
     const tune_cmd = b.addRunArtifact(tune_exe);
     tune_cmd.addPassthruArgs();
-    tune_cmd.step.dependOn(b.getInstallStep());
 
     const tune_tests = b.addTest(.{ .filters = test_filters, .root_module = tune_exe.root_module });
     const run_tune_tests = b.addRunArtifact(tune_tests);

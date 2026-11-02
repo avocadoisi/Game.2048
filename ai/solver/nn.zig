@@ -2106,16 +2106,25 @@ const BatchGameCtx = struct { net: Net, seed: u64, first_game: usize, lr: f64, w
 const BatchGame = struct {
     net: Net,
     score: u32,
+    moves: u32,
     diag: Diag = .{},
 };
 
 fn runBatchGame(ctx: BatchGameCtx, i: usize) BatchGame {
     const game = ctx.first_game + i;
-    var result: BatchGame = .{ .net = ctx.net, .score = 0 };
+    var result: BatchGame = .{ .net = ctx.net, .score = 0, .moves = 0 };
     var rng = std.Random.DefaultPrng.init(trainingSeed(ctx.seed, game));
-    result.score = trainGameOpts(&result.net, rng.random(), ctx.lr, if (ctx.want_diag) &result.diag else null, ctx.opts).score;
+    const trained = trainGameOpts(&result.net, rng.random(), ctx.lr, if (ctx.want_diag) &result.diag else null, ctx.opts);
+    result.score = trained.score;
+    result.moves = trained.moves;
     return result;
 }
+
+/// What a batch reports back to the CLI: the score of the last game (the historical return of
+/// `trainBatch`/`trainBatchOpts`) plus the moves the whole batch played. The moves are what the serial
+/// loop adds to `total_moves`; without them the `par` path printed `0 moves` (#208), which read as
+/// "par trains nothing".
+pub const BatchOutcome = struct { score: u32, moves: u64 };
 
 fn mergeDiag(dst: *Diag, src: *const Diag) void {
     for (0..3) |e| for (0..3) |k| {
@@ -2132,13 +2141,13 @@ fn mergeDiag(dst: *Diag, src: *const Diag) void {
 /// Runs `games` (<= max_threads) self-play games in parallel from the same starting net, then sets
 /// `net` to net_start + (1/games) * sum_i (net_after_i - net_start), summed in game order.
 /// Each game i uses `trainingSeed(seed, first_game + i)`, so the result is the same for any thread count.
-pub fn trainBatch(net: *Net, seed: u64, first_game: usize, games: usize, lr: f64, diag: ?*Diag) u32 {
+pub fn trainBatch(net: *Net, seed: u64, first_game: usize, games: usize, lr: f64, diag: ?*Diag) BatchOutcome {
     return trainBatchOpts(net, seed, first_game, games, lr, diag, .{});
 }
 
 /// `trainBatch` with options: every game trains with `trainGameOpts(.., opts)`, so any stateless
 /// variant (`backward`, `replay`, `sym`, `symlam`, `nstep`) batches the same way `base` does.
-pub fn trainBatchOpts(net: *Net, seed: u64, first_game: usize, games: usize, lr: f64, diag: ?*Diag, opts: Options) u32 {
+pub fn trainBatchOpts(net: *Net, seed: u64, first_game: usize, games: usize, lr: f64, diag: ?*Diag, opts: Options) BatchOutcome {
     std.debug.assert(games >= 1 and games <= parallel.max_threads);
     // the priority buffer is cross-game state shared by pointer: batching it would be a data race
     std.debug.assert(opts.priority == null);
@@ -2164,7 +2173,9 @@ pub fn trainBatchOpts(net: *Net, seed: u64, first_game: usize, games: usize, lr:
     const scale = opts.batch_scale / n;
     for (out_w, start_w) |*o, s| o.* = s + o.* * scale;
     if (diag) |d| for (units[0..games]) |u| mergeDiag(d, &u.diag);
-    return units[games - 1].score;
+    var moves: u64 = 0;
+    for (units[0..games]) |u| moves += u.moves;
+    return .{ .score = units[games - 1].score, .moves = moves };
 }
 
 /// Weight file: 8-byte magic, u32 version, u32 endianness marker (all little-endian), then the f64 weights as little-endian.
@@ -4103,8 +4114,16 @@ test "parallel training batch matches a serial run of the same game seeds" {
     for (flat(&serial), start, sums) |*w, s, sum| w.* = s + sum / games;
 
     var par = base;
-    _ = trainBatch(&par, 77, 0, games, 0.001, null);
+    const par_out = trainBatch(&par, 77, 0, games, 0.001, null);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&serial), std.mem.asBytes(&par));
+    // #208: the batch reports the moves it played, so the `par` CLI line never prints `0 moves`.
+    var serial_moves: u64 = 0;
+    for (0..games) |i| {
+        var rng = std.Random.DefaultPrng.init(77 + i);
+        var u = base;
+        serial_moves += trainGameOpts(&u, rng.random(), 0.001, null, .{}).moves;
+    }
+    try std.testing.expectEqual(serial_moves, par_out.moves);
 }
 
 test "batch_scale multiplies the merged delta so a batch does the work of its games (#137)" {
