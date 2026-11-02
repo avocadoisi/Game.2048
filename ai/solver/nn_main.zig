@@ -68,8 +68,9 @@ const usage =
     \\  weights_path  file to load (train_games 0) or write (default ai/solver/nn_weights.bin); use a temp path for variant runs
     \\  train_seed    seed for weight init and self-play games (default 1, omitted = same weights as before #56)
     \\  dump_path     file for the deep-position buffer (#159); required by dump|ft2|restart, after a "-" par slot
-    \\  batch_scale   (#137) multiplier on the merged batch delta for `par` runs (default 1 = mean;
-    \\                `8` = linear scaling rule, `2.8284` = sqrt). Sits after the "-" par dump slot
+    \\  batch_scale   (#137) multiplier on the merged batch delta for `par` runs (default = the batch
+    \\                size, i.e. the #208 linear scaling rule; `-` = 1 = the old mean, `8` = linear,
+    \\                `2.8284` = sqrt). Sits after the "-" par dump slot
     \\
     \\Weights are written to `weights_path` only when train_games > 0;
     \\train_games = 0 (eval only) never writes.
@@ -92,9 +93,11 @@ const default_train_seed: u64 = 1;
 /// parallel batches (issue #99). "-" is the explicit "no par" placeholder that opens the dump slots
 /// of #159; any other value is a typo.
 /// (#137) Batch delta multiplier for `par` runs, arg 12 (after the `par` slot and its `-` dump slot).
-/// Omitted = 1.0, which is the historical "mean of the per-game deltas" step.
+/// Omitted = the batch size (the #208 linear scaling rule): a batch of `games` game-deltas gets the
+/// `games` steps a serial run would have spent on them, which is what makes `par` train like serial.
+/// `-` keeps the historical 1.0 ("mean of the per-game deltas"), the config that under-trains by 1/games.
 fn parseBatchScale(args: []const []const u8) !f64 {
-    if (args.len <= 12) return 1.0;
+    if (args.len <= 12) return @floatFromInt(nn.trainBatchSize());
     if (std.mem.eql(u8, args[12], "-")) return 1.0;
     return std.fmt.parseFloat(f64, args[12]) catch error.InvalidBatchScale;
 }
@@ -358,7 +361,7 @@ pub fn main(init: std.process.Init) !void {
     // `dump` is the shared layout plus one slot: index 11 carries the dump path.
     // `par` runs may carry the #137 batch_scale at index 12, after the `-` dump slot.
     const max_args: usize = if (is_dist or is_dson) 14 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw) 12 else 11;
-    if (args.len > max_args or eval_games == 0 or seed_ranges == 0 or (uses_dump and dump_path == null)) {
+    if (args.len > max_args or seed_ranges == 0 or (uses_dump and dump_path == null)) {
         std.debug.print("{s}", .{usage});
         return;
     }
@@ -427,7 +430,9 @@ pub fn main(init: std.process.Init) !void {
             while (g < train_games) : (g += @min(batch_size, train_games - g)) {
                 const games = @min(batch_size, train_games - g);
                 const frac = @as(f64, @floatFromInt(g)) / @as(f64, @floatFromInt(train_games));
-                last_score = nn.trainBatchOpts(&net, train_seed, g, games, learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null, opts);
+                const batch = nn.trainBatchOpts(&net, train_seed, g, games, learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null, opts);
+                last_score = batch.score;
+                total_moves += batch.moves;
                 if ((g + games) % 5000 == 0) {
                     std.debug.print("train {d}/{d} last game score {d}\n", .{ g + games, train_games, last_score });
                     try nn.save(&net, init.io, weights_path); // checkpoint
@@ -465,6 +470,10 @@ pub fn main(init: std.process.Init) !void {
         }
         if (is_mstd) try staged.saveFile(init.io, init.gpa, weights_path) else try nn.save(&net, init.io, weights_path);
     }
+
+    // `eval_games = 0` is "train only": the table below plays every row on every eval game, and one
+    // `deep3`/iterative-deepening row can cost minutes, so a short training run must be able to skip it.
+    if (eval_games == 0) return;
 
     // Every row the binary knows about. A measurement run edits `row_selection` down to the rows it
     // needs (e.g. policy 0 and 2) instead of paying for the 3-ply rows twice over.
@@ -710,6 +719,17 @@ test "par flag is off without arg 10 and on with the literal par" {
     // "-" is the explicit "no par" placeholder that #159 uses to reach the dump path
     const dash = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "dump", "30", "x.bin", "3", "-", "x.dmp" };
     try std.testing.expect(!try parseParFlag(&dash));
+}
+
+test "omitted batch_scale is the linear scaling rule, '-' is the old mean (#208)" {
+    const omitted = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "base", "30", "x.bin", "3", "par", "-" };
+    try std.testing.expectEqual(@as(f64, @floatFromInt(nn.trainBatchSize())), try parseBatchScale(&omitted));
+    const dash = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "base", "30", "x.bin", "3", "par", "-", "-" };
+    try std.testing.expectEqual(@as(f64, 1), try parseBatchScale(&dash));
+    const explicit = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "base", "30", "x.bin", "3", "par", "-", "2.8284" };
+    try std.testing.expectEqual(@as(f64, 2.8284), try parseBatchScale(&explicit));
+    const typo = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "base", "30", "x.bin", "3", "par", "-", "two" };
+    try std.testing.expectError(error.InvalidBatchScale, parseBatchScale(&typo));
 }
 
 test "usage text documents the par flag for stateless variants" {
