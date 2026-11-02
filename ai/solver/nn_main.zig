@@ -68,9 +68,11 @@ const usage =
     \\  weights_path  file to load (train_games 0) or write (default ai/solver/nn_weights.bin); use a temp path for variant runs
     \\  train_seed    seed for weight init and self-play games (default 1, omitted = same weights as before #56)
     \\  dump_path     file for the deep-position buffer (#159); required by dump|ft2|restart, after a "-" par slot
-    \\  batch_scale   (#137) multiplier on the merged batch delta for `par` runs (default = the batch
-    \\                size, i.e. the #208 linear scaling rule; `-` = 1 = the old mean, `8` = linear,
-    \\                `2.8284` = sqrt). Sits after the "-" par dump slot
+    \\  batch_scale   (#137) multiplier on the merged batch delta for `par` runs (default = sqrt of the
+    \\                batch size, #203; `-` = 1 = the old mean, `8` = the #208 linear rule). Sits after
+    \\                the "-" par dump slot
+    \\  rows          (#203) eval-table rows to run, comma list after batch_scale (`-` = all), e.g.
+    \\                "0,2" for 1-ply and 2-ply only; the 3-ply rows dominate a measurement run
     \\
     \\Weights are written to `weights_path` only when train_games > 0;
     \\train_games = 0 (eval only) never writes.
@@ -89,15 +91,34 @@ const default_seed_ranges: u32 = 1;
 /// Appended after `weights_path` so existing command lines keep their meaning.
 const default_train_seed: u64 = 1;
 
+/// (#203) Fill `sel` from the `rows` argument: comma-separated indices, any bad token or an index
+/// past the table is an error, so a typo never silently runs the full 15-row table.
+fn parseRows(sel: []bool, spec: []const u8) !void {
+    @memset(sel, false);
+    var it = std.mem.splitScalar(u8, spec, ',');
+    while (it.next()) |tok| {
+        const idx = std.fmt.parseInt(usize, std.mem.trim(u8, tok, " "), 10) catch return error.InvalidRow;
+        if (idx >= sel.len) return error.InvalidRow;
+        sel[idx] = true;
+    }
+}
+
+/// Default `par` step multiplier (#203): sqrt of the batch size. The linear rule (= the batch size)
+/// matches serial over 20k games but oversteps on a 100k run at lr 0.003 (three seeds land 26k-68k
+/// behind the shipped net in the paired test), while sqrt stays at the shipped net's level.
+fn defaultBatchScale() f64 {
+    return @sqrt(@as(f64, @floatFromInt(nn.trainBatchSize())));
+}
+
 /// Positional arg 10, appended after `train_seed`: the literal "par" runs the variant of arg 6 in
 /// parallel batches (issue #99). "-" is the explicit "no par" placeholder that opens the dump slots
 /// of #159; any other value is a typo.
-/// (#137) Batch delta multiplier for `par` runs, arg 12 (after the `par` slot and its `-` dump slot).
-/// Omitted = the batch size (the #208 linear scaling rule): a batch of `games` game-deltas gets the
-/// `games` steps a serial run would have spent on them, which is what makes `par` train like serial.
-/// `-` keeps the historical 1.0 ("mean of the per-game deltas"), the config that under-trains by 1/games.
+///
+/// (#137) Batch delta multiplier for `par` runs, arg 12 (after the `par` slot and its `-` dump slot):
+/// omitted = `defaultBatchScale()`, `-` = the historical 1.0 ("mean of the per-game deltas", which
+/// under-trains by 1/games), a number = that multiplier (`8` = the #208 linear rule).
 fn parseBatchScale(args: []const []const u8) !f64 {
-    if (args.len <= 12) return @floatFromInt(nn.trainBatchSize());
+    if (args.len <= 12) return defaultBatchScale();
     if (std.mem.eql(u8, args[12], "-")) return 1.0;
     return std.fmt.parseFloat(f64, args[12]) catch error.InvalidBatchScale;
 }
@@ -360,7 +381,10 @@ pub fn main(init: std.process.Init) !void {
     };
     // `dump` is the shared layout plus one slot: index 11 carries the dump path.
     // `par` runs may carry the #137 batch_scale at index 12, after the `-` dump slot.
-    const max_args: usize = if (is_dist or is_dson) 14 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw) 12 else 11;
+    // (#203) index 13 narrows the eval table to the rows a measurement needs (`0,2`); `dist`/`dson`
+    // already own 13 as the teacher lr divisor, and `pairw` returns before the table is built.
+    const row_spec: ?[]const u8 = if (is_dist or is_dson or is_pairw or is_pair) null else if (args.len > 13) args[13] else null;
+    const max_args: usize = if (is_dist or is_dson) 14 else if (row_spec != null) 14 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw) 12 else 11;
     if (args.len > max_args or seed_ranges == 0 or (uses_dump and dump_path == null)) {
         std.debug.print("{s}", .{usage});
         return;
@@ -506,9 +530,17 @@ pub fn main(init: std.process.Init) !void {
         // ends the deepening after the first iteration, so only near-tie positions pay for a deeper tree.
         .{ .name = "nn deepening on near ties (#188)", .policy = 14 },
     };
-    // Rows are all on by default; a measurement run edits this line down to the two it needs
-    // (0 = 1-ply, 2 = 2-ply) instead of paying for the 3-ply rows twice over.
-    const row_selection: [all_rows.len]bool = @splat(true);
+    // Rows are all on by default; `rows` (arg 13, #203) keeps the two a measurement needs
+    // (0 = 1-ply, 2 = 2-ply) instead of paying for the 3-ply rows twice over. A stray token is a
+    // command-line error, never a silent fallback to the 15-row table.
+    var row_selection: [all_rows.len]bool = @splat(true);
+    if (row_spec) |spec| {
+        if (!std.mem.eql(u8, spec, "-"))
+            parseRows(&row_selection, spec) catch {
+                std.debug.print("error: rows must be a comma list of row indices (e.g. 0,2)\n{s}", .{usage});
+                return;
+            };
+    }
     var results_buf: [all_rows.len]Eval = undefined;
     var result_count: usize = 0;
     for (all_rows, 0..) |row, k| {
@@ -721,15 +753,25 @@ test "par flag is off without arg 10 and on with the literal par" {
     try std.testing.expect(!try parseParFlag(&dash));
 }
 
-test "omitted batch_scale is the linear scaling rule, '-' is the old mean (#208)" {
+test "omitted batch_scale is the sqrt rule, '-' is the old mean (#203)" {
     const omitted = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "base", "30", "x.bin", "3", "par", "-" };
-    try std.testing.expectEqual(@as(f64, @floatFromInt(nn.trainBatchSize())), try parseBatchScale(&omitted));
+    try std.testing.expectEqual(defaultBatchScale(), try parseBatchScale(&omitted));
+    try std.testing.expectEqual(@as(f64, 2.8284271247461903), defaultBatchScale());
     const dash = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "base", "30", "x.bin", "3", "par", "-", "-" };
     try std.testing.expectEqual(@as(f64, 1), try parseBatchScale(&dash));
     const explicit = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "base", "30", "x.bin", "3", "par", "-", "2.8284" };
     try std.testing.expectEqual(@as(f64, 2.8284), try parseBatchScale(&explicit));
     const typo = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "base", "30", "x.bin", "3", "par", "-", "two" };
     try std.testing.expectError(error.InvalidBatchScale, parseBatchScale(&typo));
+}
+
+test "rows argument keeps the listed eval rows and rejects junk (#203)" {
+    var sel: [15]bool = @splat(true);
+    try parseRows(&sel, "0, 2");
+    try std.testing.expect(sel[0] and sel[2]);
+    try std.testing.expect(!sel[1] and !sel[3] and !sel[14]);
+    try std.testing.expectError(error.InvalidRow, parseRows(&sel, "0,2,x"));
+    try std.testing.expectError(error.InvalidRow, parseRows(&sel, "15"));
 }
 
 test "usage text documents the par flag for stateless variants" {
