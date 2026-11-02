@@ -45,7 +45,8 @@ Writing code is parallelisable. Measuring is not.
 through `nn.trainBatchOpts`: 20,000 games from `base` (lr 0.003, seed 1) take 112 s serial and 32 s
 with `par` (3.6x): `zig build nn -Doptimize=ReleaseFast -- 5000 20 9000 0.0003 1 resume 30 /tmp/w.bin 1 par`.
 A batch averages the 8 per-game deltas into one step, so `batch_scale` (arg 12) decides the step size:
-the default is now the batch size (linear scaling rule, #208); `-` keeps the old mean (= 1/8 the
+the default is sqrt of the batch size (2.8284, #203); `8` is the linear scaling rule (fine up to 20k
+games, oversteps and loses ~26k-68k on a 100k run at lr 0.003); `-` keeps the old mean (= 1/8 the
 updates). Same-seed nets are NOT equal — compare nets on shared spawns with `pairw`, never by hash.
 `par` is refused for `mstd`, the #158 2-ply variants, `dist`/`dson`, `dump`/`ft2`/`restart` and the
 priority buffer; `replay_k` does work under `par` (each game owns its buffer).
