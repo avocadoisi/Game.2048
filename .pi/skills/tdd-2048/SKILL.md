@@ -56,6 +56,11 @@ shipped net (5,000 games at lr 3e-5: 73,100 without replay vs 93,318 with `repla
 79,657 on 20 games) — never fine-tune without it. `eval_games = 0` means "train only" and skips the
 15-row eval table (which can cost 20+ min on its own).
 
+**Games past 100k do not beat the shipped net (#204).** lr schedules (0.003 → 0.001 at 100k, halving
+every 50k to 300k, /4 twice to 400k) all land 9k-13k *behind* it in the 20-game paired test, flat from
+200k to 400k — no collapse, but no gain either. The shipped net is a ~100k-scale net; pushing further
+needs a better teacher (#207), not more games.
+
 **How a candidate net is judged (#207 / L1).** Read `docs/measurement.md` first. In one line: adopt only
 when `pairw` vs the shipped net (20 games, seed 9000) gives `mean diff - 2*stderr > 0` (≈ +15,000
 points), the non-paired 2-ply table on seeds 9000 and 9100 does not regress, and `ms/move` is unchanged.
