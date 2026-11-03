@@ -36,6 +36,8 @@ const usage =
     \\              dumpp2  (#175: `dump` from 2-ply self-play, i.e. the boards the 2-ply eval visits)
     \\              tch     (#175: teacher pass over a #159 dump: one spawn per stored afterstate, deep3 value,
     \\                       written to <dump_path>.tch; train_games is ignored and nothing is trained)
+    \\              tchadd  (#207: same pass, appended to the <dump_path>.tch that must already exist, so
+    \\                       several dumps (one per seed) build one teacher file; the cap is 32 dumps)
     \\              dist    (#175: offline distillation: base's per-move TD plus one regression step per step
     \\                       on a uniformly drawn teacher pair from <dump_path>.tch, so 50/50 the update)
     \\              dson    (#175: the teacher regression only: no self-play TD, so nothing but the deep
@@ -68,6 +70,8 @@ const usage =
     \\  weights_path  file to load (train_games 0) or write (default ai/solver/nn_weights.bin); use a temp path for variant runs
     \\  train_seed    seed for weight init and self-play games (default 1, omitted = same weights as before #56)
     \\  dump_path     file for the deep-position buffer (#159); required by dump|ft2|restart, after a "-" par slot
+    \\  deep_every    (#207) for ft2: one deep update per this many self-play moves (default 1 = the #159
+    \\                mix, which diverges; 4..8 copies what the stable offline twin `dist` uses)
     \\  batch_scale   (#137) multiplier on the merged batch delta for `par` runs (default = sqrt of the
     \\                batch size, #203; `-` = 1 = the old mean, `8` = the #208 linear rule). Sits after
     \\                the "-" par dump slot
@@ -123,18 +127,41 @@ fn parseBatchScale(args: []const []const u8) !f64 {
     return std.fmt.parseFloat(f64, args[12]) catch error.InvalidBatchScale;
 }
 
+/// (#207) `ft2` takes the deep-half thinning after the dump path: arg 12 is `deep_every`, one deep
+/// update per that many self-play moves. `1` is the #159 50% mix, which diverges to NaN; 4..8 is the
+/// mix the stable offline twin (`dist`) uses.
+fn parseDeepEvery(args: []const []const u8) !u32 {
+    if (args.len <= 12) return 1;
+    if (std.mem.eql(u8, args[12], "-")) return 1;
+    const every = std.fmt.parseInt(u32, args[12], 10) catch return error.InvalidDeepEvery;
+    if (every == 0) return error.InvalidDeepEvery;
+    return every;
+}
+
 /// (#206) `dist` / `dson` take the teacher mix after the dump path: arg 12 is `distill_every`
-/// (1 = every step) and arg 13 is the divisior applied to the TD rate for teacher updates (0 = same).
-fn parseDistillMix(args: []const []const u8) !nn.Options {
-    var opts: nn.Options = .{};
+/// (1 = every step) and arg 13 is the divisor applied to the TD rate for teacher updates (0 = same rate).
+const DistillMix = struct { every: u32 = 1, div: f64 = 0 };
+
+fn parseDistillMix(args: []const []const u8) !DistillMix {
+    var mix: DistillMix = .{};
     if (args.len > 12 and !std.mem.eql(u8, args[12], "-")) {
-        opts.distill_every = std.fmt.parseInt(u32, args[12], 10) catch return error.InvalidDistillEvery;
+        mix.every = std.fmt.parseInt(u32, args[12], 10) catch return error.InvalidDistillEvery;
     }
     if (args.len > 13 and !std.mem.eql(u8, args[13], "-")) {
-        const div = std.fmt.parseFloat(f64, args[13]) catch return error.InvalidDistillLr;
-        opts.distill_lr = if (div > 0) 1 / div else 0;
+        mix.div = std.fmt.parseFloat(f64, args[13]) catch return error.InvalidDistillLr;
+        if (!(mix.div >= 0)) return error.InvalidDistillLr;
     }
-    return opts;
+    return mix;
+}
+
+/// Absolute teacher step: the TD rate divided by the arg-13 divisor, or 0 for "same as TD".
+///
+/// `nn.Options.distill_lr` is an absolute rate (see its tests in `nn.zig`), so the divisor has to be
+/// applied here, where the TD rate is known. The #206 code wrote `1 / div` into the field instead, and
+/// `dist` with the documented divisor of 10 therefore took steps 300x the TD rate at lr 3e-4: the net
+/// blew up to NaN within a few thousand games (#207).
+fn distillRate(learning_rate: f64, div: f64) f64 {
+    return if (div > 0) learning_rate / div else 0;
 }
 
 fn parseParFlag(args: []const []const u8) !bool {
@@ -149,6 +176,9 @@ fn parseParFlag(args: []const []const u8) !bool {
 /// teacher cells (their search is the whole cost of the run; batching would only multiply it by the
 /// thread count).
 fn parSupported(opts: nn.Options, is_mstd: bool) bool {
+    // `distill` stays out: it is read-only and race-free, but a 20,000-game `dist` net trained under `par`
+    // is 30,000 points behind the same serial run at every batch_scale tried (#207), so the batched path
+    // is refused rather than silently offered.
     return opts.priority == null and !is_mstd and opts.target == .td1 and opts.selfplay == .greedy1 and
         opts.teacher == null and opts.distill == null;
 }
@@ -305,11 +335,12 @@ pub fn main(init: std.process.Init) !void {
     // Paired comparison of two weight files (#210): A = weights_path, B = the file at index 12, both with
     // the same policy, so a candidate net is judged against the shipped one on identical spawns.
     const is_pairw = std.mem.eql(u8, variant, "pairw");
-    const is_tch = std.mem.eql(u8, variant, "tch");
+    const is_tch = std.mem.eql(u8, variant, "tch") or std.mem.eql(u8, variant, "tchadd");
+    const is_tchadd = std.mem.eql(u8, variant, "tchadd");
     const is_dist = std.mem.eql(u8, variant, "dist");
     const is_dson = std.mem.eql(u8, variant, "dson");
     // (#206) the teacher mix: `distill_every` (arg 12) and the rate divisor (arg 13).
-    const dist_mix: nn.Options = if (is_dist or is_dson) try parseDistillMix(args) else .{};
+    const dist_mix: DistillMix = if (is_dist or is_dson) try parseDistillMix(args) else .{};
     // #159 variants train from the net in weights_path (the deep positions come from that net), like `resume`
     const use_resume = std.mem.eql(u8, variant, "resume") or is_dump or is_ft2 or is_restart or is_dist or is_dson or is_tch;
     // Variants that take dump_path at index 11: `dump` writes it, `ft2` and `restart` read it.
@@ -321,13 +352,17 @@ pub fn main(init: std.process.Init) !void {
     // dump path.
     const dump_path: ?[]const u8 = if (args.len > 11) args[11] else null;
     var dump: nn.Dump = .{};
-    var teachers: nn.Teachers = .{};
     var priority: nn.Priority = .{};
+    // `nn.Teachers` is ~40 MB (32 dumps worth, #207), so it is heap allocated, unlike the small buffers.
+    const teachers = try init.gpa.create(nn.Teachers);
+    defer init.gpa.destroy(teachers);
+    teachers.len = 0;
+    teachers.draws = 0;
     // (#137) `par` merges whole-game deltas into one step; arg 12 scales that step (1 = historical mean).
     const batch_scale: f64 = if (use_par) try parseBatchScale(args) else 1.0;
     // `use_resume` only decides whether `weights_path` is loaded; the variant still has to reach `opts`
     // (before, `dump`/`ft2`/`restart`/`dist` fell into this first branch and their options were dropped).
-    const opts: nn.Options = if (par_variant or is_pair or is_pairw or std.mem.eql(u8, variant, "base") or std.mem.eql(u8, variant, "resume") or is_tch)
+    var opts: nn.Options = if (par_variant or is_pair or is_pairw or std.mem.eql(u8, variant, "base") or std.mem.eql(u8, variant, "resume") or is_tch)
         .{ .batch_scale = batch_scale }
     else if (std.mem.eql(u8, variant, "backward"))
         .{ .backward = true }
@@ -366,25 +401,28 @@ pub fn main(init: std.process.Init) !void {
             .selfplay = if (is_dumpp2) .deep2 else .greedy1,
         }
     else if (is_ft2)
-        .{ .deep_mix = true, .dump = &dump }
+        .{ .deep_mix = true, .dump = &dump, .deep_every = try parseDeepEvery(args) }
     else if (is_restart)
         .{ .restart = true, .dump = &dump }
     else if (is_dist)
-        .{ .distill = &teachers, .distill_every = dist_mix.distill_every, .distill_lr = dist_mix.distill_lr }
+        .{ .distill = teachers, .distill_every = dist_mix.every, .distill_lr = distillRate(learning_rate, dist_mix.div) }
     else if (is_dson)
-        .{ .distill = &teachers, .distill_only = true, .distill_every = dist_mix.distill_every, .distill_lr = dist_mix.distill_lr }
+        .{ .distill = teachers, .distill_only = true, .distill_every = dist_mix.every, .distill_lr = distillRate(learning_rate, dist_mix.div) }
     else if (std.mem.eql(u8, variant, "oi") or std.mem.eql(u8, variant, "oi16") or is_mstd)
         .{}
     else {
         std.debug.print("{s}", .{usage});
         return;
     };
+    // (#137) the merge multiplier applies to every variant that reached a batched path; the branch above
+    // only set it for the plain ones, so `dist`/`sym`/`replay` silently ran with the struct default 1.0.
+    opts.batch_scale = batch_scale;
     // `dump` is the shared layout plus one slot: index 11 carries the dump path.
     // `par` runs may carry the #137 batch_scale at index 12, after the `-` dump slot.
     // (#203) index 13 narrows the eval table to the rows a measurement needs (`0,2`); `dist`/`dson`
     // already own 13 as the teacher lr divisor, and `pairw` returns before the table is built.
     const row_spec: ?[]const u8 = if (is_dist or is_dson or is_pairw or is_pair) null else if (args.len > 13) args[13] else null;
-    const max_args: usize = if (is_dist or is_dson) 14 else if (row_spec != null) 14 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw) 12 else 11;
+    const max_args: usize = if (is_dist or is_dson) 14 else if (row_spec != null) 14 else if (is_ft2) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw) 12 else 11;
     if (args.len > max_args or seed_ranges == 0 or (uses_dump and dump_path == null)) {
         std.debug.print("{s}", .{usage});
         return;
@@ -403,7 +441,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (is_ft2 or is_restart or is_tch) loadDump(&dump, init.io, init.gpa, dump_path.?);
-    if (is_dist or is_dson) loadTeachers(&teachers, init.io, init.gpa, dump_path.?);
+    if (is_dist or is_dson) loadTeachers(teachers, init.io, init.gpa, dump_path.?);
 
     var net: nn.Net = undefined;
     var staged: nn.Staged = undefined;
@@ -417,17 +455,25 @@ pub fn main(init: std.process.Init) !void {
     else if (std.mem.eql(u8, variant, "oi16")) nn.scaleInit(&net, 16);
     if (is_tch) {
         // #175 teacher pass: price every stored deep afterstate once, write `<dump_path>.tch`, train nothing.
+        // #207 `tchadd` appends to that file instead of replacing it, so N dumps give one N x 65,536 teacher.
+        const path = try std.fmt.allocPrint(init.arena.allocator(), "{s}.tch", .{dump_path.?});
+        if (is_tchadd) loadTeachers(teachers, init.io, init.gpa, path);
         var rng = std.Random.DefaultPrng.init(train_seed);
         const start = std.Io.Clock.awake.now(init.io);
-        nn.computeTeachers(&net, &teachers, &dump, rng.random(), .deep3);
-        const path = try std.fmt.allocPrint(init.arena.allocator(), "{s}.tch", .{dump_path.?});
+        const extra = try init.gpa.create(nn.Teachers);
+        defer init.gpa.destroy(extra);
+        nn.computeTeachers(&net, extra, &dump, rng.random(), .deep3);
+        const pass_len = extra.len;
+        const dropped = teachers.appendBuffer(extra);
         try teachers.save(init.io, init.gpa, path);
         const elapsed = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
-        std.debug.print("teacher pass: {d} samples in {d:.1} s ({d:.1} ms/sample) -> {s}\n", .{
-            teachers.len,
+        std.debug.print("teacher pass: {d} samples in {d:.1} s ({d:.1} ms/sample), file {s}: {d} samples, {d} dropped\n", .{
+            pass_len,
             @as(f64, @floatFromInt(elapsed)) / 1e9,
-            @as(f64, @floatFromInt(elapsed)) / 1e6 / @max(@as(f64, @floatFromInt(teachers.len)), 1),
+            @as(f64, @floatFromInt(elapsed)) / 1e6 / @max(@as(f64, @floatFromInt(pass_len)), 1),
             path,
+            teachers.len,
+            dropped,
         });
         return;
     }
@@ -801,6 +847,17 @@ test "usage text lists the aligned 2-ply variants (#158)" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "tp2     (#158") != null);
 }
 
+test "ft2 deep_every parses, defaults to 1 and rejects 0 (#207)" {
+    const none = [_][]const u8{ "nn", "2000", "0", "9000", "0.0003", "1", "ft2", "30", "/tmp/w.bin", "1", "-", "/tmp/d.bin" };
+    try std.testing.expectEqual(@as(u32, 1), try parseDeepEvery(&none));
+    const dash = [_][]const u8{ "nn", "2000", "0", "9000", "0.0003", "1", "ft2", "30", "/tmp/w.bin", "1", "-", "/tmp/d.bin", "-" };
+    try std.testing.expectEqual(@as(u32, 1), try parseDeepEvery(&dash));
+    const eight = [_][]const u8{ "nn", "2000", "0", "9000", "0.0003", "1", "ft2", "30", "/tmp/w.bin", "1", "-", "/tmp/d.bin", "8" };
+    try std.testing.expectEqual(@as(u32, 8), try parseDeepEvery(&eight));
+    const zero = [_][]const u8{ "nn", "2000", "0", "9000", "0.0003", "1", "ft2", "30", "/tmp/w.bin", "1", "-", "/tmp/d.bin", "0" };
+    try std.testing.expectError(error.InvalidDeepEvery, parseDeepEvery(&zero));
+}
+
 test "usage text lists the distillation variants (#167)" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "d2      (#167") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "d3      (#167") != null);
@@ -808,6 +865,9 @@ test "usage text lists the distillation variants (#167)" {
 
 test "par is refused for the priority buffer, the staged net and the 2-ply variants (#158)" {
     var pr: nn.Priority = .{};
+    // heap, because `Teachers` is ~40 MB
+    const teachers = try std.testing.allocator.create(nn.Teachers);
+    defer std.testing.allocator.destroy(teachers);
     try std.testing.expect(parSupported(.{}, false));
     try std.testing.expect(parSupported(.{ .symmetry = true, .replay_k = 30 }, false));
     try std.testing.expect(!parSupported(.{}, true));
@@ -818,6 +878,8 @@ test "par is refused for the priority buffer, the staged net and the 2-ply varia
     // #167: the teacher search is the whole cost, so a batch would only multiply it
     try std.testing.expect(!parSupported(.{ .teacher = .deep }, false));
     try std.testing.expect(!parSupported(.{ .teacher = .deep3 }, false));
+    // `dist` is read-only, but batched it loses ~30,000 points over 20,000 games (#207).
+    try std.testing.expect(!parSupported(.{ .distill = teachers, .distill_every = 8 }, false));
 }
 
 test "mstd starts from the staged weights file on eval and from 7 random nets otherwise" {
@@ -842,4 +904,20 @@ test "mstd starts from the staged weights file on eval and from 7 random nets ot
     var fresh: nn.Staged = undefined;
     try std.testing.expect(!try startStaged(&fresh, io, std.testing.allocator, 5, 99, path));
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&saved.nets), std.mem.asBytes(&fresh.nets)));
+}
+
+test "teacher mix parses the divisor and the teacher rate divides the TD rate (#207)" {
+    const mix = try parseDistillMix(&.{ "nn", "0", "0", "9000", "0.0003", "1", "dist", "30", "w", "1", "-", "t.tch", "4", "3" });
+    try std.testing.expectEqual(@as(u32, 4), mix.every);
+    try std.testing.expectApproxEqAbs(@as(f64, 3), mix.div, 1e-12);
+    // the teacher step is `learning_rate / div`, never `1 / div` (the #206 code passed 0.1 to `train`)
+    try std.testing.expectApproxEqRel(@as(f64, 1e-4), distillRate(3e-4, 3), 1e-12);
+    try std.testing.expectApproxEqRel(@as(f64, 3e-5), distillRate(3e-4, 10), 1e-12);
+    // divisor 0 / "-" keeps the teacher step at the TD rate (0 = "same as TD" in nn.Options)
+    try std.testing.expectEqual(@as(f64, 0), distillRate(3e-4, 0));
+    try std.testing.expectError(error.InvalidDistillLr, parseDistillMix(&.{ "nn", "0", "0", "9000", "0.0003", "1", "dist", "30", "w", "1", "-", "t.tch", "4", "-1" }));
+}
+
+test "usage text lists the tchadd variant (#207)" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "tchadd  (#207") != null);
 }

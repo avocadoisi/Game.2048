@@ -49,11 +49,21 @@ the default is sqrt of the batch size (2.8284, #203); `8` is the linear scaling 
 games, oversteps and loses ~26k-68k on a 100k run at lr 0.003); `-` keeps the old mean (= 1/8 the
 updates). Same-seed nets are NOT equal — compare nets on shared spawns with `pairw`, never by hash.
 `par` is refused for `mstd`, the #158 2-ply variants, `dist`/`dson`, `dump`/`ft2`/`restart` and the
-priority buffer; `replay_k` does work under `par` (each game owns its buffer).
+priority buffer; `replay_k` does work under `par` (each game owns its buffer). `dist` under `par` was
+tried and is 30,000 points behind the serial run at every `batch_scale`, so it stays refused (#207).
 Always train with `replay_k=30` and `par`. Fine-tuning without the replay buffer is what destroys the
 shipped net (5,000 games at lr 3e-5: 73,100 without replay vs 93,318 with `replay_k=30`, baseline
 79,657 on 20 games) — never fine-tune without it. `eval_games = 0` means "train only" and skips the
 15-row eval table (which can cost 20+ min on its own).
+
+**How a candidate net is judged (#207 / L1).** Read `docs/measurement.md` first. In one line: adopt only
+when `pairw` vs the shipped net (20 games, seed 9000) gives `mean diff - 2*stderr > 0` (≈ +15,000
+points), the non-paired 2-ply table on seeds 9000 and 9100 does not regress, and `ms/move` is unchanged.
+Run `scripts/eval-net.sh <candidate.bin>`: it does all three and prints `VERDICT: ADOPT|REJECT`.
+Never judge by `avg_score` alone — spawn luck moves it ±10,000, and the paired and unpaired tables have
+disagreed before. Distillation (`dist`) is the strongest fine-tune so far (every 4 / div 3 over a
+458,752-sample teacher: +1,184 ± 9,370, i.e. parity, below the bar), and `ft2` is retired: its deep half
+relabels with the live net and diverges to NaN at every lr and every thinning (#207).
 
 **Training is serial, always — one `zig build nn` at a time, even when the user asks for parallel work.**
 Only implementation, review and exploration may run in parallel. Measured: five `dson` lanes started

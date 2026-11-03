@@ -334,6 +334,13 @@ pub const ValueCache = struct {
     const Entry = struct { key: u64 = empty_key, value: f64 = 0 };
     entries: [capacity]Entry = @splat(.{}),
 
+    /// Drops every entry. `getValue` keys on the board contents alone, so a table filled by an older
+    /// weight snapshot silently answers for the current one: anything that prices a board *between*
+    /// weight updates (every teacher label, #167 / #207) has to start from an empty table.
+    pub fn clear(self: *ValueCache) void {
+        self.entries = @splat(.{});
+    }
+
     fn keyOf(board: Board) u64 {
         var h: u64 = 0xcbf29ce484222325;
         for (board) |row| for (row) |value| {
@@ -1417,6 +1424,12 @@ pub const Options = struct {
     /// per self-play step, so half the update budget stays on the self-play trajectory (uniform over the
     /// whole game, shallow positions included) and half lands on the deep tail.
     deep_mix: bool = false,
+    /// Search depth of the drawn deep half's teacher label (#207). `.deep3` matches `tch`; the deep
+    /// searches cost ~1.5 ms/sample, so `ft2` is slower than `base` per game by about that much.
+    deep_mode: Mode = .deep3,
+    /// One deep update every `deep_every` self-play steps (#207). `1` (the #159 `ft2`) is 50% deep and
+    /// diverges; `dist`'s stable offline mix is 1 in 4..8, which is what the CLI now passes.
+    deep_every: u32 = 1,
     /// Candidate (#159) `restart`: every game starts on a uniformly drawn deep afterstate of `dump`
     /// instead of an empty board. Requires `dump`.
     restart: bool = false,
@@ -1545,14 +1558,27 @@ pub const Priority = struct {
     }
 };
 
-/// One TD(0) step on a stored deep afterstate (#159 `ft2`). The board carries no history, so the reward
-/// of the move that led out of it is unknown and the target is the value of its greedy successor (reward 0).
-/// A dead board has no successor, hence no target.
-fn deepStep(net: *Net, rng: std.Random, buffer: *Dump, lr: f64, cache: *Cache) void {
-    const start = GameState{ .board = buffer.draw(rng), .score = 0 };
-    const pick = pickMove(net, start, false) orelse return;
-    _ = forward(net, start.board, cache);
-    train(net, cache, pick.value, lr);
+/// One extra update on a drawn deep afterstate for `ft2` (#159): the target is the same `deep3` teacher
+/// sample that `tch` writes offline (#207).
+///
+/// The #159 code used `pickMove(...).value` — the net's own 1-ply search value — as the target. On the
+/// deep domain that is a max over moves of `r + V(spawn)`, so every step pushes `V` up to the best
+/// branch's bootstrap: with stale deep boards and `replay_k` on top the net diverged to NaN within a few
+/// thousand games at every rate tried (`|w|` 4e275, eval stuck at 11,478). A bounded teacher label
+/// keeps the half stable and makes `ft2` the online twin of `tch` + `dist`, where deep3 decides the
+/// target and the drawn board only decides where the update lands.
+fn deepStep(net: *Net, rng: std.Random, buffer: *Dump, lr: f64, cache: *Cache, mode: Mode) void {
+    const board = buffer.draw(rng);
+    _ = forward(net, board, cache);
+    train(net, cache, deepSampleTarget(net, board, rng, mode), lr);
+}
+
+/// The label of one deep afterstate: one spawn from `rng`, then the value of `mode`'s search on it. `tch`
+/// (offline) and `ft2` (online) both call this, so the two teacher paths cannot drift apart (#207).
+fn deepSampleTarget(net: *const Net, board: Board, rng: std.Random, mode: Mode) f64 {
+    var state = GameState{ .board = board, .score = 0 };
+    _ = state.spawnRandomTile(rng);
+    return teacherValue(.{ .single = net }, state, mode, false);
 }
 
 /// Deep-position dump (issue #159): fixed-capacity buffer of afterstates whose max tile reached
@@ -1659,7 +1685,10 @@ pub const Dump = struct {
 /// 20 bytes — 16 bytes board (the post-spawn board, log2 per cell like `Dump`), then the f32 target.
 /// The board is post-spawn because `V` is defined on post-spawn boards (that is what `forward` sees).
 pub const teacher_magic = "2048-TCH";
-pub const teacher_cap: usize = dump_cap;
+/// One `tch` pass is one dump (`dump_cap` = 65,536 samples); the cap is 32x that so several passes can be
+/// merged into one teacher file (`tchadd`, #207). The struct is ~40 MB, so it lives on the heap
+/// (`nn_main.zig` allocates it), not on the stack.
+pub const teacher_cap: usize = 32 * dump_cap;
 pub const teacher_header_len = dump_header_len;
 pub const teacher_entry_len = dump_entry_len + @sizeOf(f32);
 
@@ -1678,6 +1707,19 @@ pub const Teachers = struct {
         }
         self.targets[self.len] = @floatCast(target);
         self.len += 1;
+    }
+
+    /// Appends every entry of `other` (a second `tch` pass, #207), stopping at `teacher_cap`.
+    /// Returns the number of samples that did not fit.
+    pub fn appendBuffer(self: *Teachers, other: *const Teachers) usize {
+        const room = teacher_cap - self.len;
+        const n = @min(room, other.len);
+        for (0..n) |i| {
+            @memcpy(&self.entries[self.len + i], &other.entries[i]);
+            self.targets[self.len + i] = other.targets[i];
+        }
+        self.len += n;
+        return other.len - n;
     }
 
     pub fn boardAt(self: *const Teachers, index: usize) Board {
@@ -1747,12 +1789,9 @@ pub const Teachers = struct {
 /// board contents), so the spawn stays in the target's search and out of the input.
 pub fn computeTeachers(net: *const Net, buffer: *Teachers, dump: *const Dump, rng: std.Random, mode: Mode) void {
     buffer.len = 0;
-    const vfn: Value = .{ .single = net };
     for (0..dump.len) |i| {
-        var state = GameState{ .board = dump.boardAt(i), .score = 0 };
-        _ = state.spawnRandomTile(rng);
         // the input is the stored afterstate, exactly what every V consumer evaluates (#177 P1)
-        buffer.append(dump.boardAt(i), teacherValue(vfn, state, mode, false));
+        buffer.append(dump.boardAt(i), deepSampleTarget(net, dump.boardAt(i), rng, mode));
     }
 }
 
@@ -1977,7 +2016,10 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
         }
         pending = pick;
         // `ft2` mixes one deep update into every self-play step: 50% self-play / 50% deep afterstates.
-        if (opts.deep_mix) if (opts.dump) |buffer| if (buffer.len > 0) deepStep(net, rng, buffer, lr, &cache);
+        if (opts.deep_mix) if (opts.dump) |buffer| if (buffer.len > 0) {
+            const every = @max(opts.deep_every, 1);
+            if (moves % every == 0) deepStep(net, rng, buffer, lr, &cache, opts.deep_mode);
+        };
         // `#206`: the teacher regression only every `distill_every` steps and at its own rate, so the
         // shallow half of the game keeps the parameters it learned.
         if (opts.distill) |buffer| if (buffer.len > 0) {
@@ -2029,6 +2071,9 @@ fn selfplayPick(vfn: Value, state: GameState, death: bool, selfplay: SelfPlay, t
 /// the tree `Mode.deep` ranks its moves with, so the target is what the 2-ply play side already
 /// believes the position is worth, one own move deeper than `t2` and cheap enough to train on.
 fn teacherValue(vfn: Value, state: GameState, mode: Mode, sym_leaf: bool) f64 {
+    // a fresh table per label: the previous one was filled with the weights as they stood a few steps
+    // ago, and `getValue` cannot tell (#207)
+    sharedValueCache().clear();
     const depth = phaseDepth(mode, state.board);
     var search: Search = .{
         .vfn = vfn,
@@ -4825,8 +4870,16 @@ test "Teachers round-trips boards and targets through the file format (#175)" {
     try std.testing.expectEqualStrings(teacher_magic, bytes[0..8]);
 }
 
+/// `Teachers` is ~40 MB (32 dumps, #207), so tests heap allocate it, like `nn_main` does.
+fn testTeachers() !*Teachers {
+    const t = try std.testing.allocator.create(Teachers);
+    t.* = .{};
+    return t;
+}
+
 test "Teachers parse rejects a wrong magic, a truncated file and an oversized count (#175)" {
-    var buffer: Teachers = .{};
+    const buffer = try testTeachers();
+    defer std.testing.allocator.destroy(buffer);
     var bytes: [teacher_header_len + teacher_entry_len]u8 = @splat(0);
     @memcpy(bytes[0..8], "2048-XXX");
     try std.testing.expectError(error.BadTeacherMagic, buffer.parse(&bytes));
@@ -4847,8 +4900,9 @@ test "computeTeachers prices each stored afterstate with one spawn (#175)" {
     deep[0][1] = 4096;
     dump.append(deep);
     var pass_a = std.Random.DefaultPrng.init(73);
-    var buffer: Teachers = .{};
-    computeTeachers(&net, &buffer, &dump, pass_a.random(), .deep3);
+    const buffer = try testTeachers();
+    defer std.testing.allocator.destroy(buffer);
+    computeTeachers(&net, buffer, &dump, pass_a.random(), .deep3);
     try std.testing.expectEqual(@as(usize, 1), buffer.len);
     // the sample's input is the stored afterstate itself: `V` is only ever consumed on afterstates, so
     // the spawn belongs to the target's search and not to the board the gradient sees
@@ -4863,9 +4917,10 @@ test "computeTeachers prices each stored afterstate with one spawn (#175)" {
         1e-6,
     );
     // the same seed reproduces the same pass
-    var again: Teachers = .{};
+    const again = try testTeachers();
+    defer std.testing.allocator.destroy(again);
     var pass_b = std.Random.DefaultPrng.init(73);
-    computeTeachers(&net, &again, &dump, pass_b.random(), .deep3);
+    computeTeachers(&net, again, &dump, pass_b.random(), .deep3);
     try std.testing.expectEqual(buffer.boardAt(0), again.boardAt(0));
     try std.testing.expectApproxEqAbs(buffer.targetAt(0), again.targetAt(0), 1e-12);
 }
@@ -4874,12 +4929,13 @@ test "dist takes one regression step per self-play step on average (#175)" {
     var prng = std.Random.DefaultPrng.init(97);
     const rng = prng.random();
     const net = Net.init(rng);
-    var buffer: Teachers = .{};
+    const buffer = try testTeachers();
+    defer std.testing.allocator.destroy(buffer);
     var board: Board = @splat(@splat(0));
     board[0][0] = 4096;
     buffer.append(board, 2.0);
     buffer.append(board, 0.5);
-    const opts: Options = .{ .distill = &buffer };
+    const opts: Options = .{ .distill = buffer };
     var rng_a = std.Random.DefaultPrng.init(11);
     var rng_b = std.Random.DefaultPrng.init(11);
     var a = net;
@@ -4910,30 +4966,33 @@ test "distill_every thins the teacher mix and distill_lr does not change the TD 
     var board: Board = @splat(@splat(0));
     board[0][0] = 4096;
     // `distill_every = 4`: one regression per four self-play steps, so the draws are about moves/4
-    var thinned: Teachers = .{};
+    const thinned = try testTeachers();
+    defer std.testing.allocator.destroy(thinned);
     thinned.append(board, 2.0);
     var thinned_net = net;
     var rng_a = std.Random.DefaultPrng.init(11);
-    const thinned_game = trainGameOpts(&thinned_net, rng_a.random(), 0.001, null, .{ .distill = &thinned, .distill_every = 4 });
+    const thinned_game = trainGameOpts(&thinned_net, rng_a.random(), 0.001, null, .{ .distill = thinned, .distill_every = 4 });
     try std.testing.expect(thinned.draws > 0);
     try std.testing.expect(thinned.draws <= thinned_game.moves);
     // every = 1 is the dense mix, so the same game draws strictly more teacher steps than every = 4
-    var dense: Teachers = .{};
+    const dense = try testTeachers();
+    defer std.testing.allocator.destroy(dense);
     dense.append(board, 2.0);
     var dense_net = net;
     var rng_b = std.Random.DefaultPrng.init(11);
-    const dense_game = trainGameOpts(&dense_net, rng_b.random(), 0.001, null, .{ .distill = &dense, .distill_every = 1 });
+    const dense_game = trainGameOpts(&dense_net, rng_b.random(), 0.001, null, .{ .distill = dense, .distill_every = 1 });
     try std.testing.expectEqual(dense_game.moves, dense.draws);
     try std.testing.expect(dense.draws > thinned.draws);
     // `distill_lr` only rescales the teacher step: with a teacher buffer that is never drawn the TD half
     // is bit-identical (the rate is read only inside `distStep`)
-    var empty: Teachers = .{};
+    const empty = try testTeachers();
+    defer std.testing.allocator.destroy(empty);
     var a = net;
     var b = net;
     var rng_c = std.Random.DefaultPrng.init(11);
     var rng_d = std.Random.DefaultPrng.init(11);
-    _ = trainGameOpts(&a, rng_c.random(), 0.001, null, .{ .distill = &empty });
-    _ = trainGameOpts(&b, rng_d.random(), 0.001, null, .{ .distill = &empty, .distill_lr = 1e-5 });
+    _ = trainGameOpts(&a, rng_c.random(), 0.001, null, .{ .distill = empty });
+    _ = trainGameOpts(&b, rng_d.random(), 0.001, null, .{ .distill = empty, .distill_lr = 1e-5 });
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
 }
 
@@ -5039,4 +5098,42 @@ test "rerank flips a near tie when the foreign score prefers the second move (#1
     });
     try std.testing.expectEqual(base, tight_left);
     try std.testing.expectEqual(base, tight_right);
+}
+
+test "the teacher cap holds 32 dumps and appendBuffer merges two passes (#207)" {
+    try std.testing.expectEqual(32 * dump_cap, teacher_cap);
+    const gpa = std.testing.allocator;
+    const a = try gpa.create(Teachers);
+    defer gpa.destroy(a);
+    const b = try gpa.create(Teachers);
+    defer gpa.destroy(b);
+    a.len = 2;
+    a.targets[0] = 1.5;
+    a.targets[1] = -2.0;
+    b.len = 3;
+    b.targets[0] = 10;
+    b.targets[1] = 20;
+    b.targets[2] = 30;
+    try std.testing.expectEqual(@as(usize, 0), a.appendBuffer(b));
+    try std.testing.expectEqual(@as(usize, 5), a.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), a.targets[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 30), a.targets[4], 1e-6);
+    // overflowing the cap keeps the first `teacher_cap` samples and reports the rest
+    a.len = teacher_cap - 1;
+    try std.testing.expectEqual(@as(usize, 2), a.appendBuffer(b));
+    try std.testing.expectEqual(teacher_cap, a.len);
+}
+
+test "a teacher file may hold more than one dump worth of samples (#207)" {
+    const count = dump_cap + 10;
+    const len = teacher_header_len + count * teacher_entry_len;
+    const bytes = try std.testing.allocator.alloc(u8, len);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 0);
+    @memcpy(bytes[0..8], teacher_magic);
+    std.mem.writeInt(u32, bytes[8..12], @intCast(count), .little);
+    const t = try std.testing.allocator.create(Teachers);
+    defer std.testing.allocator.destroy(t);
+    try t.parse(bytes);
+    try std.testing.expectEqual(count, t.len);
 }
