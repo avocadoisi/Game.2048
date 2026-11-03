@@ -2585,3 +2585,43 @@ done
 zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 pairw 30 ai/solver/nn_weights.bin 1 - /tmp/b.bin
 zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/b.bin 1 - - - 0,2
 ```
+
+## 蒸留の配合・教師の深さ・ゲーム数（#207 の続き）
+
+`dist` は「同梱 net を壊さない」上限までは来ているので、次は配合（`distill_every` と教師の学習率 `lr / div`）、
+教師の探索の深さ、ゲーム数を振った。すべて A = 同梱 net、`pairw` 20 局 seed 9000、lr 3e-4、学習 seed 1、
+教師は 7 dump の統合ファイル（458,752 サンプル、`deep3` ラベル）から始めた実験。
+
+| 蒸留 | 教師 | B − A（± stderr） | better |
+|---|---|---|---|
+| 20,000、every 4 / div 3 | `deep3` 458,752 | **+1,184 ± 9,370** | 9/20 |
+| 20,000、every 4 / div 2 | `deep3` 458,752 | −16,585 ± 11,599 | 5/20 |
+| 20,000、every 2 / div 3 | `deep3` 458,752 | −20,110 ± 6,303 | 2/20 |
+| 20,000、every 6 / div 3 | `deep3` 458,752 | −30,848 ± 5,586 | 1/20 |
+| 20,000、every 4 / div 3 | `h4` 589,824 | −15,588 ± 6,249 | 6/20 |
+| 100,000、every 4 / div 3 | `deep3` 458,752 | −4,696 ± 8,005 | 5/20 |
+
+**配合は 1 点だけ互角**で、その両側（every 2 / every 6、div 2）は −17k〜−31k。20 ゲームの stderr が
+6〜12k なので差はほぼノイズだが、`every 4 / div 3` の +1,184 も再現した値ではない（1 seed だけ）。
+
+**教師を深くしても効かない。** `tch` に教師モード（arg 12、`deep3` 既定 / `h4` = `phase_h4`、#171）を足し、
+9 dump を `h4` で貼り直した（4.0 ms/sample、`deep3` は 1.5 ms/sample。ラベルの差は mean|Δ| 6.4、max 44.4）。
+589,824 サンプルで蒸留しても −15,588 で、458,752 の `deep3` より悪い。「深い教師ほど良い」は成り立たない。
+
+**ゲーム数も効かない。** 100,000 ゲーム（1,788.7 s、191,593,848 moves）で −4,696 ± 8,005。20,000 の
++1,184 と同じ帯で、蒸留は互角のまま飽和する。
+
+再現（`h4` 教師を作るところから。`zz` は `zig build nn -Doptimize=ReleaseFast -- 0 0` で作った exe）:
+```
+for d in /tmp/deep.dmp /tmp/deep2.dmp /tmp/dmp_s{2..7}.bin; do
+  zz 0 0 9000 0.003 1 tch 30 ai/solver/nn_weights.bin 1 - $d h4     # -> $d.tch
+done
+# 8 x 65,536 を 1 本に連結（ヘッダは 12 バイト: "2048-TCH" + u32 count）
+cp ai/solver/nn_weights.bin /tmp/cand.bin
+zz 20000 0 9000 0.0003 1 dist 30 /tmp/cand.bin 1 - /tmp/h4.tch 4 3
+zz 0 20 9000 0.003 1 pairw 30 ai/solver/nn_weights.bin 1 - /tmp/cand.bin
+```
+
+**結論**: 教師ラベルを深くする・増やす・蒸留を長くする、のどれも同梱 net を超えない。
+蒸留は「壊さない」ための道具で、伸ばす道具ではない。次に試す価値があるのは教師の中身そのもの
+（探索の目的関数、局面表現、ネット構造）で、配合の調整ではない。
