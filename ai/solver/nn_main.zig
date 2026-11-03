@@ -71,7 +71,8 @@ const usage =
     \\  train_seed    seed for weight init and self-play games (default 1, omitted = same weights as before #56)
     \\  dump_path     file for the deep-position buffer (#159); required by dump|ft2|restart, after a "-" par slot
     \\  deep_every    (#207) for ft2: one deep update per this many self-play moves (default 1 = the #159
-    \\                mix, which diverges; 4..8 copies what the stable offline twin `dist` uses)
+    \\                mix, which diverges; 4..8 copies what the stable offline twin `dist` uses).
+    \\                For tch: the teacher search mode, `deep3` (default) or `h4` (3-ply + 4-ply in the endgame)
     \\  batch_scale   (#137) multiplier on the merged batch delta for `par` runs (default = sqrt of the
     \\                batch size, #203; `-` = 1 = the old mean, `8` = the #208 linear rule). Sits after
     \\                the "-" par dump slot
@@ -80,6 +81,9 @@ const usage =
     \\
     \\Weights are written to `weights_path` only when train_games > 0;
     \\train_games = 0 (eval only) never writes.
+    \\
+    \\No arguments (e.g. `zig build nn` without `--`) prints this and exits: it must not retrain and
+    \\overwrite ai/solver/nn_weights.bin (#207).
     \\
 ;
 
@@ -125,6 +129,18 @@ fn parseBatchScale(args: []const []const u8) !f64 {
     if (args.len <= 12) return defaultBatchScale();
     if (std.mem.eql(u8, args[12], "-")) return 1.0;
     return std.fmt.parseFloat(f64, args[12]) catch error.InvalidBatchScale;
+}
+
+/// (#207) `tch` takes the teacher's search mode at arg 12: `deep3` (the default, #175/#206) or `h4`
+/// (`phase_h4`: 3-ply everywhere plus 4-ply in the endgame, #171), which prices the deep boards the
+/// dump actually holds with one more ply. Typo = error, so a label pass never silently uses the old mode.
+fn parseTeacherMode(args: []const []const u8) !nn.Mode {
+    if (args.len <= 12) return .deep3;
+    const name = args[12];
+    if (std.mem.eql(u8, name, "-") or std.mem.eql(u8, name, "deep3")) return .deep3;
+    if (std.mem.eql(u8, name, "h4")) return .phase_h4;
+    if (std.mem.eql(u8, name, "deep")) return .deep;
+    return error.InvalidTeacherMode;
 }
 
 /// (#207) `ft2` takes the deep-half thinning after the dump path: arg 12 is `deep_every`, one deep
@@ -309,6 +325,12 @@ fn loadDump(dump: *nn.Dump, io: std.Io, gpa: std.mem.Allocator, path: []const u8
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    // `zig build nn` without `--` used to run the defaults (2000 games, write weights_path = the shipped
+    // file). It silently retrained the shipped net twice (#207), so no arguments now means "show me how".
+    if (args.len <= 1) {
+        std.debug.print("{s}", .{usage});
+        return;
+    }
     const train_games: u32 = try cli.argOr(u32, args, 1, default_train_games);
     const eval_games: u32 = try cli.argOr(u32, args, 2, default_eval_games);
     const eval_seed: u64 = try cli.argOr(u64, args, 3, default_eval_seed);
@@ -422,7 +444,7 @@ pub fn main(init: std.process.Init) !void {
     // (#203) index 13 narrows the eval table to the rows a measurement needs (`0,2`); `dist`/`dson`
     // already own 13 as the teacher lr divisor, and `pairw` returns before the table is built.
     const row_spec: ?[]const u8 = if (is_dist or is_dson or is_pairw or is_pair) null else if (args.len > 13) args[13] else null;
-    const max_args: usize = if (is_dist or is_dson) 14 else if (row_spec != null) 14 else if (is_ft2) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw) 12 else 11;
+    const max_args: usize = if (is_dist or is_dson) 14 else if (row_spec != null) 14 else if (is_ft2 or is_tch) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw) 12 else 11;
     if (args.len > max_args or seed_ranges == 0 or (uses_dump and dump_path == null)) {
         std.debug.print("{s}", .{usage});
         return;
@@ -462,7 +484,7 @@ pub fn main(init: std.process.Init) !void {
         const start = std.Io.Clock.awake.now(init.io);
         const extra = try init.gpa.create(nn.Teachers);
         defer init.gpa.destroy(extra);
-        nn.computeTeachers(&net, extra, &dump, rng.random(), .deep3);
+        nn.computeTeachers(&net, extra, &dump, rng.random(), try parseTeacherMode(args));
         const pass_len = extra.len;
         const dropped = teachers.appendBuffer(extra);
         try teachers.save(init.io, init.gpa, path);
@@ -916,6 +938,19 @@ test "teacher mix parses the divisor and the teacher rate divides the TD rate (#
     // divisor 0 / "-" keeps the teacher step at the TD rate (0 = "same as TD" in nn.Options)
     try std.testing.expectEqual(@as(f64, 0), distillRate(3e-4, 0));
     try std.testing.expectError(error.InvalidDistillLr, parseDistillMix(&.{ "nn", "0", "0", "9000", "0.0003", "1", "dist", "30", "w", "1", "-", "t.tch", "4", "-1" }));
+}
+
+test "teacher mode is deep3 by default and h4 on request (#207)" {
+    try std.testing.expectEqual(nn.Mode.deep3, try parseTeacherMode(&.{"nn"}));
+    try std.testing.expectEqual(nn.Mode.deep3, try parseTeacherMode(&.{ "nn", "0", "0", "9000", "0.0003", "1", "tch", "30", "w", "1", "-", "d.dmp" }));
+    try std.testing.expectEqual(nn.Mode.deep3, try parseTeacherMode(&.{ "nn", "0", "0", "9000", "0.0003", "1", "tch", "30", "w", "1", "-", "d.dmp", "-" }));
+    try std.testing.expectEqual(nn.Mode.phase_h4, try parseTeacherMode(&.{ "nn", "0", "0", "9000", "0.0003", "1", "tch", "30", "w", "1", "-", "d.dmp", "h4" }));
+    try std.testing.expectEqual(nn.Mode.deep, try parseTeacherMode(&.{ "nn", "0", "0", "9000", "0.0003", "1", "tch", "30", "w", "1", "-", "d.dmp", "deep" }));
+    try std.testing.expectError(error.InvalidTeacherMode, parseTeacherMode(&.{ "nn", "0", "0", "9000", "0.0003", "1", "tch", "30", "w", "1", "-", "d.dmp", "h5" }));
+}
+
+test "usage says no arguments must not retrain the shipped weights (#207)" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "must not retrain") != null);
 }
 
 test "usage text lists the tchadd variant (#207)" {
