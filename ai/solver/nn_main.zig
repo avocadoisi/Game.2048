@@ -24,6 +24,10 @@ const usage =
     \\              symbatch (#98: the 8 transformed gradients from one net snapshot, averaged and
     \\                       norm-clipped, applied as a single step instead of eight)
     \\              nstep   (#84: online n-step TD with n = 4 instead of one-step returns)
+    \\              explore (#224: 5% of the self-play moves are uniformly random instead of greedy,
+    \\                       explore20: 20% — widens the boards the value is trained on)
+    \\              open8   (#224: the first 8 moves of every game are uniformly random and train
+    \\                       nothing, open16: 16 — widens the start boards only)
     \\              death   (#101: reward -1 per move so the value learns V ≈ -(moves to game over))
     \\              t2      (#158: TD target = score delta + the 2-ply value of the post-spawn board,
     \\                       i.e. what the eval search looks at, instead of V(next afterstate))
@@ -402,6 +406,14 @@ pub fn main(init: std.process.Init) !void {
         .{ .symmetry = true, .lambda = 0.7 }
     else if (std.mem.eql(u8, variant, "symbatch"))
         .{ .sym_batch = true }
+    else if (std.mem.eql(u8, variant, "explore"))
+        .{ .explore = 0.05 }
+    else if (std.mem.eql(u8, variant, "explore20"))
+        .{ .explore = 0.20 }
+    else if (std.mem.eql(u8, variant, "open8"))
+        .{ .warm_open = 8 }
+    else if (std.mem.eql(u8, variant, "open16"))
+        .{ .warm_open = 16 }
     else if (std.mem.eql(u8, variant, "nstep"))
         .{ .nstep = 4 }
     else if (std.mem.eql(u8, variant, "death"))
@@ -848,6 +860,11 @@ test "usage text documents the par flag for stateless variants" {
 
 test "usage text lists the symbatch variant" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "symbatch (#98") != null);
+}
+
+test "usage text lists the exploration variants (#224)" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "explore (#224") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "open8   (#224") != null);
 }
 
 test "usage text lists the restart variant" {
