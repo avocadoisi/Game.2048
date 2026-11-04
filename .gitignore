@@ -5,3 +5,5 @@ result
 .direnv/
 .playwright-mcp/
 .pi/subagents/
+.pi/goals/
+.pi/.goals-pool-snapshot.json
