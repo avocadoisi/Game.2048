@@ -70,14 +70,17 @@ disagreed before. Distillation (`dist`) is the strongest fine-tune so far (every
 458,752-sample teacher: +1,184 ± 9,370, i.e. parity, below the bar), and `ft2` is retired: its deep half
 relabels with the live net and diverges to NaN at every lr and every thinning (#207).
 
-**Capacity: widen `h2`, not `h1` (#220).** `zig build nn -Dh1=… -Dh2=…` changes the architecture and the
-weights file format (the header is 16 bytes + raw f64, so a file only loads in a matching build). 128/128
-needs ~300,000 games before it beats the shipped net: 100,000 games = 72,012 (worse), 300,000 = 92,953
-(7/20 reach 8192) and `pairw` +8,624 ± 7,679 (13/20) — real, but 12x the ms/move and still under the bar;
-128/32 at the same 300,000 = 78,500, so the output layer `h2` is the only width that matters. Extending a
-300,000 net with lr 3e-4 regresses (84,118). To compare nets of different widths use `scripts/widen-net.py`
-(zero padding is value-exact — the padded shipped net reproduces 79,657.0 exactly) and run `pairw` in the
-wider build.
+**Capacity is not a lever in this codebase (#220).** `zig build nn -Dh1=… -Dh2=…` changes the architecture
+and the weights file format (16-byte header + raw f64, so a file only loads in a matching build). 128/128
+needs ~300,000 games just to look good once: 100,000 games = 72,012, 300,000 = 92,953 and `pairw`
++8,624 ± 7,679 (13/20) — but training seed 2 to the same size gives **−12,117 ± 5,848 (5/20)**, so the
++8,624 was seed luck, not capacity (seed spread ±20k, same as 64/32 in #203). 128/32 at 300,000 = 78,500
+(the output layer `h2` is the only width that matters at all), extending past 300,000 regresses even at
+lr 1.5e-3 (420k = 69,888), and distilling the wide net into 64/32 collapses it (`dson` −68,521 ± 7,048,
+`dist` −55,826 ± 6,287): a wide net's `V` is only meaningful together with its own 2-ply search. To compare
+nets of different widths use `scripts/widen-net.py` (zero padding is value-exact — the padded shipped net
+reproduces 79,657.0 exactly) and run `pairw` in the wider build. Judge capacity candidates by ≥2 training
+seeds before believing a positive pair diff.
 
 **Training is serial, always — one `zig build nn` at a time, even when the user asks for parallel work.**
 Only implementation, review and exploration may run in parallel. Measured: five `dson` lanes started

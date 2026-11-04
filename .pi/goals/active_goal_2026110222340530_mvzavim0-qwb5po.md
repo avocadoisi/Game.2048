@@ -1,0 +1,98 @@
+{
+  "version": 3,
+  "id": "mvzavim0-qwb5po",
+  "objective": "同梱 net（ai/solver/nn_weights.bin）の avg_score を長期的に上げ続けられる体制を作り、その最初の成果として `pairw` 20 局 seed 9000 で同梱 net 比 +2σ 以上（≒ +15,000 点）の net を同梱する。既存 issue の消化は目的ではなく、進行中の #207（ft2 の NaN 修正）などは素材として使う。手段は (a) 計測・判定の標準化、(b) 学習側の能力拡張（教師・蒸留・カリキュラム・ネット構造）、(c) 探索と学習スループットの高速化、(d) 候補を出し続ける反復ループと失敗の記録。現在地: 100k ゲーム sqrt 則 −1,440 ± 7,544（#203）、ゲーム数と lr スケジュールは #204 で否定済み、蒸留は現状有害（パラメータ共有）。",
+  "status": "active",
+  "autoContinue": true,
+  "usage": {
+    "tokensUsed": 2551910,
+    "activeSeconds": 162808
+  },
+  "sisyphus": false,
+  "createdAt": "2026-11-02T13:34:05.304Z",
+  "updatedAt": "2026-11-04T10:51:54.605Z",
+  "activePath": ".pi/goals/active_goal_2026110222340530_mvzavim0-qwb5po.md",
+  "revision": 444,
+  "scheduler": {
+    "version": 1,
+    "owner": "01a198ec-df4e-746e-bd69-173511497bbc",
+    "generation": "b5117037-fd33-48ea-9917-0a23775d59a5",
+    "used": 2,
+    "phase": "running",
+    "repairUsed": false,
+    "decision": {
+      "kind": "ready",
+      "purpose": "ready"
+    },
+    "dispatch": {
+      "id": "117826a4-b79d-4674-a079-2366139f2b7b",
+      "kind": "ready",
+      "claimedAt": 1793712064212
+    }
+  },
+  "taskList": {
+    "tasks": [
+      {
+        "id": "l1-harness",
+        "title": "L1: 判定と計測を標準化する — 候補 net を一律に評価する手順（pairw 20 局 seed 9000、非ペア表 seed 9000/9100、スループット表）をコマンド列として固定し、docs とスクリプトに落とす",
+        "status": "complete",
+        "verificationContract": "任意の net ファイル 1 つを渡すと、採用判定に必要な全数値（pairw mean diff ± stderr・better/worse、非ペア avg_score・8192 到達、ms/move）が出る手順が docs にあり、自分で作った 2 つの net で再現できる。判定基準（+2σ、非ペア悪化なし）が skill に書かれている。",
+        "completedAt": "2026-11-03T09:11:18.693Z",
+        "evidence": "scripts/eval-net.sh + docs/measurement.md で判定を固定。2 net で再現（-31,273±6,653 / -30,117±5,522、同梱 79,657/91,348 一致）、SKILL に +2σ ルール"
+      },
+      {
+        "id": "l2-training-capability",
+        "title": "L2: 学習側の能力を広げる — dump 教師を post-spawn 定義域で正しく作り（ft2/tch の修正）、iterated DAgger・dist・curriculum を組み合わせた候補生成を回す",
+        "status": "complete",
+        "verificationContract": "少なくとも 3 系統の候補（restart、反復 dump→ft2→dump、tch/dist）について、L1 の手順で数値が出て docs にある。修正前の ft2 が NaN（783/18,561 重み）に発散した事実と原因、修正後の安定性が数値で示される。",
+        "completedAt": "2026-11-03T09:11:18.694Z",
+        "evidence": "restart 3 seed -8,596〜-18,728、dist 5k -4,441 / 20k every4 div3 +1,184、ft2 は NaN 783/18,561→原因は学習中の再ラベリング。docs に数値"
+      },
+      {
+        "id": "l3-speed",
+        "title": "L3: 探索と学習のスループットを上げる — nn 2-ply/deep の ms/move、評価テーブル、dump/tch のコスト、par の実効 lr を改善し、同じ時間でより強い候補を作れるようにする",
+        "status": "complete",
+        "verificationContract": "同一 net・同一 seed で before/after の ms/move・games/s・評価 1 テーブル秒が数値で並び、avg_score と 8192 到達が悪化しない。改善は `zig build test` 全ターゲット exit 0 で、再現コマンドが docs にある。",
+        "completedAt": "2026-11-03T09:11:18.694Z",
+        "evidence": "measurement.md の before/after 表: build 前段 25分→150s、base 20k 112→32s、評価表 20分→70s。zig build test exit 0"
+      },
+      {
+        "id": "l4-loop",
+        "title": "L4: 候補を出し続ける反復ループを回す — 各ラウンドで候補 net を作って判定し、勝てば同梱、負けは数値と原因を docs に残す（失敗を資産にする）",
+        "status": "complete",
+        "verificationContract": "少なくとも 3 ラウンド分の記録が docs にあり、各ラウンドで候補・判定数値・採否理由が対になっている。採用された net があれば ai/solver/nn_weights.bin が更新され、旧 vs 新 の pairw が正の +2σ を再現する。",
+        "completedAt": "2026-11-03T09:11:18.694Z",
+        "evidence": "6 ラウンドの候補・数値・採否を measurement.md の L4 表に記録。採用ゼロで nn_weights.bin は未変更"
+      },
+      {
+        "id": "l5-adopt",
+        "title": "L5: 採用した net を同梱して既定経路を更新する — nn_weights.bin 差し替え、wasm 再ビルド、docs に差し替え根拠",
+        "status": "pending",
+        "verificationContract": "差し替え後の重みで非ペア表（seed 9000/9100, rows=0,2）と pairw（旧 vs 新）が新数値を再現し、mean diff > +2σ。wasm/CLI の既定がビルド・動作し、`zig build test` exit 0。"
+      }
+    ],
+    "blockCompletion": true,
+    "proposedAt": "2026-11-02T13:33:55.162Z"
+  }
+}
+
+# Goal Prompt
+
+同梱 net（ai/solver/nn_weights.bin）の avg_score を長期的に上げ続けられる体制を作り、その最初の成果として `pairw` 20 局 seed 9000 で同梱 net 比 +2σ 以上（≒ +15,000 点）の net を同梱する。既存 issue の消化は目的ではなく、進行中の #207（ft2 の NaN 修正）などは素材として使う。手段は (a) 計測・判定の標準化、(b) 学習側の能力拡張（教師・蒸留・カリキュラム・ネット構造）、(c) 探索と学習スループットの高速化、(d) 候補を出し続ける反復ループと失敗の記録。現在地: 100k ゲーム sqrt 則 −1,440 ± 7,544（#203）、ゲーム数と lr スケジュールは #204 で否定済み、蒸留は現状有害（パラメータ共有）。
+
+## Progress
+
+- Status: running
+- Auto-continue: on
+- Sisyphus mode: no
+- Time spent: 45h13m28s
+- Tokens used: 2.6M (2,551,910) tokens
+## Tasks
+
+<!-- blockCompletion: true -->
+- [x] l1-harness: L1: 判定と計測を標準化する — 候補 net を一律に評価する手順（pairw 20 局 seed 9000、非ペア表 seed 9000/9100、スループット表）をコマンド列として固定し、docs とスクリプトに落とす — evidence: scripts/eval-net.sh + docs/measurement.md で判定を固定。2 net で再現（-31,273±6,653 / -30,117±5,522、同梱 79,657/91,348 一致）、SKILL に +2σ ルール
+- [x] l2-training-capability: L2: 学習側の能力を広げる — dump 教師を post-spawn 定義域で正しく作り（ft2/tch の修正）、iterated DAgger・dist・curriculum を組み合わせた候補生成を回す — evidence: restart 3 seed -8,596〜-18,728、dist 5k -4,441 / 20k every4 div3 +1,184、ft2 は NaN 783/18,561→原因は学習中の再ラベリング。docs に数値
+- [x] l3-speed: L3: 探索と学習のスループットを上げる — nn 2-ply/deep の ms/move、評価テーブル、dump/tch のコスト、par の実効 lr を改善し、同じ時間でより強い候補を作れるようにする — evidence: measurement.md の before/after 表: build 前段 25分→150s、base 20k 112→32s、評価表 20分→70s。zig build test exit 0
+- [x] l4-loop: L4: 候補を出し続ける反復ループを回す — 各ラウンドで候補 net を作って判定し、勝てば同梱、負けは数値と原因を docs に残す（失敗を資産にする） — evidence: 6 ラウンドの候補・数値・採否を measurement.md の L4 表に記録。採用ゼロで nn_weights.bin は未変更
+- [ ] l5-adopt: L5: 採用した net を同梱して既定経路を更新する — nn_weights.bin 差し替え、wasm 再ビルド、docs に差し替え根拠 — contract: 差し替え後の重みで非ペア表（seed 9000/9100, rows=0,2）と pairw（旧 vs 新）が新数値を再現し、mean diff > +2σ。wasm/CLI の既定がビルド・動作し、`zig build test` exit 0。
+
