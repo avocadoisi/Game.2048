@@ -70,8 +70,7 @@ disagreed before. Distillation (`dist`) is the strongest fine-tune so far (every
 458,752-sample teacher: +1,184 ± 9,370, i.e. parity, below the bar), and `ft2` is retired: its deep half
 relabels with the live net and diverges to NaN at every lr and every thinning (#207).
 
-**Capacity is not a lever in this codebase (#220).** `zig build nn -Dh1=… -Dh2=…` changes the architecture
-and the weights file format (16-byte header + raw f64, so a file only loads in a matching build). 128/128
+**Capacity is not a lever in this codebase (#220).** `zig build nn -Dh1=… -Dh2=…` changes the architectureand the weights file format (16-byte header + raw f64, so a file only loads in a matching build). 128/128
 needs ~300,000 games just to look good once: 100,000 games = 72,012, 300,000 = 92,953 and `pairw`
 +8,624 ± 7,679 (13/20) — but training seed 2 to the same size gives **−12,117 ± 5,848 (5/20)**, so the
 +8,624 was seed luck, not capacity (seed spread ±20k, same as 64/32 in #203). 128/32 at 300,000 = 78,500
@@ -81,6 +80,13 @@ lr 1.5e-3 (420k = 69,888), and distilling the wide net into 64/32 collapses it (
 nets of different widths use `scripts/widen-net.py` (zero padding is value-exact — the padded shipped net
 reproduces 79,657.0 exactly) and run `pairw` in the wider build. Judge capacity candidates by ≥2 training
 seeds before believing a positive pair diff.
+
+**State-distribution shifts all fail — training must stay on-policy (#224).** `restart` (deep boards), the
+dump curriculum, `explore` (5% random moves, `explore20` = 20%) and `open8`/`open16` (random opening moves
+that train nothing) were all measured and every one loses hard: `explore` 100k = 21,224 / 400k = 12,614,
+`open8` 100k = 30,917, against the shipped net's 79,657 non-paired 2-ply. Random moves also cut a game to
+1/4–1/6 of its moves, so equal-game comparisons are not equal-sample ones. Do not re-open this direction;
+the value function has no off-trajectory extrapolation.
 
 **Training is serial, always — one `zig build nn` at a time, even when the user asks for parallel work.**
 Only implementation, review and exploration may run in parallel. Measured: five `dson` lanes started

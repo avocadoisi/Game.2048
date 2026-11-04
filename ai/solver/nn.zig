@@ -255,6 +255,24 @@ const Pick = struct {
     value: f64,
 };
 
+/// One legal move drawn uniformly (#224): the exploration half of `Options.explore`. The pick's `value`
+/// is `V(after)` so the TD step and the priority buffer see the same numbers as a greedy pick.
+fn randomPick(vfn: Value, state: GameState, rng: std.Random, death: bool) ?Pick {
+    var picks: [4]Pick = undefined;
+    var n: usize = 0;
+    for ([_]Direction{ .up, .left, .down, .right }) |d| {
+        var next = state;
+        const moved = next.slide(d);
+        if (!moved.changed) continue;
+        var cache: Cache = .{};
+        const reward = if (death) -1 / reward_scale else @as(f64, @floatFromInt(moved.score_delta)) / reward_scale;
+        picks[n] = .{ .dir = d, .after = next.board, .reward = reward, .value = valueAt(vfn, next.board, &cache) };
+        n += 1;
+    }
+    if (n == 0) return null;
+    return picks[rng.uintLessThan(usize, n)];
+}
+
 /// Best legal move by reward + V(afterstate); null when no move changes the board.
 fn pickMove(net: *const Net, state: GameState, death: bool) ?Pick {
     return pickMoveValue(.{ .single = net }, state, death);
@@ -1378,6 +1396,14 @@ pub const Options = struct {
     /// Candidate (#63): with `priority` set, the `m` extra updates keep the uniform share over the whole
     /// buffer and draw the rest by |TD error| from the 4..7 empty-cell bucket only.
     midmix: bool = false,
+    /// Candidate (#224): probability that a self-play move is a uniformly random legal move instead of
+    /// the policy's pick (0 = the historical greedy-only walk). Widens the state distribution the net
+    /// is trained on; the TD target of the random move is the same `reward + V(after)` form.
+    explore: f64 = 0,
+    /// Candidate (#224): with `warm_open` > 0 the first `warm_open` moves of every game are uniformly
+    /// random and train nothing; the game then continues greedily and trains as usual. Differently from
+    /// `explore`, the random moves never enter a TD target, so only the start distribution widens.
+    warm_open: u32 = 0,
     /// Candidate (#72): apply every per-move TD update to all 8 dihedral transforms of the afterstate,
     /// with the same target (8 samples per visited board, deterministic).
     symmetry: bool = false,
@@ -2001,7 +2027,25 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
     var dist_tick: u32 = 0;
     var moves: u32 = 0;
     var trace: Net = std.mem.zeroes(Net);
-    while (selfplayPick(vfn, state, opts.death, opts.selfplay, opts.teacher, opts.sym_leaf)) |pick| {
+    while (true) {
+        var pick = selfplayPick(vfn, state, opts.death, opts.selfplay, opts.teacher, opts.sym_leaf) orelse break;
+        // `#224`: with probability `explore` play a uniformly random legal move, so the self-play walks
+        // through boards the greedy policy would never visit. `0` (the default) draws nothing from the
+        // rng, so every older seed still spawns the same tiles. Trained targets then include the random
+        // step, which is why the variant loses badly: see `warm_open` for the target-free opening.
+        if (opts.explore > 0 and rng.float(f64) < opts.explore) {
+            if (randomPick(vfn, state, rng, opts.death)) |p| pick = p;
+        }
+        // `#224` opening diversity: the first `warm_open` moves are random and produce NO training
+        // sample, so the games start from boards the greedy policy never reaches while every stored
+        // target still comes from greedy play (random-move targets poisoned the value, see `explore`).
+        if (moves < opts.warm_open) {
+            if (randomPick(vfn, state, rng, opts.death)) |p| pick = p;
+            moves += 1;
+            pending = null;
+            _ = state.move(pick.dir, rng);
+            continue;
+        }
         moves += 1;
         if (opts.dump_record) if (opts.dump) |buffer| buffer.offer(pick.after);
         if (pending) |p| {
@@ -3766,6 +3810,57 @@ test "dump_record leaves the weights and the rng consumption unchanged" {
     try std.testing.expectEqual(recorded.moves, again.moves);
     // a fresh net stays shallow, so most games record nothing; whatever it does record must be deep enough
     for (0..dump.len) |i| try std.testing.expect(core.maxTile(dump.boardAt(i)) >= dump_min_tile);
+}
+
+test "explore plays random legal moves and explore 0 keeps the greedy game (#224)" {
+    var init_rng = std.Random.DefaultPrng.init(21);
+    const start = Net.init(init_rng.random());
+    var plain_net = start;
+    var plain_rng = std.Random.DefaultPrng.init(22);
+    const plain = trainGameOpts(&plain_net, plain_rng.random(), 0.003, null, .{});
+
+    var zero_net = start;
+    var zero_rng = std.Random.DefaultPrng.init(22);
+    const zero = trainGameOpts(&zero_net, zero_rng.random(), 0.003, null, .{ .explore = 0 });
+    try std.testing.expectEqual(plain.score, zero.score);
+    try std.testing.expectEqual(plain.moves, zero.moves);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&plain_net), std.mem.asBytes(&zero_net));
+
+    // explore = 1 never follows the policy, so the walk leaves the greedy game
+    var wild_net = start;
+    var wild_rng = std.Random.DefaultPrng.init(22);
+    const wild = trainGameOpts(&wild_net, wild_rng.random(), 0.003, null, .{ .explore = 1 });
+    try std.testing.expect(wild.moves != plain.moves or wild.score != plain.score);
+    try std.testing.expect(wild.moves > 0);
+
+    // the random moves come from the game rng, so the same seed replays the same game
+    var again_net = start;
+    var again_rng = std.Random.DefaultPrng.init(22);
+    const again = trainGameOpts(&again_net, again_rng.random(), 0.003, null, .{ .explore = 1 });
+    try std.testing.expectEqual(wild.moves, again.moves);
+    try std.testing.expectEqual(wild.score, again.score);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&wild_net), std.mem.asBytes(&again_net));
+}
+
+test "warm_open skips training for the random opening and still trains the rest (#224)" {
+    var init_rng = std.Random.DefaultPrng.init(31);
+    const start = Net.init(init_rng.random());
+    var plain_net = start;
+    var plain_rng = std.Random.DefaultPrng.init(32);
+    const plain = trainGameOpts(&plain_net, plain_rng.random(), 0.003, null, .{});
+
+    var warm_net = start;
+    var warm_rng = std.Random.DefaultPrng.init(32);
+    const warm = trainGameOpts(&warm_net, warm_rng.random(), 0.003, null, .{ .warm_open = 8 });
+    try std.testing.expect(warm.moves != plain.moves or warm.score != plain.score);
+    // the opening trains nothing, the greedy tail does: the net still moves away from `start`
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&start), std.mem.asBytes(&warm_net)));
+
+    var again_net = start;
+    var again_rng = std.Random.DefaultPrng.init(32);
+    const again = trainGameOpts(&again_net, again_rng.random(), 0.003, null, .{ .warm_open = 8 });
+    try std.testing.expectEqual(warm.moves, again.moves);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&warm_net), std.mem.asBytes(&again_net));
 }
 
 test "ft2 mixes one deep draw per self-play step and is deterministic" {
