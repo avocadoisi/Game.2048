@@ -81,6 +81,13 @@ nets of different widths use `scripts/widen-net.py` (zero padding is value-exact
 reproduces 79,657.0 exactly) and run `pairw` in the wider build. Judge capacity candidates by ≥2 training
 seeds before believing a positive pair diff.
 
+**Global features only speed up the first 20k games (#226).** `zig build nn -Dfeat=N` adds N hand-made
+board features (empties, max tile, monotonicity, smoothness, corner, mass) as extra input rows and grows
+the weights file; `scripts/widen-net.py --feat N --src-h1 … --src-h2 …` pads the shipped net with zeros
+(value-exact). `-Dfeat=1` at 20,000 games is 60,776 against a 48,279 control, but at 100,000 games it is
+81,959 against 82,600 — the one-hot net learns the same thing by then. `par` plus features is broken
+(27,433) and is refused by `parSupported`.
+
 **State-distribution shifts all fail — training must stay on-policy (#224).** `restart` (deep boards), the
 dump curriculum, `explore` (5% random moves, `explore20` = 20%) and `open8`/`open16` (random opening moves
 that train nothing) were all measured and every one loses hard: `explore` 100k = 21,224 / 400k = 12,614,

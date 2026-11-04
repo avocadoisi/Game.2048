@@ -15,6 +15,13 @@ pub const levels = 16;
 pub const input_count = core.BoardCellCount * levels;
 pub const h1_size: u32 = width.h1;
 pub const h2_size: u32 = width.h2;
+/// Hand-engineered global board features (#226): 0 (the default build) keeps the 256 one-hot inputs and
+/// the current weights file; `zig build nn -Dfeat=6` adds the first `feature_count` of `feature_all` as
+/// extra input rows (`Net.wf`), so the net no longer has to learn empty-count/monotonicity from scratch.
+pub const feature_count: u32 = width.feat;
+/// Every feature is normalised to 0..1 so one learning rate serves all of them, in this order:
+/// empties, max level, monotonicity, smoothness, max tile in a corner, total level mass.
+pub const feature_all = 6;
 /// Score deltas are divided by this before they enter the value target, so values stay near unit scale.
 pub const reward_scale: f64 = 1000;
 
@@ -27,6 +34,8 @@ pub const Net = extern struct {
     b2: [h2_size]f64,
     w3: [h2_size]f64,
     b3: f64,
+    /// (#226) One row per global feature; zero width unless the build sets `-Dfeat`.
+    wf: [feature_count][h1_size]f64,
 
     pub fn init(rng: std.Random) Net {
         var net = std.mem.zeroes(Net);
@@ -37,6 +46,9 @@ pub const Net = extern struct {
             w.* = uniform(rng, 1.0 / 8.0);
         };
         for (&net.w3) |*w| w.* = uniform(rng, 1.0 / @sqrt(@as(f64, h2_size)));
+        // `wf` stays zero (#226): the features then contribute nothing to a fresh net (so a build with
+        // `-Dfeat` reproduces the plain one until training moves them) and they still get their gradient
+        // on the first step, because the update uses `cache.feat`, not the current weight.
         return net;
     }
 };
@@ -68,11 +80,74 @@ pub const Cache = struct {
     z2: [h2_size]f64 = undefined,
     a2: [h2_size]f64 = undefined,
     out: f64 = 0,
+    /// (#226) the global features of the same board (empty array unless the build sets `-Dfeat`).
+    feat: [feature_count]f64 = undefined,
 };
 
 pub fn levelOf(value: core.Tile) usize {
     if (value == 0) return 0;
     return @min(levels - 1, std.math.log2_int(core.Tile, value));
+}
+
+/// (#226) The global features of `board`, in `feature_all` order, each in 0..1.
+pub fn featureValues(board: Board) [feature_all]f64 {
+    var empties: f64 = 0;
+    var max_level: f64 = 0;
+    var mass: f64 = 0;
+    var monotone_penalty: f64 = 0;
+    var roughness: f64 = 0;
+    for (0..core.BoardCellCount) |cell| {
+        const level: f64 = @floatFromInt(levelOf(board[cell / core.BoardSize][cell % core.BoardSize]));
+        if (level == 0) empties += 1;
+        max_level = @max(max_level, level);
+        mass += level;
+    }
+    // Rows and columns as 8 lines of 4 log2 levels (0 = empty, and empties count as 0 in both terms).
+    for (0..core.BoardSize) |fixed| {
+        for (0..2) |axis| {
+            var inc: f64 = 0;
+            var dec: f64 = 0;
+            var prev: f64 = 0;
+            for (0..core.BoardSize) |k| {
+                const level: f64 = @floatFromInt(if (axis == 0)
+                    levelOf(board[fixed][k])
+                else
+                    levelOf(board[k][fixed]));
+                const diff = level - prev;
+                if (k > 0) {
+                    inc += @max(diff, 0);
+                    dec += @max(-diff, 0);
+                    if (level > 0 and prev > 0) roughness += @abs(diff);
+                }
+                prev = level;
+            }
+            monotone_penalty += @min(inc, dec);
+        }
+    }
+    const max_tile = @max(1, max_level);
+    const corners = [_]usize{ 0, core.BoardSize - 1, core.BoardCellCount - core.BoardSize, core.BoardCellCount - 1 };
+    var in_corner = false;
+    if (max_level > 0) for (corners) |c| {
+        const level = levelOf(board[c / core.BoardSize][c % core.BoardSize]);
+        if (@as(f64, @floatFromInt(level)) == max_tile) in_corner = true;
+    };
+    const scale: f64 = @floatFromInt(core.BoardSize * core.BoardSize);
+    return .{
+        empties / scale,
+        max_level / @as(f64, @floatFromInt(levels - 1)),
+        @max(0, 1 - monotone_penalty / (scale / 2 * @as(f64, @floatFromInt(levels - 1)))),
+        @max(0, 1 - roughness / (scale * @as(f64, @floatFromInt(levels - 1)))),
+        if (in_corner) 1 else 0,
+        mass / (scale * @as(f64, @floatFromInt(levels - 1))),
+    };
+}
+
+/// (#226) The first `feature_count` values of `featureValues`, which is what the net consumes.
+pub fn features(board: Board) [feature_count]f64 {
+    const all = featureValues(board);
+    var out: [feature_count]f64 = undefined;
+    for (0..feature_count) |k| out[k] = all[k];
+    return out;
 }
 
 /// Afterstate value estimate (scalar, unit-scale). Fills `cache` for a following `train`.
@@ -84,6 +159,13 @@ pub fn forward(net: *const Net, board: Board, cache: *Cache) f64 {
     cache.z1 = net.b1;
     for (cache.rows) |row| {
         for (0..h1_size) |i| cache.z1[i] += net.w1[row][i];
+    }
+    if (comptime feature_count > 0) {
+        cache.feat = features(board);
+        for (cache.feat, 0..) |f, k| {
+            if (f == 0) continue;
+            for (0..h1_size) |i| cache.z1[i] += net.wf[k][i] * f;
+        }
     }
     for (0..h1_size) |i| cache.a1[i] = @max(cache.z1[i], 0);
 
@@ -120,6 +202,11 @@ pub fn train(net: *Net, cache: *const Cache, target: f64, lr: f64) void {
         const dz1 = if (cache.z1[i] > 0) da1[i] else 0;
         net.b1[i] -= lr * dz1;
         for (cache.rows) |row| net.w1[row][i] -= lr * dz1;
+        if (comptime feature_count > 0) {
+            for (0..feature_count) |k| if (cache.feat[k] != 0) {
+                net.wf[k][i] -= lr * dz1 * cache.feat[k];
+            };
+        }
     }
 }
 
@@ -2361,7 +2448,7 @@ fn flatConst(net: *const Net) []const f64 {
 
 /// Weight blocks that share one step, in `Net` field order. `b3` gets its own block because it is an
 /// order of magnitude larger than `w3` and would otherwise cost `w3` 13x its resolution.
-pub const quant_block_count = 6;
+pub const quant_block_count = if (feature_count > 0) 7 else 6;
 /// Activations that cross a layer boundary, each with its own step: hidden layer 1 and 2.
 pub const quant_activation_count = 2;
 
@@ -2384,9 +2471,10 @@ fn blockOf(comptime field: []const u8) Block {
     };
 }
 
-pub const quant_blocks = [quant_block_count]Block{
-    blockOf("w1"), blockOf("b1"), blockOf("w2"), blockOf("b2"), blockOf("w3"), blockOf("b3"),
-};
+pub const quant_blocks = if (feature_count > 0)
+    [7]Block{ blockOf("w1"), blockOf("b1"), blockOf("w2"), blockOf("b2"), blockOf("w3"), blockOf("b3"), blockOf("wf") }
+else
+    [6]Block{ blockOf("w1"), blockOf("b1"), blockOf("w2"), blockOf("b2"), blockOf("w3"), blockOf("b3") };
 
 /// The i16 mirror of `Net`, field for field. `extern` keeps the layout raw, so the payload in the file
 /// is these bytes little-endian (2 B per weight instead of 8).
@@ -2397,6 +2485,8 @@ pub const QPayload = extern struct {
     b2: [h2_size]i16,
     w3: [h2_size]i16,
     b3: i16,
+    /// (#226) zero-length unless the build sets `-Dfeat`, so the shipped layout is unchanged.
+    wf: [feature_count][h1_size]i16,
 };
 
 /// int16 weights plus the steps that turn them back into values (#170): `w ≈ q * steps[block]`,
@@ -5231,4 +5321,42 @@ test "a teacher file may hold more than one dump worth of samples (#207)" {
     defer std.testing.allocator.destroy(t);
     try t.parse(bytes);
     try std.testing.expectEqual(count, t.len);
+}
+
+test "global features are normalised and describe the board (#226)" {
+    const empty: Board = std.mem.zeroes(Board);
+    const f0 = featureValues(empty);
+    try std.testing.expectEqual(@as(f64, 1), f0[0]);
+    try std.testing.expectEqual(@as(f64, 0), f0[1]);
+    try std.testing.expectEqual(@as(f64, 1), f0[2]);
+    try std.testing.expectEqual(@as(f64, 1), f0[3]);
+    try std.testing.expectEqual(@as(f64, 0), f0[4]);
+    try std.testing.expectEqual(@as(f64, 0), f0[5]);
+
+    // the max tile in a corner is the one signal the one-hot input cannot place cheaply
+    var corner: Board = std.mem.zeroes(Board);
+    corner[0][0] = 2048;
+    const f1 = featureValues(corner);
+    try std.testing.expectEqual(@as(f64, 1), f1[4]);
+    try std.testing.expect(f1[0] < f0[0]);
+    try std.testing.expect(f1[1] > 0.7);
+
+    var middle: Board = std.mem.zeroes(Board);
+    middle[1][1] = 2048;
+    try std.testing.expectEqual(@as(f64, 0), featureValues(middle)[4]);
+
+    // a monotone row is smoother than an alternating one
+    var mono: Board = std.mem.zeroes(Board);
+    mono[0] = .{ 2, 4, 8, 16 };
+    var rough: Board = std.mem.zeroes(Board);
+    rough[0] = .{ 2, 1024, 4, 2048 };
+    try std.testing.expect(featureValues(mono)[3] > featureValues(rough)[3]);
+
+    // every feature stays inside 0..1 for an arbitrary mid-game board
+    var mid: Board = std.mem.zeroes(Board);
+    mid[0] = .{ 4, 8, 2, 2 };
+    mid[1] = .{ 512, 16, 4, 0 };
+    mid[2] = .{ 64, 8, 128, 2 };
+    mid[3] = .{ 1024, 32, 2, 4 };
+    for (featureValues(mid)) |f| try std.testing.expect(f >= 0 and f <= 1);
 }
