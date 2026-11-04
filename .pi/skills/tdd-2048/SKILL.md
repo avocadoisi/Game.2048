@@ -70,6 +70,15 @@ disagreed before. Distillation (`dist`) is the strongest fine-tune so far (every
 458,752-sample teacher: +1,184 ± 9,370, i.e. parity, below the bar), and `ft2` is retired: its deep half
 relabels with the live net and diverges to NaN at every lr and every thinning (#207).
 
+**Capacity: widen `h2`, not `h1` (#220).** `zig build nn -Dh1=… -Dh2=…` changes the architecture and the
+weights file format (the header is 16 bytes + raw f64, so a file only loads in a matching build). 128/128
+needs ~300,000 games before it beats the shipped net: 100,000 games = 72,012 (worse), 300,000 = 92,953
+(7/20 reach 8192) and `pairw` +8,624 ± 7,679 (13/20) — real, but 12x the ms/move and still under the bar;
+128/32 at the same 300,000 = 78,500, so the output layer `h2` is the only width that matters. Extending a
+300,000 net with lr 3e-4 regresses (84,118). To compare nets of different widths use `scripts/widen-net.py`
+(zero padding is value-exact — the padded shipped net reproduces 79,657.0 exactly) and run `pairw` in the
+wider build.
+
 **Training is serial, always — one `zig build nn` at a time, even when the user asks for parallel work.**
 Only implementation, review and exploration may run in parallel. Measured: five `dson` lanes started
 together ran at 1.0-1.35 ms/move each, the same run alone is 0.5 ms/move; the wall clock and the
