@@ -11,7 +11,8 @@ the widened file computes the same value as the original, bit for bit.
 
 Layout (little endian, `ai/solver/nn.zig`): 16-byte header (8-byte magic `2048-NN`, u32 version,
 u32 endian marker 0x01020304), then f64 weights in struct order:
-`w1[256][h1]`, `b1[h1]`, `w2[h2][h1]`, `b2[h2]`, `w3[h2]`, `b3`.
+`w1[256][h1]`, `b1[h1]`, `w2[h2][h1]`, `b2[h2]`, `w3[h2]`, `b3`, then the `-Dfeat` global rows
+`wf[feat][h1]` (absent when the source build has no features; `--feat` pads them with zeros).
 """
 import argparse
 import struct
@@ -40,6 +41,14 @@ def main() -> int:
     ap.add_argument("dst")
     ap.add_argument("--h1", type=int, required=True)
     ap.add_argument("--h2", type=int, required=True)
+    ap.add_argument("--src-h1", type=int, default=0, help="source h1 (default: infer, which is ambiguous)")
+    ap.add_argument("--src-h2", type=int, default=0, help="source h2 (default: infer, which is ambiguous)")
+    ap.add_argument(
+        "--feat",
+        type=int,
+        default=0,
+        help="global feature rows of the destination build (zig build nn -Dfeat); the source must have none",
+    )
     a = ap.parse_args()
 
     raw = open(a.src, "rb").read()
@@ -48,10 +57,15 @@ def main() -> int:
     version, marker = struct.unpack("<II", raw[8:16])
     body = raw[16:]
     values = list(struct.unpack("<%dd" % (len(body) // 8), body))
-    found = dims(len(values))
-    if found is None:
-        sys.exit(f"{a.src}: {len(values)} values is not a net width")
-    h1o, h2o = found
+    if a.src_h1 and a.src_h2:
+        h1o, h2o = a.src_h1, a.src_h2
+        if len(values) != INPUTS * h1o + h1o + h2o * h1o + h2o + h2o + 1:
+            sys.exit(f"{a.src}: {len(values)} values does not match {h1o}/{h2o}")
+    else:
+        found = dims(len(values))
+        if found is None:
+            sys.exit(f"{a.src}: {len(values)} values is not a net width")
+        h1o, h2o = found
     h1n, h2n = a.h1, a.h2
     if h1n < h1o or h2n < h2o:
         sys.exit(f"cannot narrow {h1o}/{h2o} to {h1n}/{h2n}")
@@ -80,11 +94,15 @@ def main() -> int:
     out += b2 + [0.0] * (h2n - h2o)
     out += w3 + [0.0] * (h2n - h2o)
     out += [b3]
+    # (#226) the global-feature rows sit at the very end and start at zero: a zero row contributes
+    # nothing, so the padded file computes the same value as the original.
+    out += [0.0] * (a.feat * h1n)
 
     with open(a.dst, "wb") as f:
         f.write(b"2048-NN\0" + struct.pack("<II", version, marker))
         f.write(struct.pack("<%dd" % len(out), *out))
-    print(f"{a.src} ({h1o}/{h2o}) -> {a.dst} ({h1n}/{h2n}), {len(out)} values")
+    extra = f", feat {a.feat}" if a.feat else ""
+    print(f"{a.src} ({h1o}/{h2o}) -> {a.dst} ({h1n}/{h2n}{extra}), {len(out)} values")
     return 0
 
 

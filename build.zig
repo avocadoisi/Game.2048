@@ -15,6 +15,9 @@ pub fn build(b: *std.Build) void {
     const width_opts = b.addOptions();
     width_opts.addOption(u32, "h1", b.option(u32, "h1", "hidden layer 1 width (default 64)") orelse 64);
     width_opts.addOption(u32, "h2", b.option(u32, "h2", "hidden layer 2 width (default 32)") orelse 32);
+    // Hand-engineered global features on top of the one-hot board (#226): 0 (default) keeps today's
+    // 256-input net and file format, 1..6 adds that many of `nn.featureNames` to the input layer.
+    width_opts.addOption(u32, "feat", b.option(u32, "feat", "global board features 0..6 (default 0)") orelse 0);
 
     const parallel_mod = b.addModule("parallel", .{
         .root_source_file = b.path("ai/solver/parallel.zig"),

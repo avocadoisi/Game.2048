@@ -199,8 +199,11 @@ fn parSupported(opts: nn.Options, is_mstd: bool) bool {
     // `distill` stays out: it is read-only and race-free, but a 20,000-game `dist` net trained under `par`
     // is 30,000 points behind the same serial run at every batch_scale tried (#207), so the batched path
     // is refused rather than silently offered.
+    // `-Dfeat` builds stay out too (#226): a feature net trained under `par` lands far below the same
+    // serial run (feat 1, 100k games, sqrt rule: 27,433 under `par` vs 81,959 serial), so the batched
+    // path would silently produce a broken net.
     return opts.priority == null and !is_mstd and opts.target == .td1 and opts.selfplay == .greedy1 and
-        opts.teacher == null and opts.distill == null;
+        opts.teacher == null and opts.distill == null and nn.feature_count == 0;
 }
 
 /// Foreign rerank score of the #189 eval row: the snake heuristic of `solver.evaluate` (the #117
@@ -860,6 +863,11 @@ test "usage text documents the par flag for stateless variants" {
 
 test "usage text lists the symbatch variant" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "symbatch (#98") != null);
+}
+
+test "par is refused for the global-feature build (#226)" {
+    // the default build has no features, so the guard is a no-op there; a `-Dfeat` build must refuse
+    try std.testing.expectEqual(nn.feature_count != 0, !parSupported(.{}, false));
 }
 
 test "usage text lists the exploration variants (#224)" {
