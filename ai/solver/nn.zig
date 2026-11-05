@@ -210,6 +210,37 @@ pub fn train(net: *Net, cache: *const Cache, target: f64, lr: f64) void {
     }
 }
 
+/// Adam (#231) moment estimates, one per weight. The optimizer state lives outside the weight file, so the
+/// format, the shipped net and every existing variant stay untouched.
+pub const Adam = struct {
+    m: Net = std.mem.zeroes(Net),
+    v: Net = std.mem.zeroes(Net),
+    t: u64 = 0,
+};
+
+/// One Adam step on `net` from the raw gradient `g` (= d loss / d w, the gradient of `train`'s
+/// 0.5 * (out - target)^2). `lr` is Adam's own step size: every parameter moves about `lr` per step
+/// regardless of how large `g` is, which is the point of the change — the shipped recipe scales the SGD
+/// rate against the number of updates per move (#227), and a per-parameter normaliser is free of that
+/// coupling.
+///
+/// `par` feeds it one gradient per batch (the per-game SGD deltas divided by `lr`, i.e. the summed
+/// gradient of the games in the batch) and steps once, which is the batch update Adam wants.
+pub fn applyAdam(net: *Net, g: *const Net, state: *Adam, lr: f64) void {
+    const beta1: f64 = 0.9;
+    const beta2: f64 = 0.999;
+    const eps: f64 = 1e-8;
+    state.t += 1;
+    const t: f64 = @floatFromInt(state.t);
+    const c1 = 1 - std.math.pow(f64, beta1, t);
+    const c2 = 1 - std.math.pow(f64, beta2, t);
+    for (flat(net), flatConst(g), flat(&state.m), flat(&state.v)) |*w, x, *m, *v| {
+        m.* = beta1 * m.* + (1 - beta1) * x;
+        v.* = beta2 * v.* + (1 - beta2) * x * x;
+        w.* -= lr * (m.* / c1) / (@sqrt(v.* / c2) + eps);
+    }
+}
+
 /// MS-TD (#107): one value net per afterstate stage, staged by the number of empty cells.
 /// Boundaries: 0..2, 3..4, 5..6, 7..8, 9..10, 11..12, 13..16 empties.
 pub const stage_count: usize = 7;
@@ -1513,6 +1544,13 @@ pub const Options = struct {
     /// spends on the same number of games; `batch_scale` recovers it (`games` = the linear scaling
     /// rule, `sqrt(games)` = the noise-only correction). 1.0 keeps the historical behaviour.
     batch_scale: f64 = 1.0,
+    /// Candidate (#231): take an Adam step on the merged batch gradient instead of the SGD step, so the
+    /// step size of every parameter is normalised. Only `par` (the batch path) implements it: the serial
+    /// path would need per-sample Adam state, and the batch gradient is the better input anyway.
+    adam: ?*Adam = null,
+    /// Adam's own step size (independent of `lr`, which only sets how far the per-game nets walk while the
+    /// batch gradient is accumulated and therefore cancels out of the normalised step).
+    adam_lr: f64 = 0.01,
     /// Candidate (#98): true batch symmetry augmentation — one averaged step per afterstate, where all 8
     /// transformed gradients come from one net snapshot (unlike `symmetry`, which steps 8 times sequentially).
     sym_batch: bool = false,
@@ -2335,13 +2373,16 @@ pub fn trainBatchOpts(net: *Net, seed: u64, first_game: usize, games: usize, lr:
     // the priority buffer is cross-game state shared by pointer: batching it would be a data race
     std.debug.assert(opts.priority == null);
     var units: [parallel.max_threads]BatchGame = undefined;
+    // the per-game nets train with plain SGD; Adam acts once on the merged gradient below
+    var thread_opts = opts;
+    thread_opts.adam = null;
     parallel.map(BatchGame, units[0..games], BatchGameCtx{
         .net = net.*,
         .seed = seed,
         .first_game = first_game,
         .lr = lr,
         .want_diag = diag != null,
-        .opts = opts,
+        .opts = thread_opts,
     }, runBatchGame);
 
     const start = net.*;
@@ -2355,6 +2396,15 @@ pub fn trainBatchOpts(net: *Net, seed: u64, first_game: usize, games: usize, lr:
     const n: f64 = @floatFromInt(games);
     const scale = opts.batch_scale / n;
     for (out_w, start_w) |*o, s| o.* = s + o.* * scale;
+    if (opts.adam) |state| {
+        // The merge above is `-lr * (summed batch gradient)`, so dividing by `lr` gives Adam the gradient;
+        // `start` is the net the games played with, and the optimizer step is applied to it (#231).
+        var grad: Net = undefined;
+        const inv = -1 / lr;
+        for (flat(&grad), flatConst(net), start_w) |*g, merged, s| g.* = (merged - s) * inv;
+        net.* = start;
+        applyAdam(net, &grad, state, opts.adam_lr);
+    }
     if (diag) |d| for (units[0..games]) |u| mergeDiag(d, &u.diag);
     var moves: u64 = 0;
     for (units[0..games]) |u| moves += u.moves;
@@ -4426,6 +4476,36 @@ test "batch_scale multiplies the merged delta so a batch does the work of its ga
     var mean_serial = base;
     for (flat(&mean_serial), start, sums) |*w, s, sum| w.* = s + sum / games;
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&mean_serial), std.mem.asBytes(&unscaled));
+}
+
+test "Adam normalises a unit gradient to one lr-sized step per weight (#231)" {
+    var init_rng = std.Random.DefaultPrng.init(91);
+    var net = Net.init(init_rng.random());
+    const before = net;
+    var g = std.mem.zeroes(Net);
+    for (flat(&g)) |*x| x.* = 1;
+    var state: Adam = .{};
+    applyAdam(&net, &g, &state, 0.01);
+    // first step: `m_hat = v_hat = 1` for a unit gradient, so every weight moves by exactly `lr`
+    for (flat(&net), flatConst(&before)) |w, s| try std.testing.expectApproxEqAbs(s - 0.01, w, 1e-6);
+    // a zero gradient then moves on the momentum alone, by less than the last step but not nothing
+    var zero = std.mem.zeroes(Net);
+    const before2 = net;
+    applyAdam(&net, &zero, &state, 0.01);
+    for (flat(&net), flatConst(&before2)) |w, s| try std.testing.expectApproxEqAbs(s - 0.0067, w, 1e-3);
+}
+
+test "par + Adam takes one bounded step per batch (#231)" {
+    const games = 2;
+    var init_rng = std.Random.DefaultPrng.init(77);
+    var base = Net.init(init_rng.random());
+    var state: Adam = .{};
+    var net = base;
+    _ = trainBatchOpts(&net, 77, 0, games, 0.003, null, .{ .adam = &state, .adam_lr = 0.01 });
+    try std.testing.expectEqual(@as(u64, 1), state.t);
+    for (flat(&net)) |w| try std.testing.expect(std.math.isFinite(w));
+    // the gradient scale never enters the step: |dw| <= adam_lr whatever the batch delta was
+    for (flat(&net), flatConst(&base)) |w, s| try std.testing.expect(@abs(w - s) <= 0.0101);
 }
 
 test "parallel training batch with variant opts matches a serial run of the same game seeds" {

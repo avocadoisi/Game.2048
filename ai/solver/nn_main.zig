@@ -59,6 +59,8 @@ const usage =
     \\                       self-play trajectory (shallow positions included) and 50% land on the deep tail)
     \\              restart (#159: fine tuning that starts every self-play game on a uniformly drawn deep
     \\                       afterstate of dump_path plus one fresh spawn; otherwise trains like resume)
+    \\              adam    (#231: `par` only. The batch gradient is stepped by Adam instead of plain SGD, so
+    \\                       every parameter moves about adam_lr per step whatever its gradient scale is)
     \\  pairw         (#210) paired comparison of two weight files: A = weights_path with `deep`,
     \\                B = the path after the `-` par slot with `deep`, same spawn tape per game
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
@@ -81,7 +83,8 @@ const usage =
     \\                batch size, #203; `-` = 1 = the old mean, `8` = the #208 linear rule). Sits after
     \\                the "-" par dump slot
     \\  rows          (#203) eval-table rows to run, comma list after batch_scale (`-` = all), e.g.
-    \\                "0,2" for 1-ply and 2-ply only; the 3-ply rows dominate a measurement run
+    \\                "0,2" for 1-ply and 2-ply only; the 3-ply rows dominate a measurement run.
+    \\                For variant adam this slot is adam_lr instead (default 0.01), like dist's divisor
     \\
     \\Weights are written to `weights_path` only when train_games > 0;
     \\train_games = 0 (eval only) never writes.
@@ -189,6 +192,16 @@ fn parseParFlag(args: []const []const u8) !bool {
     if (std.mem.eql(u8, args[10], "-")) return false;
     if (!std.mem.eql(u8, args[10], "par")) return error.InvalidParFlag;
     return true;
+}
+
+/// (#231) Adam's own step size for variant `adam`, at the row-spec slot (dist owns that slot for its
+/// teacher divisor, so the two variants never collide).
+fn parseAdamLr(args: []const []const u8) !f64 {
+    if (args.len <= 13) return 0.01;
+    if (std.mem.eql(u8, args[13], "-")) return 0.01;
+    const lr = std.fmt.parseFloat(f64, args[13]) catch return error.InvalidAdamLr;
+    if (!(lr > 0)) return error.InvalidAdamLr;
+    return lr;
 }
 
 /// `par` forks whole games onto threads, so it cannot carry the cross-game priority buffer (shared by
@@ -375,6 +388,8 @@ pub fn main(init: std.process.Init) !void {
     const is_t2 = std.mem.eql(u8, variant, "t2");
     const is_p2 = std.mem.eql(u8, variant, "p2");
     const is_tp2 = std.mem.eql(u8, variant, "tp2");
+    // (#231) `par` only: Adam steps on the merged batch gradient.
+    const is_adam = std.mem.eql(u8, variant, "adam");
     // (#206) the teacher mix: `distill_every` (arg 12) and the rate divisor (arg 13).
     const dist_mix: DistillMix = if (is_dist or is_dson) try parseDistillMix(args) else .{};
     // #159 variants train from the net in weights_path (the deep positions come from that net), like `resume`
@@ -390,6 +405,7 @@ pub fn main(init: std.process.Init) !void {
     const dump_path: ?[]const u8 = if (args.len > 11) args[11] else null;
     var dump: nn.Dump = .{};
     var priority: nn.Priority = .{};
+    var adam: nn.Adam = .{};
     // `nn.Teachers` is ~40 MB (32 dumps worth, #207), so it is heap allocated, unlike the small buffers.
     const teachers = try init.gpa.create(nn.Teachers);
     defer init.gpa.destroy(teachers);
@@ -435,6 +451,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .selfplay = .deep2 }
     else if (std.mem.eql(u8, variant, "tp2"))
         .{ .target = .search2, .selfplay = .deep2 }
+    else if (is_adam)
+        .{ .adam = &adam, .adam_lr = try parseAdamLr(args) }
     else if (std.mem.eql(u8, variant, "d2"))
         .{ .teacher = .deep }
     else if (std.mem.eql(u8, variant, "d3"))
@@ -465,9 +483,10 @@ pub fn main(init: std.process.Init) !void {
     // `dump` is the shared layout plus one slot: index 11 carries the dump path.
     // `par` runs may carry the #137 batch_scale at index 12, after the `-` dump slot.
     // (#203) index 13 narrows the eval table to the rows a measurement needs (`0,2`); `dist`/`dson`
-    // already own 13 as the teacher lr divisor, and `pairw` returns before the table is built.
-    const row_spec: ?[]const u8 = if (is_dist or is_dson or is_pairw or is_pair) null else if (args.len > 13) args[13] else null;
-    const max_args: usize = if (is_dist or is_dson) 14 else if (row_spec != null) 14 else if (is_ft2 or is_tch) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw) 12 else 11;
+    // already own 13 as the teacher lr divisor, `adam` as its step size, and `pairw` returns before the
+    // table is built.
+    const row_spec: ?[]const u8 = if (is_dist or is_dson or is_adam or is_pairw or is_pair) null else if (args.len > 13) args[13] else null;
+    const max_args: usize = if (is_dist or is_dson or is_adam) 14 else if (row_spec != null) 14 else if (is_ft2 or is_tch) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw) 12 else 11;
     if (args.len > max_args or seed_ranges == 0 or (uses_dump and dump_path == null)) {
         std.debug.print("{s}", .{usage});
         return;
@@ -475,6 +494,11 @@ pub fn main(init: std.process.Init) !void {
     // the priority ring buffer, the dump, the deep mix and the restart buffer are cross-game state:
     // batching would race on them. `mstd` has no batch path either (one staged net is ~1 MB).
     if (use_par and (!parSupported(opts, is_mstd) or opts.dump_record or opts.deep_mix or opts.restart or opts.distill != null)) {
+        std.debug.print("{s}", .{usage});
+        return;
+    }
+    // (#231) Adam steps on the merged batch gradient only, so the variant needs `par` at arg 10.
+    if (is_adam and !use_par) {
         std.debug.print("{s}", .{usage});
         return;
     }
