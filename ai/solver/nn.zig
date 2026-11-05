@@ -1551,6 +1551,11 @@ pub const Options = struct {
     /// Adam's own step size (independent of `lr`, which only sets how far the per-game nets walk while the
     /// batch gradient is accumulated and therefore cancels out of the normalised step).
     adam_lr: f64 = 0.01,
+    /// Candidate (#232): weight each per-move TD sample by how few empty cells its board has, so the late
+    /// game (the tail that decides the 8192 rate) takes a larger step than the midgame. 0 = off, which is
+    /// bit-identical to the historical run: for plain SGD a per-sample loss weight *is* an `lr` multiplier,
+    /// so `tailWeight` scales the step instead of touching the loss (`1 + alpha` at 0 empties, 1 at 15).
+    tail_alpha: f64 = 0,
     /// Candidate (#98): true batch symmetry augmentation — one averaged step per afterstate, where all 8
     /// transformed gradients come from one net snapshot (unlike `symmetry`, which steps 8 times sequentially).
     sym_batch: bool = false,
@@ -2130,6 +2135,31 @@ fn trainSymBatch(net: *Net, after: Board, target: f64, lr: f64) void {
     for (flat(net), flat(&grad)) |*w, x| w.* -= lr * scale * x;
 }
 
+/// (#232) The step size of one per-move TD sample: `lr` itself, or up to `lr * (1 + tail_alpha)` when the
+/// board the target bootstrapped from is nearly full. Exact SGD loss weighting, see `Options.tail_alpha`.
+fn tailWeight(opts: Options, board: Board, lr: f64) f64 {
+    if (opts.tail_alpha <= 0) return lr;
+    const empty: f64 = @floatFromInt(core.countEmpty(board));
+    return lr * (1 + opts.tail_alpha * (15 - empty) / 15);
+}
+
+test "tail weight scales only the nearly full boards (#232)" {
+    var open: Board = std.mem.zeroes(Board);
+    open[0][0] = 1;
+    try std.testing.expectEqual(@as(f64, 0.003), tailWeight(.{}, open, 0.003));
+    try std.testing.expectEqual(@as(f64, 0.003), tailWeight(.{ .tail_alpha = 3 }, open, 0.003));
+    var full: Board = std.mem.zeroes(Board);
+    for (&full) |*row| {
+        for (row) |*cell| cell.* = 1;
+    }
+    try std.testing.expectApproxEqAbs(@as(f64, 0.012), tailWeight(.{ .tail_alpha = 3 }, full, 0.003), 1e-12);
+    var half: Board = std.mem.zeroes(Board);
+    for (0..4) |r| {
+        for (0..4) |c| half[r][c] = if (c % 2 == 0) 1 else 0;
+    }
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0072), tailWeight(.{ .tail_alpha = 3 }, half, 0.003), 1e-12);
+}
+
 /// One per-move TD update on `after` with `target`: all 8 dihedral transforms when `opts.symmetry`,
 /// and TD(lambda) through `trace` when `opts.lambda > 0` (otherwise the plain TD(0) `train` step).
 fn trainStep(net: *Net, cache: *Cache, after: Board, target: f64, lr: f64, opts: Options, trace: *Net) void {
@@ -2187,7 +2217,7 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
                 const target = p.reward + tdBootstrap(net, pick, state, opts);
                 if (diag) |d| d.push(p.after, @abs(target - p.value), pick.value - p.value);
                 if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = pick.after, .terminal = false, .err = @abs(target - p.value) });
-                trainStep(net, &cache, p.after, target, lr, opts, &trace);
+                trainStep(net, &cache, p.after, target, tailWeight(opts, state.board, lr), opts, &trace);
             }
         }
         pending = pick;
@@ -2210,7 +2240,7 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
         if (!opts.distill_only) {
             if (diag) |d| d.push(p.after, @abs(p.reward - p.value), -p.value);
             if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = p.after, .terminal = true, .err = @abs(p.reward - p.value) });
-            trainStep(net, &cache, p.after, p.reward, lr, opts, &trace);
+            trainStep(net, &cache, p.after, p.reward, tailWeight(opts, state.board, lr), opts, &trace);
         }
     }
     if (pr) |b| for (0..b.m) |_| {

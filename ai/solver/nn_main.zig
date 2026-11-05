@@ -61,6 +61,8 @@ const usage =
     \\                       afterstate of dump_path plus one fresh spawn; otherwise trains like resume)
     \\              adam    (#231: `par` only. The batch gradient is stepped by Adam instead of plain SGD, so
     \\                       every parameter moves about adam_lr per step whatever its gradient scale is)
+    \\              tailw   (#232: weights every per-move TD sample by how few empty cells its board has, so
+    \\                       the late game takes up to `1 + tail_alpha` times the step of an open board)
     \\  pairw         (#210) paired comparison of two weight files: A = weights_path with `deep`,
     \\                B = the path after the `-` par slot with `deep`, same spawn tape per game
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
@@ -85,6 +87,7 @@ const usage =
     \\  rows          (#203) eval-table rows to run, comma list after batch_scale (`-` = all), e.g.
     \\                "0,2" for 1-ply and 2-ply only; the 3-ply rows dominate a measurement run.
     \\                For variant adam this slot is adam_lr instead (default 0.01), like dist's divisor
+    \\                and tailw's tail_alpha (default 1: twice the step on a full board).
     \\
     \\Weights are written to `weights_path` only when train_games > 0;
     \\train_games = 0 (eval only) never writes.
@@ -202,6 +205,17 @@ fn parseAdamLr(args: []const []const u8) !f64 {
     const lr = std.fmt.parseFloat(f64, args[13]) catch return error.InvalidAdamLr;
     if (!(lr > 0)) return error.InvalidAdamLr;
     return lr;
+}
+
+/// (#232) `tail_alpha` for variant `tailw`, at the same row-spec slot as Adam's step size: the step of a
+/// per-move sample is `lr * (1 + alpha * (15 - empties) / 15)`, i.e. up to `1 + alpha` times `lr` on a
+/// board with no empty cell. 0 would make the variant a plain `base` run, so it is refused.
+fn parseTailAlpha(args: []const []const u8) !f64 {
+    if (args.len <= 13) return 1;
+    if (std.mem.eql(u8, args[13], "-")) return 1;
+    const alpha = std.fmt.parseFloat(f64, args[13]) catch return error.InvalidTailAlpha;
+    if (!(alpha > 0)) return error.InvalidTailAlpha;
+    return alpha;
 }
 
 /// `par` forks whole games onto threads, so it cannot carry the cross-game priority buffer (shared by
@@ -390,6 +404,8 @@ pub fn main(init: std.process.Init) !void {
     const is_tp2 = std.mem.eql(u8, variant, "tp2");
     // (#231) `par` only: Adam steps on the merged batch gradient.
     const is_adam = std.mem.eql(u8, variant, "adam");
+    // (#232) `par`-compatible: the weight is a per-sample `lr` multiplier, so every game stays independent.
+    const is_tailw = std.mem.eql(u8, variant, "tailw");
     // (#206) the teacher mix: `distill_every` (arg 12) and the rate divisor (arg 13).
     const dist_mix: DistillMix = if (is_dist or is_dson) try parseDistillMix(args) else .{};
     // #159 variants train from the net in weights_path (the deep positions come from that net), like `resume`
@@ -453,6 +469,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .target = .search2, .selfplay = .deep2 }
     else if (is_adam)
         .{ .adam = &adam, .adam_lr = try parseAdamLr(args) }
+    else if (is_tailw)
+        .{ .tail_alpha = try parseTailAlpha(args) }
     else if (std.mem.eql(u8, variant, "d2"))
         .{ .teacher = .deep }
     else if (std.mem.eql(u8, variant, "d3"))
@@ -485,8 +503,8 @@ pub fn main(init: std.process.Init) !void {
     // (#203) index 13 narrows the eval table to the rows a measurement needs (`0,2`); `dist`/`dson`
     // already own 13 as the teacher lr divisor, `adam` as its step size, and `pairw` returns before the
     // table is built.
-    const row_spec: ?[]const u8 = if (is_dist or is_dson or is_adam or is_pairw or is_pair) null else if (args.len > 13) args[13] else null;
-    const max_args: usize = if (is_dist or is_dson or is_adam) 14 else if (row_spec != null) 14 else if (is_ft2 or is_tch) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw) 12 else 11;
+    const row_spec: ?[]const u8 = if (is_dist or is_dson or is_adam or is_tailw or is_pairw or is_pair) null else if (args.len > 13) args[13] else null;
+    const max_args: usize = if (is_dist or is_dson or is_adam or is_tailw) 14 else if (row_spec != null) 14 else if (is_ft2 or is_tch) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw) 12 else 11;
     if (args.len > max_args or seed_ranges == 0 or (uses_dump and dump_path == null)) {
         std.debug.print("{s}", .{usage});
         return;
