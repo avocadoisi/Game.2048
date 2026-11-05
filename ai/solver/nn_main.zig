@@ -67,9 +67,9 @@ const usage =
     \\                nstep|resume); as arg 6 it keeps its old meaning, the plain per-move variant only,
     \\                so replay_k is ignored there but its slot must be filled to reach weights_path.
     \\                Not supported for priority|midgame|midmix (cross-game replay buffer)
-    \\                or t2|p2|tp2 (#158: the extra search per move is the whole cost, batching it too
-    \\                would only multiply the work), or d2|d3 (#167: the teacher search is the whole cost). "-" here means the same as leaving it out, which
-    \\                is how dump_path is reached.
+    \\                or d2|d3 (#167: the teacher search is the whole cost). t2|p2|tp2 (#158) are plain
+    \\                per-move runs, so (#228) they batch like base. "-" here means the same as leaving
+    \\                it out, which is how dump_path is reached.
     \\  replay_k      afterstates re-trained per game for variant replay (default 30)
     \\  weights_path  file to load (train_games 0) or write (default ai/solver/nn_weights.bin); use a temp path for variant runs
     \\  train_seed    seed for weight init and self-play games (default 1, omitted = same weights as before #56)
@@ -192,9 +192,10 @@ fn parseParFlag(args: []const []const u8) !bool {
 }
 
 /// `par` forks whole games onto threads, so it cannot carry the cross-game priority buffer (shared by
-/// pointer), the staged net (no batch path, one net is ~1 MB), or the #158 2-ply variants and their #167
-/// teacher cells (their search is the whole cost of the run; batching would only multiply it by the
-/// thread count).
+/// pointer), the staged net (no batch path, one net is ~1 MB), or the #167 teacher cells (their search
+/// is the whole cost of the run; batching would only multiply it by the thread count).
+/// The #158 aligned variants t2/p2/tp2 use the plain per-move path, so they batch like base; the
+/// value cache is threadlocal and cleared per move (#228), so the games do not share stale leaves.
 fn parSupported(opts: nn.Options, is_mstd: bool) bool {
     // `distill` stays out: it is read-only and race-free, but a 20,000-game `dist` net trained under `par`
     // is 30,000 points behind the same serial run at every batch_scale tried (#207), so the batched path
@@ -202,8 +203,10 @@ fn parSupported(opts: nn.Options, is_mstd: bool) bool {
     // `-Dfeat` builds stay out too (#226): a feature net trained under `par` lands far below the same
     // serial run (feat 1, 100k games, sqrt rule: 27,433 under `par` vs 81,959 serial), so the batched
     // path would silently produce a broken net.
-    return opts.priority == null and !is_mstd and opts.target == .td1 and opts.selfplay == .greedy1 and
-        opts.teacher == null and opts.distill == null and nn.feature_count == 0;
+    return opts.priority == null and !is_mstd and opts.teacher == null and opts.distill == null and
+        nn.feature_count == 0 and
+        (opts.target == .td1 or opts.target == .search2) and
+        (opts.selfplay == .greedy1 or opts.selfplay == .deep2);
 }
 
 /// Foreign rerank score of the #189 eval row: the snake heuristic of `solver.evaluate` (the #117
@@ -368,10 +371,15 @@ pub fn main(init: std.process.Init) !void {
     const is_tchadd = std.mem.eql(u8, variant, "tchadd");
     const is_dist = std.mem.eql(u8, variant, "dist");
     const is_dson = std.mem.eql(u8, variant, "dson");
+    // (#228) the 2-ply-aligned variants: the search per move is priced from `weights_path` too.
+    const is_t2 = std.mem.eql(u8, variant, "t2");
+    const is_p2 = std.mem.eql(u8, variant, "p2");
+    const is_tp2 = std.mem.eql(u8, variant, "tp2");
     // (#206) the teacher mix: `distill_every` (arg 12) and the rate divisor (arg 13).
     const dist_mix: DistillMix = if (is_dist or is_dson) try parseDistillMix(args) else .{};
     // #159 variants train from the net in weights_path (the deep positions come from that net), like `resume`
-    const use_resume = std.mem.eql(u8, variant, "resume") or is_dump or is_ft2 or is_restart or is_dist or is_dson or is_tch;
+    const use_resume = std.mem.eql(u8, variant, "resume") or is_dump or is_ft2 or is_restart or is_dist or is_dson or is_tch or
+        is_t2 or is_p2 or is_tp2;
     // Variants that take dump_path at index 11: `dump` writes it, `ft2` and `restart` read it.
     const uses_dump = is_dump or is_ft2 or is_restart or is_tch or is_dist or is_dson;
     const replay_k: usize = try cli.argOr(usize, args, 7, default_replay_k);
@@ -910,7 +918,7 @@ test "usage text lists the distillation variants (#167)" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "d3      (#167") != null);
 }
 
-test "par is refused for the priority buffer, the staged net and the 2-ply variants (#158)" {
+test "par is refused for the priority buffer, the staged net and the teacher variants (#158, #228)" {
     var pr: nn.Priority = .{};
     // heap, because `Teachers` is ~40 MB
     const teachers = try std.testing.allocator.create(nn.Teachers);
@@ -919,9 +927,11 @@ test "par is refused for the priority buffer, the staged net and the 2-ply varia
     try std.testing.expect(parSupported(.{ .symmetry = true, .replay_k = 30 }, false));
     try std.testing.expect(!parSupported(.{}, true));
     try std.testing.expect(!parSupported(.{ .priority = &pr }, false));
-    try std.testing.expect(!parSupported(.{ .target = .search2 }, false));
-    try std.testing.expect(!parSupported(.{ .selfplay = .deep2 }, false));
-    try std.testing.expect(!parSupported(.{ .target = .search2, .selfplay = .deep2 }, false));
+    // #228: t2/p2/tp2 are plain per-move runs (the value cache is thread-local and cleared per move),
+    // so they batch like base
+    try std.testing.expect(parSupported(.{ .target = .search2 }, false));
+    try std.testing.expect(parSupported(.{ .selfplay = .deep2 }, false));
+    try std.testing.expect(parSupported(.{ .target = .search2, .selfplay = .deep2 }, false));
     // #167: the teacher search is the whole cost, so a batch would only multiply it
     try std.testing.expect(!parSupported(.{ .teacher = .deep }, false));
     try std.testing.expect(!parSupported(.{ .teacher = .deep3 }, false));
