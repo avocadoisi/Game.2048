@@ -966,6 +966,10 @@ const search2_ply: u8 = 2;
 /// the *last* reward reached, so that last reward lands in the target twice and the fixed point of
 /// the `search2` target sits ~1.5x above the true value on a 1-reward-per-move chain.
 fn search2Value(vfn: Value, state: GameState, cache: *ValueCache, sym_leaf: bool) f64 {
+    // (#228) a target is priced between weight updates, so a table filled by an older snapshot would
+    // answer for the current weights; start empty, as `teacherValue` does (#207). The search inside
+    // this call still reuses its own entries, which all come from the current weights.
+    cache.clear();
     // The leaf sits one own move deeper than `value` at the same reward count: key it as such.
     var search: Search = .{ .vfn = vfn, .cache = cache, .ply = search2_ply + 1, .sym_leaf = sym_leaf };
     return search.bootValue(state, search2_ply - 1, 1);
@@ -977,6 +981,9 @@ fn search2Value(vfn: Value, state: GameState, cache: *ValueCache, sym_leaf: bool
 /// `teacherValue` of the board this move is made on is the tree one own move deeper, exactly as
 /// `deepMove` scores the same move. Spawns are enumerated, so this draws nothing from the rng.
 fn pickTeacherValue(vfn: Value, state: GameState, mode: Mode, cache: *ValueCache, sym_leaf: bool) ?Pick {
+    // (#228) same as `search2Value`: this pick is priced after the previous move's weight update, so
+    // it must not read leaves cached with the older weights.
+    cache.clear();
     const depth = phaseDepth(mode, state.board);
     var search: Search = .{
         .vfn = vfn,
@@ -3329,9 +3336,38 @@ test "search2 target does not double count the last reward (#158)" {
     try std.testing.expectEqual(best_after, boot_search.bootValue(state, 0, 1));
 }
 
+test "search2 target and deep2 pick price with the current weights, not the shared cache (#228)" {
+    // A bias-only net is a constant value function, so a target is `search_best_reward + b3` and the
+    // difference between two such nets is exactly the bias delta, whatever the board and the spawns.
+    var old_net = std.mem.zeroes(Net);
+    old_net.b3 = 0.25;
+    var new_net = old_net;
+    new_net.b3 = 0.5;
+    const state: GameState = .{ .board = mid_board.board };
+
+    // `t2`: both calls share one table on purpose. Before #228 the second one answered from the leaves
+    // `old_net` had priced, so `after - before` was 0 instead of the bias delta.
+    var cache: ValueCache = .{};
+    const before = search2Value(.{ .single = &old_net }, state, &cache, false);
+    const after = search2Value(.{ .single = &new_net }, state, &cache, false);
+    try std.testing.expectApproxEqAbs(0.25, after - before, 1e-12);
+
+    // `p2`: the self-play pick walks the same path (`pickSearch2Value` -> `pickTeacherValue`) on the
+    // thread-local table, and a warm table must not change the Pick it returns.
+    const shared = sharedValueCache();
+    shared.clear();
+    const old_pick = pickSearch2Value(.{ .single = &old_net }, state, shared, false).?;
+    const new_pick = pickSearch2Value(.{ .single = &new_net }, state, shared, false).?;
+    shared.clear();
+    const fresh_pick = pickSearch2Value(.{ .single = &new_net }, state, shared, false).?;
+    try std.testing.expectEqual(fresh_pick.dir, new_pick.dir);
+    try std.testing.expectEqual(fresh_pick.value, new_pick.value);
+    try std.testing.expectApproxEqAbs(0.25, new_pick.value - old_pick.value, 1e-12);
+}
+
 test "teacher target equals the mode's search value (#167)" {
-    // the teacher search reads the thread-local cache, so start it cold: a leaf another test left in it
-    // was computed from another net, and the cache is keyed by board only (it changes speed, not values)
+    // (#228) `teacherValue` clears the thread-local cache at entry, so a leaf another test left in it
+    // cannot answer for this test's net; the reset below is belt and braces.
     sharedValueCache().* = .{};
     const weights = try parse(@embedFile("nn_weights.bin"));
     const vfn: Value = .{ .single = &weights };
