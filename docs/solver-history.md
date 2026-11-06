@@ -2974,3 +2974,39 @@ zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.0015 - base 30 /tmp/s2_lr
 zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - clamp 30 /tmp/s2_clamp_300k.bin 2 par - 2.8284271247461903 200
 zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 - resume 30 /tmp/s2_clamp_300k.bin 2 - - - 0,2
 ```
+
+## 反復 DAgger は「壊した分を戻す」だけ（#236）
+
+監査で「L2 が求める反復 DAgger を測っていない」と指摘された。`ft2` は #207 で発散する
+（教師が学習中に動くので自分のラベルを押し上げる）と分かっているので、**凍結ラベルの
+`tch` → `dist` を 1 周とみなし、dump → tch → dist を 2 周** 回した。A = 同梱 128/32。
+
+```
+# 1 周目: 同梱 net から 2-ply 自己対戦で深い局面を集める（lr 0 で回す。lr > 0 だと
+# ゲームが進むほど方策が壊れて 4096 に届かず、dump が 0 件になる）
+zig build nn -Doptimize=ReleaseFast -- 288 0 9000 0 - dumpp2 30 /tmp/dg0.bin 1 - /tmp/dg1.dump
+zig build nn -Doptimize=ReleaseFast -- 0 0 9000 0 - tch 30 /tmp/dg0.bin 1 - /tmp/dg1.dump
+cp /tmp/dg0.bin /tmp/dg1.bin   # dist は weights_path から読み、同じパスへ書く
+zig build nn -Doptimize=ReleaseFast -- 20000 0 9000 0.0003 1 dist 30 /tmp/dg1.bin 1 - /tmp/dg1.dump.tch 4 3
+# 2 周目: 1 周目の net で同じことをする
+zig build nn -Doptimize=ReleaseFast -- 144 0 9100 0 - dumpp2 30 /tmp/dg1.bin 1 - /tmp/dg2.dump
+zig build nn -Doptimize=ReleaseFast -- 0 0 9100 0 - tch 30 /tmp/dg1.bin 1 - /tmp/dg2.dump
+cp /tmp/dg1.bin /tmp/dg2.bin
+zig build nn -Doptimize=ReleaseFast -- 20000 0 9100 0.0003 1 dist 30 /tmp/dg2.bin 1 - /tmp/dg2.dump.tch 4 3
+```
+
+| 周 | dump（局 / 記録 / 時間） | 教師 | `dist` 20k every4 div3 | 非ペア 2-ply（9000 / 9100） | 8192 | `pairw` vs 同梱 |
+|---|---|---|---|---|---|---|
+| — | 同梱 net | — | — | 113,682.2 / 129,456.2 | 11/20, 14/20 | — |
+| 1 | 288 / 65,536（918,953 破棄）/ 96 分 | 65,536（214 s、3.3 ms/sample） | 1,048 s | 103,142.4 / 96,618.8 | 9/20, 7/20 | **−27,244.4 ± 12,873.1**（6 勝 14 敗） |
+| 2 | 144 / 65,536（325,584 破棄）/ 43 分 | 65,536（209 s） | 1,014 s | **114,409.8** / 115,239.8 | 13/20, 11/20 | **+2,366.8 ± 9,601.5**（10 勝 10 敗） |
+
+**読み**: 1 周目で −27k まで落ち、2 周目は「1 周目に壊した分」を戻して同梱と同点になる。
+seed 9000 の 8192 到達は 13/20 と同梱（11/20）より多いが、ペア比較では 10 勝 10 敗で差が出ない。
+上積みが出ない理由は蒸留の性質で、65,536 個の `deep3` ラベルの方へ 20,000 ゲームかけて引っ張る
+ので、方策は「深い局面で教師が指す手」に寄り、同梱 net の裾を作っていた自己対戦の多様性が削がれる。
+**DAgger は安定化の道具**で、教師が同梱より強いときにしか上積みしない。今の `tch` の教師
+（`deep3` の V）は #167 で「終局前の誤差 0.30」と測られていて、同梱 net より強い保証がない。
+
+コストは 1 周 2〜2.5 時間（dump 43〜96 分 + 教師 3.5 分 + dist 17 分 + 評価 20 分）。dump は
+「深い局面だけ」（4096 以上）を集めるので、`dumpp2` の自己対戦は 1 局 4,500 手・10〜20 s かかる。

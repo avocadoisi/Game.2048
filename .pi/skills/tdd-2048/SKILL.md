@@ -35,6 +35,7 @@ Cycle and test discipline: `dev-philosophy`. Order of a change: `dev-workflow`.
 - randomness in tests: `SequenceRng` (scripted) or a fixed-seed `DefaultPrng`
 - `zig build test -Doptimize=ReleaseFast` does not finish: the `nn` test binary alone compiles for 20+ min. Debug is the full-test setting
 - measure a policy with `zig build solve`; `zig build ranking` runs every policy (nnmcts etc.) and takes 10+ min per game
+- `dump` / `dumpp2` train while they play, so `lr 0.003` from the shipped net breaks the policy mid-dump and records almost nothing (`dump_min_tile = 4096`, `ai/solver/nn.zig:1767`). Pass `lr 0` and give `weights_path` a copy in `/tmp`: the variant saves back to that path
 
 ## Parallel implementation, serial measurement
 
