@@ -1274,11 +1274,17 @@ pub fn playWithOptsValue(vfn: Value, rng: std.Random, mode: Mode, stats: *Stats,
     return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves, .leaves = stats.leaves, .board = state.board };
 }
 
-/// One spawn of a game (#168): the cell the tile landed in and which of the two values it had. Packed
-/// into 5 bits, so one game's whole spawn sequence is a few KB of `Tape`.
+/// One spawn of a game (#168): which of the empty cells the tile took and which of the two values it had.
+/// Packed into 5 bits, so one game's whole spawn sequence is a few KB of `Tape`.
 pub const Spawn = packed struct {
-    /// `row * 4 + col` of the cell the tile appeared in.
-    cell: u4,
+    /// Index into the board's empty cells in `spawnRandomTile`'s order (row-major), **not** the cell
+    /// itself (#235). The two policies of a pair diverge on the first move of most games, so a recorded
+    /// cell is usually taken when it is replayed; the old "first empty cell" fallback then placed almost
+    /// every spawn of the replayed game in the top-left-most hole, i.e. B played a different, biased spawn
+    /// distribution from A (the pairing stopped meaning "same spawns, only the policy differs"). An index
+    /// into the current empty list is board-agnostic: A and B both get "the k-th hole", so a uniformly
+    /// drawn k stays uniform for both, and the clamping below only bites where the boards differ in size.
+    slot: u4,
     /// 1 for the 1-in-10 draw that spawns a 4, 0 for a 2.
     four: u1,
 
@@ -1286,13 +1292,9 @@ pub const Spawn = packed struct {
         return if (self.four == 1) 4 else 2;
     }
 
-    pub fn position(self: Spawn) core.Position {
-        return .{ .row = self.cell / core.BoardSize, .col = self.cell % core.BoardSize };
-    }
-
-    pub fn at(pos: core.Position, value: core.Tile) Spawn {
+    pub fn at(slot: usize, value: core.Tile) Spawn {
         std.debug.assert(value == 2 or value == 4);
-        return .{ .cell = @intCast(pos.row * core.BoardSize + pos.col), .four = @intFromBool(value == 4) };
+        return .{ .slot = @intCast(slot), .four = @intFromBool(value == 4) };
     }
 };
 
@@ -1335,11 +1337,12 @@ pub const Tape = struct {
                     }
                 };
                 if (empty_count == 0) return false;
-                const pos = empties[rng.uintLessThan(usize, empty_count)];
+                const slot = rng.uintLessThan(usize, empty_count);
+                const pos = empties[slot];
                 const value: core.Tile = if (rng.uintLessThan(u8, 10) == 0) 4 else 2;
                 // a full buffer only stops the recording; the game keeps consuming the same rng draws
                 if (self.len < self.spawns.len) {
-                    self.spawns[self.len] = Spawn.at(pos, value);
+                    self.spawns[self.len] = Spawn.at(slot, value);
                     self.len += 1;
                 }
                 state.board[pos.row][pos.col] = value;
@@ -1351,18 +1354,21 @@ pub const Tape = struct {
                 if (self.cursor >= self.len) return state.spawnRandomTile(rng);
                 const recorded = self.spawns[self.cursor];
                 self.cursor += 1;
-                const value = recorded.tile();
-                var pos = recorded.position();
-                // the two policies diverged, so the recorded cell can already be taken: keep the
-                // recorded value and take the first empty cell instead
-                if (state.board[pos.row][pos.col] != 0) {
-                    pos = outer: for (0..core.BoardSize) |row| {
-                        for (0..core.BoardSize) |col| {
-                            if (state.board[row][col] == 0) break :outer .{ .row = row, .col = col };
-                        }
-                    } else return false;
-                }
-                state.board[pos.row][pos.col] = value;
+                // the same empty-cell order `spawnRandomTile` (and the recording) uses, so the `slot` the
+                // tape stored picks the same place on A's board and the k-th empty cell on B's (#235)
+                var empties: [core.BoardCellCount]core.Position = undefined;
+                var empty_count: usize = 0;
+                for (0..core.BoardSize) |row| for (0..core.BoardSize) |col| {
+                    if (state.board[row][col] == 0) {
+                        empties[empty_count] = .{ .row = row, .col = col };
+                        empty_count += 1;
+                    }
+                };
+                if (empty_count == 0) return false;
+                // B's board can have fewer holes than A's had; the last hole keeps the tape's randomness
+                const slot = @min(@as(usize, recorded.slot), empty_count - 1);
+                const pos = empties[slot];
+                state.board[pos.row][pos.col] = recorded.tile();
                 return true;
             },
         }
@@ -5192,6 +5198,33 @@ test "spawn tape records and replays the same game" {
     try std.testing.expectEqual(recorded.moves, replayed.moves);
     try std.testing.expectEqual(recorded.board, replayed.board);
     try std.testing.expectEqual(tape.len, replay_tape.cursor);
+}
+
+test "tape replay takes the recorded slot among the empty cells (#235)" {
+    // A board whose first empty cell in row-major order is (0,2): the old code placed the replayed tile
+    // there whenever the recorded cell was taken, which is the bias #235 removes.
+    var state = core.GameState.initEmpty();
+    state.board[0][0] = 2;
+    state.board[0][1] = 2;
+    state.board[1][0] = 4;
+    var spawns = [_]Spawn{Spawn.at(3, 4)};
+    var tape = Tape.initReplay(&spawns);
+    var prng = std.Random.DefaultPrng.init(7);
+    try std.testing.expect(tape.spawn(&state, prng.random()));
+    // empties are (0,2), (0,3), (1,1), (1,2), ... so slot 3 is (1,2)
+    try std.testing.expectEqual(@as(core.Tile, 0), state.board[0][2]);
+    try std.testing.expectEqual(@as(core.Tile, 0), state.board[0][3]);
+    try std.testing.expectEqual(@as(core.Tile, 0), state.board[1][1]);
+    try std.testing.expectEqual(@as(core.Tile, 4), state.board[1][2]);
+    // a slot past the end of a smaller board keeps the tape's randomness at the last hole
+    var spawns2 = [_]Spawn{Spawn.at(15, 2)};
+    var tape2 = Tape.initReplay(&spawns2);
+    var small = core.GameState.initEmpty();
+    for (0..core.BoardSize) |row| for (0..core.BoardSize) |col| {
+        if (!(row == 2 and col == 3)) small.board[row][col] = 2;
+    };
+    try std.testing.expect(tape2.spawn(&small, prng.random()));
+    try std.testing.expectEqual(@as(core.Tile, 2), small.board[2][3]);
 }
 
 test "spawn tape with no room at all still plays the plain game" {
