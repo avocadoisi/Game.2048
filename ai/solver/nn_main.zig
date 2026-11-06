@@ -531,9 +531,11 @@ pub fn main(init: std.process.Init) !void {
     if (is_dist or is_dson) loadTeachers(teachers, init.io, init.gpa, dump_path.?);
 
     var net: nn.Net = undefined;
-    var staged: nn.Staged = undefined;
+    // `nn.Staged` is 7 nets (~2 MB at the 128/32 default), too much for the stack (#233).
+    const staged = try init.gpa.create(nn.Staged);
+    defer init.gpa.destroy(staged);
     const loaded = if (is_mstd)
-        try startStaged(&staged, init.io, init.gpa, train_games, train_seed, weights_path)
+        try startStaged(staged, init.io, init.gpa, train_games, train_seed, weights_path)
     else
         try startNet(&net, init.io, init.gpa, train_games, use_resume, train_seed, weights_path);
     if (loaded) std.debug.print("loaded {s}\n", .{weights_path});
@@ -573,7 +575,7 @@ pub fn main(init: std.process.Init) !void {
         if (is_mstd) {
             for (0..train_games) |g| {
                 const frac = @as(f64, @floatFromInt(g)) / @as(f64, @floatFromInt(train_games));
-                const game = nn.trainGameStaged(&staged, rng.random(), learning_rate * (1 - 0.9 * frac));
+                const game = nn.trainGameStaged(staged, rng.random(), learning_rate * (1 - 0.9 * frac));
                 last_score = game.score;
                 total_moves += game.moves;
                 if ((g + 1) % 5000 == 0) {
@@ -684,7 +686,7 @@ pub fn main(init: std.process.Init) !void {
     const results = results_buf[0..result_count];
     const games = eval_games * seed_ranges;
     // `mstd` evaluates through the staged value, everything else through the single net (#107)
-    const eval_value: nn.Value = if (is_mstd) .{ .staged = &staged } else .{ .single = &net };
+    const eval_value: nn.Value = if (is_mstd) .{ .staged = staged } else .{ .single = &net };
 
     // Paired comparison (#168): play one game with A (`deep`), then replay the same spawns with B
     // (`deep3`), so both see identical tiles. The per-game difference has much less noise than two
@@ -832,7 +834,8 @@ test "omitted train seed trains seed 1 and matches the recorded checksum" {
     const net_default = trainSeedWeights(try cli.argOr(u64, &no_args, 9, default_train_seed), 5);
     const net_seed1 = trainSeedWeights(1, 5);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&net_seed1), std.mem.asBytes(&net_default));
-    try std.testing.expectEqual(@as(u32, 4199351724), std.hash.Crc32.hash(std.mem.asBytes(&net_default)));
+    // re-recorded at #233: the shipped width changed (64/32 -> 128/32), so the same 5 games land elsewhere
+    try std.testing.expectEqual(@as(u32, 3379822721), std.hash.Crc32.hash(std.mem.asBytes(&net_default)));
 }
 
 test "different train seeds produce different weights" {
@@ -991,17 +994,21 @@ test "mstd starts from the staged weights file on eval and from 7 random nets ot
     defer std.testing.allocator.free(path);
 
     var prng = std.Random.DefaultPrng.init(41);
-    const saved = nn.Staged.init(prng.random());
+    const saved = try std.testing.allocator.create(nn.Staged);
+    defer std.testing.allocator.destroy(saved);
+    saved.* = nn.Staged.init(prng.random());
     try saved.saveFile(io, std.testing.allocator, path);
 
     // eval-only (train_games 0) and resume load the staged file byte for byte
-    var resumed: nn.Staged = undefined;
-    try std.testing.expect(try startStaged(&resumed, io, std.testing.allocator, 0, 41, path));
+    const resumed = try std.testing.allocator.create(nn.Staged);
+    defer std.testing.allocator.destroy(resumed);
+    try std.testing.expect(try startStaged(resumed, io, std.testing.allocator, 0, 41, path));
     for (saved.nets, resumed.nets) |a, b| try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
 
     // training without resume starts from a random init (seed 99, so it must differ)
-    var fresh: nn.Staged = undefined;
-    try std.testing.expect(!try startStaged(&fresh, io, std.testing.allocator, 5, 99, path));
+    const fresh = try std.testing.allocator.create(nn.Staged);
+    defer std.testing.allocator.destroy(fresh);
+    try std.testing.expect(!try startStaged(fresh, io, std.testing.allocator, 5, 99, path));
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&saved.nets), std.mem.asBytes(&fresh.nets)));
 }
 

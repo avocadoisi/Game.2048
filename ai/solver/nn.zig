@@ -3313,8 +3313,10 @@ test "greedy and chance moves are unchanged by the deep mode" {
     var prng = std.Random.DefaultPrng.init(6);
     const net = Net.init(prng.random());
     // recorded on the pre-#69 code: both modes still route to pickMove / chanceMove
-    try std.testing.expectEqual(@as(?Direction, .left), bestMove(&net, mid_board, .greedy));
-    try std.testing.expectEqual(@as(?Direction, .left), bestMove(&net, mid_board, .chance));
+    // re-recorded at #233: the width change (64 -> 128) moves the random init, and with it the
+    // directions this pin recorded on `mid_board` (was `.left` for both at 64/32).
+    try std.testing.expectEqual(@as(?Direction, .up), bestMove(&net, mid_board, .greedy));
+    try std.testing.expectEqual(@as(?Direction, .down), bestMove(&net, mid_board, .chance));
 }
 
 /// Full board without any legal move: the 2-ply search has nothing to score.
@@ -3638,7 +3640,8 @@ test "death training drives values toward minus moves to game over (#101)" {
     var init_rng = std.Random.DefaultPrng.init(11);
     var net = Net.init(init_rng.random());
     var train_rng = std.Random.DefaultPrng.init(12);
-    for (0..60) |_| _ = trainGameOpts(&net, train_rng.random(), 0.02, null, .{ .death = true });
+    // 200 games at the 128/32 default (#233): at 64 games the values had barely moved off 0
+    for (0..200) |_| _ = trainGameOpts(&net, train_rng.random(), 0.02, null, .{ .death = true });
 
     var play_rng = std.Random.DefaultPrng.init(13);
     const rng = play_rng.random();
@@ -3764,10 +3767,11 @@ test "embedded weights file parses" {
 }
 
 test "quantized file is 48 B of header plus 2 B per weight (#170)" {
-    try std.testing.expectEqual(@as(usize, 18_561), weight_count);
+    // 37,057 = 256*128 + 128 + 32*128 + 32 + 32 + 1: the 128/32 shipped net of #233 (18,561 at 64/32)
+    try std.testing.expectEqual(@as(usize, 37_057), weight_count);
     try std.testing.expectEqual(weight_count * @sizeOf(i16), @sizeOf(QPayload));
     try std.testing.expectEqual(@as(usize, 48), quant_header_len);
-    try std.testing.expectEqual(@as(usize, 37_170), quant_file_len);
+    try std.testing.expectEqual(@as(usize, 74_162), quant_file_len);
     // the i16 payload indexes the same element offsets as `Net`'s fields
     for (quant_blocks, 0..) |block, b| {
         if (b > 0) try std.testing.expectEqual(quant_blocks[b - 1].offset + quant_blocks[b - 1].len, block.offset);
@@ -3790,7 +3794,9 @@ test "quantized round trip keeps every weight within its block step (#170)" {
         for (block.offset..block.offset + block.len) |i| {
             const delta = @abs(before[i] - after[i]);
             try std.testing.expect(delta <= step); // max|w| / 32767: the contract of the format
-            try std.testing.expect(delta <= step / 2 + step * 1e-6); // what round() actually costs
+            // what round() actually costs. The step is taken from the f32 weights, so the observed
+            // ratio reaches 0.5003 x step; the slack is f32 round-off, not a broken contract (#233).
+            try std.testing.expect(delta <= step / 2 + step * 1e-3);
         }
     }
     // the activation steps are real steps, not the zero default
@@ -4171,7 +4177,7 @@ test "default trainGame weights match the recorded checksum (5 games, seeds 11/1
     var net = Net.init(init_rng.random());
     var rng = std.Random.DefaultPrng.init(12);
     for (0..5) |_| _ = trainGame(&net, rng.random(), 0.003, null);
-    try std.testing.expectEqual(@as(u32, 1621370333), std.hash.Crc32.hash(std.mem.asBytes(&net)));
+    try std.testing.expectEqual(@as(u32, 3042928886), std.hash.Crc32.hash(std.mem.asBytes(&net)));
 }
 
 test "trainGameOpts with default options equals trainGame" {
@@ -4619,7 +4625,7 @@ test "symmetry=false and lambda=0 reproduce the recorded checksum (5 games, seed
     var net = Net.init(init_rng.random());
     var rng = std.Random.DefaultPrng.init(12);
     for (0..5) |_| _ = trainGameOpts(&net, rng.random(), 0.003, null, .{ .symmetry = false, .lambda = 0 });
-    try std.testing.expectEqual(@as(u32, 1621370333), std.hash.Crc32.hash(std.mem.asBytes(&net)));
+    try std.testing.expectEqual(@as(u32, 3042928886), std.hash.Crc32.hash(std.mem.asBytes(&net)));
 }
 
 test "sym_leaf=false keeps the single-forward leaf and its own cache entry (#178)" {
@@ -4992,9 +4998,18 @@ test "stageOfEmpties maps empty-cell counts to the 7 stages" {
     try std.testing.expectEqual(@as(usize, 6), stageOfEmpties(17));
 }
 
+/// `Staged` is `stage_count` (7) nets — ~2 MB at the 128/32 default of #233 — so it has to live on the
+/// heap: the test runner and `main` stacks overflowed once the shipped width doubled (#233).
+fn heapStaged(allocator: std.mem.Allocator, rng: std.Random) !*Staged {
+    const self = try allocator.create(Staged);
+    self.* = Staged.init(rng);
+    return self;
+}
+
 test "Staged.forward reads the net of the board's own stage" {
     var prng = std.Random.DefaultPrng.init(11);
-    var staged = Staged.init(prng.random());
+    const staged = try heapStaged(std.testing.allocator, prng.random());
+    defer std.testing.allocator.destroy(staged);
     const full = boardWithEmpties(16); // stage 6
     const dense = boardWithEmpties(1); // stage 0
     const full_before = staged.forward(full);
@@ -5007,10 +5022,14 @@ test "Staged.forward reads the net of the board's own stage" {
 
 test "Staged.train updates only the destination afterstate's stage" {
     var prng = std.Random.DefaultPrng.init(13);
-    var staged = Staged.init(prng.random());
+    const staged = try heapStaged(std.testing.allocator, prng.random());
+    defer std.testing.allocator.destroy(staged);
     const after = boardWithEmpties(16); // stage 6, the net that gets the step
     const next = boardWithEmpties(1); // stage 0, read for the target only
-    var pristine = staged;
+    // the 7-net copy also has to be heap allocated (14 MB of stack otherwise)
+    const pristine = try std.testing.allocator.create(Staged);
+    defer std.testing.allocator.destroy(pristine);
+    pristine.* = staged.*;
     const before = staged.forward(after);
     const err = staged.train(after, next, 0.5, 0.01);
     const target = 0.5 + pristine.forward(next);
@@ -5025,7 +5044,8 @@ test "Staged.train updates only the destination afterstate's stage" {
 
 test "Staged.train with a terminal step uses the reward alone" {
     var prng = std.Random.DefaultPrng.init(15);
-    var staged = Staged.init(prng.random());
+    const staged = try heapStaged(std.testing.allocator, prng.random());
+    defer std.testing.allocator.destroy(staged);
     const after = boardWithEmpties(4); // stage 1
     const before = staged.forward(after);
     const err = staged.train(after, null, -1, 0.01);
@@ -5042,9 +5062,11 @@ test "staged weights round trip and stay separate from the single-net file" {
     defer std.testing.allocator.free(path);
 
     var prng = std.Random.DefaultPrng.init(17);
-    const staged = Staged.init(prng.random());
+    const staged = try heapStaged(std.testing.allocator, prng.random());
+    defer std.testing.allocator.destroy(staged);
     try staged.saveFile(io, std.testing.allocator, path);
-    var loaded: Staged = undefined;
+    const loaded = try heapStaged(std.testing.allocator, prng.random());
+    defer std.testing.allocator.destroy(loaded);
     try loaded.loadFile(io, std.testing.allocator, path);
     for (staged.nets, loaded.nets) |a, b| try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
 
@@ -5065,13 +5087,17 @@ test "staged weights round trip and stay separate from the single-net file" {
 test "staged self-play training is deterministic for a fixed seed" {
     var init_a = std.Random.DefaultPrng.init(19);
     var init_b = std.Random.DefaultPrng.init(19);
-    var staged_a = Staged.init(init_a.random());
-    var staged_b = Staged.init(init_b.random());
-    const before = staged_a;
+    const staged_a = try heapStaged(std.testing.allocator, init_a.random());
+    defer std.testing.allocator.destroy(staged_a);
+    const staged_b = try heapStaged(std.testing.allocator, init_b.random());
+    defer std.testing.allocator.destroy(staged_b);
+    const before = try std.testing.allocator.create(Staged);
+    defer std.testing.allocator.destroy(before);
+    before.* = staged_a.*;
     var rng_a = std.Random.DefaultPrng.init(23);
     var rng_b = std.Random.DefaultPrng.init(23);
-    const game_a = trainGameStaged(&staged_a, rng_a.random(), 0.003);
-    const game_b = trainGameStaged(&staged_b, rng_b.random(), 0.003);
+    const game_a = trainGameStaged(staged_a, rng_a.random(), 0.003);
+    const game_b = trainGameStaged(staged_b, rng_b.random(), 0.003);
     try std.testing.expectEqual(game_a, game_b);
     for (staged_a.nets, staged_b.nets) |a, b| try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&before.nets), std.mem.asBytes(&staged_a.nets)));
@@ -5079,8 +5105,9 @@ test "staged self-play training is deterministic for a fixed seed" {
 
 test "bestMove and play accept the staged value" {
     var prng = std.Random.DefaultPrng.init(29);
-    const staged = Staged.init(prng.random());
-    const value: Value = .{ .staged = &staged };
+    const staged = try heapStaged(std.testing.allocator, prng.random());
+    defer std.testing.allocator.destroy(staged);
+    const value: Value = .{ .staged = staged };
     const dead: GameState = .{ .board = .{
         .{ 2, 4, 2, 4 },
         .{ 4, 2, 4, 2 },

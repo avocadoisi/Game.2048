@@ -1864,18 +1864,20 @@ fn goldenPlay(policy: Policy, seed: u64, depth: u8) Golden {
 
 test "nn policy reproduces the same move sequence and score on a fixed seed" {
     const g = goldenPlay(.nn, 20240601, 0);
-    try std.testing.expectEqual(@as(u32, 32380), g.score);
-    try std.testing.expectEqual(@as(core.Tile, 2048), g.max_tile);
-    try std.testing.expectEqual(@as(u32, 1669), g.moves);
-    try std.testing.expectEqual(@as(u64, 3421224406919827547), g.checksum);
+    // re-recorded at #233 with the 128/32 shipped net (was 32,380 / 2048 / 1,669 moves)
+    try std.testing.expectEqual(@as(u32, 81104), g.score);
+    try std.testing.expectEqual(@as(core.Tile, 4096), g.max_tile);
+    try std.testing.expectEqual(@as(u32, 3744), g.moves);
+    try std.testing.expectEqual(@as(u64, 6496592461525624355), g.checksum);
 }
 
 test "nn2 policy reproduces the same move sequence and score on a fixed seed" {
     const g = goldenPlay(.nn2, 20240601, 0);
-    try std.testing.expectEqual(@as(u32, 77164), g.score);
-    try std.testing.expectEqual(@as(core.Tile, 4096), g.max_tile);
-    try std.testing.expectEqual(@as(u32, 3542), g.moves);
-    try std.testing.expectEqual(@as(u64, 3580527611182212019), g.checksum);
+    // re-recorded at #233 with the 128/32 shipped net (was 77,164 / 4096 / 3,542 moves)
+    try std.testing.expectEqual(@as(u32, 132164), g.score);
+    try std.testing.expectEqual(@as(core.Tile, 8192), g.max_tile);
+    try std.testing.expectEqual(@as(u32, 5520), g.moves);
+    try std.testing.expectEqual(@as(u64, 10726614709475710891), g.checksum);
 }
 
 test "nn policy parses the weights once per thread, not once per move" {

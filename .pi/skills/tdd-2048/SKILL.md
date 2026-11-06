@@ -53,7 +53,7 @@ priority buffer; `replay_k` does work under `par` (each game owns its buffer). `
 tried and is 30,000 points behind the serial run at every `batch_scale`, so it stays refused (#207).
 Always train with `replay_k=30` and `par`. Fine-tuning without the replay buffer is what destroys the
 shipped net (5,000 games at lr 3e-5: 73,100 without replay vs 93,318 with `replay_k=30`, baseline
-79,657 on 20 games) — never fine-tune without it. `eval_games = 0` means "train only" and skips the
+79,657 on 20 games for the then-shipped 64/32 net) — never fine-tune without it. `eval_games = 0` means "train only" and skips the
 15-row eval table (which can cost 20+ min on its own).
 
 **Games past 100k do not beat the shipped net (#204).** lr schedules (0.003 → 0.001 at 100k, halving
@@ -63,23 +63,32 @@ needs a better teacher (#207), not more games.
 
 **How a candidate net is judged (#207 / L1).** Read `docs/measurement.md` first. In one line: adopt only
 when `pairw` vs the shipped net (20 games, seed 9000) gives `mean diff - 2*stderr > 0` (≈ +15,000
-points), the non-paired 2-ply table on seeds 9000 and 9100 does not regress, and `ms/move` is unchanged.
+points; the shipped net is the 128/32 of #233, 113,682.2 on seed 9000), the non-paired 2-ply table on seeds 9000 and 9100 does not regress, and `ms/move` is unchanged.
 Run `scripts/eval-net.sh <candidate.bin>`: it does all three and prints `VERDICT: ADOPT|REJECT`.
 Never judge by `avg_score` alone — spawn luck moves it ±10,000, and the paired and unpaired tables have
 disagreed before. Distillation (`dist`) is the strongest fine-tune so far (every 4 / div 3 over a
 458,752-sample teacher: +1,184 ± 9,370, i.e. parity, below the bar), and `ft2` is retired: its deep half
 relabels with the live net and diverges to NaN at every lr and every thinning (#207).
 
-**Capacity is not a lever in this codebase (#220).** `zig build nn -Dh1=… -Dh2=…` changes the architectureand the weights file format (16-byte header + raw f64, so a file only loads in a matching build). 128/128
-needs ~300,000 games just to look good once: 100,000 games = 72,012, 300,000 = 92,953 and `pairw`
-+8,624 ± 7,679 (13/20) — but training seed 2 to the same size gives **−12,117 ± 5,848 (5/20)**, so the
-+8,624 was seed luck, not capacity (seed spread ±20k, same as 64/32 in #203). 128/32 at 300,000 = 78,500
-(the output layer `h2` is the only width that matters at all), extending past 300,000 regresses even at
-lr 1.5e-3 (420k = 69,888), and distilling the wide net into 64/32 collapses it (`dson` −68,521 ± 7,048,
-`dist` −55,826 ± 6,287): a wide net's `V` is only meaningful together with its own 2-ply search. To compare
-nets of different widths use `scripts/widen-net.py` (zero padding is value-exact — the padded shipped net
-reproduces 79,657.0 exactly) and run `pairw` in the wider build. Judge capacity candidates by ≥2 training
-seeds before believing a positive pair diff.
+**Capacity IS a lever — widen `h1`, not `h2` (#233).** The shipped net is now **128/32** (`ai/solver/nn_weights.bin`
+is 296,472 B = 16 + 37,057 x f64, and the `-Dh1`/`-Dh2` build defaults are 128/32, so the default build matches
+the shipped file): 300,000 games from scratch (`base`, lr 0.003, train seed 1, `par`, `batch_scale` sqrt(8) =
+2.8284271247461903) gives 2-ply **113,682.2** (8192 11/20) on seed 9000 and **129,456.2** (14/20) on seed 9100,
+`pairw` vs the zero-padded 64/32 net **+57,424.4 ± 7,567.9 (19 wins / 1 loss, 681 s)**. Cost: 61 min of training
+(100k = 5 min) and 1.2x inference. The eval baseline to beat is therefore 113,682.2, not 79,657.
+
+The old #220 claim "`h1` does nothing, only `h2` matters" came from a 128/32 run recorded as 78,500 — which is
+essentially the 64/32 plateau, i.e. the width almost certainly never reached the binary, or `batch_scale` got
+`2` instead of 2.8284271247461903 (that trap alone costs 26,000 points at 64/32). **Always sanity-check a
+capacity run by the weights file size** (`16 + 8 x (256*h1 + h1 + h2*h1 + 2*h2 + 1)`) and by zero-padding the
+previous net with `scripts/widen-net.py --h1 H --h2 W --src-h1 … --src-h2 …` and reproducing its old number
+exactly. 128/128 at 300,000 = 92,953 (+8,624 ± 7,679 was seed luck; seed 2 gave −12,117 ± 5,848), so `h2` at 128
+is actively worse than 32: the extra width only spends games. Judge capacity candidates by >= 2 training seeds.
+
+Other capacity facts that still hold: extending past 300,000 regresses even at lr 1.5e-3 (420k = 69,888), and
+distilling a wide net into a narrow one collapses it (`dson` −68,521 ± 7,048, `dist` −55,826 ± 6,287) — a wide
+net's `V` is only meaningful together with its own 2-ply search. `nn.Staged` is 7 nets (~2 MB at 128/32), so it
+must stay on the heap (`heapStaged`); on the stack the test runner segfaults.
 
 **Global features only speed up the first 20k games (#226).** `zig build nn -Dfeat=N` adds N hand-made
 board features (empties, max tile, monotonicity, smoothness, corner, mass) as extra input rows and grows
@@ -91,7 +100,8 @@ the weights file; `scripts/widen-net.py --feat N --src-h1 … --src-h2 …` pads
 **State-distribution shifts all fail — training must stay on-policy (#224).** `restart` (deep boards), the
 dump curriculum, `explore` (5% random moves, `explore20` = 20%) and `open8`/`open16` (random opening moves
 that train nothing) were all measured and every one loses hard: `explore` 100k = 21,224 / 400k = 12,614,
-`open8` 100k = 30,917, against the shipped net's 79,657 non-paired 2-ply. Random moves also cut a game to
+`open8` 100k = 30,917, against the then-shipped net's 79,657 non-paired 2-ply (the 128/32 net of
+#233 is 113,682.2, so the gap only widened). Random moves also cut a game to
 1/4–1/6 of its moves, so equal-game comparisons are not equal-sample ones. Do not re-open this direction;
 the value function has no off-trajectory extrapolation.
 
