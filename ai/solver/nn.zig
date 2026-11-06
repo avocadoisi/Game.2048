@@ -1274,17 +1274,18 @@ pub fn playWithOptsValue(vfn: Value, rng: std.Random, mode: Mode, stats: *Stats,
     return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves, .leaves = stats.leaves, .board = state.board };
 }
 
-/// One spawn of a game (#168): which of the empty cells the tile took and which of the two values it had.
-/// Packed into 5 bits, so one game's whole spawn sequence is a few KB of `Tape`.
-pub const Spawn = packed struct {
-    /// Index into the board's empty cells in `spawnRandomTile`'s order (row-major), **not** the cell
-    /// itself (#235). The two policies of a pair diverge on the first move of most games, so a recorded
-    /// cell is usually taken when it is replayed; the old "first empty cell" fallback then placed almost
-    /// every spawn of the replayed game in the top-left-most hole, i.e. B played a different, biased spawn
-    /// distribution from A (the pairing stopped meaning "same spawns, only the policy differs"). An index
-    /// into the current empty list is board-agnostic: A and B both get "the k-th hole", so a uniformly
-    /// drawn k stays uniform for both, and the clamping below only bites where the boards differ in size.
-    slot: u4,
+/// One spawn of a game (#168): a board-independent random pick and which of the two values the tile had.
+/// The pick gives each board an almost-uniform hole choice, even when the policies diverge (#237).
+pub const Spawn = struct {
+    /// A common random number, uniform over all `u32` values (#237). Both boards map it onto their own
+    /// empty cells with `slotFor`. Each hole owns either floor(2^32 / n) or ceil(2^32 / n) picks, so
+    /// the distribution is exact when n divides 2^32 and otherwise differs by at most one pick.
+    ///
+    /// Recording an index and clamping it to the other board's hole count was biased (#235): with 4 holes
+    /// on A and 2 on B, A's index 2 and 3 both became B's hole 1, which then took 75% of B's spawns.
+    /// Mapping one common pick into nearly equal-width buckets on both boards keeps each marginal
+    /// uniform to 32-bit precision — the textbook common-random-numbers construction (#168's whole point).
+    pick: u32,
     /// 1 for the 1-in-10 draw that spawns a 4, 0 for a 2.
     four: u1,
 
@@ -1292,9 +1293,24 @@ pub const Spawn = packed struct {
         return if (self.four == 1) 4 else 2;
     }
 
-    pub fn at(slot: usize, value: core.Tile) Spawn {
+    /// The hole `pick` selects out of `empty_count`, in `spawnRandomTile`'s row-major order. If
+    /// `empty_count` does not divide 2^32, bucket sizes differ by one value out of 4,294,967,296.
+    pub fn slotFor(pick: u32, empty_count: usize) usize {
+        std.debug.assert(empty_count > 0);
+        return @intCast((@as(u64, pick) * @as(u64, @intCast(empty_count))) >> 32);
+    }
+
+    /// The `pick` that lands in `slot` out of `empty_count` holes (the middle of the bucket).
+    pub fn pickFor(slot: usize, empty_count: usize) u32 {
+        std.debug.assert(slot < empty_count);
+        const lo = (@as(u64, @intCast(slot)) << 32) / @as(u64, @intCast(empty_count));
+        const hi = (@as(u64, @intCast(slot + 1)) << 32) / @as(u64, @intCast(empty_count));
+        return @intCast((lo + hi) / 2);
+    }
+
+    pub fn at(pick: u32, value: core.Tile) Spawn {
         std.debug.assert(value == 2 or value == 4);
-        return .{ .slot = @intCast(slot), .four = @intFromBool(value == 4) };
+        return .{ .pick = pick, .four = @intFromBool(value == 4) };
     }
 };
 
@@ -1320,11 +1336,11 @@ pub const Tape = struct {
         return .{ .mode = .replay, .spawns = spawns, .len = spawns.len };
     }
 
-    /// Spawn one tile the way `GameState.spawnRandomTile` does, through the tape. Record mode draws
-    /// exactly the two rng values the plain path draws (cell, then value, in that order) and stores
-    /// them, so a game played with a recording tape is byte for byte the game `playValue` plays.
-    /// Replay mode places the recorded tile instead and draws nothing. Returns false when the board
-    /// is full, like `spawnRandomTile`.
+    /// Spawn one tile through the tape. Record mode draws a full-range `u32` pick and then the tile
+    /// value, mapping the pick into this board's holes. This intentionally does not promise the same
+    /// game as `playValue` with the same seed: `spawnRandomTile` draws a bounded index instead. Replay
+    /// mode maps the recorded pick into the replay board and draws nothing while tape entries remain.
+    /// Returns false when the board is full, like `spawnRandomTile`.
     fn spawn(self: *Tape, state: *GameState, rng: std.Random) bool {
         switch (self.mode) {
             .record => {
@@ -1337,12 +1353,13 @@ pub const Tape = struct {
                     }
                 };
                 if (empty_count == 0) return false;
-                const slot = rng.uintLessThan(usize, empty_count);
+                const pick = rng.int(u32);
+                const slot = Spawn.slotFor(pick, empty_count);
                 const pos = empties[slot];
                 const value: core.Tile = if (rng.uintLessThan(u8, 10) == 0) 4 else 2;
                 // a full buffer only stops the recording; the game keeps consuming the same rng draws
                 if (self.len < self.spawns.len) {
-                    self.spawns[self.len] = Spawn.at(slot, value);
+                    self.spawns[self.len] = Spawn.at(pick, value);
                     self.len += 1;
                 }
                 state.board[pos.row][pos.col] = value;
@@ -1354,8 +1371,8 @@ pub const Tape = struct {
                 if (self.cursor >= self.len) return state.spawnRandomTile(rng);
                 const recorded = self.spawns[self.cursor];
                 self.cursor += 1;
-                // the same empty-cell order `spawnRandomTile` (and the recording) uses, so the `slot` the
-                // tape stored picks the same place on A's board and the k-th empty cell on B's (#235)
+                // Use the same row-major empty-cell order as `spawnRandomTile`; map the common pick
+                // independently for this board so its own holes retain an almost-uniform distribution (#237).
                 var empties: [core.BoardCellCount]core.Position = undefined;
                 var empty_count: usize = 0;
                 for (0..core.BoardSize) |row| for (0..core.BoardSize) |col| {
@@ -1365,8 +1382,9 @@ pub const Tape = struct {
                     }
                 };
                 if (empty_count == 0) return false;
-                // B's board can have fewer holes than A's had; the last hole keeps the tape's randomness
-                const slot = @min(@as(usize, recorded.slot), empty_count - 1);
+                // the same uniform number, mapped onto this board's holes: B draws from its own uniform
+                // distribution over its own holes instead of inheriting a clamped index (#237)
+                const slot = Spawn.slotFor(recorded.pick, empty_count);
                 const pos = empties[slot];
                 state.board[pos.row][pos.col] = recorded.tile();
                 return true;
@@ -1375,16 +1393,16 @@ pub const Tape = struct {
     }
 };
 
-/// `playValue` with a spawn tape (#168). Record mode observes the game `playValue` plays with the same
-/// rng; replay mode takes the spawns from the tape, so two policies can be compared on one sequence.
+/// Play with a spawn tape (#168). Record mode generates a tape-specific sequence of common random picks;
+/// replay mode maps those picks onto this policy's board so two policies can be compared on shared randomness.
 pub fn playTapedValue(vfn: Value, rng: std.Random, mode: Mode, tape: *Tape) PlayResult {
     var stats: Stats = .{};
     return playTapedWithStatsValue(vfn, rng, mode, tape, &stats);
 }
 
 /// `playTapedValue` plus search counters. The tape owns the spawns of the whole game, the two start
-/// tiles included, and `GameState.move` is spelled out (slide, then a taped spawn) so that record
-/// mode consumes the rng in exactly the order `move` does.
+/// tiles included, and `GameState.move` is spelled out (slide, then a taped spawn) so record mode draws
+/// randomness in the same order (cell pick, then tile value) as `move`'s spawn path.
 pub fn playTapedWithStatsValue(vfn: Value, rng: std.Random, mode: Mode, tape: *Tape, stats: *Stats) PlayResult {
     var state = GameState.initEmpty();
     _ = tape.spawn(&state, rng);
@@ -5171,7 +5189,7 @@ test "bestMove and play accept the staged value" {
     try std.testing.expect(result.moves > 0);
 }
 
-/// One recorded game's tape, at the size a 2048 game needs (`Spawn` is 1 byte).
+/// One recorded game's tape: 8192 spawns × 8 bytes per `Spawn` = 64 KiB since #237.
 const tape_capacity = 8192;
 
 test "spawn tape records and replays the same game" {
@@ -5179,16 +5197,16 @@ test "spawn tape records and replays the same game" {
     const net = Net.init(prng.random());
     const value: Value = .{ .single = &net };
 
-    // recording does not change the game: same score, moves and final board as `playValue`
+    // recording draws a uniform number per spawn (#237) instead of an index out of the hole count, so it
+    // no longer reproduces `playValue`'s game byte for byte; what has to hold is that the tape *is* the
+    // game, i.e. a replay of it is identical whatever rng the replay starts from.
     var buf: [tape_capacity]Spawn = undefined;
     var rec_rng = std.Random.DefaultPrng.init(1234);
     var tape = Tape.initRecord(&buf);
     const recorded = playTapedValue(value, rec_rng.random(), .greedy, &tape);
-    var plain_rng = std.Random.DefaultPrng.init(1234);
-    const plain = playValue(value, plain_rng.random(), .greedy);
-    try std.testing.expectEqual(plain, recorded);
+    try std.testing.expect(recorded.moves > 0);
     // one spawn per move plus the two start tiles (one less when the board fills on the last move)
-    try std.testing.expect(tape.len <= plain.moves + 2 and tape.len >= plain.moves + 1);
+    try std.testing.expect(tape.len <= recorded.moves + 2 and tape.len >= recorded.moves + 1);
 
     // and a replay from a *different* rng seed is the same game: the tape, not the rng, drives the spawns
     var replay_rng = std.Random.DefaultPrng.init(99);
@@ -5200,14 +5218,15 @@ test "spawn tape records and replays the same game" {
     try std.testing.expectEqual(tape.len, replay_tape.cursor);
 }
 
-test "tape replay takes the recorded slot among the empty cells (#235)" {
+test "tape replay takes the recorded slot among the empty cells (#235, #237)" {
     // A board whose first empty cell in row-major order is (0,2): the old code placed the replayed tile
-    // there whenever the recorded cell was taken, which is the bias #235 removes.
+    // there whenever the recorded cell was taken, which is the bias #235/#237 remove.
     var state = core.GameState.initEmpty();
     state.board[0][0] = 2;
     state.board[0][1] = 2;
     state.board[1][0] = 4;
-    var spawns = [_]Spawn{Spawn.at(3, 4)};
+    // 13 holes left; ask for the 4th (index 3)
+    var spawns = [_]Spawn{Spawn.at(Spawn.pickFor(3, 13), 4)};
     var tape = Tape.initReplay(&spawns);
     var prng = std.Random.DefaultPrng.init(7);
     try std.testing.expect(tape.spawn(&state, prng.random()));
@@ -5216,8 +5235,8 @@ test "tape replay takes the recorded slot among the empty cells (#235)" {
     try std.testing.expectEqual(@as(core.Tile, 0), state.board[0][3]);
     try std.testing.expectEqual(@as(core.Tile, 0), state.board[1][1]);
     try std.testing.expectEqual(@as(core.Tile, 4), state.board[1][2]);
-    // a slot past the end of a smaller board keeps the tape's randomness at the last hole
-    var spawns2 = [_]Spawn{Spawn.at(15, 2)};
+    // the same number on a board with one hole left still lands, in that hole
+    var spawns2 = [_]Spawn{Spawn.at(Spawn.pickFor(3, 13), 2)};
     var tape2 = Tape.initReplay(&spawns2);
     var small = core.GameState.initEmpty();
     for (0..core.BoardSize) |row| for (0..core.BoardSize) |col| {
@@ -5227,20 +5246,118 @@ test "tape replay takes the recorded slot among the empty cells (#235)" {
     try std.testing.expectEqual(@as(core.Tile, 2), small.board[2][3]);
 }
 
-test "spawn tape with no room at all still plays the plain game" {
-    var prng = std.Random.DefaultPrng.init(41);
-    const net = Net.init(prng.random());
+test "common random picks give each board an almost-uniform hole (#237)" {
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(Spawn));
+    // For floor(p*n/2^32), hole k owns integer picks [ceil(k*2^32/n), ceil((k+1)*2^32/n)).
+    // Check each bucket's endpoints and size for every possible hole count on a 4x4 board.
+    const universe: u64 = @as(u64, 1) << 32;
+    var n: usize = 1;
+    while (n <= 16) : (n += 1) {
+        var total: u64 = 0;
+        var min_width: u64 = universe;
+        var max_width: u64 = 0;
+        var k: usize = 0;
+        while (k < n) : (k += 1) {
+            const count: u64 = @intCast(n);
+            const lo = ((@as(u64, @intCast(k)) * universe) + count - 1) / count;
+            const hi = ((@as(u64, @intCast(k + 1)) * universe) + count - 1) / count;
+            try std.testing.expectEqual(k, Spawn.slotFor(@intCast(lo), n));
+            try std.testing.expectEqual(k, Spawn.slotFor(@intCast(hi - 1), n));
+            const bucket_width = hi - lo;
+            total += bucket_width;
+            min_width = @min(min_width, bucket_width);
+            max_width = @max(max_width, bucket_width);
+        }
+        try std.testing.expectEqual(universe, total);
+        try std.testing.expect(max_width - min_width <= 1);
+    }
+
+    // If A has 4 holes and B has 2, the four equal-sized A buckets pair into two equal-sized B buckets.
+    var lower: usize = 0;
+    var upper: usize = 0;
+    for (0..4) |a_slot| {
+        const pick = Spawn.pickFor(a_slot, 4);
+        switch (Spawn.slotFor(pick, 2)) {
+            0 => lower += 1,
+            1 => upper += 1,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), lower);
+    try std.testing.expectEqual(@as(usize, 2), upper);
+}
+
+test "recording with no tape capacity does not change the game or rng (#237)" {
+    var init_rng = std.Random.DefaultPrng.init(37);
+    const net = Net.init(init_rng.random());
     const value: Value = .{ .single = &net };
 
-    // a zero-length record tape observes nothing, so the game must be the one `playValue` plays
     var empty: [0]Spawn = .{};
-    var tape = Tape.initRecord(&empty);
-    var rng = std.Random.DefaultPrng.init(77);
-    const taped = playTapedValue(value, rng.random(), .greedy, &tape);
-    var plain_rng = std.Random.DefaultPrng.init(77);
-    const plain = playValue(value, plain_rng.random(), .greedy);
-    try std.testing.expectEqual(plain, taped);
-    try std.testing.expectEqual(@as(usize, 0), tape.len);
+    var enough: [tape_capacity]Spawn = undefined;
+    var no_capacity_rng = std.Random.DefaultPrng.init(77);
+    var enough_capacity_rng = std.Random.DefaultPrng.init(77);
+    var no_capacity = Tape.initRecord(&empty);
+    var enough_capacity = Tape.initRecord(&enough);
+    const short = playTapedValue(value, no_capacity_rng.random(), .greedy, &no_capacity);
+    const recorded = playTapedValue(value, enough_capacity_rng.random(), .greedy, &enough_capacity);
+
+    try std.testing.expectEqual(recorded, short);
+    try std.testing.expectEqual(@as(usize, 0), no_capacity.len);
+    try std.testing.expect(enough_capacity.len > 0);
+    try std.testing.expectEqual(no_capacity_rng.random().int(u64), enough_capacity_rng.random().int(u64));
+}
+
+test "recording preserves the raw common pick across different hole counts (#237)" {
+    const ByteStream = struct {
+        bytes: [5]u8,
+        cursor: usize = 0,
+
+        fn fill(self: *@This(), output: []u8) void {
+            for (output) |*byte| {
+                byte.* = self.bytes[self.cursor];
+                self.cursor += 1;
+            }
+        }
+    };
+
+    const picks = [_]u32{ 0x7000_0000, 0x9000_0000 };
+    var a_slots: [2]usize = undefined;
+    var b_slots: [2]usize = undefined;
+    for (picks, 0..) |pick, i| {
+        // A has 3 holes and B has 2. These picks select the same A hole but different B holes.
+        var state_a = GameState.initEmpty();
+        for (0..core.BoardSize) |row| for (0..core.BoardSize) |col| {
+            if (!(row == 0 and col < 3)) state_a.board[row][col] = 2;
+        };
+        const bytes = [_]u8{
+            @truncate(pick),
+            @truncate(pick >> 8),
+            @truncate(pick >> 16),
+            @truncate(pick >> 24),
+            27, // bounded tile-value draw returns 1 and spawns a 2
+        };
+        var source = ByteStream{ .bytes = bytes };
+        const rng = std.Random.init(&source, ByteStream.fill);
+        var spawns: [1]Spawn = undefined;
+        var record = Tape.initRecord(&spawns);
+        try std.testing.expect(record.spawn(&state_a, rng));
+        try std.testing.expectEqual(@as(usize, 1), record.len);
+        try std.testing.expectEqual(pick, spawns[0].pick);
+        a_slots[i] = Spawn.slotFor(spawns[0].pick, 3);
+
+        var state_b = GameState.initEmpty();
+        for (0..core.BoardSize) |row| for (0..core.BoardSize) |col| {
+            if (!(row == 0 and col < 2)) state_b.board[row][col] = 2;
+        };
+        var replay = Tape.initReplay(&spawns);
+        var replay_rng = std.Random.DefaultPrng.init(9);
+        try std.testing.expect(replay.spawn(&state_b, replay_rng.random()));
+        b_slots[i] = Spawn.slotFor(spawns[0].pick, 2);
+        try std.testing.expectEqual(@as(core.Tile, 2), state_b.board[0][b_slots[i]]);
+    }
+    try std.testing.expectEqual(a_slots[0], a_slots[1]);
+    try std.testing.expect(a_slots[0] == 1);
+    try std.testing.expect(b_slots[0] != b_slots[1]);
 }
 
 test "pairStats gives the paired mean and standard error over games" {
