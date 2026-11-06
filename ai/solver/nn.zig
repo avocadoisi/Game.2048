@@ -1556,6 +1556,12 @@ pub const Options = struct {
     /// bit-identical to the historical run: for plain SGD a per-sample loss weight *is* an `lr` multiplier,
     /// so `tailWeight` scales the step instead of touching the loss (`1 + alpha` at 0 empties, 1 at 15).
     tail_alpha: f64 = 0,
+    /// (#234) Ceiling on the TD target, in `reward_scale` units (0 = off). TD(0) with function approximation
+    /// has no fixed point when the bootstrapped value runs away, and the 128/32 net did exactly that on
+    /// training seed 2 (|w| 1e86, 6,334 NaN between 100,000 and 300,000 games). A score is bounded by the
+    /// board (1,000 x score, so ~131 for a 16k tile), so clamping the target keeps every sane update and
+    /// cuts the V -> target -> V feedback that explodes.
+    clamp: f64 = 0,
     /// Candidate (#98): true batch symmetry augmentation — one averaged step per afterstate, where all 8
     /// transformed gradients come from one net snapshot (unlike `symmetry`, which steps 8 times sequentially).
     sym_batch: bool = false,
@@ -2135,6 +2141,13 @@ fn trainSymBatch(net: *Net, after: Board, target: f64, lr: f64) void {
     for (flat(net), flat(&grad)) |*w, x| w.* -= lr * scale * x;
 }
 
+/// (#234) Bound the TD target at `Options.clamp` (0 = untouched), so a diverging value cannot bootstrap
+/// itself into `inf`.
+fn clampTarget(target: f64, opts: Options) f64 {
+    if (!(opts.clamp > 0)) return target;
+    return std.math.clamp(target, -opts.clamp, opts.clamp);
+}
+
 /// (#232) The step size of one per-move TD sample: `lr` itself, or up to `lr * (1 + tail_alpha)` when the
 /// board the target bootstrapped from is nearly full. Exact SGD loss weighting, see `Options.tail_alpha`.
 fn tailWeight(opts: Options, board: Board, lr: f64) f64 {
@@ -2214,7 +2227,7 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
             if (!opts.distill_only) {
                 // `state` is still the post-spawn board the pending step led into (this move has not been
                 // applied yet), which is the board the `search2` and `teacher` targets evaluate.
-                const target = p.reward + tdBootstrap(net, pick, state, opts);
+                const target = clampTarget(p.reward + tdBootstrap(net, pick, state, opts), opts);
                 if (diag) |d| d.push(p.after, @abs(target - p.value), pick.value - p.value);
                 if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = pick.after, .terminal = false, .err = @abs(target - p.value) });
                 trainStep(net, &cache, p.after, target, tailWeight(opts, state.board, lr), opts, &trace);
@@ -2525,6 +2538,17 @@ fn flat(net: *Net) []f64 {
 
 fn flatConst(net: *const Net) []const f64 {
     return std.mem.bytesAsSlice(f64, std.mem.asBytes(net)[0..@sizeOf(Net)]);
+}
+
+/// TD with function approximation can diverge: on the 128/32 net the weights reached 1e86 (and 6,334 NaN)
+/// somewhere between 100,000 and 300,000 games on training seed 2 (#234). A half-day `par` run that ends in
+/// a NaN net wastes the whole run and, worse, overwrites the last good checkpoint, so training checks this
+/// every few games and stops instead of saving (`main` reports `diverged at N games`).
+pub fn weightsFinite(net: *const Net) bool {
+    for (flatConst(net)) |w| {
+        if (!std.math.isFinite(w) or @abs(w) > 1e6) return false;
+    }
+    return true;
 }
 
 // ---- quantized weights (#170) ----
@@ -4512,6 +4536,27 @@ test "batch_scale multiplies the merged delta so a batch does the work of its ga
     var mean_serial = base;
     for (flat(&mean_serial), start, sums) |*w, s, sum| w.* = s + sum / games;
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&mean_serial), std.mem.asBytes(&unscaled));
+}
+
+test "clamp bounds the TD target (#234)" {
+    try std.testing.expectEqual(@as(f64, 7), clampTarget(7, .{}));
+    try std.testing.expectEqual(@as(f64, -7), clampTarget(-7, .{ .clamp = 200 }));
+    try std.testing.expectEqual(@as(f64, 200), clampTarget(1e6, .{ .clamp = 200 }));
+    try std.testing.expectEqual(@as(f64, -200), clampTarget(-1.685e86, .{ .clamp = 200 }));
+}
+
+test "weightsFinite rejects a diverged net (#234)" {
+    var prng = std.Random.DefaultPrng.init(31);
+    var net = Net.init(prng.random());
+    try std.testing.expect(weightsFinite(&net));
+    net.b3 = std.math.nan(f64);
+    try std.testing.expect(!weightsFinite(&net));
+    net.b3 = 2e6; // finite but far past anything training reaches (the shipped net's max is 27)
+    try std.testing.expect(!weightsFinite(&net));
+    net.b3 = 1.685e86; // what seed 2 actually reached (#234)
+    try std.testing.expect(!weightsFinite(&net));
+    net.b3 = 0;
+    try std.testing.expect(weightsFinite(&net));
 }
 
 test "Adam normalises a unit gradient to one lr-sized step per weight (#231)" {

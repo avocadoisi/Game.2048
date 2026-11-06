@@ -85,6 +85,15 @@ previous net with `scripts/widen-net.py --h1 H --h2 W --src-h1 … --src-h2 …`
 exactly. 128/128 at 300,000 = 92,953 (+8,624 ± 7,679 was seed luck; seed 2 gave −12,117 ± 5,848), so `h2` at 128
 is actively worse than 32: the extra width only spends games. Judge capacity candidates by >= 2 training seeds.
 
+**The 128/32 recipe is seed-sensitive: seed 2 diverges (#234).** At lr 0.003 training seed 2 reaches 100,000
+games fine (2-ply 84,040.6) and then blows up — 323 moves/game, `|w|` 1.685e86, 6,334 of 37,057 weights NaN —
+so the run ends in a NaN net. Training now checks `nn.weightsFinite` every game and stops with
+`diverged at N/M games (non-finite or |w| > 1e6), not saving <path>` (exit 1) instead of overwriting the last
+good checkpoint. Both stabilizations lose the 8192 tail: lr 1.5e-3 gives 76,366.6 (0/20 at 8192) and the
+`clamp` variant (TD target bounded at 200 = score 200,000) gives 70,131.8 — the adopted net's 11/20 at 8192
+only appears right at the edge of stability. Practical loop: run 2-3 training seeds and keep the one that
+beats the bar.
+
 Other capacity facts that still hold: extending past 300,000 regresses even at lr 1.5e-3 (420k = 69,888), and
 distilling a wide net into a narrow one collapses it (`dson` −68,521 ± 7,048, `dist` −55,826 ± 6,287) — a wide
 net's `V` is only meaningful together with its own 2-ply search. `nn.Staged` is 7 nets (~2 MB at 128/32), so it

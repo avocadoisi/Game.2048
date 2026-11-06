@@ -63,6 +63,8 @@ const usage =
     \\                       every parameter moves about adam_lr per step whatever its gradient scale is)
     \\              tailw   (#232: weights every per-move TD sample by how few empty cells its board has, so
     \\                       the late game takes up to `1 + tail_alpha` times the step of an open board)
+    \\              clamp   (#234: bounds the TD target at +/- `clamp` (default 200, i.e. score 200,000) so a
+    \\                       diverging value cannot bootstrap itself; `par` compatible)
     \\  pairw         (#210) paired comparison of two weight files: A = weights_path with `deep`,
     \\                B = the path after the `-` par slot with `deep`, same spawn tape per game
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
@@ -86,8 +88,8 @@ const usage =
     \\                the "-" par dump slot
     \\  rows          (#203) eval-table rows to run, comma list after batch_scale (`-` = all), e.g.
     \\                "0,2" for 1-ply and 2-ply only; the 3-ply rows dominate a measurement run.
-    \\                For variant adam this slot is adam_lr instead (default 0.01), like dist's divisor
-    \\                and tailw's tail_alpha (default 1: twice the step on a full board).
+    \\                For variant adam this slot is adam_lr instead (default 0.01), like dist's divisor,
+    \\                tailw's tail_alpha (default 1: twice the step on a full board) and clamp's ceiling.
     \\
     \\Weights are written to `weights_path` only when train_games > 0;
     \\train_games = 0 (eval only) never writes.
@@ -205,6 +207,16 @@ fn parseAdamLr(args: []const []const u8) !f64 {
     const lr = std.fmt.parseFloat(f64, args[13]) catch return error.InvalidAdamLr;
     if (!(lr > 0)) return error.InvalidAdamLr;
     return lr;
+}
+
+/// (#234) Ceiling on the TD target for variant `clamp`, at the same row-spec slot as Adam's step size and
+/// `tailw`'s alpha. 0 or `-` leaves the target alone (i.e. a plain `base` run), so a value is required.
+fn parseClamp(args: []const []const u8) !f64 {
+    if (args.len <= 13) return 200;
+    if (std.mem.eql(u8, args[13], "-")) return 200;
+    const cap = std.fmt.parseFloat(f64, args[13]) catch return error.InvalidClamp;
+    if (!(cap > 0)) return error.InvalidClamp;
+    return cap;
 }
 
 /// (#232) `tail_alpha` for variant `tailw`, at the same row-spec slot as Adam's step size: the step of a
@@ -406,6 +418,8 @@ pub fn main(init: std.process.Init) !void {
     const is_adam = std.mem.eql(u8, variant, "adam");
     // (#232) `par`-compatible: the weight is a per-sample `lr` multiplier, so every game stays independent.
     const is_tailw = std.mem.eql(u8, variant, "tailw");
+    // (#234) `par`-compatible: a bounded TD target, so a diverging value cannot bootstrap itself.
+    const is_clamp = std.mem.eql(u8, variant, "clamp");
     // (#206) the teacher mix: `distill_every` (arg 12) and the rate divisor (arg 13).
     const dist_mix: DistillMix = if (is_dist or is_dson) try parseDistillMix(args) else .{};
     // #159 variants train from the net in weights_path (the deep positions come from that net), like `resume`
@@ -471,6 +485,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .adam = &adam, .adam_lr = try parseAdamLr(args) }
     else if (is_tailw)
         .{ .tail_alpha = try parseTailAlpha(args) }
+    else if (is_clamp)
+        .{ .clamp = try parseClamp(args) }
     else if (std.mem.eql(u8, variant, "d2"))
         .{ .teacher = .deep }
     else if (std.mem.eql(u8, variant, "d3"))
@@ -503,8 +519,8 @@ pub fn main(init: std.process.Init) !void {
     // (#203) index 13 narrows the eval table to the rows a measurement needs (`0,2`); `dist`/`dson`
     // already own 13 as the teacher lr divisor, `adam` as its step size, and `pairw` returns before the
     // table is built.
-    const row_spec: ?[]const u8 = if (is_dist or is_dson or is_adam or is_tailw or is_pairw or is_pair) null else if (args.len > 13) args[13] else null;
-    const max_args: usize = if (is_dist or is_dson or is_adam or is_tailw) 14 else if (row_spec != null) 14 else if (is_ft2 or is_tch) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw) 12 else 11;
+    const row_spec: ?[]const u8 = if (is_dist or is_dson or is_adam or is_tailw or is_clamp or is_pairw or is_pair) null else if (args.len > 13) args[13] else null;
+    const max_args: usize = if (is_dist or is_dson or is_adam or is_tailw or is_clamp) 14 else if (row_spec != null) 14 else if (is_ft2 or is_tch) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw) 12 else 11;
     if (args.len > max_args or seed_ranges == 0 or (uses_dump and dump_path == null)) {
         std.debug.print("{s}", .{usage});
         return;
@@ -578,6 +594,7 @@ pub fn main(init: std.process.Init) !void {
                 const game = nn.trainGameStaged(staged, rng.random(), learning_rate * (1 - 0.9 * frac));
                 last_score = game.score;
                 total_moves += game.moves;
+                if (!stagedFinite(staged)) return diverged(g + 1, train_games, weights_path);
                 if ((g + 1) % 5000 == 0) {
                     std.debug.print("train {d}/{d} last game score {d}\n", .{ g + 1, train_games, last_score });
                     try staged.saveFile(init.io, init.gpa, weights_path); // checkpoint
@@ -592,6 +609,7 @@ pub fn main(init: std.process.Init) !void {
                 const batch = nn.trainBatchOpts(&net, train_seed, g, games, learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null, opts);
                 last_score = batch.score;
                 total_moves += batch.moves;
+                if (!nn.weightsFinite(&net)) return diverged(g + games, train_games, weights_path);
                 if ((g + games) % 5000 == 0) {
                     std.debug.print("train {d}/{d} last game score {d}\n", .{ g + games, train_games, last_score });
                     try nn.save(&net, init.io, weights_path); // checkpoint
@@ -604,6 +622,7 @@ pub fn main(init: std.process.Init) !void {
                 const game = nn.trainGameOpts(&net, rng.random(), learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null, opts);
                 last_score = game.score;
                 total_moves += game.moves;
+                if (!nn.weightsFinite(&net)) return diverged(g + 1, train_games, weights_path);
                 if ((g + 1) % 5000 == 0) {
                     std.debug.print("train {d}/{d} last game score {d}\n", .{ g + 1, train_games, last_score });
                     try nn.save(&net, init.io, weights_path); // checkpoint
@@ -820,6 +839,20 @@ test "train seed argument (position 9) is optional and defaults to 1" {
     try std.testing.expectError(error.InvalidCharacter, cli.argOr(u64, &[_][]const u8{ "nn", "0", "20", "2000", "0.003", "-", "base", "30", "x.bin", "x" }, 9, default_train_seed));
 }
 
+/// `mstd` keeps seven nets, so the divergence check has to look at every stage (#234).
+fn stagedFinite(staged: *const nn.Staged) bool {
+    for (0..nn.stage_count) |k| {
+        if (!nn.weightsFinite(&staged.nets[k])) return false;
+    }
+    return true;
+}
+
+/// Stop before the checkpoint write: a diverged run must leave the last good weights file in place (#234).
+fn diverged(done: usize, total: usize, weights_path: []const u8) error{Diverged} {
+    std.debug.print("diverged at {d}/{d} games (non-finite or |w| > 1e6), not saving {s}\n", .{ done, total, weights_path });
+    return error.Diverged;
+}
+
 /// Test-only replica of the serial training setup in `main` (init + game RNG both from the seed).
 fn trainSeedWeights(seed: u64, games: usize) nn.Net {
     var init_rng = std.Random.DefaultPrng.init(seed);
@@ -899,6 +932,17 @@ test "omitted batch_scale is the sqrt rule, '-' is the old mean (#203)" {
     try std.testing.expectEqual(@as(f64, 2.8284), try parseBatchScale(&explicit));
     const typo = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "base", "30", "x.bin", "3", "par", "-", "two" };
     try std.testing.expectError(error.InvalidBatchScale, parseBatchScale(&typo));
+}
+
+test "clamp variant reads its TD target ceiling from the row-spec slot (#234)" {
+    const omitted = [_][]const u8{ "nn", "2000", "0", "2000", "0.003", "-", "clamp", "30", "x.bin", "3", "par" };
+    try std.testing.expectEqual(@as(f64, 200), try parseClamp(&omitted));
+    const dash = [_][]const u8{ "nn", "2000", "0", "2000", "0.003", "-", "clamp", "30", "x.bin", "3", "par", "-", "-", "-" };
+    try std.testing.expectEqual(@as(f64, 200), try parseClamp(&dash));
+    const explicit = [_][]const u8{ "nn", "2000", "0", "2000", "0.003", "-", "clamp", "30", "x.bin", "3", "par", "-", "2.8284", "50" };
+    try std.testing.expectEqual(@as(f64, 50), try parseClamp(&explicit));
+    const zero = [_][]const u8{ "nn", "2000", "0", "2000", "0.003", "-", "clamp", "30", "x.bin", "3", "par", "-", "-", "0" };
+    try std.testing.expectError(error.InvalidClamp, parseClamp(&zero));
 }
 
 test "rows argument keeps the listed eval rows and rejects junk (#203)" {
