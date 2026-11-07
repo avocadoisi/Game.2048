@@ -4,7 +4,7 @@
 #
 #   scripts/eval-net.sh <candidate.bin>             20 games, seed 9000, vs ai/solver/nn_weights.bin
 #   scripts/eval-net.sh <candidate.bin> --games 40 --seed 9000
-#   scripts/eval-net.sh <candidate.bin> --shipped /tmp/other.bin
+#   scripts/eval-net.sh <candidate.bin> --shipped /tmp/other.bin --h1 256 --h2 32
 #
 # What it prints
 #   1. pairw: A = shipped, B = candidate, identical spawn tape per game. `mean diff` is B - A, and
@@ -24,18 +24,22 @@ cand=""
 games=20
 seed=9000
 shipped="ai/solver/nn_weights.bin"
+h1=128
+h2=32
 while [ $# -gt 0 ]; do
   case "$1" in
     --games) games="$2"; shift 2 ;;
     --seed) seed="$2"; shift 2 ;;
     --shipped) shipped="$2"; shift 2 ;;
+    --h1) h1="$2"; shift 2 ;;
+    --h2) h2="$2"; shift 2 ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) cand="$1"; shift ;;
   esac
 done
 
 if [ -z "$cand" ] || [ ! -f "$cand" ]; then
-  echo "usage: scripts/eval-net.sh <candidate.bin> [--games N] [--seed S] [--shipped PATH]" >&2
+  echo "usage: scripts/eval-net.sh <candidate.bin> [--games N] [--seed S] [--shipped PATH] [--h1 N] [--h2 N]" >&2
   exit 2
 fi
 if [ ! -f "$shipped" ]; then
@@ -44,7 +48,7 @@ if [ ! -f "$shipped" ]; then
 fi
 
 seed_b=$((seed + 100))
-run() { zig build nn -Doptimize=ReleaseFast -- "$@" 2>&1; }
+run() { zig build nn -Doptimize=ReleaseFast -Dh1="$h1" -Dh2="$h2" -- "$@" 2>&1; }
 
 table=$(mktemp)
 trap 'rm -f "$table"' EXIT
