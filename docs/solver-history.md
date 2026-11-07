@@ -3010,3 +3010,22 @@ seed 9000 の 8192 到達は 13/20 と同梱（11/20）より多いが、ペア�
 
 コストは 1 周 2〜2.5 時間（dump 43〜96 分 + 教師 3.5 分 + dist 17 分 + 評価 20 分）。dump は
 「深い局面だけ」（4096 以上）を集めるので、`dumpp2` の自己対戦は 1 局 4,500 手・10〜20 s かかる。
+
+## pairw の共通 spawn を盤面ごとに一様に写像する（#237）
+
+#235 は spawn の記録を「空きマス index」に直したが、A と B の空き数が違うと、B 側で index を末尾へ
+clamp するため穴の分布が偏る（4 穴の A から 2 穴の B へ渡す例では、B の 2 番目の穴が 75%）。
+pairw の tape は盤面に依存しない一様な `u32 pick` を記録し、各盤面が `floor(pick × empty_count / 2^32)`
+で自身の row-major 空きマスへ写像する。各 hole bucket の大きさは `floor(2^32 / n)` または
+`ceil(2^32 / n)` なので、有限の 32-bit 入力で生じる偏りは最大 1 pick / 2^32。A/B は同じ乱数列を
+使いながら、それぞれの盤面でほぼ一様な spawn 分布を保つ。
+
+`Spawn` は 1 byte から 8 bytes になった。テストの `tape_capacity = 8192` は 64 KiB、実際の `pairw`
+は `ai/solver/nn_main.zig` で 20,000 件を heap に確保するため 20 KB → 160 KB（+140 KB）。記録側の
+cell draw も bounded `usize` index から full-range `u32` に変わるので、同じ seed の `playValue` と
+byte-for-byte 同じゲームになる保証はなくなった。tape を使った記録と replay の再現性は維持する。
+
+回帰テストは空き数 1..16 の全 bucket 境界・サイズ、4-hole → 2-hole の偏り例、raw pick の記録/replay、
+ゼロ容量と通常容量でゲーム・乱数状態が一致することを確認する。学習・強さのベンチマークはこの修正では
+実行していない。**#237 より前の pairw 結果は index+clamp の旧テープで得た歴史値**であり、今後候補を
+採否判定するときは現在の実装で A/B を比較し直す。
