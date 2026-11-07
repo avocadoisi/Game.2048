@@ -29,6 +29,7 @@
 scripts/eval-net.sh /tmp/cand.bin                 # 20 局 seed 9000、同梱 net と比較
 scripts/eval-net.sh /tmp/cand.bin --games 40      # σ を縮めたいとき
 scripts/eval-net.sh /tmp/cand.bin --shipped /tmp/base.bin
+scripts/eval-net.sh /tmp/cand.bin --h1 96      # 幅の違う net は build 側も合わせる（既定 128/32）
 ```
 
 出力は 3 ブロック:
@@ -166,7 +167,7 @@ bar を超えたものを採る**のが運用（21 行目の `clamp` は発散�
 毎回同じ値で出る**（差し替え前の 64/32 は 79,657 / 91,348、4/20・5/20）。1 本あたり約 17 分
 （`pairw` 690 s + 非ペア 4 行 280 s）。数字は同じ日に 2 回通して一致を確認した。
 
-判定はスクリプトに任せる（#235）。`scripts/eval-net.sh <cand.bin> [--shipped <A.bin>] [--games N]`
+判定はスクリプトに任せる（#235）。`scripts/eval-net.sh <cand.bin> [--shipped <A.bin>] [--games N] [--h1 N] [--h2 N]`
 は `pairw` → 非ペア表 → **`VERDICT: ADOPT|REJECT`** まで出し、REJECT なら落ちた条件を `FAIL: ...` で
 列挙する。ADOPT の条件は (a) `mean − 2*stderr > 0`、(b) 両 seed で `avg_score >= A × 0.97` /
 `8192 到達 >= A − 1 局` / `ms/move <= A × 1.20`、(c) `better > worse` の 3 つ。A と B に同じ net を
