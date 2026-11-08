@@ -84,7 +84,7 @@ essentially the 64/32 plateau, i.e. the width almost certainly never reached the
 capacity run by the weights file size** (`16 + 8 x (256*h1 + h1 + h2*h1 + 2*h2 + 1)`) and by zero-padding the
 previous net with `scripts/widen-net.py --h1 H --h2 W --src-h1 … --src-h2 …` and reproducing its old number
 exactly. 128/128 at 300,000 = 92,953 (+8,624 ± 7,679 was seed luck; seed 2 gave −12,117 ± 5,848), so `h2` at 128
-is actively worse than 32: the extra width only spends games. Judge capacity candidates by >= 2 training seeds.
+is actively worse than 32: the extra width only spends games. Judge capacity candidates by >= 2 training seeds. The #233 follow-up tested h1=96/192/256 at h2=32, 300k games, two train seeds each; all six candidates lost to 128/32 (pairw −42k to −95k; 2-ply 25k–79k). Do not continue a simple width sweep under this recipe; see `docs/solver-history.md`'s #233 follow-up.
 
 **The 128/32 recipe is seed-sensitive: seed 2 diverges (#234).** At lr 0.003 training seed 2 reaches 100,000
 games fine (2-ply 84,040.6) and then blows up — 323 moves/game, `|w|` 1.685e86, 6,334 of 37,057 weights NaN —
