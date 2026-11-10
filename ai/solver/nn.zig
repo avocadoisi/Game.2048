@@ -183,6 +183,18 @@ pub fn forward(net: *const Net, board: Board, cache: *Cache) f64 {
 
 /// One SGD step on 0.5 * (out - target)^2, using the activations in `cache` (from forward on the same board).
 pub fn train(net: *Net, cache: *const Cache, target: f64, lr: f64) void {
+    trainCapped(net, cache, target, lr, 0);
+}
+
+/// (#246) One element of a step, cut to +-`cap` when `cap > 0`. A non-positive cap returns the delta
+/// unchanged, so `train` (which passes 0) stays bit-identical to the historical update.
+fn capStep(delta: f64, cap: f64) f64 {
+    return if (cap > 0) std.math.clamp(delta, -cap, cap) else delta;
+}
+
+/// `train` with a per-element ceiling on `|dw|` (#246, candidate b): the serial per-move step and the
+/// merged `par` step are the two places that apply a step, and both pass their `step_clip` here.
+pub fn trainCapped(net: *Net, cache: *const Cache, target: f64, lr: f64, step_clip: f64) void {
     const d = cache.out - target;
     var dz2: [h2_size]f64 = undefined;
     var da1 = std.mem.zeroes([h1_size]f64);
@@ -191,20 +203,20 @@ pub fn train(net: *Net, cache: *const Cache, target: f64, lr: f64) void {
         for (0..h1_size) |i| da1[i] += net.w2[j][i] * dz2[j];
     }
 
-    net.b3 -= lr * d;
+    net.b3 -= capStep(lr * d, step_clip);
     for (0..h2_size) |j| {
-        net.w3[j] -= lr * d * cache.a2[j];
-        net.b2[j] -= lr * dz2[j];
-        for (0..h1_size) |i| net.w2[j][i] -= lr * dz2[j] * cache.a1[i];
+        net.w3[j] -= capStep(lr * d * cache.a2[j], step_clip);
+        net.b2[j] -= capStep(lr * dz2[j], step_clip);
+        for (0..h1_size) |i| net.w2[j][i] -= capStep(lr * dz2[j] * cache.a1[i], step_clip);
     }
 
     for (0..h1_size) |i| {
         const dz1 = if (cache.z1[i] > 0) da1[i] else 0;
-        net.b1[i] -= lr * dz1;
-        for (cache.rows) |row| net.w1[row][i] -= lr * dz1;
+        net.b1[i] -= capStep(lr * dz1, step_clip);
+        for (cache.rows) |row| net.w1[row][i] -= capStep(lr * dz1, step_clip);
         if (comptime feature_count > 0) {
             for (0..feature_count) |k| if (cache.feat[k] != 0) {
-                net.wf[k][i] -= lr * dz1 * cache.feat[k];
+                net.wf[k][i] -= capStep(lr * dz1 * cache.feat[k], step_clip);
             };
         }
     }
@@ -1595,6 +1607,15 @@ pub const Options = struct {
     /// board (1,000 x score, so ~131 for a 16k tile), so clamping the target keeps every sane update and
     /// cuts the V -> target -> V feedback that explodes.
     clamp: f64 = 0,
+    /// Candidate (#246, a) L2-norm ceiling on the delta one merged `par` batch applies, 0 = off (#234
+    /// left the update side, not the target, as the suspect: the batch delta is `lr x the sum of the
+    /// games' gradients`, so its norm can grow with the batch while a single sample's cannot). Same
+    /// style as `sym_batch_clip`: scale the whole delta down to the cap, never up.
+    grad_clip: f64 = 0,
+    /// Candidate (#246, b) per-element ceiling on one step's `|dw|`, 0 = off. Cuts every parameter
+    /// update to +-`step_clip`. Applies to the serial per-move step and to the single merged `par`
+    /// step; the per-game nets inside a batch only accumulate gradient, so they stay uncapped.
+    step_clip: f64 = 0,
     /// Candidate (#98): true batch symmetry augmentation — one averaged step per afterstate, where all 8
     /// transformed gradients come from one net snapshot (unlike `symmetry`, which steps 8 times sequentially).
     sym_batch: bool = false,
@@ -2217,7 +2238,7 @@ fn trainStep(net: *Net, cache: *Cache, after: Board, target: f64, lr: f64, opts:
     const transforms: usize = if (opts.symmetry) symmetry_count else 1;
     for (0..transforms) |k| {
         _ = forward(net, if (opts.symmetry) transformBoard(k, after) else after, cache);
-        if (opts.lambda > 0) trainTrace(net, cache, target, lr, trace, opts.lambda) else train(net, cache, target, lr);
+        if (opts.lambda > 0) trainTrace(net, cache, target, lr, trace, opts.lambda) else trainCapped(net, cache, target, lr, opts.step_clip);
     }
 }
 
@@ -2479,6 +2500,9 @@ pub fn trainBatchOpts(net: *Net, seed: u64, first_game: usize, games: usize, lr:
     // the per-game nets train with plain SGD; Adam acts once on the merged gradient below
     var thread_opts = opts;
     thread_opts.adam = null;
+    // (#246) a batch applies one step: the per-game nets accumulate the gradient, and the merge below
+    // caps that single step. Capping inside the games would cap 8 sub-steps instead of one.
+    thread_opts.step_clip = 0;
     parallel.map(BatchGame, units[0..games], BatchGameCtx{
         .net = net.*,
         .seed = seed,
@@ -2507,6 +2531,8 @@ pub fn trainBatchOpts(net: *Net, seed: u64, first_game: usize, games: usize, lr:
         for (flat(&grad), flatConst(net), start_w) |*g, merged, s| g.* = (merged - s) * inv;
         net.* = start;
         applyAdam(net, &grad, state, opts.adam_lr);
+    } else if (opts.grad_clip > 0 or opts.step_clip > 0) {
+        clipMergedDelta(out_w, start_w, opts);
     }
     if (diag) |d| for (units[0..games]) |u| mergeDiag(d, &u.diag);
     var moves: u64 = 0;
@@ -2520,6 +2546,22 @@ pub fn trainBatchOpts(net: *Net, seed: u64, first_game: usize, games: usize, lr:
         }
     }
     return .{ .score = units[games - 1].score, .moves = moves, .capped_game = capped_game, .capped_moves = capped_moves };
+}
+
+/// (#246) Bound the single step `trainBatchOpts` applies: `grad_clip` scales the whole delta down to
+/// that L2 norm (source and target of the step, so the comparison is on `dw` alone), then `step_clip`
+/// caps every element. Both 0 (the default) leaves the merged delta untouched, bit for bit.
+fn clipMergedDelta(merged: []f64, start: []const f64, opts: Options) void {
+    if (opts.grad_clip > 0) {
+        var norm2: f64 = 0;
+        for (merged, start) |m, s| norm2 += (m - s) * (m - s);
+        const norm = @sqrt(norm2);
+        const scale: f64 = if (norm > opts.grad_clip) opts.grad_clip / norm else 1;
+        for (merged, start) |*m, s| m.* = s + (m.* - s) * scale;
+    }
+    if (opts.step_clip > 0) {
+        for (merged, start) |*m, s| m.* = s + std.math.clamp(m.* - s, -opts.step_clip, opts.step_clip);
+    }
 }
 
 /// Weight file: 8-byte magic, u32 version, u32 endianness marker (all little-endian), then the f64 weights as little-endian.
@@ -4611,6 +4653,78 @@ test "clamp bounds the TD target (#234)" {
     try std.testing.expectEqual(@as(f64, -7), clampTarget(-7, .{ .clamp = 200 }));
     try std.testing.expectEqual(@as(f64, 200), clampTarget(1e6, .{ .clamp = 200 }));
     try std.testing.expectEqual(@as(f64, -200), clampTarget(-1.685e86, .{ .clamp = 200 }));
+}
+
+test "a zero step ceiling leaves serial and batch training bit-identical (#246)" {
+    var init_rng = std.Random.DefaultPrng.init(246);
+    const base = Net.init(init_rng.random());
+    var cache: Cache = .{};
+    _ = forward(&base, sample_board, &cache);
+
+    var plain = base;
+    train(&plain, &cache, 0.7, 0.01);
+    var zero = base;
+    trainCapped(&zero, &cache, 0.7, 0.01, 0);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&plain), std.mem.asBytes(&zero));
+
+    // the default Options carry both zeros, so an explicit zero batch is the historical batch
+    const games = 2;
+    var history = base;
+    _ = trainBatch(&history, 246, 0, games, 0.003, null);
+    var explicit = base;
+    _ = trainBatchOpts(&explicit, 246, 0, games, 0.003, null, .{ .grad_clip = 0, .step_clip = 0 });
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&history), std.mem.asBytes(&explicit));
+}
+
+test "step clip cuts every element of one SGD step (#246)" {
+    var init_rng = std.Random.DefaultPrng.init(246);
+    const base = Net.init(init_rng.random());
+    var cache: Cache = .{};
+    _ = forward(&base, sample_board, &cache);
+    // lr 1 makes the step equal to the gradient, so the clip threshold is a real fraction of it
+    var plain = base;
+    train(&plain, &cache, 1.0, 1.0);
+    var biggest: f64 = 0;
+    for (flat(&plain), flatConst(&base)) |a, b| biggest = @max(biggest, @abs(a - b));
+    try std.testing.expect(biggest > 1e-6);
+
+    const cap = biggest / 2;
+    var capped = base;
+    trainCapped(&capped, &cache, 1.0, 1.0, cap);
+    var hit = false;
+    for (flat(&capped), flatConst(&base)) |a, b| {
+        const moved = @abs(a - b);
+        try std.testing.expect(moved <= cap * (1 + 1e-12));
+        if (moved >= cap * (1 - 1e-9)) hit = true;
+    }
+    try std.testing.expect(hit);
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&plain), std.mem.asBytes(&capped)));
+}
+
+test "grad clip bounds the L2 norm of one merged batch step (#246)" {
+    const games = 4;
+    var init_rng = std.Random.DefaultPrng.init(246);
+    const base = Net.init(init_rng.random());
+
+    var plain = base;
+    _ = trainBatchOpts(&plain, 246, 0, games, 0.003, null, .{});
+    var norm2: f64 = 0;
+    for (flat(&plain), flatConst(&base)) |a, b| norm2 += (a - b) * (a - b);
+    const norm = @sqrt(norm2);
+    try std.testing.expect(norm > 0);
+
+    const cap = norm / 4;
+    var capped = base;
+    _ = trainBatchOpts(&capped, 246, 0, games, 0.003, null, .{ .grad_clip = cap });
+    const scale = cap / norm;
+    var capped_norm2: f64 = 0;
+    for (flat(&capped), flat(&plain), flatConst(&base)) |a, p, b| {
+        // one scale for the whole delta: the direction of the step survives
+        try std.testing.expectApproxEqRel((p - b) * scale, a - b, 1e-6);
+        capped_norm2 += (a - b) * (a - b);
+    }
+    try std.testing.expectApproxEqRel(cap, @sqrt(capped_norm2), 1e-6);
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&plain), std.mem.asBytes(&capped)));
 }
 
 test "weightsFinite rejects a diverged net (#234)" {

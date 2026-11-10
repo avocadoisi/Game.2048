@@ -95,7 +95,9 @@ good checkpoint. Both stabilizations lose the 8192 tail: lr 1.5e-3 gives 76,366.
 only appears right at the edge of stability. Raising the ceiling does not help (#244): 300 still completes
 (2-ply 71,981.8, 0/20 at 8192, |w| 29.19, 1,842 moves/game) while 500/1000/2000 are byte-identical to no
 clamp (same 50k checkpoint, md5 38818bb4c8b3cfa2fd2481ab3b946f25) and stop at `diverged at 50440/300000`.
-The target is not the cause (|w| goes 17 -> >1e6 with every target under 500), so cap the update next. Practical loop: run 2-3 training seeds and keep the one that
+The target is not the cause (|w| goes 17 -> >1e6 with every target under 500), so cap the update next: variant `clip` (#246)
+bounds one step instead (`norm` = L2 norm of the merged `par` batch delta, default 1; `step` = per-element |Δw|);
+as with `clamp`, a cap the run never reaches is byte-identical to `base`. Practical loop: run 2-3 training seeds and keep the one that
 beats the bar. Seed 3 never diverges but is unusable: #241 saw one 8-game batch near 60,000 stall for 53
 minutes with finite weights (the guard checks weights, not game length), and #242's clean re-run finished
 300,000 in 49.9 min (508,236,212 moves, no long game) only to score 22,924.0 / 0/20 at 8192 (pairw

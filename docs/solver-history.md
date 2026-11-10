@@ -3228,3 +3228,36 @@ seed 3 の失敗は「clamp が強すぎて裾を捨てる」型ではなく、�
 方策が弱い型なので、`clamp` の上限を動かす方向では改善しない。`#244` の結論どおり、次は
 更新量（1 step の `|Δw|` か勾配ノルム）の制限を試す。同梱 `ai/solver/nn_weights.bin` は
 差し替えない（bar は seed 1 の 113,682.2 / 8192 11/20 のまま）。
+
+### 更新量の上限 variant `clip` を足した（#246）
+
+`#234` / `#244` / `#245` の結論は「発散も seed 3 の弱さも TD 目標の大きさでは動かない」だったので、
+次は 1 step の更新量そのものに上限をかける variant を入れた。**採否の 300k 測定はまだで、ここにあるのは
+実装とスモーク確認だけ**（次の測定の入力になる）。
+
+- `nn.Options.grad_clip`（a）: `par` が 1 バッチで適用するマージ済み delta の L2 ノルム上限。
+  `sym_batch_clip` と同じ流儀で、上限を超えたら delta 全体を同じ比で縮める（方向は保つ）。
+- `nn.Options.step_clip`（b）: 1 step の要素ごとの `|Δw|` 上限。直列の 1 手 1 更新と、`par` が 1 バッチで
+  適用する 1 step の両方に効く（バッチ内の各ゲームは勾配を貯めるだけなので切らない = 切るのは 1 step）。
+- どちらも既定 0 = 上限なし。0 では演算を足さないので、既存 run はバイト一致のまま。
+
+CLI は variant `clip`（arg 13 = 上限、既定 1 = `sym_batch_clip` と同じスケール、arg 14 = `norm`|`step`）。
+`norm` はマージ済みバッチ delta にしか効かないので `par` 必須、`step` は直列でも可。ログは
+`variant=clip:norm+par` / `variant=clip:step+par` と、どちらの上限が動いたかを出す。
+
+確認（128/32、200 ゲーム、`par`、batch_scale sqrt(8)、train seed 1、`/tmp/nn246_*.bin`）:
+
+```
+zig build nn -Doptimize=ReleaseFast -- 200 0 9000 0.003 1 base 30 /tmp/nn246_base.bin 1 par - 2.8284271247461903
+# trained 200 games, 24930 moves in 0.2 s (lr=0.003, seed=1, variant=base+par)   md5 976fea58b0c4b1e28eca694e5b78c445
+zig build nn -Doptimize=ReleaseFast -- 200 0 9000 0.003 1 clip 30 /tmp/nn246_step_huge.bin 1 par - 2.8284271247461903 1000000000 step
+# variant=clip:step+par, md5 976fea58... = base と一致（上限が発火しない run は従来と同一）
+zig build nn -Doptimize=ReleaseFast -- 200 0 9000 0.003 1 clip 30 /tmp/nn246_step.bin 1 par - 2.8284271247461903 0.001 step
+# variant=clip:step+par, md5 ddc4a1101382af9720be0dc6e4c1d0ff（重みが変わる）
+zig build nn -Doptimize=ReleaseFast -- 200 0 9000 0.003 1 clip 30 /tmp/nn246_norm.bin 1 par - 2.8284271247461903 1e-5
+# variant=clip:norm+par, md5 b1a79e29bbd5604b80457b62ada778e1（重みが変わる）
+```
+
+`zig build test` は通過。上限 0 が直列・バッチとも従来とバイト一致すること、`step_clip` が 1 step の
+全要素を切り、`grad_clip` がマージ済み delta のノルムを上限にし方向を保つことをテストで固定した。
+同梱 `ai/solver/nn_weights.bin` は差し替えない（bar は seed 1 の 113,682.2 / 8192 11/20 のまま）。
