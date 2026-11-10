@@ -3406,3 +3406,40 @@ zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 resume 30 /tmp/issue250
 zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 resume 30 ai/solver/nn_weights.bin 1 - - - 0,2
 # nn 2-ply (deep): avg score=129456.2 ... avg moves=5486.0 reach8192=14/20
 ```
+
+### seed 2 の 128/32・300k で `clip` norm 1 を測定（#251）
+
+#247 の norm 3 / 10 は完走するものの両 seed で 8192 が 0/20 だった。さらに低い norm 1 なら、40k〜50k の
+発散前に起きる軌道変化で裾を保てるかを確認した。条件は seed 2、128/32、300,000 games、`base` 相当、
+lr 0.003、`par`、batch_scale √8 = 2.8284271247461903。候補は 300k を完走し、547,999,305 moves、
+max|w| = 27.2242、NaN なし。重みは 296,472 B（md5 `cd786cd1b7f9a74bd9a96c17d2102d92`）。学習コマンドの
+報告時間は 2,997.5 s（49m57s）、shell の wall time は 99m22.7s だった。CLI は clip 発火回数を記録しないが、
+上限なしの同条件が #244 のとおり 50,440 games で発散するのに対して本 run は完走したため、上限は少なくとも
+1 回発火した。正確な回数は未計測。
+
+2-ply 20 games / seed 9000, 9100 の結果（avg moves と ms/move も記録）:
+
+| 候補 | avg_score 9000 / 9100 | avg moves 9000 / 9100 | reach8192 9000 / 9100 | ms/move 9000 / 9100 |
+|---|---:|---:|---:|---:|
+| `clip` norm 1 (#251) | 46,417.4 / 46,907.4 | 2,069.6 / 2,072.6 | 0/20 / 0/20 | 1.08 / 1.03 |
+| `clip` norm 3 (#247) | 69,415.8 / 68,284.4 | 3,134 / 3,076 | 0/20 / 0/20 | 1.09 / 1.10 |
+| `clip` norm 10 (#247) | 73,388.0 / 73,560.2 | 3,327 / 3,335 | 0/20 / 0/20 | 0.95 / 0.97 |
+| 同梱 net 128/32 | 113,682.2 / 129,456.2 | — / 5,486 | 11/20 / 14/20 | 0.91 / 0.88 |
+
+同梱 net の seed 9000 の avg moves は未記録。seed 9100 の 5,486 は #250 の値。
+
+norm 1 は norm 3 より 9000 で約23k、9100 で約21k低く、norm 10 より約27k / 27k低い。両 seed で
+avg_score は同梱 net に大きく劣り、8192 到達も 0/20 のまま。したがって裾を保つ仮説は否定され、
+`eval-net.sh` の採用判定・`pairw` には進まない（両 seed の非ペア評価ですでに悪化）。**不採用。**
+`ai/solver/nn_weights.bin` は変更しない。clip norm 1 は軌道を変えて完走させても方策を改善せず、norm 3/10
+よりさらに弱いので、この clip 上限を下げる方向は打ち切る。
+
+再現（ReleaseFast）:
+```
+zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - clip 30 /tmp/s2_clip_norm1_300k.bin 2 par - 2.8284271247461903 1 norm
+# trained 300000 games, 547999305 moves in 2997.5 s (lr=0.003, seed=2, variant=clip:norm+par)
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/s2_clip_norm1_300k.bin 1 - - - 0,2
+# nn 2-ply (deep): avg score=46417.4 ... avg moves=2069.6 ... ms/move=1.08 ... reach8192=0/20
+zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 resume 30 /tmp/s2_clip_norm1_300k.bin 1 - - - 0,2
+# nn 2-ply (deep): avg score=46907.4 ... avg moves=2072.6 ... ms/move=1.03 ... reach8192=0/20
+```
