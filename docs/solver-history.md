@@ -3082,3 +3082,54 @@ seed 2（#234）の「`|w|` 1.685e86・6,334 NaN」とは別の失敗形で、**
 **判定: 不採用（未完走）。** 学習 seed 1 の 113,682.2 を超える net は seed 3 からは得られていない。
 seed 2 と合わせて、lr 0.003 の 128/32 レシピは 3 seed 中 2 seed で実用にならない。次に seed を
 振るなら、1 ゲーム（または 1 バッチ）の手数上限を入れて「長すぎるゲーム」を検出して止めるのが先。
+
+## 手数上限で病的な長ゲームを止め、seed 3 の 300k を判定する（#242）
+
+`#241` の結論どおり、1 ゲームの手数上限を既定で入れた。
+
+- `ai/solver/nn.zig`: `default_move_cap = 100_000` と `Options.move_cap`（0 で無効）。
+  `trainGameOpts` の 3 経路（既定の per-move / `nstep` / `backward`・`replay`・`death`）と
+  `trainGameStaged` が上限で打ち切り、`GameResult.capped = true` を返す。`par` は
+  `BatchOutcome.capped_game` / `capped_moves` で「バッチ内の何番目が何手で上限に達したか」を返す。
+- CLI（`ai/solver/nn_main.zig`）は serial / `par` / `mstd` のどの経路でも
+  `game 60001/300000 hit the 100000-move cap at 100000 moves, stopping the run and not saving <path>`
+  を出して `error.MoveCap`（exit 1）で止まる。`diverged` と同じく最後の good checkpoint は書かない。
+- 上限チェックは rng を引かず、上限未満のゲームは従来と同じ乱数列・更新・`moves` 集計。
+  テスト 2 本が固定する: `move cap leaves a normal game bit-identical and stops a long one (#242)`
+  （同じ seed の重みがバイト一致、rng 状態と `moves` も一致、上限 0 で従来どおり）と
+  `the parallel batch reports and aggregates the capped game (#242)`（serial の集計と一致）。
+  上限を 10 手に下げた CLI スモークでも、上記メッセージ・exit 1・`weights_path` を書かないことを確認。
+
+### 実測: seed 3 300k は 49.9 分で完走し、上限は発火しなかった
+
+```
+zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - base 30 /tmp/w128_32_300k_s3_cap.bin 3 par - 2.8284271247461903
+# trained 300000 games, 508236212 moves in 2995.3 s (lr=0.003, seed=3, variant=base+par)
+# 開始 08:08:50 → 08:58:25（wall 50.6 分）
+```
+
+- 上限メッセージは出ず**完走**した。1 ゲーム平均 1,694 手。病的な長ゲームはこの再走では現れなかった。
+- 再走は決定的: 同じコマンドで 60,000 ゲームまでを 2 回回すと、checkpoint（296,472 B）もログも
+  バイト一致（`trained 60000 games, 53164118 moves`、292.7 s / 308.1 s の差は wall だけ）。
+- ただし `#241` の 60k checkpoint `/tmp/w128_32_300k_s3.bin` とは一致しない。あの run は何かの
+  環境差（バッチ幅など）で別の軌道を走っており、「55k→60k に 53 分」は今日のこのマシンでは
+  再現しない。手数上限はその再発に対する保険として残す（上限未満のゲームの結果は変えない）。
+
+`scripts/eval-net.sh /tmp/w128_32_300k_s3_cap.bin`（20 局、seed 9000）:
+
+| net | seed | avg_score | 8192 | ms/move |
+|---|---:|---:|---:|---:|
+| 同梱 128/32 | 9000 | 113,682.2 | 11/20 | 0.89 |
+| seed 3 300k | 9000 | 22,924.0 | 0/20 | 0.91 |
+| 同梱 128/32 | 9100 | 129,456.2 | 14/20 | 0.85 |
+| seed 3 300k | 9100 | 22,774.0 | 0/20 | 0.89 |
+
+`pairw`（A = 同梱、B = seed 3、20 局、seed 9000）: **−97,245.0 ± 8,392.3**（0 勝 20 敗、468.5 s）。
+
+**判定: REJECT。** seed 3 は完走するが、300k の net は 2-ply で 22.9k、8192 到達 0/20 で、同梱 net の
+約 1/5。`#241` の失敗形（長ゲームで止まる）とは別で、重みは有限のまま方策だけが壊れている。
+したがって lr 0.003 の 128/32 は 3 seed 中 1 seed（seed 1 = 113,682.2）だけが実用で、seed 2 は発散、
+seed 3 は完走しても弱すぎる。同梱 `ai/solver/nn_weights.bin` は差し替えない。
+
+同じレシピで seed を増やすのは打ち切り（当たりは 1/3）。次は安定化を入れて seed 2/3 を作り直す
+（`clip` は既に 8192 の裾を失って 70,131.8 なので、より弱い介入が要る）。

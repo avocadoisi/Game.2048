@@ -1529,8 +1529,17 @@ pub const Target = enum { td1, search2 };
 /// Self-play policy of the per-move trainer (#158); see `Options.selfplay`.
 pub const SelfPlay = enum { greedy1, deep2 };
 
+/// (#242) Default upper bound on the moves of one self-play game. A healthy game ends in a few
+/// thousand moves, so this is far past anything normal; a game that reaches it is pathological.
+pub const default_move_cap: u32 = 100_000;
+
 /// Opt-in training variants (issue #33). Default `.{}` is the plain per-move TD(0) of `trainGame`.
 pub const Options = struct {
+    /// (#242) Upper bound on the moves of one self-play game, 0 = no cap. Reaching it ends the game
+    /// with `GameResult.capped = true` and trains nothing more; the CLI then stops the run before the
+    /// checkpoint write. Seed 3 at 60,000 games spent 53 minutes in one 8-game batch while the weights
+    /// stayed finite (the #234 guard only checks weights), so the run could not finish (#241).
+    move_cap: u32 = default_move_cap,
     /// Candidate A: no per-move update during the game; afterwards train every stored afterstate from last to first.
     backward: bool = false,
     /// Candidate B: after the game, re-train the last `replay_k` afterstates once more (0 = off), oldest first.
@@ -2091,11 +2100,11 @@ pub fn trainGame(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag) u32 {
     return trainGameOpts(net, rng, lr, diag, .{}).score;
 }
 
-pub const GameResult = struct { score: u32, moves: u32 };
+pub const GameResult = struct { score: u32, moves: u32, capped: bool = false };
 
 /// `trainGame` with options. `diag` is only recorded on the default path (`opts` all off).
 pub fn trainGameOpts(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
-    if (opts.nstep > 0) return trainGameNStep(net, rng, lr, opts.nstep);
+    if (opts.nstep > 0) return trainGameNStep(net, rng, lr, opts.nstep, opts.move_cap);
     if (opts.priority != null and !opts.death) return trainGamePerMove(net, rng, lr, diag, opts);
     if (!opts.backward and opts.replay_k == 0 and !opts.death) return trainGamePerMove(net, rng, lr, diag, opts);
     var steps: [step_cap]Step = undefined;
@@ -2103,7 +2112,11 @@ pub fn trainGameOpts(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Op
     var state = GameState.gameStart(rng);
     var cache: Cache = .{};
     var pending: ?Pick = null;
-    while (pickMove(net, state, opts.death)) |pick| {
+    while (true) {
+        // (#242) Stop before the pick: a capped game is pathological, and its unfinished tail must not
+        // enter any target. The check reads no rng, so every normal game is unchanged.
+        if (opts.move_cap > 0 and n >= @as(usize, opts.move_cap)) return .{ .score = state.score, .moves = @intCast(n), .capped = true };
+        const pick = pickMove(net, state, opts.death) orelse break;
         if (pending) |p| if (!opts.backward and !opts.death) trainAfter(net, &cache, p.after, p.reward + pick.value, lr);
         steps[n % step_cap] = .{ .after = pick.after, .reward = pick.reward };
         n += 1;
@@ -2227,6 +2240,11 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
     var moves: u32 = 0;
     var trace: Net = std.mem.zeroes(Net);
     while (true) {
+        // (#242) See `Options.move_cap`: stop before the search, and before the pending step's update.
+        if (opts.move_cap > 0 and moves >= opts.move_cap) {
+            if (diag) |d| d.finish();
+            return .{ .score = state.score, .moves = moves, .capped = true };
+        }
         var pick = selfplayPick(vfn, state, opts.death, opts.selfplay, opts.teacher, opts.sym_leaf) orelse break;
         // `#224`: with probability `explore` play a uniformly random legal move, so the self-play walks
         // through boards the greedy policy would never visit. `0` (the default) draws nothing from the
@@ -2281,12 +2299,14 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
         }
     }
     if (pr) |b| for (0..b.m) |_| {
-        const e = &b.items[if (opts.midmix)
-            b.sampleMidmix(rng)
-        else if (opts.midgame)
-            b.sampleMidgame(rng)
-        else
-            b.sample(rng)];
+        const e = &b.items[
+            if (opts.midmix)
+                b.sampleMidmix(rng)
+            else if (opts.midgame)
+                b.sampleMidgame(rng)
+            else
+                b.sample(rng)
+        ];
         const target = e.reward + if (e.terminal) 0 else valueOf(net, e.next);
         _ = forward(net, e.after, &cache);
         e.err = @abs(target - cache.out);
@@ -2346,12 +2366,15 @@ fn tdBootstrap(net: *const Net, next: Pick, spawned: GameState, opts: Options) f
 /// Online n-step TD (issue #84) on the same 1-ply self-play policy as `trainGamePerMove`: each step enters
 /// the window with V of its afterstate, and the step leaving the window is trained on its n rewards plus
 /// that value. The last min(n, game length) steps are flushed at game over with the rewards alone.
-fn trainGameNStep(net: *Net, rng: std.Random, lr: f64, n: usize) GameResult {
+fn trainGameNStep(net: *Net, rng: std.Random, lr: f64, n: usize, move_cap: u32) GameResult {
     var window = NStepWindow.init(n);
     var state = GameState.gameStart(rng);
     var cache: Cache = .{};
     var moves: u32 = 0;
-    while (pickMove(net, state, false)) |pick| {
+    while (true) {
+        // (#242) A capped game is not terminal, so its window is not flushed as one either.
+        if (move_cap > 0 and moves >= move_cap) return .{ .score = state.score, .moves = moves, .capped = true };
+        const pick = pickMove(net, state, false) orelse break;
         moves += 1;
         if (window.push(.{ .after = pick.after, .reward = pick.reward }, pick.value)) |done|
             trainAfter(net, &cache, done.after, done.target, lr);
@@ -2368,7 +2391,10 @@ pub fn trainGameStaged(staged: *Staged, rng: std.Random, lr: f64) GameResult {
     var state = GameState.gameStart(rng);
     var pending: ?Pick = null;
     var moves: u32 = 0;
-    while (pickMoveValue(value, state, false)) |pick| {
+    while (true) {
+        // (#242) Same cap on the MS-TD path; the staged weights are also finite-safe (#234).
+        if (moves >= default_move_cap) return .{ .score = state.score, .moves = moves, .capped = true };
+        const pick = pickMoveValue(value, state, false) orelse break;
         moves += 1;
         if (pending) |p| _ = staged.train(p.after, pick.after, p.reward, lr);
         pending = pick;
@@ -2395,6 +2421,7 @@ const BatchGame = struct {
     net: Net,
     score: u32,
     moves: u32,
+    capped: bool = false,
     diag: Diag = .{},
 };
 
@@ -2405,6 +2432,7 @@ fn runBatchGame(ctx: BatchGameCtx, i: usize) BatchGame {
     const trained = trainGameOpts(&result.net, rng.random(), ctx.lr, if (ctx.want_diag) &result.diag else null, ctx.opts);
     result.score = trained.score;
     result.moves = trained.moves;
+    result.capped = trained.capped;
     return result;
 }
 
@@ -2412,7 +2440,15 @@ fn runBatchGame(ctx: BatchGameCtx, i: usize) BatchGame {
 /// `trainBatch`/`trainBatchOpts`) plus the moves the whole batch played. The moves are what the serial
 /// loop adds to `total_moves`; without them the `par` path printed `0 moves` (#208), which read as
 /// "par trains nothing".
-pub const BatchOutcome = struct { score: u32, moves: u64 };
+pub const BatchOutcome = struct {
+    score: u32,
+    moves: u64,
+    /// (#242) Index (within this batch) and move count of the first game that hit `Options.move_cap`;
+    /// null when every game ended normally. One pathological game stalls the whole batch, so the CLI
+    /// must stop on this instead of waiting for the other games.
+    capped_game: ?usize = null,
+    capped_moves: u32 = 0,
+};
 
 fn mergeDiag(dst: *Diag, src: *const Diag) void {
     for (0..3) |e| for (0..3) |k| {
@@ -2474,8 +2510,16 @@ pub fn trainBatchOpts(net: *Net, seed: u64, first_game: usize, games: usize, lr:
     }
     if (diag) |d| for (units[0..games]) |u| mergeDiag(d, &u.diag);
     var moves: u64 = 0;
-    for (units[0..games]) |u| moves += u.moves;
-    return .{ .score = units[games - 1].score, .moves = moves };
+    var capped_game: ?usize = null;
+    var capped_moves: u32 = 0;
+    for (units[0..games], 0..) |u, i| {
+        moves += u.moves;
+        if (u.capped and capped_game == null) {
+            capped_game = i;
+            capped_moves = u.moves;
+        }
+    }
+    return .{ .score = units[games - 1].score, .moves = moves, .capped_game = capped_game, .capped_moves = capped_moves };
 }
 
 /// Weight file: 8-byte magic, u32 version, u32 endianness marker (all little-endian), then the f64 weights as little-endian.
@@ -4641,6 +4685,70 @@ test "parallel training batch with variant opts matches a serial run of the same
         _ = trainBatchOpts(&par, 77, 0, games, 0.001, null, opts);
         try std.testing.expectEqualSlices(u8, std.mem.asBytes(&serial), std.mem.asBytes(&par));
     }
+}
+
+test "move cap leaves a normal game bit-identical and stops a long one (#242)" {
+    var init_rng = std.Random.DefaultPrng.init(242);
+    const start = Net.init(init_rng.random());
+
+    // The cap is on by default but 100,000 is far past a real game: nothing about a normal run moves,
+    // including the rng draws left after the game (same spawn tape, same training, same `moves`).
+    var plain_net = start;
+    var plain_rng = std.Random.DefaultPrng.init(243);
+    const plain = trainGameOpts(&plain_net, plain_rng.random(), 0.003, null, .{});
+    try std.testing.expect(!plain.capped);
+    try std.testing.expect(plain.moves < default_move_cap);
+
+    var same_net = start;
+    var same_rng = std.Random.DefaultPrng.init(243);
+    const same = trainGameOpts(&same_net, same_rng.random(), 0.003, null, .{ .move_cap = default_move_cap });
+    try std.testing.expectEqual(plain.score, same.score);
+    try std.testing.expectEqual(plain.moves, same.moves);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&plain_net), std.mem.asBytes(&same_net));
+    try std.testing.expectEqual(plain_rng.random().uintLessThan(u64, 1_000_000), same_rng.random().uintLessThan(u64, 1_000_000));
+
+    // A frozen (lr = 0) game has a fixed policy, so half its length is a cap the same spawn tape must hit.
+    const frozen = frozenGame(&start, 243, .{});
+    const cap: u32 = @max(1, frozen.moves / 2);
+    var short_net = start;
+    var short_rng = std.Random.DefaultPrng.init(243);
+    const short = trainGameOpts(&short_net, short_rng.random(), 0, null, .{ .move_cap = cap });
+    try std.testing.expect(short.capped);
+    try std.testing.expectEqual(cap, short.moves);
+    // 0 disables the cap, so the same game runs to its normal end
+    const uncapped = frozenGame(&start, 243, .{ .move_cap = 0 });
+    try std.testing.expect(!uncapped.capped);
+    try std.testing.expectEqual(frozen.moves, uncapped.moves);
+}
+
+test "the parallel batch reports and aggregates the capped game (#242)" {
+    const games = 4;
+    const cap: u32 = 20;
+    var init_rng = std.Random.DefaultPrng.init(242);
+    const base = Net.init(init_rng.random());
+
+    var par = base;
+    const out = trainBatchOpts(&par, 242, 0, games, 0.003, null, .{ .move_cap = cap });
+
+    // Same games serially: one capped game must not hide the other games' moves from the batch.
+    var serial_moves: u64 = 0;
+    var capped_game: ?usize = null;
+    var capped_moves: u32 = 0;
+    for (0..games) |i| {
+        var unit = base;
+        var rng = std.Random.DefaultPrng.init(trainingSeed(242, i));
+        const game = trainGameOpts(&unit, rng.random(), 0.003, null, .{ .move_cap = cap });
+        serial_moves += game.moves;
+        if (game.capped and capped_game == null) {
+            capped_game = i;
+            capped_moves = game.moves;
+        }
+    }
+    try std.testing.expect(capped_game != null);
+    try std.testing.expectEqual(capped_game, out.capped_game);
+    try std.testing.expectEqual(capped_moves, out.capped_moves);
+    try std.testing.expectEqual(serial_moves, out.moves);
+    try std.testing.expectEqual(cap, out.capped_moves);
 }
 
 test "the 8 dihedral transforms are distinct for a non-symmetric board and compose back to identity" {
