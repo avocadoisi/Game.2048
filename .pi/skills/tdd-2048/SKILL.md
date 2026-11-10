@@ -92,7 +92,10 @@ so the run ends in a NaN net. Training now checks `nn.weightsFinite` every game 
 `diverged at N/M games (non-finite or |w| > 1e6), not saving <path>` (exit 1) instead of overwriting the last
 good checkpoint. Both stabilizations lose the 8192 tail: lr 1.5e-3 gives 76,366.6 (0/20 at 8192) and the
 `clamp` variant (TD target bounded at 200 = score 200,000) gives 70,131.8 — the adopted net's 11/20 at 8192
-only appears right at the edge of stability. Practical loop: run 2-3 training seeds and keep the one that
+only appears right at the edge of stability. Raising the ceiling does not help (#244): 300 still completes
+(2-ply 71,981.8, 0/20 at 8192, |w| 29.19, 1,842 moves/game) while 500/1000/2000 are byte-identical to no
+clamp (same 50k checkpoint, md5 38818bb4c8b3cfa2fd2481ab3b946f25) and stop at `diverged at 50440/300000`.
+The target is not the cause (|w| goes 17 -> >1e6 with every target under 500), so cap the update next. Practical loop: run 2-3 training seeds and keep the one that
 beats the bar. Seed 3 never diverges but is unusable: #241 saw one 8-game batch near 60,000 stall for 53
 minutes with finite weights (the guard checks weights, not game length), and #242's clean re-run finished
 300,000 in 49.9 min (508,236,212 moves, no long game) only to score 22,924.0 / 0/20 at 8192 (pairw
