@@ -3443,3 +3443,26 @@ zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/s2_clip_
 zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 resume 30 /tmp/s2_clip_norm1_300k.bin 1 - - - 0,2
 # nn 2-ply (deep): avg score=46907.4 ... avg moves=2072.6 ... ms/move=1.03 ... reach8192=0/20
 ```
+
+### 学習 seed 4 の 128/32・300k を測定（#252）
+
+seed 1 の採用 net が再現するか確認するため、128/32、300,000 games、`base`、lr 0.003、`par`、batch_scale √8 = 2.8284271247461903 を固定して train seed 4 を実行した。5,000 games ごとに checkpoint を保存し、300k を完走。合計 512,708,842 moves、学習 CLI の報告時間は 2,903.6 s（48m23.6s）、重みは 296,472 B（md5 `ef6248aed329fa2ae9c64c4d5bd721c7`、SHA-256 `697bfac28373bdedd8e9bf32928b8d37682a7412e9bd803dbc52883bbf4544b8`）。発散・move cap 停止なし。
+
+2-ply 20 games / seed 9000, 9100 で同梱 net と比較:
+
+| net | avg_score 9000 / 9100 | avg moves 9000 / 9100 | reach8192 9000 / 9100 | ms/move 9000 / 9100 |
+|---|---:|---:|---:|---:|
+| train seed 4 | 67,497.8 / 66,838.0 | 3,036.0 / 2,987.3 | 0/20 / 0/20 | 0.94 / 0.89 |
+| 同梱 net (train seed 1) | 113,682.2 / 129,456.2 | 4,919.0 / 5,486.0 | 11/20 / 14/20 | 0.85 / 0.87 |
+
+両 seed で avg_score が同梱 net より大幅に低く（約40.6% / 48.4%減）、8192 到達も 0/20。avg moves も低く、ms/move は同等〜やや遅い。事前条件「両 seed で大きく悪化しない」を満たさないため `scripts/eval-net.sh` / `pairw` の正式判定には進まず、**不採用**。学習 seed 1 の強さは seed 4 では再現せず、同梱 `ai/solver/nn_weights.bin` は変更しない。
+
+再現（ReleaseFast、batch_scale を明示）:
+```
+zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 1 base 30 /tmp/252-s4-candidate.bin 4 par - 2.8284271247461903
+# trained 300000 games, 512708842 moves in 2903.6 s (lr=0.003, seed=4, variant=base+par)
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/252-s4-candidate.bin 1 - - - 0,2
+# nn 2-ply (deep): avg score=67497.8 ... avg moves=3036.0 ... ms/move=0.94 ... reach8192=0/20
+zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 resume 30 /tmp/252-s4-candidate.bin 1 - - - 0,2
+# nn 2-ply (deep): avg score=66838.0 ... avg moves=2987.3 ... ms/move=0.89 ... reach8192=0/20
+```
