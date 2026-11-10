@@ -3365,3 +3365,44 @@ zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/s2_300k_
 zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 resume 30 /tmp/s2_300k_50000.bin 1 - - - 0,2
 # nn 2-ply (deep): avg score=75496.2 ... avg moves=3454.7 reach8192=2/20
 ```
+
+### seed 2 の 300k レシピを 5k〜15k で評価（#250）
+
+#249 と同じ seed 2 / 128/32 / `base` / lr 0.003 / `par` / batch_scale √8 の学習を、`train_games=300000`
+のまま再実行した。5k ごとの通常 checkpoint を保存し、50,440 ゲームで発散した。50k checkpoint は
+md5 `38818bb4c8b3cfa2fd2481ab3b946f25` で #249 と一致し、序盤も同じ軌道であることを確認した。
+学習ログの last game score と、seed 9000 の 20 局 2-ply 評価を含める。
+
+| checkpoint | 学習ログ last game score | 2-ply avg_score (9000) | avg moves/game (9000) | reach8192 (9000) | max|w| |
+|---:|---:|---:|---:|---:|---:|
+| 5k | 2,944 | 22,583.8 | 1,236.5 | 0/20 | 0.7573 |
+| 10k | 8,736 | 28,080.0 | 1,474.9 | 0/20 | 2.0638 |
+| 15k | 15,476 | **34,053.6** | **1,729.5** | 0/20 | 4.1976 |
+| 20k (#249) | 27,476 | 45,651.6 | 2,216.1 | 0/20 | 6.7368 |
+
+15k が 5k〜15k の最高だったため seed 9100 でも確認した: 2-ply avg_score **33,017.6**, avg moves
+**1,680.0**, reach8192 **0/20**。同じ seed 9100 の同梱 net は **129,456.2**, **5,486.0 moves**,
+reach8192 **14/20**（seed 9000 は 113,682.2 / 11/20）。早期 checkpoint は同梱 net に及ばない。
+
+**結論: 5k〜15k に有望な checkpoint は見つからず、悪化開始点もこの窓では特定できない。** avg_score と
+moves は 5k から 20k まで順に伸びるが、8192 は全点で 0/20。よって 15k の最高値は 20k より低く、
+8192 の裾も回復していない。単一 seed の 20 局では裾の消失を 20k より前と断定できず、#249 と合わせても
+「20k 以前に落ちた」か「seed 9000 の試行で観測できなかった」かは未解決。`max|w|` は 5k 0.76 から
+20k 6.74 へ増え、学習の進行に伴う重みの増大は確認できる。`ai/solver/nn_weights.bin` は変更していない。
+
+再現（固定 300k horizon。run は 50k checkpoint 後、50,440 で発散）:
+```
+zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - base 30 /tmp/s2_300k_horizon_issue250b.bin 2 par - 2.8284271247461903
+# 5k/10k/15k checkpoint md5: 9668ecdfc0de7e3b10ddecfa981d4a63 / 813c330ba2a4af1e614ad33aaf8bd274 / 9d551ef0a83fe4e3af91e823377eef6e
+# 20k checkpoint md5 2b541e6f1df0fb550906ed4bdf3ac9d6; 50k matches #249; diverged at 50440/300000
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/issue250-5000.bin 1 - - - 0,2
+# nn 2-ply (deep): avg score=22583.8 ... avg moves=1236.5 reach8192=0/20
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/issue250-10000.bin 1 - - - 0,2
+# nn 2-ply (deep): avg score=28080.0 ... avg moves=1474.9 reach8192=0/20
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/issue250-15000.bin 1 - - - 0,2
+# nn 2-ply (deep): avg score=34053.6 ... avg moves=1729.5 reach8192=0/20
+zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 resume 30 /tmp/issue250-15000.bin 1 - - - 0,2
+# nn 2-ply (deep): avg score=33017.6 ... avg moves=1680.0 reach8192=0/20
+zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 resume 30 ai/solver/nn_weights.bin 1 - - - 0,2
+# nn 2-ply (deep): avg score=129456.2 ... avg moves=5486.0 reach8192=14/20
+```
