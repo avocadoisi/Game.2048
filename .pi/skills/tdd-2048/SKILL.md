@@ -93,8 +93,12 @@ so the run ends in a NaN net. Training now checks `nn.weightsFinite` every game 
 good checkpoint. Both stabilizations lose the 8192 tail: lr 1.5e-3 gives 76,366.6 (0/20 at 8192) and the
 `clamp` variant (TD target bounded at 200 = score 200,000) gives 70,131.8 — the adopted net's 11/20 at 8192
 only appears right at the edge of stability. Practical loop: run 2-3 training seeds and keep the one that
-beats the bar. Seed 3 does not diverge but stalls: one 8-game batch at 60,000 took 53 minutes with finite
-weights (the guard checks weights, not game length), so that run was killed (#241).
+beats the bar. Seed 3 never diverges but is unusable: #241 saw one 8-game batch near 60,000 stall for 53
+minutes with finite weights (the guard checks weights, not game length), and #242's clean re-run finished
+300,000 in 49.9 min (508,236,212 moves, no long game) only to score 22,924.0 / 0/20 at 8192 (pairw
+−97,245.0 ± 8,392.3, REJECTED). So seed 3 completes but is not a candidate; every self-play game now also
+stops at `nn.Options.move_cap` (default 100,000, `0` disables) with `error.MoveCap`, which keeps a
+pathological run from burning hours and leaves games under the cap bit-identical.
 
 Other capacity facts that still hold: extending past 300,000 regresses even at lr 1.5e-3 (420k = 69,888), and
 distilling a wide net into a narrow one collapses it (`dson` −68,521 ± 7,048, `dist` −55,826 ± 6,287) — a wide

@@ -594,6 +594,7 @@ pub fn main(init: std.process.Init) !void {
                 const game = nn.trainGameStaged(staged, rng.random(), learning_rate * (1 - 0.9 * frac));
                 last_score = game.score;
                 total_moves += game.moves;
+                if (game.capped) return moveCap(g + 1, train_games, game.moves, nn.default_move_cap, weights_path);
                 if (!stagedFinite(staged)) return diverged(g + 1, train_games, weights_path);
                 if ((g + 1) % 5000 == 0) {
                     std.debug.print("train {d}/{d} last game score {d}\n", .{ g + 1, train_games, last_score });
@@ -609,6 +610,9 @@ pub fn main(init: std.process.Init) !void {
                 const batch = nn.trainBatchOpts(&net, train_seed, g, games, learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null, opts);
                 last_score = batch.score;
                 total_moves += batch.moves;
+                // (#242) One pathological game stalls the whole batch (seed 3 spent 53 min in one at 60k),
+                // so stop on the first capped game instead of waiting for the other seven.
+                if (batch.capped_game) |i| return moveCap(g + i + 1, train_games, batch.capped_moves, opts.move_cap, weights_path);
                 if (!nn.weightsFinite(&net)) return diverged(g + games, train_games, weights_path);
                 if ((g + games) % 5000 == 0) {
                     std.debug.print("train {d}/{d} last game score {d}\n", .{ g + games, train_games, last_score });
@@ -622,6 +626,7 @@ pub fn main(init: std.process.Init) !void {
                 const game = nn.trainGameOpts(&net, rng.random(), learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null, opts);
                 last_score = game.score;
                 total_moves += game.moves;
+                if (game.capped) return moveCap(g + 1, train_games, game.moves, opts.move_cap, weights_path);
                 if (!nn.weightsFinite(&net)) return diverged(g + 1, train_games, weights_path);
                 if ((g + 1) % 5000 == 0) {
                     std.debug.print("train {d}/{d} last game score {d}\n", .{ g + 1, train_games, last_score });
@@ -851,6 +856,13 @@ fn stagedFinite(staged: *const nn.Staged) bool {
 fn diverged(done: usize, total: usize, weights_path: []const u8) error{Diverged} {
     std.debug.print("diverged at {d}/{d} games (non-finite or |w| > 1e6), not saving {s}\n", .{ done, total, weights_path });
     return error.Diverged;
+}
+
+/// (#242) Same policy for a game that hit the move cap: report which game and how many moves, then
+/// stop without overwriting the last good checkpoint. The game is pathological, not a result to keep.
+fn moveCap(done: usize, total: usize, moves: u32, cap: u32, weights_path: []const u8) error{MoveCap} {
+    std.debug.print("game {d}/{d} hit the {d}-move cap at {d} moves, stopping the run and not saving {s}\n", .{ done, total, cap, moves, weights_path });
+    return error.MoveCap;
 }
 
 /// Test-only replica of the serial training setup in `main` (init + game RNG both from the seed).
