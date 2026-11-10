@@ -65,6 +65,9 @@ const usage =
     \\                       the late game takes up to `1 + tail_alpha` times the step of an open board)
     \\              clamp   (#234: bounds the TD target at +/- `clamp` (default 200, i.e. score 200,000) so a
     \\                       diverging value cannot bootstrap itself; `par` compatible)
+    \\              clip    (#246: bounds the update itself, cap in the row-spec slot, mode at arg 14:
+    \\                       `norm` (default, `par` only) scales the merged batch delta to an L2 norm of
+    \\                       the cap; `step` caps every |dw| of a step at the cap; `par` compatible)
     \\  pairw         (#210) paired comparison of two weight files: A = weights_path with `deep`,
     \\                B = the path after the `-` par slot with `deep`, same spawn tape per game
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
@@ -89,7 +92,9 @@ const usage =
     \\  rows          (#203) eval-table rows to run, comma list after batch_scale (`-` = all), e.g.
     \\                "0,2" for 1-ply and 2-ply only; the 3-ply rows dominate a measurement run.
     \\                For variant adam this slot is adam_lr instead (default 0.01), like dist's divisor,
-    \\                tailw's tail_alpha (default 1: twice the step on a full board) and clamp's ceiling.
+    \\                tailw's tail_alpha (default 1: twice the step on a full board), clamp's ceiling and
+    \\                clip's cap (default 1, the sym_batch_clip scale). Arg 14 then picks clip's mode,
+    \\                `norm` (default) or `step`.
     \\
     \\Weights are written to `weights_path` only when train_games > 0;
     \\train_games = 0 (eval only) never writes.
@@ -228,6 +233,33 @@ fn parseTailAlpha(args: []const []const u8) !f64 {
     const alpha = std.fmt.parseFloat(f64, args[13]) catch return error.InvalidTailAlpha;
     if (!(alpha > 0)) return error.InvalidTailAlpha;
     return alpha;
+}
+
+/// (#246) Which ceiling the `clip` variant applies: the L2 norm of one merged `par` batch delta
+/// (`norm`, the `sym_batch_clip` style) or every element of one step's `|dw|` (`step`).
+const ClipMode = enum { norm, step };
+
+/// (#246) `clip`'s default ceiling: the unit L2 norm `sym_batch_clip` already uses for an averaged
+/// symmetry gradient, so `clip` without a value bounds a batch step to a single sample's scale.
+const default_clip_cap: f64 = nn.sym_batch_clip;
+
+/// (#246) `clip`'s ceiling, at the same row-spec slot as Adam's step size, `tailw`'s alpha and
+/// `clamp`'s target bound. 0 or `-` would be a plain `base` run, so it is refused.
+fn parseStepCap(args: []const []const u8) !f64 {
+    if (args.len <= 13) return default_clip_cap;
+    if (std.mem.eql(u8, args[13], "-")) return default_clip_cap;
+    const cap = std.fmt.parseFloat(f64, args[13]) catch return error.InvalidStepCap;
+    if (!(cap > 0)) return error.InvalidStepCap;
+    return cap;
+}
+
+/// (#246) `clip`'s mode at arg 14: `norm` (default) bounds the merged batch delta's L2 norm, `step`
+/// bounds every element of a step. A stray token is an error, never a silent fallback to `norm`.
+fn parseClipMode(args: []const []const u8) !ClipMode {
+    if (args.len <= 14) return .norm;
+    if (std.mem.eql(u8, args[14], "-") or std.mem.eql(u8, args[14], "norm")) return .norm;
+    if (std.mem.eql(u8, args[14], "step")) return .step;
+    return error.InvalidClipMode;
 }
 
 /// `par` forks whole games onto threads, so it cannot carry the cross-game priority buffer (shared by
@@ -420,6 +452,9 @@ pub fn main(init: std.process.Init) !void {
     const is_tailw = std.mem.eql(u8, variant, "tailw");
     // (#234) `par`-compatible: a bounded TD target, so a diverging value cannot bootstrap itself.
     const is_clamp = std.mem.eql(u8, variant, "clamp");
+    // (#246) the step ceiling: `norm` bounds the merged `par` delta, `step` every element of a step.
+    const is_clip = std.mem.eql(u8, variant, "clip");
+    const clip_mode: ClipMode = if (is_clip) try parseClipMode(args) else .norm;
     // (#206) the teacher mix: `distill_every` (arg 12) and the rate divisor (arg 13).
     const dist_mix: DistillMix = if (is_dist or is_dson) try parseDistillMix(args) else .{};
     // #159 variants train from the net in weights_path (the deep positions come from that net), like `resume`
@@ -487,6 +522,10 @@ pub fn main(init: std.process.Init) !void {
         .{ .tail_alpha = try parseTailAlpha(args) }
     else if (is_clamp)
         .{ .clamp = try parseClamp(args) }
+    else if (is_clip) switch (clip_mode) {
+        .norm => .{ .grad_clip = try parseStepCap(args) },
+        .step => .{ .step_clip = try parseStepCap(args) },
+    }
     else if (std.mem.eql(u8, variant, "d2"))
         .{ .teacher = .deep }
     else if (std.mem.eql(u8, variant, "d3"))
@@ -519,8 +558,8 @@ pub fn main(init: std.process.Init) !void {
     // (#203) index 13 narrows the eval table to the rows a measurement needs (`0,2`); `dist`/`dson`
     // already own 13 as the teacher lr divisor, `adam` as its step size, and `pairw` returns before the
     // table is built.
-    const row_spec: ?[]const u8 = if (is_dist or is_dson or is_adam or is_tailw or is_clamp or is_pairw or is_pair) null else if (args.len > 13) args[13] else null;
-    const max_args: usize = if (is_dist or is_dson or is_adam or is_tailw or is_clamp) 14 else if (row_spec != null) 14 else if (is_ft2 or is_tch) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw) 12 else 11;
+    const row_spec: ?[]const u8 = if (is_dist or is_dson or is_adam or is_tailw or is_clamp or is_clip or is_pairw or is_pair) null else if (args.len > 13) args[13] else null;
+    const max_args: usize = if (is_clip) 15 else if (is_dist or is_dson or is_adam or is_tailw or is_clamp) 14 else if (row_spec != null) 14 else if (is_ft2 or is_tch) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw) 12 else 11;
     if (args.len > max_args or seed_ranges == 0 or (uses_dump and dump_path == null)) {
         std.debug.print("{s}", .{usage});
         return;
@@ -533,6 +572,11 @@ pub fn main(init: std.process.Init) !void {
     }
     // (#231) Adam steps on the merged batch gradient only, so the variant needs `par` at arg 10.
     if (is_adam and !use_par) {
+        std.debug.print("{s}", .{usage});
+        return;
+    }
+    // (#246) the norm ceiling is on the delta one merged batch builds, which only `par` has.
+    if (is_clip and clip_mode == .norm and !use_par) {
         std.debug.print("{s}", .{usage});
         return;
     }
@@ -635,7 +679,11 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         const elapsed = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
-        const variant_label = if (par_tail) try std.fmt.allocPrint(init.arena.allocator(), "{s}+par", .{variant}) else variant;
+        const variant_label = label: {
+            // (#246) `clip` has two ceilings, so the log names the one that ran.
+            const base_label = if (is_clip) try std.fmt.allocPrint(init.arena.allocator(), "{s}:{s}", .{ variant, @tagName(clip_mode) }) else variant;
+            break :label if (par_tail) try std.fmt.allocPrint(init.arena.allocator(), "{s}+par", .{base_label}) else base_label;
+        };
         std.debug.print("trained {d} games, {d} moves in {d:.1} s (lr={d}, seed={d}, variant={s})\n", .{
             train_games,
             total_moves,
@@ -955,6 +1003,28 @@ test "clamp variant reads its TD target ceiling from the row-spec slot (#234)" {
     try std.testing.expectEqual(@as(f64, 50), try parseClamp(&explicit));
     const zero = [_][]const u8{ "nn", "2000", "0", "2000", "0.003", "-", "clamp", "30", "x.bin", "3", "par", "-", "-", "0" };
     try std.testing.expectError(error.InvalidClamp, parseClamp(&zero));
+}
+
+test "clip variant reads its step ceiling and mode from args 13 and 14 (#246)" {
+    const omitted = [_][]const u8{ "nn", "2000", "0", "2000", "0.003", "-", "clip", "30", "x.bin", "3", "par" };
+    try std.testing.expectEqual(default_clip_cap, try parseStepCap(&omitted));
+    try std.testing.expectEqual(ClipMode.norm, try parseClipMode(&omitted));
+    // the ceiling of a step is much smaller than the unit norm a batch delta is capped to
+    const step = [_][]const u8{ "nn", "2000", "0", "2000", "0.003", "-", "clip", "30", "x.bin", "3", "par", "-", "2.8284", "0.001", "step" };
+    try std.testing.expectEqual(@as(f64, 0.001), try parseStepCap(&step));
+    try std.testing.expectEqual(ClipMode.step, try parseClipMode(&step));
+    const dash = [_][]const u8{ "nn", "2000", "0", "2000", "0.003", "-", "clip", "30", "x.bin", "3", "par", "-", "-", "-", "-" };
+    try std.testing.expectEqual(default_clip_cap, try parseStepCap(&dash));
+    try std.testing.expectEqual(ClipMode.norm, try parseClipMode(&dash));
+    const zero = [_][]const u8{ "nn", "2000", "0", "2000", "0.003", "-", "clip", "30", "x.bin", "3", "par", "-", "-", "0" };
+    try std.testing.expectError(error.InvalidStepCap, parseStepCap(&zero));
+    const typo = [_][]const u8{ "nn", "2000", "0", "2000", "0.003", "-", "clip", "30", "x.bin", "3", "par", "-", "-", "1", "l2" };
+    try std.testing.expectError(error.InvalidClipMode, parseClipMode(&typo));
+}
+
+test "usage text lists the clip variant and its mode slot (#246)" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "clip    (#246") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "`norm` (default)") != null);
 }
 
 test "rows argument keeps the listed eval rows and rejects junk (#203)" {
