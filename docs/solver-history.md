@@ -3182,3 +3182,49 @@ zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - base 30 /tmp/s2_bas
 zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/s2_clamp300_300k.bin 1 - - - 0,2
 # nn 2-ply (deep): avg score=71981.8 ... avg moves=3269.0 reach8192=0/20
 ```
+
+### 弱い clamp（300）は seed 3 でも効かず、net は clamp なしとバイト一致（#245）
+
+`#244` で「完走した中で最も良い」= `clamp` 300 を、seed 3 / 128/32 / 300k / lr 0.003 / `par` /
+`batch_scale` = sqrt(8) にそのまま適用した。seed 2 の 300 は「完走するが裾を捨てる」だったので、
+seed 3 でも `clamp` が弱すぎて効かない可能性を確かめるのが目的。
+
+```
+zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - clamp 30 /tmp/s3_clamp300_300k.bin 3 par - 2.8284271247461903 300
+# trained 300000 games, 508236212 moves in 3053.8 s (lr=0.003, seed=3, variant=clamp+par)
+```
+
+| 項目 | seed 3 + `clamp` 300 |
+|---|---|
+| 完走 | ○（300,000 / 300,000、上限メッセージなし） |
+| moves | 508,236,212（1,694 手/ゲーム） |
+| max\|w\| | 28.80 |
+| 2-ply seed 9000 | 22,924.0（8192 0/20） |
+| 2-ply seed 9100 | 22,774.0（8192 0/20） |
+
+**`clamp` 300 は seed 3 では一度も発火していない。** できた net の md5
+（`78ed71734004c9a994abd7224193764b`）は `#243` の clamp なし seed 3
+（`/tmp/w128_32_300k_s3_cap.bin`）と一致し、ファイルサイズも同じ 296,472 B。つまり
+`variant=clamp+par` と表示されていても、学習の軌道は `base+par` とバイト単位で同じ。
+`#244` の seed 2 では 300 が効いた（max\|w\| 29.19、2-ply 71,981.8）が、seed 3 は目標が 300 に
+届く前に学習が終わる（重みも 28.80 で seed 1 の 27.06 と同程度）。**clamp の上限は seed ごとに
+効く/効かないが変わる on/off スイッチで、seed 3 の弱さは clamp では動かない。**
+
+`scripts/eval-net.sh /tmp/s3_clamp300_300k.bin`（20 局、seed 9000）:
+
+| net | seed | avg_score | 8192 | ms/move |
+|---|---:|---:|---:|---:|
+| 同梱 128/32 | 9000 | 113,682.2 | 11/20 | 0.91 |
+| seed 3 300k + clamp 300 | 9000 | 22,924.0 | 0/20 | 0.99 |
+| 同梱 128/32 | 9100 | 129,456.2 | 14/20 | 0.88 |
+| seed 3 300k + clamp 300 | 9100 | 22,774.0 | 0/20 | 1.02 |
+
+`pairw`（A = 同梱、B = seed 3 + clamp 300、20 局、seed 9000）: **−97,245.0 ± 8,392.3**
+（0 勝 20 敗、466.7 s）。`eval-net.sh` の VERDICT は **REJECT**（paired margin −114,029.6、
+seed 9000 / 9100 の avg_score と 8192 到達が両方とも band 外）。
+
+**判定: 不採用。** 数値は `#243` の clamp なし seed 3 と同一（net がバイト一致なので当然）。
+seed 3 の失敗は「clamp が強すぎて裾を捨てる」型ではなく、そもそも clamp がかからないまま
+方策が弱い型なので、`clamp` の上限を動かす方向では改善しない。`#244` の結論どおり、次は
+更新量（1 step の `|Δw|` か勾配ノルム）の制限を試す。同梱 `ai/solver/nn_weights.bin` は
+差し替えない（bar は seed 1 の 113,682.2 / 8192 11/20 のまま）。
