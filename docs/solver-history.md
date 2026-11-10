@@ -3466,3 +3466,32 @@ zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/252-s4-c
 zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 resume 30 /tmp/252-s4-candidate.bin 1 - - - 0,2
 # nn 2-ply (deep): avg score=66838.0 ... avg moves=2987.3 ... ms/move=0.89 ... reach8192=0/20
 ```
+
+### 128/32 の train seed 5 は 300k 完走したが同梱 net を大きく下回る（#254）
+
+既知の `base` レシピを変えず train seed 5 で実行。300,000 games を完走し、548,853,567 moves、3,089.6 s
+（51m29.6s）、最終ゲーム score 56,324。重みは 296,472 B、md5 `2a8e37fa81284b6085fe532d5986b36a`。
+5,000 games ごとの checkpoint（5k〜295k）を保存し、完走時の 300k 重みも退避した。発散・長ゲーム停止はなし。
+
+2-ply / 20 games の評価:
+
+| net | seed | avg_score | avg moves | reach8192 | ms/move |
+|---|---:|---:|---:|---:|---:|
+| 同梱 128/32 | 9000 | 113,682.2 | 4,919.0 | 11/20 | 0.87 |
+| seed 5 / 300k | 9000 | 55,401.6 | 2,509.0 | 0/20 | 1.05 |
+| 同梱 128/32 | 9100 | 129,456.2 | 5,486.0 | 14/20 | 0.85 |
+| seed 5 / 300k | 9100 | 55,363.8 | 2,504.7 | 0/20 | 0.93 |
+
+**判定: 不採用。** 両 seed で avg_score が同梱の約半分、8192 到達は 0/20。ms/move も悪化した。
+両 seed とも明確な大幅回帰なので、issue の条件どおり `scripts/eval-net.sh` / `pairw` の正式判定には進まない。
+`ai/solver/nn_weights.bin` は変更しない。seed 5 でも同梱 net を超える候補は再現せず、seed 1 の成功は train seed に敏感という結論を補強した。
+
+再現（ReleaseFast、128/32、300k horizon、`base`、lr 0.003、`par`、batch_scale √8）:
+```
+zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 1 base 30 /tmp/issue254-seed5/seed5-live.bin 5 par - 2.8284271247461903
+# trained 300000 games, 548853567 moves in 3089.6 s (lr=0.003, seed=5, variant=base+par)
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/issue254-seed5/seed5-live.bin 1 - - - 0,2
+# nn 2-ply (deep): avg score=55401.6 ... avg moves=2509.0 ... ms/move=1.05 ... reach8192=0/20
+zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 resume 30 /tmp/issue254-seed5/seed5-live.bin 1 - - - 0,2
+# nn 2-ply (deep): avg score=55363.8 ... avg moves=2504.7 ... ms/move=0.93 ... reach8192=0/20
+```
