@@ -3495,3 +3495,27 @@ zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/issue254
 zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 resume 30 /tmp/issue254-seed5/seed5-live.bin 1 - - - 0,2
 # nn 2-ply (deep): avg score=55363.8 ... avg moves=2504.7 ... ms/move=0.93 ... reach8192=0/20
 ```
+
+### 同梱 128/32 net の探索深度を再評価（#255）
+
+現行 net を固定して、2-ply (`deep`)、3-ply (`deep3`)、空き 2 以下だけ 4-ply (`phase_h4`) を比較した。Zig 0.17.0 / native ReleaseFast、各設定とも seed 9000 と 9100 から 20 局ずつ（9000–9019 / 9100–9119）。重みは run 前に `/tmp/issue255-128-32.bin` へコピーし、SHA-256 `c98ea27cf723cc96258173bd7be74630e80c2f1f358777c5ddaec059ec19a6c1`（296,472 B）を確認。リポジトリの重みは変更していない。
+
+| policy | seed 9000 avg_score / reach8192 / ms/move | seed 9100 avg_score / reach8192 / ms/move | 40 局 avg_score | reach8192 | pooled ms/move |
+|---|---:|---:|---:|---:|---:|
+| 2-ply (`deep`) | 113,682.2 / 11/20 / 0.89 | 129,456.2 / 14/20 / 0.88 | 121,569.2 | 25/40 | 0.884 |
+| 3-ply (`deep3`) | 140,438.2 / 17/20 / 18.34 | 134,245.0 / 16/20 / 20.35 | **137,341.6** | **33/40** | 19.326 |
+| 終盤 4-ply (`phase_h4`) | 139,068.8 / 15/20 / 42.80 | 134,117.8 / 15/20 / 43.76 | 136,593.3 | 30/40 | 43.272 |
+
+Pooled ms/move は両 seed の経過時間合計 / 総手数。3-ply は 2-ply より両 seed で avg_score が高く、40 局平均で +15,772.4（+13.0%）、8192 到達は +8 局。一方コストは 21.9 倍。avg score を優先する次の候補は 3-ply とするが、約 22 倍の遅さを許容する用途に限る。2-ply を既定から置き換える変更は行わない。サンプルは各 20 局 × 2 seed 範囲で、統計的有意差を示す測定ではない。
+
+`phase_h4` は 3-ply より avg_score が 748.3 低く、8192 到達も 3 局少ない一方、2.24 倍遅い。2-ply からの改善はあるが、同じ seed 上でその上積みを 3-ply より得られず追加コストに見合わないため、4-ply は次候補にしない。比較は同じ開始 seed 範囲だが、方策が分岐した後の spawn は共通乱数テープで揃えていない。
+
+再現コマンド（各 policy を独立実行。`rows`: 2 = 2-ply、4 = 3-ply、8 = phase_h4）:
+```
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 /tmp/issue255-128-32.bin 1 - - - 2
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 /tmp/issue255-128-32.bin 1 - - - 4
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 /tmp/issue255-128-32.bin 1 - - - 8
+zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 base 30 /tmp/issue255-128-32.bin 1 - - - 2
+zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 base 30 /tmp/issue255-128-32.bin 1 - - - 4
+zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 base 30 /tmp/issue255-128-32.bin 1 - - - 8
+```
