@@ -70,6 +70,9 @@ const usage =
     \\                       the cap; `step` caps every |dw| of a step at the cap; `par` compatible)
     \\  pairw         (#210) paired comparison of two weight files: A = weights_path with `deep`,
     \\                B = the path after the `-` par slot with `deep`, same spawn tape per game
+    \\  pairleaf      (#260) A = current, B = omit the last reward before a leaf; same spawn tape,
+    \\                optional search mode `deep` (default) or `deep3` at arg 12
+    \\  leaf          (#260) eval-only candidate; rows 2 (`deep`) and 4 (`deep3`) omit the leaf reward
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
     \\                game i uses seed train_seed + i and the batch result is the mean of its games.
     \\                (#99) as arg 10 it batches any stateless variant (base|backward|replay|sym|symlam|
@@ -404,6 +407,13 @@ fn loadDump(dump: *nn.Dump, io: std.Io, gpa: std.mem.Allocator, path: []const u8
     std.debug.print("dump {s}: {d} deep afterstates\n", .{ path, dump.len });
 }
 
+fn parsePairLeafMode(arg: ?[]const u8) ?nn.Mode {
+    const mode = arg orelse return .deep;
+    if (std.mem.eql(u8, mode, "deep")) return .deep;
+    if (std.mem.eql(u8, mode, "deep3")) return .deep3;
+    return null;
+}
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     // `zig build nn` without `--` used to run the defaults (2000 games, write weights_path = the shipped
@@ -438,6 +448,12 @@ pub fn main(init: std.process.Init) !void {
     // Paired comparison of two weight files (#210): A = weights_path, B = the file at index 12, both with
     // the same policy, so a candidate net is judged against the shipped one on identical spawns.
     const is_pairw = std.mem.eql(u8, variant, "pairw");
+    const is_pairleaf = std.mem.eql(u8, variant, "pairleaf");
+    const is_leaf = std.mem.eql(u8, variant, "leaf");
+    const leaf_mode: nn.Mode = if (is_pairleaf) parsePairLeafMode(if (args.len > 11) args[11] else null) orelse {
+        std.debug.print("pairleaf mode must be deep or deep3\\n{s}", .{usage});
+        return;
+    } else .deep;
     const is_tch = std.mem.eql(u8, variant, "tch") or std.mem.eql(u8, variant, "tchadd");
     const is_tchadd = std.mem.eql(u8, variant, "tchadd");
     const is_dist = std.mem.eql(u8, variant, "dist");
@@ -480,8 +496,10 @@ pub fn main(init: std.process.Init) !void {
     const batch_scale: f64 = if (use_par) try parseBatchScale(args) else 1.0;
     // `use_resume` only decides whether `weights_path` is loaded; the variant still has to reach `opts`
     // (before, `dump`/`ft2`/`restart`/`dist` fell into this first branch and their options were dropped).
-    var opts: nn.Options = if (par_variant or is_pair or is_pairw or std.mem.eql(u8, variant, "base") or std.mem.eql(u8, variant, "resume") or is_tch)
+    var opts: nn.Options = if (par_variant or is_pair or is_pairw or is_pairleaf or std.mem.eql(u8, variant, "base") or std.mem.eql(u8, variant, "resume") or is_tch)
         .{ .batch_scale = batch_scale }
+    else if (is_leaf)
+        .{ .omit_leaf_reward = true }
     else if (std.mem.eql(u8, variant, "backward"))
         .{ .backward = true }
     else if (std.mem.eql(u8, variant, "replay"))
@@ -558,9 +576,9 @@ pub fn main(init: std.process.Init) !void {
     // (#203) index 13 narrows the eval table to the rows a measurement needs (`0,2`); `dist`/`dson`
     // already own 13 as the teacher lr divisor, `adam` as its step size, and `pairw` returns before the
     // table is built.
-    const row_spec: ?[]const u8 = if (is_dist or is_dson or is_adam or is_tailw or is_clamp or is_clip or is_pairw or is_pair) null else if (args.len > 13) args[13] else null;
-    const max_args: usize = if (is_clip) 15 else if (is_dist or is_dson or is_adam or is_tailw or is_clamp) 14 else if (row_spec != null) 14 else if (is_ft2 or is_tch) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw) 12 else 11;
-    if (args.len > max_args or seed_ranges == 0 or (uses_dump and dump_path == null)) {
+    const row_spec: ?[]const u8 = if (is_dist or is_dson or is_adam or is_tailw or is_clamp or is_clip or is_pairw or is_pair or is_pairleaf) null else if (args.len > 13) args[13] else null;
+    const max_args: usize = if (is_clip) 15 else if (is_dist or is_dson or is_adam or is_tailw or is_clamp) 14 else if (row_spec != null) 14 else if (is_ft2 or is_tch) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw or is_pairleaf) 12 else 11;
+    if (args.len > max_args or seed_ranges == 0 or (uses_dump and dump_path == null) or ((is_pairleaf or is_leaf) and train_games != 0)) {
         std.debug.print("{s}", .{usage});
         return;
     }
@@ -774,7 +792,7 @@ pub fn main(init: std.process.Init) !void {
         try nn.load(&net_b, init.io, init.gpa, args[11]);
         break :blk .{ .single = &net_b };
     } else eval_value;
-    if (is_pair or is_pairw) {
+    if (is_pair or is_pairw or is_pairleaf) {
         const pair_games = eval_games * seed_ranges;
         const spawns = try init.gpa.alloc(nn.Spawn, 20_000);
         defer init.gpa.free(spawns);
@@ -784,10 +802,13 @@ pub fn main(init: std.process.Init) !void {
         const start_pair = std.Io.Clock.awake.now(init.io);
         for (0..pair_games) |i| {
             var tape = nn.Tape.initRecord(spawns);
-            const a = nn.playTapedValue(eval_value, pair_rng.random(), .deep, &tape);
+            const pair_mode = if (is_pairleaf) leaf_mode else .deep;
+            const a = nn.playTapedValue(eval_value, pair_rng.random(), pair_mode, &tape);
             var replay = nn.Tape.initReplay(spawns[0..tape.len]);
             const b = if (is_pairw)
                 nn.playTapedValue(pair_b_value, pair_rng.random(), .deep, &replay)
+            else if (is_pairleaf)
+                nn.playTapedValueOpts(eval_value, pair_rng.random(), leaf_mode, &replay, .{ .omit_leaf_reward = true })
             else
                 nn.playTapedValue(eval_value, pair_rng.random(), .deep3, &replay);
             diffs[i] = @as(f64, @floatFromInt(b.score)) - @as(f64, @floatFromInt(a.score));
@@ -798,7 +819,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("pair A vs B: games={d} mean diff={d:.1} ± {d:.1} (stderr) better={d} worse={d} elapsed={d:.1} s\n", .{ st.games, st.mean, st.stderr, st.better, st.worse, @as(f64, @floatFromInt(elapsed)) / 1e9 });
         return;
     }
-    const EvalCtx = struct { vfn: nn.Value, policy: usize, eval_seed: u64 };
+    const EvalCtx = struct { vfn: nn.Value, policy: usize, eval_seed: u64, opts: nn.Options };
     // #189 policy 11: the snake heuristic (#117 `baseline` weights) as the foreign rerank score,
     // divided by `reward_scale` so it lands on the NN value scale.
     const rerank: nn.Rerank = .{ .margin = 0.05, .weight = 0.5, .score = &snakeScore };
@@ -809,13 +830,13 @@ pub fn main(init: std.process.Init) !void {
             return switch (c.policy) {
                 0 => nn.playValue(c.vfn, prng.random(), .greedy),
                 1 => nn.playValue(c.vfn, prng.random(), .chance),
-                2 => nn.playValue(c.vfn, prng.random(), .deep),
+                2 => nn.playValueOpts(c.vfn, prng.random(), .deep, c.opts),
                 3 => blk: {
                     const b = solver.playPolicy(prng.random(), .expectimax, 2);
                     break :blk nn.PlayResult{ .score = b.score, .max_tile = b.max_tile, .moves = b.moves };
                 },
                 // nn3 baseline for the phase rows below (#157): same seeds, so the cost and score compare directly
-                4 => nn.playValue(c.vfn, prng.random(), .deep3),
+                4 => nn.playValueOpts(c.vfn, prng.random(), .deep3, c.opts),
                 5 => nn.playValue(c.vfn, prng.random(), .phase_h1),
                 6 => nn.playValue(c.vfn, prng.random(), .phase_h2),
                 7 => nn.playValue(c.vfn, prng.random(), .phase_h3),
@@ -840,7 +861,7 @@ pub fn main(init: std.process.Init) !void {
         r.range_scores = try init.arena.allocator().alloc(f64, seed_ranges);
         const res_all = try init.arena.allocator().alloc(nn.PlayResult, games);
         const start = std.Io.Clock.awake.now(init.io);
-        parallel.map(nn.PlayResult, res_all, EvalCtx{ .vfn = eval_value, .policy = r.policy, .eval_seed = eval_seed }, playGame);
+        parallel.map(nn.PlayResult, res_all, EvalCtx{ .vfn = eval_value, .policy = r.policy, .eval_seed = eval_seed, .opts = opts }, playGame);
         var total_moves: u64 = 0;
         for (0..seed_ranges) |range| {
             var total_score: u64 = 0;
@@ -956,6 +977,18 @@ test "resume starts from the saved weights file instead of a random init" {
     var fresh: nn.Net = undefined;
     try std.testing.expect(!try startNet(&fresh, io, std.testing.allocator, 5, false, 99, path));
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&saved), std.mem.asBytes(&fresh)));
+}
+
+test "pairleaf accepts deep and deep3 and defaults to deep (#260)" {
+    try std.testing.expectEqual(nn.Mode.deep, parsePairLeafMode(null).?);
+    try std.testing.expectEqual(nn.Mode.deep, parsePairLeafMode("deep").?);
+    try std.testing.expectEqual(nn.Mode.deep3, parsePairLeafMode("deep3").?);
+    try std.testing.expectEqual(@as(?nn.Mode, null), parsePairLeafMode("greedy"));
+}
+
+test "usage text lists the leaf-reward evaluation modes (#260)" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "pairleaf      (#260)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "leaf          (#260)") != null);
 }
 
 test "usage text lists the resume variant" {
