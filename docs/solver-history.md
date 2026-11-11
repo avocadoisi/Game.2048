@@ -3519,3 +3519,27 @@ zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 base 30 /tmp/issue255-1
 zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 base 30 /tmp/issue255-128-32.bin 1 - - - 4
 zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 base 30 /tmp/issue255-128-32.bin 1 - - - 8
 ```
+
+### 現行 128/32 net で downside risk を再評価（#258）
+
+#187 の `risk_weight=0.3` が現行 net で avg score を上げるか、標準 2-ply (`deep`, policy 2) と
+downside risk (policy 13) を比較した。Zig 0.17.0 / native ReleaseFast。同梱
+`ai/solver/nn_weights.bin` は 296,472 B、SHA-256 `c98ea27cf723cc96258173bd7be74630e80c2f1f358777c5ddaec059ec19a6c1`。
+各方策を seed 9000–9019 と 9100–9119 の各20局、非ペアで評価した（row selection `2,13`）。
+重みと既定方策は変更していない。
+
+| policy | seed 9000 avg_score / reach8192 / ms/move | seed 9100 avg_score / reach8192 / ms/move | 40局 avg_score | reach8192 | pooled ms/move |
+|---|---:|---:|---:|---:|---:|
+| `deep`, risk 0 | 113,682.2 / 11/20 / 0.91 | 129,456.2 / 14/20 / 0.98 | **121,569.2** | **25/40** | **0.95** |
+| `deep` + downside risk 0.3 | 117,421.0 / 10/20 / 0.95 | 121,558.6 / 13/20 / 1.01 | 119,489.8 | 23/40 | 0.98 |
+
+Pooled ms/move は両 seed の経過時間合計 / 総手数（出力された0.1秒単位の経過時間から算出）。risk は seed 9000 で
++3,738.8 点だが seed 9100 で −7,897.6 点となり、40局平均では **−2,079.4 点（−1.7%）**、8192 到達は2局減、
+探索コストは約3%増えた。改善は再現せず、現行 net でも downside risk は不採用。`nn_main` の既定 policy 2 を維持する。
+各 seed 範囲20局の非ペア比較であり、統計的有意差を示す測定ではない。
+
+再現（両 policy を同時に選択。`rows`: 2 = `deep`、13 = downside risk）:
+```
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 ai/solver/nn_weights.bin 1 - - - 2,13
+zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 resume 30 ai/solver/nn_weights.bin 1 - - - 2,13
+```
