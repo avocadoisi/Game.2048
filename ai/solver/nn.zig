@@ -467,7 +467,7 @@ pub const Stats = struct { leaves: u64 = 0, hits: u64 = 0 };
 /// `cutoff` (`0` keeps every branch) and dropping the lowest-probability branches up to a share
 /// `mass_cutoff` of each chance node's mass (#182, `0` keeps every branch). Part of the value-cache
 /// key (#157), because a phase game asks for the same board at two depths.
-pub const Depth = struct { ply: u8 = 0, cutoff: f64 = 0, mass_cutoff: f64 = 0, risk_weight: f64 = 0 };
+pub const Depth = struct { ply: u8 = 0, cutoff: f64 = 0, mass_cutoff: f64 = 0, risk_weight: f64 = 0, omit_leaf_reward: bool = false };
 
 /// Key depth of the 1-ply lookups (`get` / `getValue`, e.g. the `nnmcts` rollouts), which never search.
 pub const leaf_depth: Depth = .{};
@@ -676,6 +676,8 @@ const Search = struct {
     risk_weight: f64 = 0,
     /// Own-move plies this whole search runs at; with `cutoff` it keys every leaf lookup (#157).
     ply: u8 = 0,
+    /// #260: omit the reward of a move whose following chance node resolves directly to a leaf.
+    omit_leaf_reward: bool = false,
     /// #178: average every leaf over the 8 dihedral transforms instead of one forward pass.
     sym_leaf: bool = false,
     /// #183: `leaf` calls this search may still make (cache hits count too). Unbounded by default, so
@@ -753,18 +755,28 @@ const Search = struct {
         return if (mass == 0) self.bootValue(state, rewards, cprob) else total / mass;
     }
 
+    const SearchResult = struct { value: f64, direct_leaf: bool = false };
+
     /// Max over legal moves of reward + expected value after the spawn; 0 when no move changes the board.
-    fn value(self: *Search, state: GameState, depth: u8, cprob: f64) f64 {
-        if (self.out_of_budget) return 0; // #183: the caller discards this iteration
+    fn valueResult(self: *Search, state: GameState, depth: u8, cprob: f64) SearchResult {
+        if (self.out_of_budget) return .{ .value = 0 }; // #183: the caller discards this iteration
         var best: f64 = -std.math.inf(f64);
         for ([_]Direction{ .up, .left, .down, .right }) |d| {
             var next = state;
             const moved = next.slide(d);
             if (!moved.changed) continue;
-            const v = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale + self.chance(next, depth - 1, cprob);
-            best = @max(best, v);
+            const continuation = self.chanceResult(next, depth - 1, cprob);
+            const reward = if (self.omit_leaf_reward and continuation.direct_leaf)
+                0
+            else
+                @as(f64, @floatFromInt(moved.score_delta)) / reward_scale;
+            best = @max(best, reward + continuation.value);
         }
-        return if (best == -std.math.inf(f64)) 0 else best;
+        return .{ .value = if (best == -std.math.inf(f64)) 0 else best };
+    }
+
+    fn value(self: *Search, state: GameState, depth: u8, cprob: f64) f64 {
+        return self.valueResult(state, depth, cprob).value;
     }
 
     /// Expected value of a post-move board after spawning; depth 0 is the value leaf (the afterstate itself).
@@ -772,16 +784,18 @@ const Search = struct {
     /// mass, so a cut node keeps the scale of a full average instead of shrinking with the dropped ones.
     /// Two passes (#182): the first collects every branch's probability, the second evaluates the ones
     /// the fixed `cutoff` and the mass `mass_cutoff` both keep.
-    fn chance(self: *Search, state: GameState, depth: u8, cprob: f64) f64 {
-        if (depth == 0) return self.leaf(state.board);
-        if (self.out_of_budget) return 0; // #183: the caller discards this iteration
+    /// Direct leaves include both the depth boundary and all-pruned chance nodes; a full board instead
+    /// keeps moving at the same depth, and a terminal board's value remains 0 (no legal move).
+    fn chanceResult(self: *Search, state: GameState, depth: u8, cprob: f64) SearchResult {
+        if (depth == 0) return .{ .value = self.leaf(state.board), .direct_leaf = true };
+        if (self.out_of_budget) return .{ .value = 0 }; // #183: the caller discards this iteration
         var empties: f64 = 0;
         for (0..core.BoardSize) |r| {
             for (0..core.BoardSize) |c| {
                 if (state.board[r][c] == 0) empties += 1;
             }
         }
-        if (empties == 0) return self.value(state, depth, cprob);
+        if (empties == 0) return self.valueResult(state, depth, cprob);
         // pass 1: every branch of this node, in board order (the tie-break of the mass cut)
         var branches: [max_chance_branches]ChanceBranch = undefined;
         var count: usize = 0;
@@ -809,16 +823,20 @@ const Search = struct {
             if (dropped[i] or (depth > 1 and branch.p / empties < self.cutoff)) continue;
             var child = state;
             child.board[branch.r][branch.c] = branch.tile;
-            const v = self.value(child, depth, branch.p);
-            total += branch.p * v;
+            const result = self.valueResult(child, depth, branch.p);
+            total += branch.p * result.value;
             mass += branch.p;
-            kept_values[kept] = v;
+            kept_values[kept] = result.value;
             kept_probs[kept] = branch.p;
             kept += 1;
         }
         // every branch cut: the node is already that unlikely, so the afterstate leaf is the answer
-        if (mass == 0) return self.leaf(state.board);
-        return riskScore(total / mass, kept_values[0..kept], kept_probs[0..kept], self.risk_weight);
+        if (mass == 0) return .{ .value = self.leaf(state.board), .direct_leaf = true };
+        return .{ .value = riskScore(total / mass, kept_values[0..kept], kept_probs[0..kept], self.risk_weight) };
+    }
+
+    fn chance(self: *Search, state: GameState, depth: u8, cprob: f64) f64 {
+        return self.chanceResult(state, depth, cprob).value;
     }
 };
 
@@ -846,7 +864,12 @@ fn rootMove(search: *Search, state: GameState, order: [4]Direction, rerank: ?Rer
         var next = state;
         const moved = next.slide(d);
         if (!moved.changed) continue;
-        const v = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale + search.chance(next, search.ply, 1);
+        const continuation = search.chanceResult(next, search.ply, 1);
+        const reward = if (search.omit_leaf_reward and continuation.direct_leaf)
+            0
+        else
+            @as(f64, @floatFromInt(moved.score_delta)) / reward_scale;
+        const v = reward + continuation.value;
         if (best.dir == null or v > best.value) {
             second = best;
             best = .{ .dir = d, .value = v };
@@ -910,6 +933,7 @@ fn newSearch(vfn: Value, cache: *ValueCache, depth: Depth, sym_leaf: bool, risk_
         .cutoff = depth.cutoff,
         .mass_cutoff = depth.mass_cutoff,
         .ply = depth.ply,
+        .omit_leaf_reward = depth.omit_leaf_reward,
         .sym_leaf = sym_leaf,
         // a phase row may carry its own #187 weight; the caller's option is the one every other row uses
         .risk_weight = if (depth.risk_weight != 0) depth.risk_weight else risk_weight,
@@ -948,7 +972,7 @@ fn deepMoveId(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, s
     var best_ply: u8 = 0;
     var ply: u8 = @max(start.ply, 2);
     while (ply <= max_id_ply) : (ply += 1) {
-        var search = newSearch(vfn, cache, .{ .ply = ply, .cutoff = start.cutoff, .mass_cutoff = start.mass_cutoff }, sym_leaf, risk_weight);
+        var search = newSearch(vfn, cache, .{ .ply = ply, .cutoff = start.cutoff, .mass_cutoff = start.mass_cutoff, .omit_leaf_reward = start.omit_leaf_reward }, sym_leaf, risk_weight);
         // what this iteration may still spend: the budget minus every iteration before it
         search.nodes_left = budget -| @as(usize, @intCast(spent));
         const root = rootMove(&search, state, order, rerank);
@@ -1184,6 +1208,12 @@ fn phaseDepth(mode: Mode, board: Board) Depth {
     unreachable; // every schedule ends with min_empty = 0
 }
 
+fn searchDepth(mode: Mode, board: Board, omit_leaf_reward: bool) Depth {
+    var depth = phaseDepth(mode, board);
+    depth.omit_leaf_reward = omit_leaf_reward;
+    return depth;
+}
+
 pub fn bestMove(net: *const Net, state: GameState, mode: Mode) ?Direction {
     return bestMoveValue(.{ .single = net }, state, mode);
 }
@@ -1220,7 +1250,7 @@ pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stat
     if (opts.id_budget) |budget| {
         const dir = switch (mode) {
             .greedy, .chance => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
-            .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMoveId(vfn, state, stats, cache, phaseDepth(mode, state.board), budget, opts.sym_leaf, opts.rerank, opts.risk_weight, opts.id_margin).dir,
+            .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMoveId(vfn, state, stats, cache, searchDepth(mode, state.board, opts.omit_leaf_reward), budget, opts.sym_leaf, opts.rerank, opts.risk_weight, opts.id_margin).dir,
         };
         // a budget too small for one full iteration still has to answer with a legal move
         return dir orelse firstLegalMove(state);
@@ -1229,7 +1259,7 @@ pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stat
         .greedy => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
         .chance => chanceMove(vfn, state),
         // every search mode takes its (ply, cutoff, mass cutoff) for this board from the phase table (#157)
-        .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, phaseDepth(mode, state.board), opts.sym_leaf, opts.rerank, opts.risk_weight),
+        .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, searchDepth(mode, state.board, opts.omit_leaf_reward), opts.sym_leaf, opts.rerank, opts.risk_weight),
     };
 }
 
@@ -1408,14 +1438,22 @@ pub const Tape = struct {
 /// Play with a spawn tape (#168). Record mode generates a tape-specific sequence of common random picks;
 /// replay mode maps those picks onto this policy's board so two policies can be compared on shared randomness.
 pub fn playTapedValue(vfn: Value, rng: std.Random, mode: Mode, tape: *Tape) PlayResult {
+    return playTapedValueOpts(vfn, rng, mode, tape, .{});
+}
+
+pub fn playTapedValueOpts(vfn: Value, rng: std.Random, mode: Mode, tape: *Tape, opts: Options) PlayResult {
     var stats: Stats = .{};
-    return playTapedWithStatsValue(vfn, rng, mode, tape, &stats);
+    return playTapedWithStatsValueOpts(vfn, rng, mode, tape, &stats, opts);
 }
 
 /// `playTapedValue` plus search counters. The tape owns the spawns of the whole game, the two start
 /// tiles included, and `GameState.move` is spelled out (slide, then a taped spawn) so record mode draws
 /// randomness in the same order (cell pick, then tile value) as `move`'s spawn path.
 pub fn playTapedWithStatsValue(vfn: Value, rng: std.Random, mode: Mode, tape: *Tape, stats: *Stats) PlayResult {
+    return playTapedWithStatsValueOpts(vfn, rng, mode, tape, stats, .{});
+}
+
+pub fn playTapedWithStatsValueOpts(vfn: Value, rng: std.Random, mode: Mode, tape: *Tape, stats: *Stats, opts: Options) PlayResult {
     var state = GameState.initEmpty();
     _ = tape.spawn(&state, rng);
     _ = tape.spawn(&state, rng);
@@ -1424,7 +1462,7 @@ pub fn playTapedWithStatsValue(vfn: Value, rng: std.Random, mode: Mode, tape: *T
     var cache: ValueCache = .{};
     while (true) {
         move_stats = .{};
-        const dir = bestMoveWithCacheValue(vfn, state, mode, &move_stats, &cache) orelse break;
+        const dir = bestMoveWithCacheValueOpts(vfn, state, mode, &move_stats, &cache, opts) orelse break;
         stats.leaves += move_stats.leaves;
         stats.hits += move_stats.hits;
         const result = state.slide(dir);
@@ -1661,6 +1699,8 @@ pub const Options = struct {
     /// 1-ply modes (`.greedy` / `.chance`) have no `Search` and are unchanged, as is the default
     /// (`false`), which keeps the single forward pass bit for bit.
     sym_leaf: bool = false,
+    /// Candidate (#260): omit only a move reward whose next chance node resolves directly to a leaf.
+    omit_leaf_reward: bool = false,
     /// Candidate (#183): leaf-evaluation budget of an iterative deepening search, `null` = off. When
     /// set, `bestMoveWithCacheValueOpts` searches depth 2, 3, ... and keeps the best move of the last
     /// iteration that finished inside the budget (`mode` only sets the first depth and the spawn cut).
@@ -3488,6 +3528,72 @@ const post_spawn_board: Board = .{
     .{ 8, 16, 32, 64 },
     .{ 16, 32, 64, 128 },
 };
+
+test "search leaf reward can be omitted without changing intermediate or terminal rewards (#260)" {
+    var zero_net = std.mem.zeroes(Net);
+    const vfn: Value = .{ .single = &zero_net };
+    var plain_cache: ValueCache = .{};
+    var omit_cache: ValueCache = .{};
+    var plain: Search = .{ .vfn = vfn, .cache = &plain_cache, .ply = 1 };
+    var omit: Search = .{ .vfn = vfn, .cache = &omit_cache, .ply = 1, .omit_leaf_reward = true };
+    const full: GameState = .{ .board = post_spawn_board };
+
+    // At depth 1, the move's afterstate is the leaf: retain the old r + V(A), or use only V(A).
+    try std.testing.expectApproxEqAbs(4 / reward_scale, plain.value(full, 1, 1), 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), omit.value(full, 1, 1), 1e-12);
+
+    // The top-level root uses the same convention rather than bypassing `Search.value`'s flag.
+    var root_plain_cache: ValueCache = .{};
+    var root_omit_cache: ValueCache = .{};
+    var root_plain: Search = .{ .vfn = vfn, .cache = &root_plain_cache, .ply = 0 };
+    var root_omit: Search = .{ .vfn = vfn, .cache = &root_omit_cache, .ply = 0, .omit_leaf_reward = true };
+    const order = [_]Direction{ .up, .left, .down, .right };
+    try std.testing.expectApproxEqAbs(4 / reward_scale, rootMove(&root_plain, full, order, null).value, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), rootMove(&root_omit, full, order, null).value, 1e-12);
+
+    // A full-board chance node continues at the same depth instead of becoming a direct leaf. At the
+    // following depth boundary only the last reward is omitted (the earlier reward remains); a
+    // terminal board with no legal move is 0.
+    const no_spawn = plain.chanceResult(full, 1, 1);
+    try std.testing.expect(!no_spawn.direct_leaf);
+    var full_plain_cache: ValueCache = .{};
+    var full_omit_cache: ValueCache = .{};
+    var full_plain: Search = .{ .vfn = vfn, .cache = &full_plain_cache, .ply = 2 };
+    var full_omit: Search = .{ .vfn = vfn, .cache = &full_omit_cache, .ply = 2, .omit_leaf_reward = true };
+    try std.testing.expect(full_plain.value(full, 2, 1) > full_omit.value(full, 2, 1));
+    try std.testing.expectApproxEqAbs(8 / reward_scale, full_plain.value(full, 2, 1) - full_omit.value(full, 2, 1), 1e-12);
+    const dead: GameState = .{ .board = dead_board };
+    try std.testing.expectEqual(@as(f64, 0), full_plain.value(dead, 2, 1));
+    try std.testing.expectEqual(@as(f64, 0), full_omit.value(dead, 2, 1));
+
+    // At depth 3, cutoff=1 prunes every spawn at the first chance node. That direct leaf follows the
+    // root move, so the candidate omits exactly that reward just as at a normal depth boundary.
+    var cut_plain_cache: ValueCache = .{};
+    var cut_omit_cache: ValueCache = .{};
+    var cut_plain: Search = .{ .vfn = vfn, .cache = &cut_plain_cache, .ply = 3, .cutoff = 1 };
+    var cut_omit: Search = .{ .vfn = vfn, .cache = &cut_omit_cache, .ply = 3, .cutoff = 1, .omit_leaf_reward = true };
+    var cut_state = mid_board;
+    cut_state.board[0][1] = 2; // give the open board one known merge while retaining its spawn holes
+    var best_reward: f64 = 0;
+    for ([_]Direction{ .up, .left, .down, .right }) |d| {
+        var moved = cut_state;
+        const result = moved.slide(d);
+        if (result.changed) best_reward = @max(best_reward, @as(f64, @floatFromInt(result.score_delta)) / reward_scale);
+    }
+    try std.testing.expect(best_reward > 0);
+    try std.testing.expectApproxEqAbs(best_reward, cut_plain.value(cut_state, 3, 1), 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), cut_omit.value(cut_state, 3, 1), 1e-12);
+
+    // The disabled option follows the identical search path and preserves the baseline move.
+    const weights = try parse(@embedFile("nn_weights.bin"));
+    var default_cache: ValueCache = .{};
+    var explicit_off_cache: ValueCache = .{};
+    var default_stats: Stats = .{};
+    var explicit_off_stats: Stats = .{};
+    const default_move = bestMoveWithCacheValueOpts(.{ .single = &weights }, mid_board, .deep, &default_stats, &default_cache, .{});
+    const explicit_off_move = bestMoveWithCacheValueOpts(.{ .single = &weights }, mid_board, .deep, &explicit_off_stats, &explicit_off_cache, .{ .omit_leaf_reward = false });
+    try std.testing.expectEqual(default_move, explicit_off_move);
+}
 
 test "search2 bootstraps from the post-spawn board, td1 from V of the next afterstate (#158)" {
     // zero net: V is 0 everywhere, so the td1 bootstrap cannot see a single future reward

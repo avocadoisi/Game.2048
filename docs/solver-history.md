@@ -3543,3 +3543,33 @@ Pooled ms/move は両 seed の経過時間合計 / 総手数（出力された0.
 zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 ai/solver/nn_weights.bin 1 - - - 2,13
 zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 resume 30 ai/solver/nn_weights.bin 1 - - - 2,13
 ```
+
+### 葉の直前の報酬を省く評価（#260、2026-11-11）
+
+`Search.value` が葉へ直接進む手の報酬 `r` も `V(A)` に足す既定 `r + V(A)` と、直前の報酬だけを省く `V(A)` を比較した。変更は opt-in の評価専用 (`omit_leaf_reward=false` が既定) とし、訓練ターゲット・重み・スポーン・合法手・同点順は変更していない。深さ境界と全スポーン枝を刈った場合を直接葉として扱う。盤面に空きがないときは従来どおり同じ深さで続行し、合法手のない終局値は 0 のまま。
+
+同梱 128/32 net (`nn_weights.bin`, SHA-256 `c98ea27cf723cc96258173bd7be74630e80c2f1f358777c5ddaec059ec19a6c1`) で、ReleaseFast、同じ #237 32-bit spawn tape、seed 9000 の20局を `.deep` でペア評価した。A は既定、B は葉の直前の報酬を省く候補。
+
+| 比較 | B−A 平均 ± stderr | B勝 / A勝 | mean − 2×stderr |
+|---|---:|---:|---:|
+| `pairleaf deep`, 20局 | −1,911.6 ± 12,264.9 | 12 / 8 | **−26,441.4** |
+
+paired 判定 `mean − 2×stderr > 0` を満たさないため候補は有望とは言えず、`.deep3` の追加測定は行わなかった。非ペア `.deep` を seed 9000 と 9100 で各20局測定した結果も、片方のseedでスコア・裾・速度が悪化した。
+
+| 方策 | seed 9000 avg_score / reach8192 / ms/move | seed 9100 avg_score / reach8192 / ms/move | 40局 avg_score / reach8192 | elapsed / search volume (9000; 9100) |
+|---|---:|---:|---:|---:|
+| 既定 | 113,682.2 / 11/20 / 0.91 | 129,456.2 / 14/20 / 0.86 | 121,569.2 / 25/40 | 89.7 s / 98,006,119 leaves; 94.2 s / 106,310,853 leaves |
+| 葉報酬省略 | 131,587.4 / 15/20 / 0.83 | 114,746.2 / 11/20 / 0.96 | 123,166.8 / 26/40 | 92.1 s / 106,408,350 leaves; 95.0 s / 96,794,002 leaves |
+
+候補の40局平均は +1,597.6 点だが seed 9100 では −14,710.0 点、8192 到達は3局減、ms/move は0.86から0.96（+11.6%）となり、全seedで悪化しない条件を満たさない。**不採用**。既定方策・同梱重みは維持し、 opt-in の比較スイッチのみ残す。統計的な勝ちも速度・裾の一貫した改善も確認できなかった。
+
+再現（weights は同梱ファイル、`rows=2` のみで `.deep` を測定）:
+```
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 pairleaf 30 ai/solver/nn_weights.bin 1 - deep
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 2
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 leaf 30 ai/solver/nn_weights.bin 1 - - - 2
+zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 2
+zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 leaf 30 ai/solver/nn_weights.bin 1 - - - 2
+```
+
+`zig build test-nn -Dtest-filter='search leaf reward can be omitted'` と `zig build test-nn-main -Dtest-filter='pairleaf accepts'` を通した。テストは既定式、葉境界、全枝カット、空き無し盤面の継続、終局値0、root search と option 無効時の同一手、および `deep`/`deep3` CLI mode を確認する。
