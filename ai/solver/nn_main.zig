@@ -757,9 +757,10 @@ pub fn main(init: std.process.Init) !void {
         // #188: the #183 budget, but a root move that already beats its runner-up by more than 0.05
         // ends the deepening after the first iteration, so only near-tie positions pay for a deeper tree.
         .{ .name = "nn deepening on near ties (#188)", .policy = 14 },
-        // #263: the .deep3 row with completed interior nodes reused inside one search; the move must
-        // be the same as row 4, so a faster row buys a wider cut or another ply.
-        .{ .name = "nn 3-ply + node TT (#263)", .policy = 15 },
+        // #263: the .deep3 row with completed interior nodes reused inside one search. #266 made this
+        // the default for 3-ply, so the row passes no options and measures the shipped path; row 4 is
+        // the explicit-off baseline the two are compared on.
+        .{ .name = "nn 3-ply + node TT default (#266)", .policy = 15 },
         // #263: the same table at a 1e-3 spawn cut: the time the table saved, spent on a wider tree.
         .{ .name = "nn 3-ply 1e-3 + node TT (#263)", .policy = 16 },
     };
@@ -844,7 +845,12 @@ pub fn main(init: std.process.Init) !void {
                     break :blk nn.PlayResult{ .score = b.score, .max_tile = b.max_tile, .moves = b.moves };
                 },
                 // nn3 baseline for the phase rows below (#157): same seeds, so the cost and score compare directly
-                4 => nn.playValueOpts(c.vfn, prng.random(), .deep3, c.opts),
+                // #263/#266: the TT-less baseline the default (row 15) is compared on
+                4 => blk: {
+                    var no_tt = c.opts;
+                    no_tt.node_tt = false;
+                    break :blk nn.playValueOpts(c.vfn, prng.random(), .deep3, no_tt);
+                },
                 5 => nn.playValue(c.vfn, prng.random(), .phase_h1),
                 6 => nn.playValue(c.vfn, prng.random(), .phase_h2),
                 7 => nn.playValue(c.vfn, prng.random(), .phase_h3),
@@ -861,10 +867,10 @@ pub fn main(init: std.process.Init) !void {
                 13 => nn.playValueOpts(c.vfn, prng.random(), .deep, .{ .risk_weight = 0.3 }),
                 // #188: deepen (#183) only when the 2-ply root move is within 0.05 of its runner-up
                 14 => nn.playValueOpts(c.vfn, prng.random(), .deep, .{ .id_budget = 200_000, .id_margin = 0.05 }),
-                // #263: the .deep3 tree, with its completed interior nodes reused inside each search
-                15 => nn.playValueOpts(c.vfn, prng.random(), .deep3, .{ .node_tt = true }),
+                // #266: the shipped 3-ply path, node TT on by default, so the row passes no options
+                15 => nn.playValueOpts(c.vfn, prng.random(), .deep3, .{}),
                 // #263: the table's saved time spent on a wider spawn cut (1e-3 instead of 1e-2)
-                16 => nn.playValueOpts(c.vfn, prng.random(), .deep3, .{ .node_tt = true, .cutoff = 1e-3 }),
+                16 => nn.playValueOpts(c.vfn, prng.random(), .deep3, .{ .cutoff = 1e-3 }),
                 else => unreachable,
             };
         }

@@ -3579,7 +3579,8 @@ zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 leaf 30 ai/solver/nn_we
 `ValueCache` は探索の葉（afterstate）だけを覚えており、`Search.value` / `Search.chance` が返した内部ノードの
 値は、同じ盤面が別経路から再訪されても毎回計算し直していた。深さ 3 の `deep3` は spawn の組み合わせで
 同じ盤面に何度も到達するため、1 探索内で完了した内部ノードを再利用する direct-mapped の `NodeCache` を
-`Options.node_tt` として追加した。既定は off で、off の探索結果は従来とビット単位で同じ。
+`Options.node_tt` として追加した。当時は既定 off で、off の探索結果は従来とビット単位で同じだった
+（#266 で 3-ply 以上だけ既定 on にした）。
 
 キーは盤面の厳密な 16 バイト表現（タイルの `log2 + 1`、空き 0）、`value` / `chance` の別、残り深さ、
 そして cprob。cprob は固定 spawn カットが効く深さ（`chance` は depth > 1、`value` は depth > 2）だけ
@@ -3605,14 +3606,50 @@ A 149,533.6、B 135,209.2。B は 1 局あたり 80k 前後まで落ちる負け
 探索が別の手を選んで悪いゲームに入る影響が大きい。ms/move は A 69.47、B 96.12（8 並列実行なので
 絶対値は参考、比は約 1.38 倍）。node hit rate は A 19.9%、B 21.4%。
 
-node TT は既定 off の `Options.node_tt` と評価 row 15 として採用する。`deep3` の既定 cutoff は 1e-2 の
-まま（1e-3 は paired で負けたため不採用）。row 16 は 1e-3 を再測定するための候補として残す。
+node TT は `Options.node_tt` と評価 row 15 として追加し、#266 で 3-ply 以上の既定 on にした。
+`deep3` の既定 cutoff は 1e-2 のまま（1e-3 は paired で負けたため不採用）。
+row 16 は 1e-3 を再測定するための候補として残す。
 1e-3 の非ペア 9000/9100 各 20 局は、paired で採用条件を満たさなかったため実施していない。
 
-再現（row 4 と 15 を同時に。`rows`: 4 = `deep3`、15 = `deep3` + node TT）:
+再現（row 4 と 15 を同時に。`rows`: 4 = `deep3` の明示 off、15 = 既定の 3-ply）:
 ```
 zig build nn -Doptimize=ReleaseFast -- 0 10 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 4,15
 ```
 20 局ペア比較は一時的な `pairtt` variant（A: `deep3` + TT 1e-2、B: 同 1e-3、同じ tape）で行い、
 再現用には残していない。テストは `zig build test-nn -Dtest-filter='#263'`（key の分離、衝突ミス、
 予算切れの非保存、TT あり/なしの値と手の一致、テーブルのクリア、48 B/slot と direct_leaf の保持）。
+
+### node TT を 3-ply の既定にする（#266）
+
+#263 の node TT は opt-in だったが、`deep3` は #108 以来の既定の 3-ply 方策で、同じ手・同じ値のまま
+39.5% 速くなることが分かっていた。`Options.node_tt` を `?bool = null` にして、未指定なら探索深さが
+3-ply 以上のときだけテーブルを確保する既定にした。`null` は「3-ply 以上で on」、`false` は明示 off で、
+#263 の比較テストと TT なしの測定に使う。2-ply の `deep`（`id_budget` の初回反復を含む）は従来どおり
+テーブルを確保も probe もしないので、結果はビット単位で変わらない。テーブルの有無は探索開始後に
+深さが決まってから選び、確保したテーブルはトップレベル探索ごとにクリアする。既定の phase 行では
+3-ply のパート（`h1`〜`h3` の深い側、`h4` の 4-ply を含む）が on、2-ply のパートは off のまま。
+1 スロット 48 B、desktop 4096 スロット = 192 KiB/thread、wasm 512 スロット = 24 KiB/thread。
+
+同梱 128/32 net、seed 9000–9009 の 10 局を、同じプロセスで row 4（明示 off）と row 15（既定）に
+同じ spawn で打たせた。avg score / moves / 8192 到達は完全に一致し、22.95 → 12.80 ms/move（−44.2%）、
+leaves/move は 19,278.4 → 10,675.8 になった。node TT の probe 661,724,183 回に対し hit 132,069,729 回（20.0%）。
+
+| row | policy | avg score | avg moves | reach8192 | elapsed | leaves/move | ms/move | node hit rate |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 4 | `deep3` (node TT off) | 138,669.6 | 5,862.8 | 8/10 | 1345.4 s | 19,278.4 | 22.95 | — |
+| 15 | `deep3` (既定、node TT on) | 138,669.6 | 5,862.8 | 8/10 | 750.3 s | 10,675.8 | 12.80 | 20.0% |
+
+wasm は `zig build wasm -Doptimize=ReleaseFast` で、変更前 540,957 B（初期メモリ 29 ページ = 1,856 KiB）→
+変更後 566,031 B（同じ 29 ページ）。増分は 24 KiB のテーブル像（data +24,628 B）とクリア処理の
+コード +446 B。`clear` を `@splat` 代入のままにすると同サイズの定数が data にもう 1 つ入り
+590,156 B になったため、1 エントリずつの代入にして約 24 KiB 減らした。
+
+テストは `node TT defaults on for 3-ply and never for 2-ply (#266)` を追加し、2-ply の既定が明示 off と
+同じ手・同じ leaves/hits で probe 0、3-ply の既定がクリア・probe・hit すること、明示 off がテーブルを
+触らないことを固定した。#263 の「ゲームに沿って同じ手」テストは 4 手に延ばし、既定経路も比較する。
+`zig build test` 全通過、wasm ビルド通過。
+
+再現（row 4 と 15 を同時に。`rows`: 4 = `deep3` の明示 off、15 = 既定の 3-ply）:
+```
+zig build nn -Doptimize=ReleaseFast -- 0 10 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 4,15
+```
