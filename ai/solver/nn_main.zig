@@ -342,6 +342,9 @@ const Eval = struct {
     best_tile: core.Tile = 0,
     total_score: u64 = 0,
     leaves: u64 = 0,
+    /// #263 interior-node probes and hits over the whole run (0 when the row has no node table).
+    node_probes: u64 = 0,
+    node_hits: u64 = 0,
     elapsed_ns: i96 = 0,
     /// Games whose final `max_tile` is at or above the tile (counts, not rates); the avg score is a
     /// central measure, so how often a run actually gets there has to be counted separately (#156).
@@ -754,6 +757,11 @@ pub fn main(init: std.process.Init) !void {
         // #188: the #183 budget, but a root move that already beats its runner-up by more than 0.05
         // ends the deepening after the first iteration, so only near-tie positions pay for a deeper tree.
         .{ .name = "nn deepening on near ties (#188)", .policy = 14 },
+        // #263: the .deep3 row with completed interior nodes reused inside one search; the move must
+        // be the same as row 4, so a faster row buys a wider cut or another ply.
+        .{ .name = "nn 3-ply + node TT (#263)", .policy = 15 },
+        // #263: the same table at a 1e-3 spawn cut: the time the table saved, spent on a wider tree.
+        .{ .name = "nn 3-ply 1e-3 + node TT (#263)", .policy = 16 },
     };
     // Rows are all on by default; `rows` (arg 13, #203) keeps the two a measurement needs
     // (0 = 1-ply, 2 = 2-ply) instead of paying for the 3-ply rows twice over. A stray token is a
@@ -853,6 +861,10 @@ pub fn main(init: std.process.Init) !void {
                 13 => nn.playValueOpts(c.vfn, prng.random(), .deep, .{ .risk_weight = 0.3 }),
                 // #188: deepen (#183) only when the 2-ply root move is within 0.05 of its runner-up
                 14 => nn.playValueOpts(c.vfn, prng.random(), .deep, .{ .id_budget = 200_000, .id_margin = 0.05 }),
+                // #263: the .deep3 tree, with its completed interior nodes reused inside each search
+                15 => nn.playValueOpts(c.vfn, prng.random(), .deep3, .{ .node_tt = true }),
+                // #263: the table's saved time spent on a wider spawn cut (1e-3 instead of 1e-2)
+                16 => nn.playValueOpts(c.vfn, prng.random(), .deep3, .{ .node_tt = true, .cutoff = 1e-3 }),
                 else => unreachable,
             };
         }
@@ -870,6 +882,8 @@ pub fn main(init: std.process.Init) !void {
                 r.total_score += res.score;
                 total_moves += res.moves;
                 r.leaves += res.leaves;
+                r.node_probes += res.node_probes;
+                r.node_hits += res.node_hits;
                 r.best_tile = @max(r.best_tile, res.max_tile);
                 if (res.max_tile >= 4096) r.reach_4096 += 1;
                 if (res.max_tile >= 8192) r.reach_8192 += 1;
@@ -900,6 +914,10 @@ pub fn main(init: std.process.Init) !void {
             .dead_below_2048 = r.dead_below_2048,
         }, r.total_score, r.leaves);
         std.debug.print(" reach4096={d}/{d} reach8192={d}/{d} reach16384={d}/{d} dead<2048={d}/{d}\n", .{ r.reach_4096, games, r.reach_8192, games, r.reach_16384, games, r.dead_below_2048, games });
+        if (r.node_probes > 0) {
+            const probes: f64 = @floatFromInt(r.node_probes);
+            std.debug.print(" nodeTT probes={d} hits={d} hit_rate={d:.1}%\n", .{ r.node_probes, r.node_hits, 100 * @as(f64, @floatFromInt(r.node_hits)) / probes });
+        }
     }
 }
 
