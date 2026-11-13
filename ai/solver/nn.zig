@@ -610,7 +610,7 @@ pub const NodeCache = struct {
     /// Drops every entry; a search must start from an empty table because the key does not carry the
     /// net, the cutoffs or `risk_weight`.
     pub fn clear(self: *NodeCache) void {
-        self.entries = @splat(.{});
+        for (&self.entries) |*entry| entry.* = .{};
     }
 
     /// Exact board fingerprint, one byte per cell: the tile's log2 plus one (0 for empty). Game tiles
@@ -1383,22 +1383,25 @@ pub fn bestMoveWithCacheValue(vfn: Value, state: GameState, mode: Mode, stats: *
 /// `id_budget` (#183) swaps the fixed-depth search for a node-budgeted iterative deepening.
 /// `rerank` (#189) re-scores the top two moves of a near tie with a foreign evaluator.
 pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stats: *Stats, cache: *ValueCache, opts: Options) ?Direction {
-    // #263: one interior-node table per top-level search, cleared here because settings and net are
-    // not part of its key (a table surviving a weight update would price boards with the old net).
-    const nodes: ?*NodeCache = if (opts.node_tt) blk: {
-        const table = sharedNodeCache();
-        table.clear();
-        break :blk table;
-    } else null;
     // `.greedy` / `.chance` have no phase schedule (and no search), so only search modes resolve a depth.
     var depth: Depth = undefined;
+    var searching = false;
     switch (mode) {
         .greedy, .chance => {},
         else => {
             depth = searchDepth(mode, state.board, opts.omit_leaf_reward);
             if (opts.cutoff) |cutoff| depth.cutoff = cutoff;
+            searching = true;
         },
     }
+    // #263: one interior-node table per top-level search, cleared here because settings and net are
+    // not part of its key (a table surviving a weight update would price boards with the old net).
+    // #266: 3-ply and deeper default to the table (same moves, ~40% cheaper); 2-ply keeps no table.
+    const nodes: ?*NodeCache = if (opts.node_tt orelse (searching and depth.ply >= 3)) blk: {
+        const table = sharedNodeCache();
+        table.clear();
+        break :blk table;
+    } else null;
     // #183: a node budget means iterative deepening. `mode` only sets the first iteration's depth (its
     // phase row, so `.deep` starts at ply 2 and `.deep3` at ply 3) and the spawn cut every ply keeps.
     if (opts.id_budget) |budget| {
@@ -1423,7 +1426,8 @@ pub const PlayResult = struct {
     moves: u32,
     /// `forward` leaf evaluations summed over the game (0 for modes that do not search).
     leaves: u64 = 0,
-    /// Interior-node lookups and hits summed over the game (#263; both 0 without `Options.node_tt`).
+    /// Interior-node lookups and hits summed over the game (#263; both 0 for a 2-ply search or with
+    /// `Options.node_tt = false`, #266).
     node_probes: u64 = 0,
     node_hits: u64 = 0,
     /// The board the game ended on (the tape replay test compares it, #168). Zero for callers that
@@ -1864,10 +1868,12 @@ pub const Options = struct {
     sym_leaf: bool = false,
     /// Candidate (#260): omit only a move reward whose next chance node resolves directly to a leaf.
     omit_leaf_reward: bool = false,
-    /// Candidate (#263): reuse completed `Search.value` / `Search.chance` nodes inside one top-level
-    /// search. The table is cleared per move, so the same board/depth/cprob gives the same value as
-    /// without it; `false` (the default) keeps every pre-#263 search bit for bit.
-    node_tt: bool = false,
+    /// Reuse completed `Search.value` / `Search.chance` nodes inside one top-level search (#263).
+    /// The table is cleared per move, so the same board/depth/cprob gives the same value as without
+    /// it. `null` (the default, #266) turns the table on for a search whose phase row is 3-ply or
+    /// deeper and leaves 2-ply (`deep`) without it, so `deep` stays byte-identical to pre-#263 and
+    /// allocates nothing; `false` is the explicit off switch for tests and #263 comparisons.
+    node_tt: ?bool = null,
     /// Override the spawn-probability cut the mode's phase row would use (`null` = the row's cutoff).
     /// A measurement needs e.g. `.deep3` at 1e-3 instead of 1e-2 without a second mode (#263/#256).
     cutoff: ?f64 = null,
@@ -3382,12 +3388,43 @@ test "node table is cleared at the start of every top-level search (#263)" {
     _ = bestMoveWithCacheValueOpts(vfn, mid_board, .deep3, &stats, &cache, .{ .node_tt = true });
     try std.testing.expect(table.get(stale, &stats) == null);
 
-    // off by default: no probes and no clear, so the table is untouched
+    // explicit off: no probes and no clear, so the table is untouched
     table.put(stale, .{ .value = 123 });
     var off_stats: Stats = .{};
-    _ = bestMoveWithCacheValueOpts(vfn, mid_board, .deep3, &off_stats, &cache, .{});
+    _ = bestMoveWithCacheValueOpts(vfn, mid_board, .deep3, &off_stats, &cache, .{ .node_tt = false });
     try std.testing.expectEqual(@as(u64, 0), off_stats.node_probes);
     try std.testing.expectEqual(@as(f64, 123), table.get(stale, &off_stats).?.value);
+}
+
+test "node TT defaults on for 3-ply and never for 2-ply (#266)" {
+    const weights = try parse(@embedFile("nn_weights.bin"));
+    const vfn: Value = .{ .single = &weights };
+    var cache: ValueCache = .{};
+    const table = sharedNodeCache();
+    // a depth no 3-ply search can store, so only a 3-ply search's per-search clear can remove it
+    const stale = NodeCache.keyFor(late_board.board, .value, 200, 1);
+
+    // `.deep` is 2-ply: the default leaves the table alone, exactly as an explicit off would
+    table.put(stale, .{ .value = 123 });
+    var deep_stats: Stats = .{};
+    const deep_move = bestMoveWithCacheValueOpts(vfn, mid_board, .deep, &deep_stats, &cache, .{});
+    try std.testing.expectEqual(@as(u64, 0), deep_stats.node_probes);
+    try std.testing.expectEqual(@as(f64, 123), table.get(stale, &deep_stats).?.value);
+
+    // ... and takes the same path: same move and leaf work, so the 2-ply result is bit-identical
+    var off_stats: Stats = .{};
+    var off_cache: ValueCache = .{};
+    const off_move = bestMoveWithCacheValueOpts(vfn, mid_board, .deep, &off_stats, &off_cache, .{ .node_tt = false });
+    try std.testing.expectEqual(deep_move, off_move);
+    try std.testing.expectEqual(deep_stats.leaves, off_stats.leaves);
+    try std.testing.expectEqual(deep_stats.hits, off_stats.hits);
+
+    // `.deep3` is 3-ply: the default clears, probes and hits like `.node_tt = true`
+    var deep3_stats: Stats = .{};
+    _ = bestMoveWithCacheValueOpts(vfn, mid_board, .deep3, &deep3_stats, &cache, .{});
+    try std.testing.expect(deep3_stats.node_probes > 0);
+    try std.testing.expect(deep3_stats.node_hits > 0);
+    try std.testing.expect(table.get(stale, &deep3_stats) == null);
 }
 
 test "node cache withholds a node from a budget-exhausted search (#263)" {
@@ -3430,7 +3467,7 @@ test "node cache values match a fresh search at the same cprob (#263)" {
     }
 }
 
-test "node cache keeps the chosen move along a game (#263)" {
+test "node cache keeps the chosen move along a game (#263/#266)" {
     const weights = try parse(@embedFile("nn_weights.bin"));
     const vfn: Value = .{ .single = &weights };
     var prng = std.Random.DefaultPrng.init(263);
@@ -3438,13 +3475,23 @@ test "node cache keeps the chosen move along a game (#263)" {
     var state = GameState.gameStart(random);
     var plain_leaf: ValueCache = .{};
     var cached_leaf: ValueCache = .{};
-    for (0..3) |i| {
-        const mode: Mode = if (i == 0) .deep3 else .deep;
+    var default_leaf: ValueCache = .{};
+    for (0..4) |i| {
+        const mode: Mode = if (i % 2 == 0) .deep3 else .deep;
         var plain_stats: Stats = .{};
         var cached_stats: Stats = .{};
-        const plain = bestMoveWithCacheValueOpts(vfn, state, mode, &plain_stats, &plain_leaf, .{});
+        var default_stats: Stats = .{};
+        const plain = bestMoveWithCacheValueOpts(vfn, state, mode, &plain_stats, &plain_leaf, .{ .node_tt = false });
         const cached = bestMoveWithCacheValueOpts(vfn, state, mode, &cached_stats, &cached_leaf, .{ .node_tt = true });
+        // #266: the default is the same search as explicit on for 3-ply and as explicit off for 2-ply
+        const default = bestMoveWithCacheValueOpts(vfn, state, mode, &default_stats, &default_leaf, .{});
         try std.testing.expectEqual(plain, cached);
+        try std.testing.expectEqual(plain, default);
+        if (mode == .deep3) {
+            try std.testing.expect(default_stats.node_probes > 0);
+        } else {
+            try std.testing.expectEqual(@as(u64, 0), default_stats.node_probes);
+        }
         const dir = plain orelse break;
         var moved = state;
         try std.testing.expect(moved.slide(dir).changed);
