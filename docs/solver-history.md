@@ -3573,3 +3573,46 @@ zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 leaf 30 ai/solver/nn_we
 ```
 
 `zig build test-nn -Dtest-filter='search leaf reward can be omitted'` と `zig build test-nn-main -Dtest-filter='pairleaf accepts'` を通した。テストは既定式、葉境界、全枝カット、空き無し盤面の継続、終局値0、root search と option 無効時の同一手、および `deep`/`deep3` CLI mode を確認する。
+
+### NN の内部探索値を再利用する node TT は同じ手で 39.5% 速い（#263）
+
+`ValueCache` は探索の葉（afterstate）だけを覚えており、`Search.value` / `Search.chance` が返した内部ノードの
+値は、同じ盤面が別経路から再訪されても毎回計算し直していた。深さ 3 の `deep3` は spawn の組み合わせで
+同じ盤面に何度も到達するため、1 探索内で完了した内部ノードを再利用する direct-mapped の `NodeCache` を
+`Options.node_tt` として追加した。既定は off で、off の探索結果は従来とビット単位で同じ。
+
+キーは盤面の厳密な 16 バイト表現（タイルの `log2 + 1`、空き 0）、`value` / `chance` の別、残り深さ、
+そして cprob。cprob は固定 spawn カットが効く深さ（`chance` は depth > 1、`value` は depth > 2）だけ
+キーに入れ、浅いノードは cprob 非依存なので 1 キーを共有する。ハッシュはスロット選択だけに使い、
+衝突時は 16 バイト全部を比較してミスにする。予算切れの探索で得た値は保存せず、テーブルはトップレベル
+探索ごとにクリアする（net / cutoff / risk_weight をキーに含めない代わりに、重み更新や設定変更をまたがない）。
+1 スロット 48 B（#260 の `direct_leaf` も一緒に保存するため）、desktop 4096 スロット = 192 KiB/thread、wasm 512 スロット = 24 KiB/thread。
+
+同梱 128/32 net、seed 9000–9009 の 10 局を、同じプロセスで row 4 (`deep3`, cutoff 1e-2) と row 15
+(`deep3` + node TT) に同じ spawn で打たせた。avg score / moves / 8192 到達は完全に一致し、
+node TT は 23.87 → 14.45 ms/move（−39.5%）、leaves/move は 19,278.4 → 10,675.8 になった。
+node TT の probe 661,724,183 回に対し hit 132,069,729 回（20.0%）。
+
+| row | policy | avg score | avg moves | reach8192 | elapsed | leaves/move | ms/move | node hit rate |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 4 | `deep3` (cutoff 1e-2) | 138,669.6 | 5,862.8 | 8/10 | 1399.6 s | 19,278.4 | 23.87 | — |
+| 15 | `deep3` + node TT | 138,669.6 | 5,862.8 | 8/10 | 847.2 s | 10,675.8 | 14.45 | 20.0% |
+
+節約した時間を 1e-3 の spawn カットに使う案も、#237 の 32-bit spawn tape で A = `deep3` + TT (1e-2)、
+B = 同じ (1e-3) として seed 9000–9019 の 20 局をペアで比較した。B は 10 勝 10 敗、平均差
+−14,324.4 ± 11,574.6 点（B−A）、`mean − 2*stderr = −37,473.5` で採用条件を満たさない。avg score は
+A 149,533.6、B 135,209.2。B は 1 局あたり 80k 前後まで落ちる負け方が 5 局あり、カットを緩めると
+探索が別の手を選んで悪いゲームに入る影響が大きい。ms/move は A 69.47、B 96.12（8 並列実行なので
+絶対値は参考、比は約 1.38 倍）。node hit rate は A 19.9%、B 21.4%。
+
+node TT は既定 off の `Options.node_tt` と評価 row 15 として採用する。`deep3` の既定 cutoff は 1e-2 の
+まま（1e-3 は paired で負けたため不採用）。row 16 は 1e-3 を再測定するための候補として残す。
+1e-3 の非ペア 9000/9100 各 20 局は、paired で採用条件を満たさなかったため実施していない。
+
+再現（row 4 と 15 を同時に。`rows`: 4 = `deep3`、15 = `deep3` + node TT）:
+```
+zig build nn -Doptimize=ReleaseFast -- 0 10 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 4,15
+```
+20 局ペア比較は一時的な `pairtt` variant（A: `deep3` + TT 1e-2、B: 同 1e-3、同じ tape）で行い、
+再現用には残していない。テストは `zig build test-nn -Dtest-filter='#263'`（key の分離、衝突ミス、
+予算切れの非保存、TT あり/なしの値と手の一致、テーブルのクリア、48 B/slot と direct_leaf の保持）。

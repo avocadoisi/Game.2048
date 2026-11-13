@@ -460,14 +460,19 @@ fn chanceMove(vfn: Value, state: GameState) ?Direction {
     return best;
 }
 
-/// Search statistics for one move (issue #69): afterstate evaluations and value-cache hits.
-pub const Stats = struct { leaves: u64 = 0, hits: u64 = 0 };
+/// Search statistics for one move (issue #69): afterstate evaluations and value-cache hits, plus the
+/// interior-node lookups of the transposition table (#263; both counters stay 0 when it is off).
+pub const Stats = struct { leaves: u64 = 0, hits: u64 = 0, node_probes: u64 = 0, node_hits: u64 = 0 };
 
 /// Depth one search runs at: `ply` own moves deep, dropping spawn branches under path probability
 /// `cutoff` (`0` keeps every branch) and dropping the lowest-probability branches up to a share
 /// `mass_cutoff` of each chance node's mass (#182, `0` keeps every branch). Part of the value-cache
 /// key (#157), because a phase game asks for the same board at two depths.
 pub const Depth = struct { ply: u8 = 0, cutoff: f64 = 0, mass_cutoff: f64 = 0, risk_weight: f64 = 0, omit_leaf_reward: bool = false };
+
+/// A completed search node: its value and whether that value is a direct leaf (#260). The node table
+/// stores both, because the parent of a direct leaf omits that move's reward.
+const SearchResult = struct { value: f64 = 0, direct_leaf: bool = false };
 
 /// Key depth of the 1-ply lookups (`get` / `getValue`, e.g. the `nnmcts` rollouts), which never search.
 pub const leaf_depth: Depth = .{};
@@ -573,6 +578,109 @@ pub fn sharedValueCache() *ValueCache {
     return &move_cache;
 }
 
+/// Bounded transposition table for the completed interior nodes of one search (#263), direct-mapped
+/// and deterministic like `ValueCache`. A node is identified by its exact board fingerprint, whether
+/// it is a `value` or a `chance` node, its remaining depth, and the path probability where that
+/// probability can still change the result. The full fingerprint is compared on a probe, so a slot
+/// collision is a miss and never returns another position's value.
+///
+/// It is cleared at the start of every top-level search: the key does not carry the net, the cutoffs
+/// or `risk_weight`, and a table surviving a weight update would price boards with the old net. Within
+/// one search those settings are fixed, and the key's remaining depth keeps a shallower backup from
+/// answering a deeper node (iterations may share nodes that really are at the same remaining depth).
+pub const NodeCache = struct {
+    /// The table lives in thread-local storage like `ValueCache`; wasm gets the smaller one because
+    /// the 8K-entry leaf cache already overflowed that stack.
+    pub const capacity = if (builtin.target.cpu.arch.isWasm()) 1 << 9 else 1 << 12;
+    /// `0xff` marks an unused slot; a real cell stores the tile's exponent plus one (1..32, 0 empty),
+    /// so no board the game can produce collides with the sentinel.
+    const unused_cell = 0xff;
+    const NodeKind = enum(u8) { value, chance };
+    const Key = struct {
+        cells: [core.BoardCellCount]u8 = @splat(unused_cell),
+        /// The exact `cprob` bits when `cprobRelevant`, otherwise 0 (all those nodes share one key).
+        cprob: f64 = 0,
+        depth: u8 = 0,
+        kind: NodeKind = .value,
+    };
+    /// 32 B key + 16 B result (value + direct_leaf) = 48 B per slot.
+    const Entry = struct { key: Key = .{}, result: SearchResult = .{} };
+    entries: [capacity]Entry = @splat(.{}),
+
+    /// Drops every entry; a search must start from an empty table because the key does not carry the
+    /// net, the cutoffs or `risk_weight`.
+    pub fn clear(self: *NodeCache) void {
+        self.entries = @splat(.{});
+    }
+
+    /// Exact board fingerprint, one byte per cell: the tile's log2 plus one (0 for empty). Game tiles
+    /// are powers of two up to `2^31`, so this is lossless; comparing these bytes instead of a hash
+    /// makes a collision a miss.
+    fn cellsOf(board: Board) [core.BoardCellCount]u8 {
+        var cells: [core.BoardCellCount]u8 = undefined;
+        var i: usize = 0;
+        for (board) |row| for (row) |tile| {
+            cells[i] = if (tile == 0) 0 else @as(u8, @intCast(@ctz(tile))) + 1;
+            i += 1;
+        };
+        return cells;
+    }
+
+    /// Whether `cprob` can change this node's value. The fixed cut is only tested at `chance` depth
+    /// > 1, so `value` depth <= 2 and `chance` depth <= 1 never read it; their cutoffs and the mass
+    /// cut compare relative probabilities, and `riskScore` normalizes by the node's own mass, so the
+    /// scale of `cprob` cancels. Deeper nodes keep the exact bits because the cut depends on them.
+    fn cprobRelevant(kind: NodeKind, depth: u8) bool {
+        return switch (kind) {
+            .value => depth > 2,
+            .chance => depth > 1,
+        };
+    }
+
+    fn keyFor(board: Board, kind: NodeKind, depth: u8, cprob: f64) Key {
+        return .{
+            .cells = cellsOf(board),
+            .cprob = if (cprobRelevant(kind, depth)) cprob else 0,
+            .depth = depth,
+            .kind = kind,
+        };
+    }
+
+    fn slotOf(key: Key) usize {
+        var h: u64 = 0xcbf29ce484222325;
+        for (key.cells) |cell| h = (h ^ cell) *% 0x100000001b3;
+        h = (h ^ @as(u64, @backingInt(key.kind))) *% 0x100000001b3;
+        h = (h ^ key.depth) *% 0x100000001b3;
+        h = (h ^ @as(u64, @bitCast(key.cprob))) *% 0x100000001b3;
+        return @intCast(h & (capacity - 1));
+    }
+
+    /// The completed value of this exact node; null on an empty or mismatched slot. `stats` counts
+    /// probes and hits so a measurement can report the table's hit rate.
+    fn get(self: *const NodeCache, key: Key, stats: *Stats) ?SearchResult {
+        stats.node_probes += 1;
+        const entry = self.entries[slotOf(key)];
+        if (entry.key.depth != key.depth or entry.key.kind != key.kind or
+            entry.key.cprob != key.cprob or !std.mem.eql(u8, &entry.key.cells, &key.cells)) return null;
+        stats.node_hits += 1;
+        return entry.result;
+    }
+
+    /// Store a completed node; `Search.nodePut` withholds incomplete (budget-exhausted) values.
+    fn put(self: *NodeCache, key: Key, result: SearchResult) void {
+        self.entries[slotOf(key)] = .{ .key = key, .result = result };
+    }
+};
+
+/// Per-thread interior-node table reused by the opt-in search (issue #263). The search clears it, so
+/// a warm table changes speed only and can never answer across a weight update.
+threadlocal var node_cache: NodeCache = .{};
+
+/// The calling thread's reusable interior-node table.
+pub fn sharedNodeCache() *NodeCache {
+    return &node_cache;
+}
+
 /// shortcut: branch probability cut for `deep3` (issue #108), the same idea as `solver.zig`'s
 /// `prob_cutoff` at a coarser scale. A 4 under a 4 is already ~1e-3 of the path at the second spawn
 /// layer, so 1e-2 drops those subtrees (about 10% of a node's mass, renormalized away) while the
@@ -664,6 +772,8 @@ fn massCutMask(branches: []const ChanceBranch, mass_cutoff: f64, dropped: *[max_
 const Search = struct {
     vfn: Value,
     cache: *ValueCache,
+    /// Optional #263 interior-node table; null (the default) searches exactly as before.
+    nodes: ?*NodeCache = null,
     stats: Stats = .{},
     /// Spawn branches under this path probability are dropped; 0 searches every branch (`.deep`).
     cutoff: f64 = 0,
@@ -699,6 +809,21 @@ const Search = struct {
             .cutoff = self.cutoff,
             .mass_cutoff = self.mass_cutoff,
         }, self.sym_leaf, &self.stats);
+    }
+
+    /// Completed-node lookup in the #263 table; null when this search has no table or the slot holds
+    /// another node. The counters stay at 0 without a table, so every pre-#263 search is unchanged.
+    fn nodeGet(self: *Search, board: Board, kind: NodeCache.NodeKind, depth: u8, cprob: f64) ?SearchResult {
+        const nodes = self.nodes orelse return null;
+        return nodes.get(NodeCache.keyFor(board, kind, depth, cprob), &self.stats);
+    }
+
+    /// Store a completed node. A value computed after the leaf budget ran out is meaningless (its
+    /// caller discards the iteration), so it must never be reused as if it were exact (#183).
+    fn nodePut(self: *Search, board: Board, kind: NodeCache.NodeKind, depth: u8, cprob: f64, result: SearchResult) void {
+        const nodes = self.nodes orelse return;
+        if (self.out_of_budget) return;
+        nodes.put(NodeCache.keyFor(board, kind, depth, cprob), result);
     }
 
     /// `value` with the leaf one own move further out and no reward at it: `bootValue(S, 0)` is the
@@ -755,11 +880,10 @@ const Search = struct {
         return if (mass == 0) self.bootValue(state, rewards, cprob) else total / mass;
     }
 
-    const SearchResult = struct { value: f64, direct_leaf: bool = false };
-
     /// Max over legal moves of reward + expected value after the spawn; 0 when no move changes the board.
     fn valueResult(self: *Search, state: GameState, depth: u8, cprob: f64) SearchResult {
         if (self.out_of_budget) return .{ .value = 0 }; // #183: the caller discards this iteration
+        if (self.nodeGet(state.board, .value, depth, cprob)) |cached| return cached;
         var best: f64 = -std.math.inf(f64);
         for ([_]Direction{ .up, .left, .down, .right }) |d| {
             var next = state;
@@ -772,7 +896,9 @@ const Search = struct {
                 @as(f64, @floatFromInt(moved.score_delta)) / reward_scale;
             best = @max(best, reward + continuation.value);
         }
-        return .{ .value = if (best == -std.math.inf(f64)) 0 else best };
+        const result: SearchResult = .{ .value = if (best == -std.math.inf(f64)) 0 else best };
+        self.nodePut(state.board, .value, depth, cprob, result);
+        return result;
     }
 
     fn value(self: *Search, state: GameState, depth: u8, cprob: f64) f64 {
@@ -789,6 +915,7 @@ const Search = struct {
     fn chanceResult(self: *Search, state: GameState, depth: u8, cprob: f64) SearchResult {
         if (depth == 0) return .{ .value = self.leaf(state.board), .direct_leaf = true };
         if (self.out_of_budget) return .{ .value = 0 }; // #183: the caller discards this iteration
+        if (self.nodeGet(state.board, .chance, depth, cprob)) |cached| return cached;
         var empties: f64 = 0;
         for (0..core.BoardSize) |r| {
             for (0..core.BoardSize) |c| {
@@ -831,8 +958,12 @@ const Search = struct {
             kept += 1;
         }
         // every branch cut: the node is already that unlikely, so the afterstate leaf is the answer
-        if (mass == 0) return .{ .value = self.leaf(state.board), .direct_leaf = true };
-        return .{ .value = riskScore(total / mass, kept_values[0..kept], kept_probs[0..kept], self.risk_weight) };
+        const result: SearchResult = if (mass == 0)
+            .{ .value = self.leaf(state.board), .direct_leaf = true }
+        else
+            .{ .value = riskScore(total / mass, kept_values[0..kept], kept_probs[0..kept], self.risk_weight) };
+        self.nodePut(state.board, .chance, depth, cprob, result);
+        return result;
     }
 
     fn chance(self: *Search, state: GameState, depth: u8, cprob: f64) f64 {
@@ -918,18 +1049,19 @@ fn rerankScore(r: Rerank, state: GameState, d: Direction) f64 {
 /// `depth.ply` own moves deep: my move -> spawn -> ... -> afterstate value + score_delta/reward_scale.
 /// `ply` 2 is `deep` (full width); `ply` 3 is `deep3`, whose cost only fits with a spawn-probability cut;
 /// `ply` 4 is `phase_h4` (#171), which only ever runs where the board is nearly full.
-fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, depth: Depth, sym_leaf: bool, rerank: ?Rerank, risk_weight: f64) ?Direction {
-    var search = newSearch(vfn, cache, depth, sym_leaf, risk_weight);
+fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, nodes: ?*NodeCache, depth: Depth, sym_leaf: bool, rerank: ?Rerank, risk_weight: f64) ?Direction {
+    var search = newSearch(vfn, cache, nodes, depth, sym_leaf, risk_weight);
     defer stats.* = search.stats;
     return rootMove(&search, state, dir_order, rerank).dir;
 }
 
 /// A `Search` over the depth row `depth` (#183 factored this out of `deepMove` so the iterative
 /// deepening can rebuild the same search at another ply).
-fn newSearch(vfn: Value, cache: *ValueCache, depth: Depth, sym_leaf: bool, risk_weight: f64) Search {
+fn newSearch(vfn: Value, cache: *ValueCache, nodes: ?*NodeCache, depth: Depth, sym_leaf: bool, risk_weight: f64) Search {
     return .{
         .vfn = vfn,
         .cache = cache,
+        .nodes = nodes,
         .cutoff = depth.cutoff,
         .mass_cutoff = depth.mass_cutoff,
         .ply = depth.ply,
@@ -964,20 +1096,24 @@ pub const IdMove = struct {
 /// same tree one spawn layer out, not a different width. The previous iteration's root move goes first
 /// in the next iteration's move order, so with a budget that runs out mid-iteration the deeper tree is
 /// explored from its most promising branch outward.
-fn deepMoveId(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, start: Depth, budget: usize, sym_leaf: bool, rerank: ?Rerank, risk_weight: f64, margin: ?f64) IdMove {
+fn deepMoveId(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, nodes: ?*NodeCache, start: Depth, budget: usize, sym_leaf: bool, rerank: ?Rerank, risk_weight: f64, margin: ?f64) IdMove {
     var order = dir_order;
     var spent: u64 = 0;
     var hits: u64 = 0;
+    var node_probes: u64 = 0;
+    var node_hits: u64 = 0;
     var best: ?Direction = null;
     var best_ply: u8 = 0;
     var ply: u8 = @max(start.ply, 2);
     while (ply <= max_id_ply) : (ply += 1) {
-        var search = newSearch(vfn, cache, .{ .ply = ply, .cutoff = start.cutoff, .mass_cutoff = start.mass_cutoff, .omit_leaf_reward = start.omit_leaf_reward }, sym_leaf, risk_weight);
+        var search = newSearch(vfn, cache, nodes, .{ .ply = ply, .cutoff = start.cutoff, .mass_cutoff = start.mass_cutoff, .omit_leaf_reward = start.omit_leaf_reward }, sym_leaf, risk_weight);
         // what this iteration may still spend: the budget minus every iteration before it
         search.nodes_left = budget -| @as(usize, @intCast(spent));
         const root = rootMove(&search, state, order, rerank);
         spent += search.stats.leaves;
         hits += search.stats.hits;
+        node_probes += search.stats.node_probes;
+        node_hits += search.stats.node_hits;
         // a partial iteration (or a dead board) keeps the previous iteration's move
         if (search.out_of_budget or root.dir == null) break;
         // #188: with a tie margin, only the first iteration's near tie justifies a deeper tree. A root
@@ -1005,6 +1141,8 @@ fn deepMoveId(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, s
     }
     stats.leaves += spent;
     stats.hits += hits;
+    stats.node_probes += node_probes;
+    stats.node_hits += node_hits;
     return .{ .dir = best, .ply = best_ply, .leaves = spent };
 }
 
@@ -1245,12 +1383,28 @@ pub fn bestMoveWithCacheValue(vfn: Value, state: GameState, mode: Mode, stats: *
 /// `id_budget` (#183) swaps the fixed-depth search for a node-budgeted iterative deepening.
 /// `rerank` (#189) re-scores the top two moves of a near tie with a foreign evaluator.
 pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stats: *Stats, cache: *ValueCache, opts: Options) ?Direction {
+    // #263: one interior-node table per top-level search, cleared here because settings and net are
+    // not part of its key (a table surviving a weight update would price boards with the old net).
+    const nodes: ?*NodeCache = if (opts.node_tt) blk: {
+        const table = sharedNodeCache();
+        table.clear();
+        break :blk table;
+    } else null;
+    // `.greedy` / `.chance` have no phase schedule (and no search), so only search modes resolve a depth.
+    var depth: Depth = undefined;
+    switch (mode) {
+        .greedy, .chance => {},
+        else => {
+            depth = searchDepth(mode, state.board, opts.omit_leaf_reward);
+            if (opts.cutoff) |cutoff| depth.cutoff = cutoff;
+        },
+    }
     // #183: a node budget means iterative deepening. `mode` only sets the first iteration's depth (its
     // phase row, so `.deep` starts at ply 2 and `.deep3` at ply 3) and the spawn cut every ply keeps.
     if (opts.id_budget) |budget| {
         const dir = switch (mode) {
             .greedy, .chance => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
-            .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMoveId(vfn, state, stats, cache, searchDepth(mode, state.board, opts.omit_leaf_reward), budget, opts.sym_leaf, opts.rerank, opts.risk_weight, opts.id_margin).dir,
+            .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMoveId(vfn, state, stats, cache, nodes, depth, budget, opts.sym_leaf, opts.rerank, opts.risk_weight, opts.id_margin).dir,
         };
         // a budget too small for one full iteration still has to answer with a legal move
         return dir orelse firstLegalMove(state);
@@ -1259,7 +1413,7 @@ pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stat
         .greedy => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
         .chance => chanceMove(vfn, state),
         // every search mode takes its (ply, cutoff, mass cutoff) for this board from the phase table (#157)
-        .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, searchDepth(mode, state.board, opts.omit_leaf_reward), opts.sym_leaf, opts.rerank, opts.risk_weight),
+        .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, nodes, depth, opts.sym_leaf, opts.rerank, opts.risk_weight),
     };
 }
 
@@ -1269,6 +1423,9 @@ pub const PlayResult = struct {
     moves: u32,
     /// `forward` leaf evaluations summed over the game (0 for modes that do not search).
     leaves: u64 = 0,
+    /// Interior-node lookups and hits summed over the game (#263; both 0 without `Options.node_tt`).
+    node_probes: u64 = 0,
+    node_hits: u64 = 0,
     /// The board the game ended on (the tape replay test compares it, #168). Zero for callers that
     /// build a `PlayResult` without playing (the expectimax row of `nn_main`).
     board: Board = std.mem.zeroes(Board),
@@ -1310,10 +1467,12 @@ pub fn playWithOptsValue(vfn: Value, rng: std.Random, mode: Mode, stats: *Stats,
         const dir = bestMoveWithCacheValueOpts(vfn, state, mode, &move_stats, &cache, opts) orelse break;
         stats.leaves += move_stats.leaves;
         stats.hits += move_stats.hits;
+        stats.node_probes += move_stats.node_probes;
+        stats.node_hits += move_stats.node_hits;
         _ = state.move(dir, rng);
         moves += 1;
     }
-    return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves, .leaves = stats.leaves, .board = state.board };
+    return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves, .leaves = stats.leaves, .node_probes = stats.node_probes, .node_hits = stats.node_hits, .board = state.board };
 }
 
 /// One spawn of a game (#168): a board-independent random pick and which of the two values the tile had.
@@ -1453,6 +1612,8 @@ pub fn playTapedWithStatsValue(vfn: Value, rng: std.Random, mode: Mode, tape: *T
     return playTapedWithStatsValueOpts(vfn, rng, mode, tape, stats, .{});
 }
 
+/// `playTapedWithStatsValue` with the search options, so a tape recorded by one policy can be
+/// replayed with a search option (#263's node table) on exactly the same spawns.
 pub fn playTapedWithStatsValueOpts(vfn: Value, rng: std.Random, mode: Mode, tape: *Tape, stats: *Stats, opts: Options) PlayResult {
     var state = GameState.initEmpty();
     _ = tape.spawn(&state, rng);
@@ -1465,11 +1626,13 @@ pub fn playTapedWithStatsValueOpts(vfn: Value, rng: std.Random, mode: Mode, tape
         const dir = bestMoveWithCacheValueOpts(vfn, state, mode, &move_stats, &cache, opts) orelse break;
         stats.leaves += move_stats.leaves;
         stats.hits += move_stats.hits;
+        stats.node_probes += move_stats.node_probes;
+        stats.node_hits += move_stats.node_hits;
         const result = state.slide(dir);
         if (result.changed) _ = tape.spawn(&state, rng);
         moves += 1;
     }
-    return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves, .leaves = stats.leaves, .board = state.board };
+    return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves, .leaves = stats.leaves, .node_probes = stats.node_probes, .node_hits = stats.node_hits, .board = state.board };
 }
 
 /// Paired comparison of two policies on the same spawn tape (#168): `diffs[i]` is `score_b - score_a`
@@ -1701,6 +1864,13 @@ pub const Options = struct {
     sym_leaf: bool = false,
     /// Candidate (#260): omit only a move reward whose next chance node resolves directly to a leaf.
     omit_leaf_reward: bool = false,
+    /// Candidate (#263): reuse completed `Search.value` / `Search.chance` nodes inside one top-level
+    /// search. The table is cleared per move, so the same board/depth/cprob gives the same value as
+    /// without it; `false` (the default) keeps every pre-#263 search bit for bit.
+    node_tt: bool = false,
+    /// Override the spawn-probability cut the mode's phase row would use (`null` = the row's cutoff).
+    /// A measurement needs e.g. `.deep3` at 1e-3 instead of 1e-2 without a second mode (#263/#256).
+    cutoff: ?f64 = null,
     /// Candidate (#183): leaf-evaluation budget of an iterative deepening search, `null` = off. When
     /// set, `bestMoveWithCacheValueOpts` searches depth 2, 3, ... and keeps the best move of the last
     /// iteration that finished inside the budget (`mode` only sets the first depth and the spawn cut).
@@ -3138,6 +3308,147 @@ test "deep3 returns only legal moves on random boards" {
                 try std.testing.expect(!moved.slide(d).changed);
             }
         }
+    }
+}
+
+test "node cache key separates board, kind, depth and a relevant cprob (#263)" {
+    const a = NodeCache.keyFor(mid_board.board, .value, 3, 0.25);
+    var changed = mid_board.board;
+    changed[0][0] = 4;
+    const b = NodeCache.keyFor(changed, .value, 3, 0.25);
+    try std.testing.expect(!std.mem.eql(u8, &a.cells, &b.cells));
+    const kind = NodeCache.keyFor(mid_board.board, .chance, 3, 0.25);
+    try std.testing.expect(a.kind != kind.kind);
+    const depth = NodeCache.keyFor(mid_board.board, .value, 2, 0.25);
+    try std.testing.expect(a.depth != depth.depth);
+    const cprob = NodeCache.keyFor(mid_board.board, .value, 3, 0.5);
+    try std.testing.expect(a.cprob != cprob.cprob);
+
+    // the fixed cut is only tested at chance depth > 1, so value depth <= 2 and chance depth <= 1
+    // never read cprob and deliberately share one key
+    const shallow_value = NodeCache.keyFor(mid_board.board, .value, 2, 0.01);
+    const shallow_chance = NodeCache.keyFor(mid_board.board, .chance, 1, 0.01);
+    try std.testing.expectEqual(@as(f64, 0), shallow_value.cprob);
+    try std.testing.expectEqual(@as(f64, 0), shallow_chance.cprob);
+    const deep_chance = NodeCache.keyFor(mid_board.board, .chance, 2, 0.5);
+    try std.testing.expectEqual(@as(f64, 0.5), deep_chance.cprob);
+}
+
+test "node cache collision is a miss, never another board's value (#263)" {
+    var table: NodeCache = .{};
+    var stats: Stats = .{};
+    const wanted = NodeCache.keyFor(mid_board.board, .value, 3, 0.25);
+    const other = NodeCache.keyFor(late_board.board, .value, 3, 0.25);
+    // force the two keys into one slot, as a hash collision would
+    table.entries[NodeCache.slotOf(wanted)] = .{ .key = other, .result = .{ .value = 99 } };
+    try std.testing.expect(table.get(wanted, &stats) == null);
+    try std.testing.expectEqual(@as(u64, 1), stats.node_probes);
+    try std.testing.expectEqual(@as(u64, 0), stats.node_hits);
+
+    table.put(wanted, .{ .value = 1.5 });
+    try std.testing.expectEqual(@as(f64, 1.5), table.get(wanted, &stats).?.value);
+    try std.testing.expectEqual(@as(u64, 1), stats.node_hits);
+    try std.testing.expect(table.get(NodeCache.keyFor(mid_board.board, .value, 2, 0.25), &stats) == null);
+    try std.testing.expect(table.get(NodeCache.keyFor(mid_board.board, .chance, 3, 0.25), &stats) == null);
+    try std.testing.expect(table.get(NodeCache.keyFor(mid_board.board, .value, 3, 0.5), &stats) == null);
+}
+
+test "node cache slot is 48 bytes and the table size follows the capacity (#263)" {
+    try std.testing.expectEqual(@as(usize, 48), @sizeOf(NodeCache.Entry));
+    try std.testing.expectEqual(@as(usize, NodeCache.capacity) * 48, @sizeOf(NodeCache));
+    const expected = if (builtin.target.cpu.arch.isWasm()) 512 else 4096;
+    try std.testing.expectEqual(@as(usize, expected), NodeCache.capacity);
+}
+
+test "node cache keeps the direct-leaf flag (#263/#260)" {
+    var table: NodeCache = .{};
+    var stats: Stats = .{};
+    const key = NodeCache.keyFor(mid_board.board, .chance, 3, 0.25);
+    table.put(key, .{ .value = -0.25, .direct_leaf = true });
+    const got = table.get(key, &stats).?;
+    try std.testing.expectEqual(@as(f64, -0.25), got.value);
+    try std.testing.expect(got.direct_leaf);
+}
+
+test "node table is cleared at the start of every top-level search (#263)" {
+    const weights = try parse(@embedFile("nn_weights.bin"));
+    const vfn: Value = .{ .single = &weights };
+    var cache: ValueCache = .{};
+    var stats: Stats = .{};
+    const table = sharedNodeCache();
+    // a depth no 3-ply search can store, so only the per-search clear can remove it
+    const stale = NodeCache.keyFor(late_board.board, .value, 200, 1);
+    table.put(stale, .{ .value = 123 });
+    _ = bestMoveWithCacheValueOpts(vfn, mid_board, .deep3, &stats, &cache, .{ .node_tt = true });
+    try std.testing.expect(table.get(stale, &stats) == null);
+
+    // off by default: no probes and no clear, so the table is untouched
+    table.put(stale, .{ .value = 123 });
+    var off_stats: Stats = .{};
+    _ = bestMoveWithCacheValueOpts(vfn, mid_board, .deep3, &off_stats, &cache, .{});
+    try std.testing.expectEqual(@as(u64, 0), off_stats.node_probes);
+    try std.testing.expectEqual(@as(f64, 123), table.get(stale, &off_stats).?.value);
+}
+
+test "node cache withholds a node from a budget-exhausted search (#263)" {
+    var prng = std.Random.DefaultPrng.init(263);
+    const net = Net.init(prng.random());
+    const vfn: Value = .{ .single = &net };
+    var cache: ValueCache = .{};
+    var table: NodeCache = .{};
+    var search: Search = .{ .vfn = vfn, .cache = &cache, .cutoff = deep3_cutoff, .ply = 3, .nodes = &table };
+    search.nodes_left = 3;
+    _ = search.value(mid_board, 3, 1);
+    try std.testing.expect(search.out_of_budget);
+    try std.testing.expect(table.get(NodeCache.keyFor(mid_board.board, .value, 3, 1), &search.stats) == null);
+
+    // a completed rerun of the same root stores it
+    search = .{ .vfn = vfn, .cache = &cache, .cutoff = deep3_cutoff, .ply = 3, .nodes = &table };
+    _ = search.value(mid_board, 3, 1);
+    try std.testing.expect(!search.out_of_budget);
+    try std.testing.expect(table.get(NodeCache.keyFor(mid_board.board, .value, 3, 1), &search.stats) != null);
+}
+
+test "node cache values match a fresh search at the same cprob (#263)" {
+    const weights = try parse(@embedFile("nn_weights.bin"));
+    const vfn: Value = .{ .single = &weights };
+    inline for ([_]struct { depth: u8, cprob: f64 }{
+        .{ .depth = 2, .cprob = 0.37 },
+        .{ .depth = 3, .cprob = 0.37 },
+        .{ .depth = 3, .cprob = 1 },
+    }) |case| {
+        var plain_leaf: ValueCache = .{};
+        var cached_leaf: ValueCache = .{};
+        var table: NodeCache = .{};
+        var plain: Search = .{ .vfn = vfn, .cache = &plain_leaf, .cutoff = deep3_cutoff, .ply = 3 };
+        var cached: Search = .{ .vfn = vfn, .cache = &cached_leaf, .cutoff = deep3_cutoff, .ply = 3, .nodes = &table };
+        const want = plain.value(mid_board, case.depth, case.cprob);
+        const got = cached.value(mid_board, case.depth, case.cprob);
+        try std.testing.expectApproxEqAbs(want, got, 1e-12);
+        try std.testing.expectEqual(got, cached.value(mid_board, case.depth, case.cprob));
+        try std.testing.expect(cached.stats.node_hits >= 1);
+    }
+}
+
+test "node cache keeps the chosen move along a game (#263)" {
+    const weights = try parse(@embedFile("nn_weights.bin"));
+    const vfn: Value = .{ .single = &weights };
+    var prng = std.Random.DefaultPrng.init(263);
+    const random = prng.random();
+    var state = GameState.gameStart(random);
+    var plain_leaf: ValueCache = .{};
+    var cached_leaf: ValueCache = .{};
+    for (0..3) |i| {
+        const mode: Mode = if (i == 0) .deep3 else .deep;
+        var plain_stats: Stats = .{};
+        var cached_stats: Stats = .{};
+        const plain = bestMoveWithCacheValueOpts(vfn, state, mode, &plain_stats, &plain_leaf, .{});
+        const cached = bestMoveWithCacheValueOpts(vfn, state, mode, &cached_stats, &cached_leaf, .{ .node_tt = true });
+        try std.testing.expectEqual(plain, cached);
+        const dir = plain orelse break;
+        var moved = state;
+        try std.testing.expect(moved.slide(dir).changed);
+        _ = state.move(dir, random);
     }
 }
 
@@ -5161,7 +5472,7 @@ test "id_budget adopts a monotonically deeper ply as the budget grows (#183)" {
     for ([_]usize{ 0, 200, 2_000, 20_000 }) |budget| {
         var stats: Stats = .{};
         var cache: ValueCache = .{};
-        const got = deepMoveId(vfn, mid_board, &stats, &cache, phaseDepth(.deep, mid_board.board), budget, false, null, 0, null);
+        const got = deepMoveId(vfn, mid_board, &stats, &cache, null, phaseDepth(.deep, mid_board.board), budget, false, null, 0, null);
         try std.testing.expect(got.ply >= previous);
         try std.testing.expectEqual(got.leaves, stats.leaves);
         previous = got.ply;
@@ -5178,11 +5489,11 @@ test "id_margin stops the deepening when the start depth's move is not a near ti
     // a huge budget and a zero margin: any positive gap at ply 2 ends the search at ply 2
     var tight_stats: Stats = .{};
     var tight_cache: ValueCache = .{};
-    const tight = deepMoveId(vfn, mid_board, &tight_stats, &tight_cache, phaseDepth(.deep, mid_board.board), 5_000_000, false, null, 0, 0);
+    const tight = deepMoveId(vfn, mid_board, &tight_stats, &tight_cache, null, phaseDepth(.deep, mid_board.board), 5_000_000, false, null, 0, 0);
     // without the margin the same budget goes deeper, so the cut is what saved the leaves
     var open_stats: Stats = .{};
     var open_cache: ValueCache = .{};
-    const open = deepMoveId(vfn, mid_board, &open_stats, &open_cache, phaseDepth(.deep, mid_board.board), 5_000_000, false, null, 0, null);
+    const open = deepMoveId(vfn, mid_board, &open_stats, &open_cache, null, phaseDepth(.deep, mid_board.board), 5_000_000, false, null, 0, null);
     try std.testing.expect(tight.ply == 2);
     try std.testing.expect(open.ply > tight.ply);
     try std.testing.expect(tight.leaves < open.leaves);
@@ -5194,11 +5505,11 @@ test "id_margin = null and a wide margin keep every iteration (#188)" {
     const vfn: Value = .{ .single = &net };
     var plain_stats: Stats = .{};
     var plain_cache: ValueCache = .{};
-    const plain = deepMoveId(vfn, mid_board, &plain_stats, &plain_cache, phaseDepth(.deep, mid_board.board), 200_000, false, null, 0, null);
+    const plain = deepMoveId(vfn, mid_board, &plain_stats, &plain_cache, null, phaseDepth(.deep, mid_board.board), 200_000, false, null, 0, null);
     // a margin no root gap can exceed never triggers the cut, so the search is the same one
     var wide_stats: Stats = .{};
     var wide_cache: ValueCache = .{};
-    const wide = deepMoveId(vfn, mid_board, &wide_stats, &wide_cache, phaseDepth(.deep, mid_board.board), 200_000, false, null, 0, 1e9);
+    const wide = deepMoveId(vfn, mid_board, &wide_stats, &wide_cache, null, phaseDepth(.deep, mid_board.board), 200_000, false, null, 0, 1e9);
     try std.testing.expectEqual(plain.dir, wide.dir);
     try std.testing.expectEqual(plain.ply, wide.ply);
     try std.testing.expectEqual(plain.leaves, wide.leaves);
