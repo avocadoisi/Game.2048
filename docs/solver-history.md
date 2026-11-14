@@ -3653,3 +3653,49 @@ wasm は `zig build wasm -Doptimize=ReleaseFast` で、変更前 540,957 B（初
 ```
 zig build nn -Doptimize=ReleaseFast -- 0 10 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 4,15
 ```
+
+### node TT 付き 4-ply は同じ tape で負け、探索コストは約26倍（#267）
+
+#255 で `deep3` が既定の 2-ply を上回り、#263 では node TT が同じ手のまま `deep3` を 39.5% 速くした。
+この節では、節約した時間を 1 ply 深くするのに使えるかを確かめるため、`deep3` にもう 1 手と spawn 層を
+足した `deep4`（`ply=4`、cutoff は `deep3` と同じ 1e-2）に node TT を組み合わせ、row 15
+（`deep3` + node TT、既定）と同じ net・同じ #237 32-bit spawn tape で比較した。既定方策・同梱重みは
+変更していない。`deep4` は評価専用の row 17、比較は同じプロセスで A/B を順に打つ一時的な
+`pairrow` variant として追加した。
+
+seed 9000 の 1 局を同じ tape で打った結果は次のとおり。A は row 15、B は row 17。
+
+| 方策 | row | avg score | moves | reach8192 | leaves/move | ms/move |
+|---|---:|---:|---:|---:|---:|---:|
+| `deep3` + node TT（既定） | 15 | 174,680 | 7,267 | 1/1 | 10,352.5 | 77.67* |
+| `deep4` + node TT | 17 | 130,656 | 5,423 | 1/1 | 253,901.0 | 2,015.90* |
+
+\* 10 局スクリーニングを 10 並列で走らせた中の値で、絶対値は CPU 競合で膨らんでいる。同じ run の
+B/A 比は ms/move で 25.95 倍、leaves/move で 24.53 倍。10 並列を始める前のクリーンな row 15 は
+12.80 ms/move（#266）なので、4-ply の絶対コストはこの表の値よりかなり小さい可能性があるが、
+それでも 3-ply の 20 倍前後という探索量の増加と整合する。
+
+B は A より 44,024 点低く、手数も 5,423 対 7,267 と短い。10 局スクリーニングは 10 本の
+単局プロセス（seed 9000–9009）で開始したが、3 時間 22 分時点で B の完了が 1 局もなく、
+1 局あたりのコストが非現実的なため 9 本を停止した。残した seed 9000 の 1 本は起動から約 4 時間で
+完了し、上記の結果になった。1 局目で明確に負け、コストも約 26 倍だったため、10 局への延長、
+20 局ペア、seed 9100 の非ペア測定は行っていない。したがってこの節の結果は統計的有意差ではなく、
+「この実装の 4-ply は採用候補にならない」というスクリーニング判定である。
+
+探索葉の増加は、空き 4/6/8 の probe で `deep3` の 20.1/21.8/22.6 倍だった。`deep4` は
+1 手あたり約 20 倍の葉を読むため、node TT があっても既定の 3-ply と同じ時間予算には収まらない。
+**不採用**。row 17 と `pairrow` は再現・将来の高速化用に opt-in で残し、既定 policy と
+`nn_weights.bin` は変更しない。
+
+再現（1 局。A = row 15、B = row 17。B は数時間かかることがある）:
+```
+zig build nn -Doptimize=ReleaseFast -- 0 1 9000 0.003 - pairrow 30 ai/solver/nn_weights.bin 1 - 15 17
+```
+10 局スクリーニングは、同じコマンドの seed だけを 9000–9009 に変えた単局プロセスを 10 本並列で
+走らせた（スコア比較用。ms/move の測定には使わない）。
+
+テストは `zig build test` と
+`zig build test-nn -Dtest-filter='deep4 searches one row'`、
+`zig build test-nn-main -Dtest-filter='pairrow reads two eval row indices'` を通した。
+`deep4` の phase 行が全空き数で `ply=4`・cutoff 1e-2 になること、`deep4` が `deep3` より多い葉を
+読むこと、row 17 が `deep4` + node TT に対応すること、`pairrow` が row 3 を拒否することを固定した。

@@ -72,6 +72,9 @@ const usage =
     \\                B = the path after the `-` par slot with `deep`, same spawn tape per game
     \\  pairleaf      (#260) A = current, B = omit the last reward before a leaf; same spawn tape,
     \\                optional search mode `deep` (default) or `deep3` at arg 12
+    \\  pairrow       (#267) paired comparison of two eval rows: A = the row index at the dump slot
+    \\                (arg 11), B = the index at arg 12, same net and spawn tape; prints per-side
+    \\                avg score, reach8192, leaves/move and serially measured ms/move
     \\  leaf          (#260) eval-only candidate; rows 2 (`deep`) and 4 (`deep3`) omit the leaf reward
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
     \\                game i uses seed train_seed + i and the batch result is the mean of its games.
@@ -417,6 +420,40 @@ fn parsePairLeafMode(arg: ?[]const u8) ?nn.Mode {
     return null;
 }
 
+/// `pairrow` row index (#267): a 0-based index into `all_rows`, so `15` is the shipped 3-ply row.
+fn parsePairRow(arg: ?[]const u8) ?usize {
+    const text = arg orelse return null;
+    return std.fmt.parseInt(usize, std.mem.trim(u8, text, " "), 10) catch null;
+}
+
+/// The search a `pairrow` eval row runs (#267). This mirrors the `playGame` switch, but takes no
+/// training options: the pair is evaluated on the loaded net and the same spawn tape.
+const EvalRowSpec = struct { mode: nn.Mode, opts: nn.Options = .{} };
+
+fn evalRowSpec(policy: usize) ?EvalRowSpec {
+    return switch (policy) {
+        0 => .{ .mode = .greedy },
+        1 => .{ .mode = .chance },
+        2 => .{ .mode = .deep },
+        // row 3 is the expectimax baseline, not an NN search; `pairrow` refuses it
+        4 => .{ .mode = .deep3, .opts = .{ .node_tt = false } }, // #266: explicit TT-off baseline
+        5 => .{ .mode = .phase_h1 },
+        6 => .{ .mode = .phase_h2 },
+        7 => .{ .mode = .phase_h3 },
+        8 => .{ .mode = .phase_h4 },
+        9 => .{ .mode = .deep_mass },
+        10 => .{ .mode = .deep, .opts = .{ .sym_leaf = true } },
+        11 => .{ .mode = .deep, .opts = .{ .id_budget = 200_000 } },
+        12 => .{ .mode = .deep, .opts = .{ .rerank = .{ .margin = 0.05, .weight = 0.5, .score = &snakeScore } } },
+        13 => .{ .mode = .deep, .opts = .{ .risk_weight = 0.3 } },
+        14 => .{ .mode = .deep, .opts = .{ .id_budget = 200_000, .id_margin = 0.05 } },
+        15 => .{ .mode = .deep3, .opts = .{} }, // #266 default node TT
+        16 => .{ .mode = .deep3, .opts = .{ .cutoff = 1e-3 } },
+        17 => .{ .mode = .deep4, .opts = .{ .node_tt = true } }, // #267
+        else => null,
+    };
+}
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     // `zig build nn` without `--` used to run the defaults (2000 games, write weights_path = the shipped
@@ -452,6 +489,7 @@ pub fn main(init: std.process.Init) !void {
     // the same policy, so a candidate net is judged against the shipped one on identical spawns.
     const is_pairw = std.mem.eql(u8, variant, "pairw");
     const is_pairleaf = std.mem.eql(u8, variant, "pairleaf");
+    const is_pairrow = std.mem.eql(u8, variant, "pairrow");
     const is_leaf = std.mem.eql(u8, variant, "leaf");
     const leaf_mode: nn.Mode = if (is_pairleaf) parsePairLeafMode(if (args.len > 11) args[11] else null) orelse {
         std.debug.print("pairleaf mode must be deep or deep3\\n{s}", .{usage});
@@ -499,7 +537,7 @@ pub fn main(init: std.process.Init) !void {
     const batch_scale: f64 = if (use_par) try parseBatchScale(args) else 1.0;
     // `use_resume` only decides whether `weights_path` is loaded; the variant still has to reach `opts`
     // (before, `dump`/`ft2`/`restart`/`dist` fell into this first branch and their options were dropped).
-    var opts: nn.Options = if (par_variant or is_pair or is_pairw or is_pairleaf or std.mem.eql(u8, variant, "base") or std.mem.eql(u8, variant, "resume") or is_tch)
+    var opts: nn.Options = if (par_variant or is_pair or is_pairw or is_pairleaf or is_pairrow or std.mem.eql(u8, variant, "base") or std.mem.eql(u8, variant, "resume") or is_tch)
         .{ .batch_scale = batch_scale }
     else if (is_leaf)
         .{ .omit_leaf_reward = true }
@@ -579,9 +617,9 @@ pub fn main(init: std.process.Init) !void {
     // (#203) index 13 narrows the eval table to the rows a measurement needs (`0,2`); `dist`/`dson`
     // already own 13 as the teacher lr divisor, `adam` as its step size, and `pairw` returns before the
     // table is built.
-    const row_spec: ?[]const u8 = if (is_dist or is_dson or is_adam or is_tailw or is_clamp or is_clip or is_pairw or is_pair or is_pairleaf) null else if (args.len > 13) args[13] else null;
-    const max_args: usize = if (is_clip) 15 else if (is_dist or is_dson or is_adam or is_tailw or is_clamp) 14 else if (row_spec != null) 14 else if (is_ft2 or is_tch) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw or is_pairleaf) 12 else 11;
-    if (args.len > max_args or seed_ranges == 0 or (uses_dump and dump_path == null) or ((is_pairleaf or is_leaf) and train_games != 0)) {
+    const row_spec: ?[]const u8 = if (is_dist or is_dson or is_adam or is_tailw or is_clamp or is_clip or is_pairw or is_pair or is_pairleaf or is_pairrow) null else if (args.len > 13) args[13] else null;
+    const max_args: usize = if (is_clip) 15 else if (is_dist or is_dson or is_adam or is_tailw or is_clamp) 14 else if (row_spec != null) 14 else if (is_ft2 or is_tch) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw or is_pairleaf) 12 else if (is_pairrow) 13 else 11;
+    if (args.len > max_args or seed_ranges == 0 or (uses_dump and dump_path == null) or ((is_pairleaf or is_leaf or is_pairrow) and train_games != 0)) {
         std.debug.print("{s}", .{usage});
         return;
     }
@@ -763,6 +801,9 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "nn 3-ply + node TT default (#266)", .policy = 15 },
         // #263: the same table at a 1e-3 spawn cut: the time the table saved, spent on a wider tree.
         .{ .name = "nn 3-ply 1e-3 + node TT (#263)", .policy = 16 },
+        // #267: `deep4`, one more own move and spawn layer than row 15 at the same 1e-2 cut, with the
+        // node table on. A/B against row 15 answers whether the saved time buys a deeper tree.
+        .{ .name = "nn 4-ply + node TT (#267)", .policy = 17 },
     };
     // Rows are all on by default; `rows` (arg 13, #203) keeps the two a measurement needs
     // (0 = 1-ply, 2 = 2-ply) instead of paying for the 3-ply rows twice over. A stray token is a
@@ -801,7 +842,39 @@ pub fn main(init: std.process.Init) !void {
         try nn.load(&net_b, init.io, init.gpa, args[11]);
         break :blk .{ .single = &net_b };
     } else eval_value;
-    if (is_pair or is_pairw or is_pairleaf) {
+    var pair_spec_a: ?EvalRowSpec = null;
+    var pair_spec_b: ?EvalRowSpec = null;
+    var pair_name_a: []const u8 = "";
+    var pair_name_b: []const u8 = "";
+    if (is_pairrow) {
+        if (args.len <= 12) {
+            std.debug.print("pairrow needs two eval row indices after the `-` par slot (e.g. `- 15 17`)\n{s}", .{usage});
+            return;
+        }
+        const row_a = parsePairRow(args[11]) orelse {
+            std.debug.print("pairrow row A must be an eval row index, got `{s}`\n{s}", .{ args[11], usage });
+            return;
+        };
+        const row_b = parsePairRow(args[12]) orelse {
+            std.debug.print("pairrow row B must be an eval row index, got `{s}`\n{s}", .{ args[12], usage });
+            return;
+        };
+        if (row_a >= all_rows.len or row_b >= all_rows.len) {
+            std.debug.print("pairrow rows must be 0..{d}, got {d} and {d}\n{s}", .{ all_rows.len - 1, row_a, row_b, usage });
+            return;
+        }
+        pair_name_a = all_rows[row_a].name;
+        pair_name_b = all_rows[row_b].name;
+        pair_spec_a = evalRowSpec(all_rows[row_a].policy) orelse {
+            std.debug.print("pairrow row {d} ({s}) is not an NN search row\n{s}", .{ row_a, pair_name_a, usage });
+            return;
+        };
+        pair_spec_b = evalRowSpec(all_rows[row_b].policy) orelse {
+            std.debug.print("pairrow row {d} ({s}) is not an NN search row\n{s}", .{ row_b, pair_name_b, usage });
+            return;
+        };
+    }
+    if (is_pair or is_pairw or is_pairleaf or is_pairrow) {
         const pair_games = eval_games * seed_ranges;
         const spawns = try init.gpa.alloc(nn.Spawn, 20_000);
         defer init.gpa.free(spawns);
@@ -809,23 +882,67 @@ pub fn main(init: std.process.Init) !void {
         defer init.gpa.free(diffs);
         var pair_rng = std.Random.DefaultPrng.init(eval_seed);
         const start_pair = std.Io.Clock.awake.now(init.io);
+        var a_ns: u64 = 0;
+        var b_ns: u64 = 0;
+        var a_moves: u64 = 0;
+        var b_moves: u64 = 0;
+        var a_score: u64 = 0;
+        var b_score: u64 = 0;
+        var a_leaves: u64 = 0;
+        var b_leaves: u64 = 0;
+        var a_reach_8192: usize = 0;
+        var b_reach_8192: usize = 0;
         for (0..pair_games) |i| {
             var tape = nn.Tape.initRecord(spawns);
             const pair_mode = if (is_pairleaf) leaf_mode else .deep;
-            const a = nn.playTapedValue(eval_value, pair_rng.random(), pair_mode, &tape);
+            const a_start = std.Io.Clock.awake.now(init.io);
+            const a = if (is_pairrow)
+                nn.playTapedValueOpts(eval_value, pair_rng.random(), pair_spec_a.?.mode, &tape, pair_spec_a.?.opts)
+            else
+                nn.playTapedValue(eval_value, pair_rng.random(), pair_mode, &tape);
+            const a_ns_i: u64 = @intCast(a_start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds());
             var replay = nn.Tape.initReplay(spawns[0..tape.len]);
-            const b = if (is_pairw)
+            const b_start = std.Io.Clock.awake.now(init.io);
+            const b = if (is_pairrow)
+                nn.playTapedValueOpts(eval_value, pair_rng.random(), pair_spec_b.?.mode, &replay, pair_spec_b.?.opts)
+            else if (is_pairw)
                 nn.playTapedValue(pair_b_value, pair_rng.random(), .deep, &replay)
             else if (is_pairleaf)
                 nn.playTapedValueOpts(eval_value, pair_rng.random(), leaf_mode, &replay, .{ .omit_leaf_reward = true })
             else
                 nn.playTapedValue(eval_value, pair_rng.random(), .deep3, &replay);
+            const b_ns_i: u64 = @intCast(b_start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds());
             diffs[i] = @as(f64, @floatFromInt(b.score)) - @as(f64, @floatFromInt(a.score));
-            std.debug.print("pair {d}: A={d} ({d}) B={d} ({d}) diff={d:.0}\n", .{ i, a.score, a.moves, b.score, b.moves, diffs[i] });
+            a_ns += a_ns_i;
+            b_ns += b_ns_i;
+            a_moves += a.moves;
+            b_moves += b.moves;
+            a_score += a.score;
+            b_score += b.score;
+            a_leaves += a.leaves;
+            b_leaves += b.leaves;
+            if (a.max_tile >= 8192) a_reach_8192 += 1;
+            if (b.max_tile >= 8192) b_reach_8192 += 1;
+            if (is_pairrow) {
+                const a_ms = @as(f64, @floatFromInt(a_ns_i)) / 1e6 / @as(f64, @floatFromInt(a.moves));
+                const b_ms = @as(f64, @floatFromInt(b_ns_i)) / 1e6 / @as(f64, @floatFromInt(b.moves));
+                std.debug.print("pair {d}: A={d} ({d}) B={d} ({d}) diff={d:.0} A={d:.2} ms/move B={d:.2} ms/move\n", .{ i, a.score, a.moves, b.score, b.moves, diffs[i], a_ms, b_ms });
+            } else {
+                std.debug.print("pair {d}: A={d} ({d}) B={d} ({d}) diff={d:.0}\n", .{ i, a.score, a.moves, b.score, b.moves, diffs[i] });
+            }
         }
         const st = nn.pairStats(diffs);
         const elapsed = start_pair.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
         std.debug.print("pair A vs B: games={d} mean diff={d:.1} ± {d:.1} (stderr) better={d} worse={d} elapsed={d:.1} s\n", .{ st.games, st.mean, st.stderr, st.better, st.worse, @as(f64, @floatFromInt(elapsed)) / 1e9 });
+        if (is_pairrow) {
+            const n: f64 = @floatFromInt(pair_games);
+            const a_ms = @as(f64, @floatFromInt(a_ns)) / 1e6 / @as(f64, @floatFromInt(a_moves));
+            const b_ms = @as(f64, @floatFromInt(b_ns)) / 1e6 / @as(f64, @floatFromInt(b_moves));
+            const a_lpm = @as(f64, @floatFromInt(a_leaves)) / @as(f64, @floatFromInt(a_moves));
+            const b_lpm = @as(f64, @floatFromInt(b_leaves)) / @as(f64, @floatFromInt(b_moves));
+            std.debug.print("pairrow A={s}: avg={d:.1} reach8192={d}/{d} leaves/move={d:.1} ms/move={d:.2}\n", .{ pair_name_a, @as(f64, @floatFromInt(a_score)) / n, a_reach_8192, pair_games, a_lpm, a_ms });
+            std.debug.print("pairrow B={s}: avg={d:.1} reach8192={d}/{d} leaves/move={d:.1} ms/move={d:.2}\n", .{ pair_name_b, @as(f64, @floatFromInt(b_score)) / n, b_reach_8192, pair_games, b_lpm, b_ms });
+        }
         return;
     }
     const EvalCtx = struct { vfn: nn.Value, policy: usize, eval_seed: u64, opts: nn.Options };
@@ -871,6 +988,8 @@ pub fn main(init: std.process.Init) !void {
                 15 => nn.playValueOpts(c.vfn, prng.random(), .deep3, .{}),
                 // #263: the table's saved time spent on a wider spawn cut (1e-3 instead of 1e-2)
                 16 => nn.playValueOpts(c.vfn, prng.random(), .deep3, .{ .cutoff = 1e-3 }),
+                // #267: one more ply than row 15 at the same cut, node TT explicitly on
+                17 => nn.playValueOpts(c.vfn, prng.random(), .deep4, .{ .node_tt = true }),
                 else => unreachable,
             };
         }
@@ -925,6 +1044,22 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print(" nodeTT probes={d} hits={d} hit_rate={d:.1}%\n", .{ r.node_probes, r.node_hits, 100 * @as(f64, @floatFromInt(r.node_hits)) / probes });
         }
     }
+}
+
+test "pairrow reads two eval row indices and maps row 17 to deep4 (#267)" {
+    try std.testing.expectEqual(@as(?usize, 15), parsePairRow("15"));
+    try std.testing.expectEqual(@as(?usize, 17), parsePairRow(" 17 "));
+    try std.testing.expectEqual(@as(?usize, null), parsePairRow("deep4"));
+    try std.testing.expectEqual(@as(?usize, null), parsePairRow(null));
+    try std.testing.expectEqual(nn.Mode.deep3, evalRowSpec(15).?.mode);
+    try std.testing.expectEqual(nn.Mode.deep4, evalRowSpec(17).?.mode);
+    try std.testing.expectEqual(@as(?bool, true), evalRowSpec(17).?.opts.node_tt);
+    try std.testing.expect(evalRowSpec(3) == null);
+}
+
+test "usage text lists the pairrow variant (#267)" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "pairrow") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "15") != null);
 }
 
 test "train seed argument (position 9) is optional and defaults to 1" {

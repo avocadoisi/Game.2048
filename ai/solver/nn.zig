@@ -1048,7 +1048,8 @@ fn rerankScore(r: Rerank, state: GameState, d: Direction) f64 {
 
 /// `depth.ply` own moves deep: my move -> spawn -> ... -> afterstate value + score_delta/reward_scale.
 /// `ply` 2 is `deep` (full width); `ply` 3 is `deep3`, whose cost only fits with a spawn-probability cut;
-/// `ply` 4 is `phase_h4` (#171), which only ever runs where the board is nearly full.
+/// `ply` 4 is `deep4` (#267) or `phase_h4` (#171), the former everywhere at that cut and the latter
+/// only where the board is nearly full.
 fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, nodes: ?*NodeCache, depth: Depth, sym_leaf: bool, rerank: ?Rerank, risk_weight: f64) ?Direction {
     var search = newSearch(vfn, cache, nodes, depth, sym_leaf, risk_weight);
     defer stats.* = search.stats;
@@ -1241,6 +1242,8 @@ pub const Mode = enum {
     deep,
     /// 3-ply: `deep` plus one more own move and spawn layer, with the probability cut (issue #108).
     deep3,
+    /// 4-ply: `deep3` plus one more own move and spawn layer at the same 1e-2 cut (#267).
+    deep4,
     /// 2-ply with the cumulative-mass cut of #182 instead of the fixed probability cut: the same tree as
     /// `deep`, minus the lowest-probability spawn branches up to `mass2_ply_cutoff` of each node's mass.
     deep_mass,
@@ -1279,6 +1282,9 @@ const mass2_ply_cutoff: f64 = 0.05;
 const phase_schedules = struct {
     const deep = [_]Phase{.{ .min_empty = 0, .ply = 2, .cutoff = full_width_cutoff }};
     const deep3 = [_]Phase{.{ .min_empty = 0, .ply = 3, .cutoff = deep3_cutoff }};
+    /// #267: one row, `deep3` plus one more own move and spawn layer at the same cut, so the only
+    /// difference from `deep3` is the extra ply.
+    const deep4 = [_]Phase{.{ .min_empty = 0, .ply = 4, .cutoff = deep3_cutoff }};
     /// #182: one row, the `deep` tree with the cumulative-mass cut
     const deep_mass = [_]Phase{.{ .min_empty = 0, .ply = 2, .cutoff = full_width_cutoff, .mass_cutoff = mass2_ply_cutoff }};
     const phase_h1 = [_]Phase{
@@ -1310,6 +1316,7 @@ fn schedule(mode: Mode) []const Phase {
         .greedy, .chance => &.{},
         .deep => &phase_schedules.deep,
         .deep3 => &phase_schedules.deep3,
+        .deep4 => &phase_schedules.deep4,
         .deep_mass => &phase_schedules.deep_mass,
         .phase_h1 => &phase_schedules.phase_h1,
         .phase_h2 => &phase_schedules.phase_h2,
@@ -1407,7 +1414,7 @@ pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stat
     if (opts.id_budget) |budget| {
         const dir = switch (mode) {
             .greedy, .chance => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
-            .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMoveId(vfn, state, stats, cache, nodes, depth, budget, opts.sym_leaf, opts.rerank, opts.risk_weight, opts.id_margin).dir,
+            .deep, .deep3, .deep4, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMoveId(vfn, state, stats, cache, nodes, depth, budget, opts.sym_leaf, opts.rerank, opts.risk_weight, opts.id_margin).dir,
         };
         // a budget too small for one full iteration still has to answer with a legal move
         return dir orelse firstLegalMove(state);
@@ -1416,7 +1423,7 @@ pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stat
         .greedy => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
         .chance => chanceMove(vfn, state),
         // every search mode takes its (ply, cutoff, mass cutoff) for this board from the phase table (#157)
-        .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, nodes, depth, opts.sym_leaf, opts.rerank, opts.risk_weight),
+        .deep, .deep3, .deep4, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, nodes, depth, opts.sym_leaf, opts.rerank, opts.risk_weight),
     };
 }
 
@@ -3514,7 +3521,7 @@ test "mass cutoff is off at 0 and full width at 1 (#182)" {
     const net = Net.init(prng.random());
     const vfn: Value = .{ .single = &net };
     // (a) the phase rows carry no mass cut, so `.deep` / `.deep3` search what they searched before
-    for ([_]Mode{ .deep, .deep3, .phase_h1, .phase_h2, .phase_h3, .phase_h4 }) |mode| {
+    for ([_]Mode{ .deep, .deep3, .deep4, .phase_h1, .phase_h2, .phase_h3, .phase_h4 }) |mode| {
         try std.testing.expectEqual(@as(f64, 0), phaseDepth(mode, mid_board.board).mass_cutoff);
     }
     var plain_cache: ValueCache = .{};
@@ -3587,7 +3594,7 @@ test "risk weight 0 is the plain expectation, bit for bit (#187)" {
     const net = Net.init(prng.random());
     const vfn: Value = .{ .single = &net };
     // every existing phase row carries no risk weight, so the phase table is unchanged
-    for ([_]Mode{ .deep, .deep3, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 }) |mode| {
+    for ([_]Mode{ .deep, .deep3, .deep4, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 }) |mode| {
         try std.testing.expectEqual(@as(f64, 0), phaseDepth(mode, mid_board.board).risk_weight);
     }
     var plain_cache: ValueCache = .{};
@@ -3763,6 +3770,26 @@ test "phase h4 depth 4 only in the last two empty cells (#171)" {
     _ = bestMoveWithStats(&net, endgame, .deep3, &deep3_stats);
     try std.testing.expect(h4_move != null);
     try std.testing.expect(h4_stats.leaves > deep3_stats.leaves);
+}
+
+test "deep4 searches one row at 4-ply and the deep3 cutoff (#267)" {
+    // every empty-cell count uses the same row: the extra ply is the only difference from `deep3`
+    for (0..17) |empties| {
+        try std.testing.expectEqual(
+            Depth{ .ply = 4, .cutoff = deep3_cutoff },
+            phaseDepth(.deep4, boardWithEmpties(empties)),
+        );
+    }
+    // and the extra ply is really searched, even where `phase_h4` would still be at 3-ply
+    var prng = std.Random.DefaultPrng.init(267);
+    const net = Net.init(prng.random());
+    const midgame: GameState = .{ .board = boardWithEmpties(3) };
+    var deep4_stats: Stats = .{};
+    var deep3_stats: Stats = .{};
+    const deep4_move = bestMoveWithStats(&net, midgame, .deep4, &deep4_stats);
+    _ = bestMoveWithStats(&net, midgame, .deep3, &deep3_stats);
+    try std.testing.expect(deep4_move != null);
+    try std.testing.expect(deep4_stats.leaves > deep3_stats.leaves);
 }
 
 test "phase_h4 leaves the earlier schedules alone (#171)" {
