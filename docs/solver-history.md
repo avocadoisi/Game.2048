@@ -3825,3 +3825,53 @@ zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 100 0 9000 0.003 1 rsym 
 コスト: base 100k が 767 s、rsym の発散は par 0.2 s / serial 数秒、lr/8 の 5k smoke が 4.4 s。
 pairw は rsym の checkpoint ができないため未実施。`zig build test` は既存の checksum テストを
 含めて全通過。
+
+## 入力と目標を同じ対称変換で回す rtgt も avg score を下げる（#273）
+
+#271 の rsym は入力だけを回し、TD 目標 `r + V(s')` の `s'` は正準のままだった。この節では、
+1 手につき 1 回だけ `k` を引き、入力 `p.after` と目標の次盤面 `next.after` を同じ `T_k` で回す
+`rtgt` を試した。`t2`/teacher では `spawned`（post-spawn 盤）を同じ `k` で回す。終端の目標は
+`p.reward` だけで、回さない。`base` は rng を引かず、更新も従来と同一。`rsym` の意味は変えない。
+
+実装は `nn.Options.rtgt`（既定 false）と CLI variant `rtgt`。`trainGamePerMove` の
+非終端・終端更新を `tdUpdate`/`tdTerminalUpdate` に切り出し、`updateSym` が 1 回だけ
+`k = rng.uintLessThan(usize, symmetry_count)` を引いて入力と目標の両方に渡す。`tdBootstrap` は
+`next_sym` を受け取り、`td1` は `V(T_k next.after)`、`t2`/teacher は `T_k spawned` を評価する。
+`par` も同じ経路を通る。
+
+正しさ: 非対称な盤面で k=0..7 を固定した rng から作り、各 k の `tdUpdate` が
+`trainStep(T_k(after), reward + V(T_k(next)), ...)` と一致することをテストした。k=0 は base と
+一致し、base が rng を引かないことも確認した。終端は入力だけ回り、目標は reward のまま。
+既存の checksum テスト（5 局、seeds 11/12）は `Crc32 3042928886` のまま通った。
+
+5k smoke は指定レシピ（128/32、lr 0.003、seed 9000、par）で 5,000 局 / 745,635 moves / 5.0 s で
+完走した。100k の base は 100,000 局 / 134,574,330 moves / 785.6 s（#271 と同じ move 数）、
+同じ設定の rtgt は 100,000 局 / 28,086,194 moves / 208.8 s で、最終局は 6,964 点だった。
+base の checkpoint は 296,472 B、max|w1| 3.25。rtgt も 296,472 B だが max|w1| 0.61 で、
+1 局あたり 281 moves（base は 1,346 moves）と短い局に流れた。
+
+20 局 seed 9000 の pairw（A=/tmp/base.bin, B=/tmp/rtgt.bin）は
+`mean diff=-77064.0 ± 5507.7`、B の勝ち 0 / 負け 20（374.9 s）。非ペア 2-ply は
+base が seed 9000 で 83,796.0（8192 4/20、0.93 ms/move）、seed 9100 で 93,993.4（5/20、0.91）、
+rtgt が 10,159.6（0/20、1.19）と 12,042.8（0/20、1.22）。`scripts/eval-net.sh` の判定は
+**REJECT**（paired margin -88,079.4、score/reach/ms の全項目で fail）。
+
+解釈: 同じ k で回しても、`td1` の目標 `V(T_k next.after)` の `next.after` は正準盤面で方策が
+選んだ手の回転であって、回転盤面で方策が選ぶ最善手ではない。ネットが対称になる前は
+`V(T_k next.after)` が `T_k spawned` の値より低く出る（off-policy のバイアス）。このバイアスで
+値が縮み、短い局に流れた、という筋。実装の契約テストは各 k で指定どおりの更新になっており、
+k=0 が base と一致するので、実装ミスではなく「同じ k で回すだけでは足りない」という結果。
+回転盤面で search し直す `t2` 経路ならこのバイアスは入らないが、`rtgt`+`t2` は今回測っていない。
+
+**不採用**。既定 policy と `ai/solver/nn_weights.bin` は変更しない。`rtgt` は再現用の
+opt-in variant として残す。300k の追試はしない。
+
+再現:
+```
+zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 100000 0 9000 0.003 1 base 30 /tmp/base.bin 1 par
+zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 100000 0 9000 0.003 1 rtgt 30 /tmp/rtgt.bin 1 par
+scripts/eval-net.sh /tmp/rtgt.bin --shipped /tmp/base.bin --games 20 --seed 9000
+```
+
+コスト: base 100k 785.6 s、rtgt 100k 208.8 s、pairw 20 局 374.9 s。
+`zig build test` は checksum を含めて全通過。
