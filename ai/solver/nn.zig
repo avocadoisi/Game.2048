@@ -1789,6 +1789,12 @@ pub const Options = struct {
     /// Candidate (#72): apply every per-move TD update to all 8 dihedral transforms of the afterstate,
     /// with the same target (8 samples per visited board, deterministic).
     symmetry: bool = false,
+    /// Candidate (#271): apply each per-move TD update to one uniformly random dihedral transform of the
+    /// afterstate, drawn per update. Keeps one update per move (unlike `symmetry`'s 8), so the cost is
+    /// `base`'s. The target was assumed scalar so the orientation would only augment the input; #271
+    /// measured that this fails before the net is symmetric (see docs/solver-history.md). Draws one
+    /// rng value per update, so the self-play spawn stream differs from `base` after the first move.
+    rsym: bool = false,
     /// Candidate (#101): reward every move with -1 and sweep the afterstates backward at game over, so
     /// the value learns V ≈ -(moves to game over) and the self-play policy plays the fastest game over
     /// (a death net). Backward full return instead of per-move TD(0): with -1 per move the TD target is
@@ -2474,6 +2480,14 @@ fn restartState(rng: std.Random, buffer: *Dump) GameState {
     return state;
 }
 
+/// (#271) The afterstate one per-move TD update trains on. `rsym` draws one uniformly random dihedral
+/// transform per update; `base` returns `after` and draws nothing, so its rng stream, spawns and
+/// updates stay bit-identical. `distill_only` skips both `trainStep` calls below, so no draw happens.
+fn rsymAfter(after: Board, rng: std.Random, opts: Options) Board {
+    if (!opts.rsym) return after;
+    return transformBoard(rng.uintLessThan(usize, symmetry_count), after);
+}
+
 fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
     const pr = opts.priority;
     const vfn: Value = .{ .single = net };
@@ -2516,7 +2530,7 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
                 const target = clampTarget(p.reward + tdBootstrap(net, pick, state, opts), opts);
                 if (diag) |d| d.push(p.after, @abs(target - p.value), pick.value - p.value);
                 if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = pick.after, .terminal = false, .err = @abs(target - p.value) });
-                trainStep(net, &cache, p.after, target, tailWeight(opts, state.board, lr), opts, &trace);
+                trainStep(net, &cache, rsymAfter(p.after, rng, opts), target, tailWeight(opts, state.board, lr), opts, &trace);
             }
         }
         pending = pick;
@@ -2539,7 +2553,7 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
         if (!opts.distill_only) {
             if (diag) |d| d.push(p.after, @abs(p.reward - p.value), -p.value);
             if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = p.after, .terminal = true, .err = @abs(p.reward - p.value) });
-            trainStep(net, &cache, p.after, p.reward, tailWeight(opts, state.board, lr), opts, &trace);
+            trainStep(net, &cache, rsymAfter(p.after, rng, opts), p.reward, tailWeight(opts, state.board, lr), opts, &trace);
         }
     }
     if (pr) |b| for (0..b.m) |_| {
@@ -5408,6 +5422,35 @@ test "symmetry=false and lambda=0 reproduce the recorded checksum (5 games, seed
     var rng = std.Random.DefaultPrng.init(12);
     for (0..5) |_| _ = trainGameOpts(&net, rng.random(), 0.003, null, .{ .symmetry = false, .lambda = 0 });
     try std.testing.expectEqual(@as(u32, 3042928886), std.hash.Crc32.hash(std.mem.asBytes(&net)));
+}
+
+test "rsym trains one random dihedral transform and base draws nothing (#271)" {
+    const board: Board = .{
+        .{ 2, 4, 8, 16 },
+        .{ 32, 64, 128, 256 },
+        .{ 2, 0, 4, 0 },
+        .{ 0, 8, 0, 16 },
+    };
+    var prng = std.Random.DefaultPrng.init(271);
+    const rng = prng.random();
+    var seen: [symmetry_count]bool = @splat(false);
+    for (0..256) |_| {
+        const trained = rsymAfter(board, rng, .{ .rsym = true });
+        var found = false;
+        for (0..symmetry_count) |k| if (std.meta.eql(trained, transformBoard(k, board))) {
+            seen[k] = true;
+            found = true;
+        };
+        try std.testing.expect(found);
+    }
+    // 256 uniform draws over 8 transforms hit every orientation (no realistic chance of a miss)
+    for (seen) |hit| try std.testing.expect(hit);
+    // base returns the stored afterstate and consumes no rng, so two identical streams stay aligned
+    var a = std.Random.DefaultPrng.init(271);
+    var b = std.Random.DefaultPrng.init(271);
+    try std.testing.expectEqual(board, rsymAfter(board, a.random(), .{}));
+    _ = rsymAfter(board, b.random(), .{});
+    try std.testing.expectEqual(a.random().int(u64), b.random().int(u64));
 }
 
 test "sym_leaf=false keeps the single-forward leaf and its own cache entry (#178)" {

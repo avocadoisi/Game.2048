@@ -20,6 +20,8 @@ const usage =
     \\              midgame (#59: 32 extra updates per game from buffer entries with 4..7 empty cells, uniform)
     \\              midmix  (#63: same but 50% uniform over the whole buffer, 50% |TD error| in the 4..7 bucket)
     \\              sym     (#72: every per-move update applied to all 8 dihedral transforms of the afterstate)
+    \\              rsym    (#271: one per-move TD update, on a uniformly random dihedral transform of
+    \\                       the afterstate; same cost as base, unlike sym's 8 updates)
     \\              symlam  (#72: sym plus TD(lambda) eligibility traces with lambda = 0.7)
     \\              symbatch (#98: the 8 transformed gradients from one net snapshot, averaged and
     \\                       norm-clipped, applied as a single step instead of eight)
@@ -557,6 +559,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .symmetry = true, .lambda = 0.7 }
     else if (std.mem.eql(u8, variant, "symbatch"))
         .{ .sym_batch = true }
+    else if (std.mem.eql(u8, variant, "rsym"))
+        .{ .rsym = true }
     else if (std.mem.eql(u8, variant, "explore"))
         .{ .explore = 0.05 }
     else if (std.mem.eql(u8, variant, "explore20"))
@@ -1236,6 +1240,10 @@ test "usage text lists the symbatch variant" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "symbatch (#98") != null);
 }
 
+test "usage text lists the rsym variant (#271)" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "rsym    (#271") != null);
+}
+
 test "par is refused for the global-feature build (#226)" {
     // the default build has no features, so the guard is a no-op there; a `-Dfeat` build must refuse
     try std.testing.expectEqual(nn.feature_count != 0, !parSupported(.{}, false));
@@ -1288,6 +1296,8 @@ test "par is refused for the priority buffer, the staged net and the teacher var
     defer std.testing.allocator.destroy(teachers);
     try std.testing.expect(parSupported(.{}, false));
     try std.testing.expect(parSupported(.{ .symmetry = true, .replay_k = 30 }, false));
+    // #271: rsym is one per-move update with a random input orientation, stateless like base
+    try std.testing.expect(parSupported(.{ .rsym = true }, false));
     try std.testing.expect(!parSupported(.{}, true));
     try std.testing.expect(!parSupported(.{ .priority = &pr }, false));
     // #228: t2/p2/tp2 are plain per-move runs (the value cache is thread-local and cleared per move),
