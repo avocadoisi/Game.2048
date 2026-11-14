@@ -1770,6 +1770,13 @@ pub const Options = struct {
     replay_k: usize = 0,
     /// Learning rate of the replay pass, as a factor of the training lr.
     replay_lr_scale: f64 = 0.5,
+    /// Candidate (#262): frozen bootstrap net. When set, the V of the next afterstate in every TD
+    /// target (online TD, priority replay and the backwards/replay sweeps) comes from this net instead
+    /// of the live one. The self-play move is still chosen and ranked by the live net, so the policy and
+    /// the spawn tape are unchanged; only the regression target stops moving with the weights being
+    /// trained. `null` (the default) is the historical live bootstrap, bit for bit. The caller owns the
+    /// net and must not mutate it during a parallel batch (the CLI refreshes it between batches only).
+    target_net: ?*const Net = null,
     /// Candidate D (#34): prioritized replay buffer; null = off. Normal per-move updates run as well.
     priority: ?*Priority = null,
     /// Candidate E (#59): with `priority` set, the `m` extra updates draw uniformly from buffer entries
@@ -2367,7 +2374,10 @@ pub fn trainGameOpts(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Op
         // enter any target. The check reads no rng, so every normal game is unchanged.
         if (opts.move_cap > 0 and n >= @as(usize, opts.move_cap)) return .{ .score = state.score, .moves = @intCast(n), .capped = true };
         const pick = pickMove(net, state, opts.death) orelse break;
-        if (pending) |p| if (!opts.backward and !opts.death) trainAfter(net, &cache, p.after, p.reward + pick.value, lr);
+        // (#262) With replay_k > 0 this path, not `tdBootstrap`, is the online TD update. Keep the
+        // live `pick.value` unless a frozen target was asked for, so the default stays bit-identical.
+        const next_value = if (opts.target_net != null) bootstrapValue(net, opts, pick.after) else pick.value;
+        if (pending) |p| if (!opts.backward and !opts.death) trainAfter(net, &cache, p.after, p.reward + next_value, lr);
         steps[n % step_cap] = .{ .after = pick.after, .reward = pick.reward };
         n += 1;
         pending = pick;
@@ -2380,7 +2390,7 @@ pub fn trainGameOpts(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Op
         while (i > n -| step_cap) {
             i -= 1;
             const s = steps[i % step_cap];
-            const next = if (i + 1 < n) valueOf(net, steps[(i + 1) % step_cap].after) else 0;
+            const next = if (i + 1 < n) bootstrapValue(net, opts, steps[(i + 1) % step_cap].after) else 0;
             trainAfter(net, &cache, s.after, s.reward + next, lr);
         }
     }
@@ -2389,7 +2399,7 @@ pub fn trainGameOpts(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Op
         var i = n -| @min(opts.replay_k, step_cap);
         while (i < n) : (i += 1) {
             const s = steps[i % step_cap];
-            const next = if (i + 1 < n) valueOf(net, steps[(i + 1) % step_cap].after) else 0;
+            const next = if (i + 1 < n) bootstrapValue(net, opts, steps[(i + 1) % step_cap].after) else 0;
             trainAfter(net, &cache, s.after, s.reward + next, lr_replay);
         }
     }
@@ -2404,6 +2414,12 @@ fn trainAfter(net: *Net, cache: *Cache, after: Board, target: f64, lr: f64) void
 fn valueOf(net: *const Net, after: Board) f64 {
     var cache: Cache = .{};
     return forward(net, after, &cache);
+}
+
+/// V of the afterstate that closes a TD target (#262). A frozen target net answers the bootstrap;
+/// without one this is exactly the old `valueOf(net, after)`.
+fn bootstrapValue(net: *const Net, opts: Options, after: Board) f64 {
+    return valueOf(opts.target_net orelse net, after);
 }
 
 /// Global L2 norm the averaged symmetry gradient is clipped to (#98). Measured averaged-gradient norms are
@@ -2565,7 +2581,7 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
             else
                 b.sample(rng)
         ];
-        const target = e.reward + if (e.terminal) 0 else valueOf(net, e.next);
+        const target = e.reward + if (e.terminal) 0 else bootstrapValue(net, opts, e.next);
         _ = forward(net, e.after, &cache);
         e.err = @abs(target - cache.out);
         train(net, &cache, target, lr);
@@ -2616,7 +2632,14 @@ fn teacherValue(vfn: Value, state: GameState, mode: Mode, sym_leaf: bool) f64 {
 fn tdBootstrap(net: *const Net, next: Pick, spawned: GameState, opts: Options) f64 {
     if (opts.teacher) |mode| return teacherValue(.{ .single = net }, spawned, mode, opts.sym_leaf);
     return switch (opts.target) {
-        .td1 => if (opts.selfplay == .deep2) valueOf(net, next.after) else next.value,
+        // A frozen target prices the next afterstate even when the live policy is `deep2`: `next.value`
+        // would be the live net's search value, i.e. the moving target this variant removes.
+        .td1 => if (opts.target_net != null)
+            bootstrapValue(net, opts, next.after)
+        else if (opts.selfplay == .deep2)
+            valueOf(net, next.after)
+        else
+            next.value,
         .search2 => search2Value(.{ .single = net }, spawned, sharedValueCache(), opts.sym_leaf),
     };
 }
@@ -4964,6 +4987,81 @@ test "replay tail changes the weights and K=0 is off" {
     _ = trainGameOpts(&off, rng_c.random(), 0.003, null, .{ .replay_k = 0 });
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&base), std.mem.asBytes(&replay)));
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&base), std.mem.asBytes(&off));
+}
+
+// (#262) A frozen target must be the only source of the bootstrap value; otherwise the regression
+// target still moves with the live weights and the variant measures nothing.
+test "bootstrapValue reads the frozen target net while the live net is the default" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    const live = Net.init(init_rng.random());
+    var target = live;
+    target.b3 += 1; // `forward` adds b3 once, so the two values differ by exactly one
+    var game_rng = std.Random.DefaultPrng.init(12);
+    const state = GameState.gameStart(game_rng.random());
+    const pick = pickMove(&live, state, false).?;
+
+    const frozen = bootstrapValue(&live, .{ .target_net = &target }, pick.after);
+    try std.testing.expectEqual(valueOf(&target, pick.after), frozen);
+    try std.testing.expectApproxEqAbs(valueOf(&live, pick.after) + 1, frozen, 1e-12);
+    try std.testing.expectEqual(valueOf(&live, pick.after), bootstrapValue(&live, .{}, pick.after));
+}
+
+// (#262) lr = 0 makes every update a no-op, so the live net never moves. Any use of the frozen
+// target for move selection would change the game; keeping score and moves equal proves the policy
+// and the spawn tape still come from the live net.
+test "frozen target leaves the live policy and spawn tape unchanged" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    const base = Net.init(init_rng.random());
+    var target = base;
+    target.b3 += 1;
+    const target_before = target;
+    var with_target = base;
+    var live = base;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    const a = trainGameOpts(&with_target, rng_a.random(), 0, null, .{ .target_net = &target });
+    const b = trainGameOpts(&live, rng_b.random(), 0, null, .{});
+    try std.testing.expectEqual(b.score, a.score);
+    try std.testing.expectEqual(b.moves, a.moves);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&base), std.mem.asBytes(&with_target));
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&target_before), std.mem.asBytes(&target));
+}
+
+// (#262) The per-move path, the online half of the replay path (`replay_lr_scale = 0` leaves only
+// the online updates at a nonzero rate) and the replay path itself all have to see the target. The
+// same test asserts the target snapshot is never written during a game.
+test "frozen target changes the online and replay updates without being mutated" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    const base = Net.init(init_rng.random());
+    var target = base;
+    target.b3 += 1;
+    const target_before = target;
+
+    var plain_with = base;
+    var plain_without = base;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    _ = trainGameOpts(&plain_with, rng_a.random(), 0.003, null, .{ .target_net = &target });
+    _ = trainGameOpts(&plain_without, rng_b.random(), 0.003, null, .{});
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&plain_with), std.mem.asBytes(&plain_without)));
+
+    var online_with = base;
+    var online_without = base;
+    var rng_c = std.Random.DefaultPrng.init(13);
+    var rng_d = std.Random.DefaultPrng.init(13);
+    _ = trainGameOpts(&online_with, rng_c.random(), 0.003, null, .{ .target_net = &target, .replay_k = 30, .replay_lr_scale = 0 });
+    _ = trainGameOpts(&online_without, rng_d.random(), 0.003, null, .{ .replay_k = 30, .replay_lr_scale = 0 });
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&online_with), std.mem.asBytes(&online_without)));
+
+    var replay_with = base;
+    var replay_without = base;
+    var rng_e = std.Random.DefaultPrng.init(14);
+    var rng_f = std.Random.DefaultPrng.init(14);
+    _ = trainGameOpts(&replay_with, rng_e.random(), 0.003, null, .{ .target_net = &target, .replay_k = 30 });
+    _ = trainGameOpts(&replay_without, rng_f.random(), 0.003, null, .{ .replay_k = 30 });
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&replay_with), std.mem.asBytes(&replay_without)));
+
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&target_before), std.mem.asBytes(&target));
 }
 
 test "priority sampling gives the uniform share plus the |err|^alpha share" {

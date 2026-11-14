@@ -3699,6 +3699,77 @@ zig build nn -Doptimize=ReleaseFast -- 0 1 9000 0.003 - pairrow 30 ai/solver/nn_
 `deep4` の phase 行が全空き数で `ply=4`・cutoff 1e-2 になること、`deep4` が `deep3` より多い葉を
 読むこと、row 17 が `deep4` + node TT に対応すること、`pairrow` が row 3 を拒否することを固定した。
 
+### 凍結 target net で TD の bootstrap を固定する `tnet`（#262）
+
+#234 の 128/32・seed 2 は 300k の途中で発散し、#244 / #247 の clamp と更新量の上限は発散を止めても
+8192 の裾を戻さなかった。どれも 1 手の更新は「次の afterstate の V」を更新中の自分自身で見積もる
+on-policy TD のままで、目標が重みと一緒に動く。ここでは目標だけを止める。自己プレーの手と spawn tape は
+従来どおり live net が決め、TD 目標の次状態 V だけを、live net の読み取り専用コピー（target net）から取る。
+
+- `nn.Options.target_net`（既定 `null` = 従来の live bootstrap とバイト一致）。`bootstrapValue` が
+  `target_net orelse net` を引く。
+- 効く経路は 4 つ。通常の 1 手 1 更新（`tdBootstrap` の `.td1`）、`replay_k > 0` の online 更新
+  （この経路は `tdBootstrap` を通らない）、backward / replay の末尾、priority の追加更新。
+  terminal の最終 afterstate は従来どおり reward だけを目標にする。
+- CLI variant `tnet`。`par` 必須で、arg 13 が「何バッチごとに target を同期するか」（既定 100）。
+  `par` の各バッチは同じ target を読み、バッチが終わってからだけ live net をコピーするので、
+  バッチ内のゲームが途中で同期した target を見ることはない。`tnet` は scratch 開始（`resume` ではない）。
+  重みの保存は他 variant と同じ 5,000 ゲームごとと完走時。
+
+確認した契約:
+
+- `bootstrapValue` は target net の V を返し、`target_net = null` では live net の V と一致する。
+- target を渡しても、lr = 0 のゲームは score / moves / live 重み / target 重みが live のみの run と一致する
+  （手の選択と spawn は live のまま）。
+- target を渡すと、1 手 1 更新・`replay_k > 0` の online 更新・replay 末尾の 3 経路すべてで
+  更新後の重みが live のみの run と変わり、ゲーム中に target は書き換わらない。
+- `TargetSync` は同期間隔の途中で live net が変わってもコピーせず、間隔が来たバッチの終わりにだけコピーする。
+- arg 13 は既定 100、`-` も 100、0 は `error.InvalidTargetEvery`。
+
+テストは `zig build test` 全通過（Debug）。
+
+### 測定: 300k は安定するがゲームが伸びない（seed 2）
+
+条件は 128/32、lr 0.003、`par`、`batch_scale=sqrt(8)=2.8284271247461903`、300,000 ゲーム。
+`tnet` の arg 13 が同期間隔（バッチ数）。対照は同じ条件の `replay 30`。
+
+| 条件 | moves / train s | 最後のゲーム | 2-ply seed 9000 / 9100（8192） | 判定 |
+|---|---:|---:|---|---|
+| `replay 30`（対照、seed 2） | 539,243,727 / 3,184.9 | 65,476 | 66,186.0 / 66,126.8（0/20） | 安定、裾なし |
+| `tnet 30`、同期 100（seed 2） | 79,205,713 / 694.2 | 3,156 | 7,213.4 / 7,784.8（0/20） | 不採用 |
+| `tnet 30`、同期 100（seed 1） | 80,097,021 / 627.9 | 3,480 | — | 崩壊（267 手/ゲーム） |
+| `tnet 0`、同期 100 | 90,486,323 / 649.6 | 6,324 | — | 崩壊（302 手/ゲーム） |
+| `tnet 0`、同期 1 | 108,272,536 / 753.4 | 5,480 | — | 崩壊（361 手/ゲーム） |
+| `tnet 30`、同期 1、`batch_scale=0.25` | 101,230,912 / 742.4 | 4,352 | — | 崩壊（337 手/ゲーム） |
+
+`tnet 30` の pairw は shipped に対して **−112,444.4 ± 8,419.5**、0 勝 20 敗。非ペア 2-ply は
+seed 9000 が 7,213.4（0/20、1.39 ms/手）、seed 9100 が 7,784.8（0/20、1.32 ms/手）。
+対照 `replay 30` は 1-ply 55,836.2 / 2-ply 66,186.0（seed 9000、0/20、0.96 ms/手）、
+1-ply 53,161.2 / 2-ply 66,126.8（seed 9100、0/20、1.19 ms/手）だったので、
+`tnet` は発散は止めたが、対照よりさらにゲームを短くする。
+
+**切り分け。** target を shipped net に固定したまま（同期を実質無効化）5,000 ゲームだけ回すと、
+最後のゲーム 31,356 / 5,708,577 手で安定した。したがって `target_net` の読み出しや
+`TargetSync` のコピーは壊れていない。同期間隔を 1 にしても、`replay_k` を 0 にしても、
+`batch_scale` を 0.25 にしても 300k では同じ崩壊になったので、原因は
+「greedy 1-ply の on-policy データで、live net から target を更新する閉ループ」にある。
+target を固定した場合だけ値が保たれるが、それは学習ではなく shipped net への回帰である。
+
+**読み。** 凍結 target は #234 の seed 2 発散を有限重みに留めるが、その代償として
+「今の手の価値」を目標にできず、即時 reward だけを追う短いゲームに落ちる。lr を下げた
+#234 の追試や clamp と同じく、安定と 8192 の裾は両立しなかった。**判定: 不採用**。
+重みは置き換えず、`tnet` は再現用の opt-in variant として残す（既定の学習経路には入らない）。
+同期間隔・replay_k・batch_scale を変えても 300k で崩壊するため、この形の target net を
+既定レシピに採用しない。
+
+再現:
+
+```
+zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - tnet 30 /tmp/s2_tnet100_300k.bin 2 par - 2.8284271247461903 100
+zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - tnet 0 /tmp/s2_tnet1_300k.bin 2 par - 2.8284271247461903 1
+./scripts/eval-net.sh /tmp/s2_tnet100_300k.bin --games 20 --seed 9000
+```
+
 ## 1手ごとのランダムな8対称変換 rsym は入力だけ回すと発散する（#271）
 
 #72 の `sym` は 1 局面を 8 回更新して過剰更新になり、`symbatch` は平均 1 回にしたが clip で
