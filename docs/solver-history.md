@@ -3769,3 +3769,59 @@ zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - tnet 30 /tmp/s2_tne
 zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - tnet 0 /tmp/s2_tnet1_300k.bin 2 par - 2.8284271247461903 1
 ./scripts/eval-net.sh /tmp/s2_tnet100_300k.bin --games 20 --seed 9000
 ```
+
+## 1手ごとのランダムな8対称変換 rsym は入力だけ回すと発散する（#271）
+
+#72 の `sym` は 1 局面を 8 回更新して過剰更新になり、`symbatch` は平均 1 回にしたが clip で
+学習を止めた。この節では、1 手につき 1 回だけランダムな対称変換を選んで入力に適用する `rsym` を
+試した。狙いは更新回数を base と同じに保ったまま、8 方向のデータを 1/8 ずつ使うこと。
+
+実装は `nn.Options.rsym`（既定 false）と CLI variant `rsym`。`trainGamePerMove` の TD 更新で
+`p.after` を `T_k(p.after)`（`k = rng.uintLessThan(usize, symmetry_count)`）に差し替えて
+`trainStep` に渡す。`distill_only` は TD 更新を行わないため対象外。base は rng を引かず、
+乱数列も更新も従来と同一。`par` も同じ経路を通る。
+
+CLI の `base` と `rsym` は arg 7 の `30` を `opts.replay_k` に渡さない（`replay_k` は `replay`
+variant 専用）。どちらも `replay_k=0` の `trainGamePerMove` を通るので、比較条件は揃っている。
+
+正しさ: 非対称な盤面で 256 回引くと 8 方向がすべて現れ、base は同じ 2 本の rng 列を消費しない
+（テスト）。推論経路は変更していない。
+
+100k の base は `zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 100000 0 9000 0.003 1 base 30 /tmp/base.bin 1 par`
+で 100,000 局 / 134,574,330 moves / 767.2 s（130.3 games/s）で完走し、296,472 B の checkpoint を
+保存した。同じ設定の rsym は par で 40/100000 局、serial で 8/100 局で
+`diverged at ... (non-finite or |w| > 1e6)` となり、checkpoint を保存しなかった。
+
+初期化直後のネットを連続 rng で 10 局回すと、rsym の max|w1| は 0.2500 → 0.2503 → 0.2544 →
+0.2578 → 0.2652 → 0.3170 → 0.8955（6 局目）と増え、base は 10 局を通して 0.2500 のままだった。
+非対称な probe 盤の V を 8 方向で見ると、開始時 0.16–0.37、5 局目 13.2–16.1、6 局目に負、
+7 局目 0.87–0.93 と、過大評価のあと崩壊する。spawn 列だけを rsym と同じにした対照（変換は
+適用しない）では max|w1| が base と同じく安定したので、乱数列の変化だけが原因ではない。
+
+我々の解釈では、TD 目標 `r + V(s')` の `V(s')` は自己対戦方策が常に正準の向きで評価する。
+ネットが対称になる前は V が向きに依存するので、回した入力に対する目標はその盤面の値に
+ならない。正準の向きは方策の評価にも使われ、更新は 8 方向に分散するため、正準の向きの補正は
+1/8 しか入らない。過大評価が次の目標に入る帰還で重みが成長し、発散ガードに掛かる、という筋。
+これは「TD 目標はスカラーなので向きに依らない」という前提が、V がまだ対称でない時点では
+成り立たないことを示す。
+
+lr を 1/8（0.000375）にすると 5,000 局は完走した（745,686 moves、4.4 s、最終局 1,240 点）。
+ただしこれは指定の 0.003 ではなく、5,000 局だけの smoke なので採用判断には使わない。
+
+**不採用**。指定 lr 0.003 の rsym は 100k を完走できず、pairw を打てる checkpoint がない。
+したがって「avg score が上がるか」の比較は成立せず、300k の追試もしない。既定 policy と
+`ai/solver/nn_weights.bin` は変更しない。`rsym` は再現用の opt-in variant として残す。
+
+次の候補は、入力と目標を同じ k で回す（`r + V(T_k s')`）、8 方向の目標を平均する、target を
+clamp する、のいずれか。入力だけを回す案はここで否定する。
+
+再現（rsym は 0.2 s で発散する）:
+```
+zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 100000 0 9000 0.003 1 base 30 /tmp/base.bin 1 par
+zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 100000 0 9000 0.003 1 rsym 30 /tmp/rsym.bin 1 par
+zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 100 0 9000 0.003 1 rsym 30 /tmp/rsym.bin 1 -
+```
+
+コスト: base 100k が 767 s、rsym の発散は par 0.2 s / serial 数秒、lr/8 の 5k smoke が 4.4 s。
+pairw は rsym の checkpoint ができないため未実施。`zig build test` は既存の checksum テストを
+含めて全通過。
