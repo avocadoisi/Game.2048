@@ -3660,8 +3660,7 @@ zig build nn -Doptimize=ReleaseFast -- 0 10 9000 0.003 1 base 30 ai/solver/nn_we
 この節では、節約した時間を 1 ply 深くするのに使えるかを確かめるため、`deep3` にもう 1 手と spawn 層を
 足した `deep4`（`ply=4`、cutoff は `deep3` と同じ 1e-2）に node TT を組み合わせ、row 15
 （`deep3` + node TT、既定）と同じ net・同じ #237 32-bit spawn tape で比較した。既定方策・同梱重みは
-変更していない。`deep4` は評価専用の row 17、比較は同じプロセスで A/B を順に打つ一時的な
-`pairrow` variant として追加した。
+変更していない。`deep4` は評価専用の row 17、比較は同じプロセスで A/B を順に打つ `pairrow` variant として追加し、再現用に残した。
 
 seed 9000 の 1 局を同じ tape で打った結果は次のとおり。A は row 15、B は row 17。
 
