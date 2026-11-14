@@ -1802,6 +1802,12 @@ pub const Options = struct {
     /// measured that this fails before the net is symmetric (see docs/solver-history.md). Draws one
     /// rng value per update, so the self-play spawn stream differs from `base` after the first move.
     rsym: bool = false,
+    /// Candidate (#273): draw one uniformly random dihedral transform per per-move TD update and apply
+    /// it to both the trained afterstate and the TD target's next board (`next.after` for `td1`, the
+    /// post-spawn board for `search2` and a teacher), so the update is the TD update of the rotated
+    /// transition. A terminal target is the reward alone and is not rotated. Draws one rng value per
+    /// update, the same as `rsym`; `base` draws nothing. See docs/solver-history.md.
+    rtgt: bool = false,
     /// Candidate (#101): reward every move with -1 and sweep the afterstates backward at game over, so
     /// the value learns V ≈ -(moves to game over) and the self-play policy plays the fastest game over
     /// (a death net). Backward full return instead of per-move TD(0): with -1 per move the TD target is
@@ -2496,12 +2502,52 @@ fn restartState(rng: std.Random, buffer: *Dump) GameState {
     return state;
 }
 
-/// (#271) The afterstate one per-move TD update trains on. `rsym` draws one uniformly random dihedral
-/// transform per update; `base` returns `after` and draws nothing, so its rng stream, spawns and
-/// updates stay bit-identical. `distill_only` skips both `trainStep` calls below, so no draw happens.
-fn rsymAfter(after: Board, rng: std.Random, opts: Options) Board {
-    if (!opts.rsym) return after;
-    return transformBoard(rng.uintLessThan(usize, symmetry_count), after);
+/// (#273) The dihedral transform drawn for one per-move TD update. `rtgt` draws once and gives the same
+/// `k` to the input afterstate and to the target's next board, so the update is the TD update of the
+/// rotated transition. `rsym` (#271) keeps the target canonical and rotates only the input.
+const UpdateSym = struct {
+    /// Transform of the stored afterstate (the trained input), or null for none.
+    after: ?usize = null,
+    /// Transform of the target's next board, or null for none. Only `rtgt` sets it.
+    next: ?usize = null,
+};
+
+/// One draw per update for `rtgt`/`rsym`; `base` returns `.{}` and draws nothing, so its rng stream,
+/// spawns and updates stay bit-identical. `distill_only` skips both `tdUpdate` calls below.
+fn updateSym(rng: std.Random, opts: Options) UpdateSym {
+    if (opts.rtgt) {
+        const k = rng.uintLessThan(usize, symmetry_count);
+        return .{ .after = k, .next = k };
+    }
+    if (opts.rsym) return .{ .after = rng.uintLessThan(usize, symmetry_count) };
+    return .{};
+}
+
+fn symBoard(board: Board, k: ?usize) Board {
+    return if (k) |index| transformBoard(index, board) else board;
+}
+
+fn symState(state: GameState, k: ?usize) GameState {
+    return if (k) |index| .{ .board = transformBoard(index, state.board), .score = state.score } else state;
+}
+
+/// One non-terminal per-move TD update (#158, #273): draw the update's symmetry once, build the target
+/// from the next board rotated by the same `k`, and train the rotated afterstate. Returns the target for
+/// the diagnostics and the priority buffer. `spawned` is the post-spawn board the pending step led into
+/// (this move has not been applied yet), the board the `search2` and `teacher` targets evaluate.
+fn tdUpdate(net: *Net, cache: *Cache, p: Pick, next: Pick, spawned: GameState, lr: f64, rng: std.Random, opts: Options, trace: *Net) f64 {
+    const sym = updateSym(rng, opts);
+    const target = clampTarget(p.reward + tdBootstrap(net, next, spawned, opts, sym.next), opts);
+    trainStep(net, cache, symBoard(p.after, sym.after), target, tailWeight(opts, spawned.board, lr), opts, trace);
+    return target;
+}
+
+/// The last update of a game (#273): a terminal transition has no next board, so its target is the
+/// reward alone and is never rotated; the input afterstate still gets the update's one draw.
+fn tdTerminalUpdate(net: *Net, cache: *Cache, p: Pick, spawned: GameState, lr: f64, rng: std.Random, opts: Options, trace: *Net) f64 {
+    const sym = updateSym(rng, opts);
+    trainStep(net, cache, symBoard(p.after, sym.after), p.reward, tailWeight(opts, spawned.board, lr), opts, trace);
+    return p.reward;
 }
 
 fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
@@ -2543,10 +2589,9 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
             if (!opts.distill_only) {
                 // `state` is still the post-spawn board the pending step led into (this move has not been
                 // applied yet), which is the board the `search2` and `teacher` targets evaluate.
-                const target = clampTarget(p.reward + tdBootstrap(net, pick, state, opts), opts);
+                const target = tdUpdate(net, &cache, p, pick, state, lr, rng, opts, &trace);
                 if (diag) |d| d.push(p.after, @abs(target - p.value), pick.value - p.value);
                 if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = pick.after, .terminal = false, .err = @abs(target - p.value) });
-                trainStep(net, &cache, rsymAfter(p.after, rng, opts), target, tailWeight(opts, state.board, lr), opts, &trace);
             }
         }
         pending = pick;
@@ -2567,9 +2612,9 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
     }
     if (pending) |p| {
         if (!opts.distill_only) {
-            if (diag) |d| d.push(p.after, @abs(p.reward - p.value), -p.value);
-            if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = p.after, .terminal = true, .err = @abs(p.reward - p.value) });
-            trainStep(net, &cache, rsymAfter(p.after, rng, opts), p.reward, tailWeight(opts, state.board, lr), opts, &trace);
+            const target = tdTerminalUpdate(net, &cache, p, state, lr, rng, opts, &trace);
+            if (diag) |d| d.push(p.after, @abs(target - p.value), -p.value);
+            if (pr) |b| b.push(.{ .after = p.after, .reward = p.reward, .next = p.after, .terminal = true, .err = @abs(target - p.value) });
         }
     }
     if (pr) |b| for (0..b.m) |_| {
@@ -2629,18 +2674,23 @@ fn teacherValue(vfn: Value, state: GameState, mode: Mode, sym_leaf: bool) f64 {
 /// the afterstate one move past the last of them (see `search2Value`). With a `deep2` policy `next.value`
 /// is already a search value, so `td1` reads V of the afterstate directly then. A teacher (#167)
 /// replaces the bootstrap entirely: its own search value of `spawned`, and `target` is ignored.
-fn tdBootstrap(net: *const Net, next: Pick, spawned: GameState, opts: Options) f64 {
-    if (opts.teacher) |mode| return teacherValue(.{ .single = net }, spawned, mode, opts.sym_leaf);
+/// `next_sym` is the `rtgt` (#273) transform of the board being valued: `next.after` for `td1`, the
+/// post-spawn `spawned` for `search2` and a teacher. When set, `td1` prices the rotated board directly
+/// (a frozen `target_net` included) instead of reusing `next.value`, which is canonical.
+fn tdBootstrap(net: *const Net, next: Pick, spawned: GameState, opts: Options, next_sym: ?usize) f64 {
+    if (opts.teacher) |mode| return teacherValue(.{ .single = net }, symState(spawned, next_sym), mode, opts.sym_leaf);
     return switch (opts.target) {
         // A frozen target prices the next afterstate even when the live policy is `deep2`: `next.value`
         // would be the live net's search value, i.e. the moving target this variant removes.
-        .td1 => if (opts.target_net != null)
+        .td1 => if (next_sym) |k|
+            bootstrapValue(net, opts, transformBoard(k, next.after))
+        else if (opts.target_net != null)
             bootstrapValue(net, opts, next.after)
         else if (opts.selfplay == .deep2)
             valueOf(net, next.after)
         else
             next.value,
-        .search2 => search2Value(.{ .single = net }, spawned, sharedValueCache(), opts.sym_leaf),
+        .search2 => search2Value(.{ .single = net }, symState(spawned, next_sym), sharedValueCache(), opts.sym_leaf),
     };
 }
 
@@ -4022,19 +4072,19 @@ test "search2 bootstraps from the post-spawn board, td1 from V of the next after
     const net = std.mem.zeroes(Net);
     const next: Pick = .{ .dir = .left, .after = post_spawn_board, .reward = 0, .value = 0 };
     const spawned: GameState = .{ .board = post_spawn_board };
-    const td1 = tdBootstrap(&net, next, spawned, .{ .target = .td1 });
-    const search2 = tdBootstrap(&net, next, spawned, .{ .target = .search2 });
+    const td1 = tdBootstrap(&net, next, spawned, .{ .target = .td1 }, null);
+    const search2 = tdBootstrap(&net, next, spawned, .{ .target = .search2 }, null);
     try std.testing.expectEqual(@as(f64, 0), td1);
     // merging the 2s is 4 points / reward_scale, and the 2-ply search starts on this post-spawn board
     try std.testing.expect(search2 >= 4 / reward_scale);
     // same target on a board with no legal move stays 0: the bootstrap is the search of the given board
     const dead_spawned: GameState = .{ .board = dead_board };
-    try std.testing.expectEqual(@as(f64, 0), tdBootstrap(&net, next, dead_spawned, .{ .target = .search2 }));
+    try std.testing.expectEqual(@as(f64, 0), tdBootstrap(&net, next, dead_spawned, .{ .target = .search2 }, null));
     // with the committed weights the two targets also differ on a midgame board
     const weights = try parse(@embedFile("nn_weights.bin"));
     const trained_next: Pick = .{ .dir = .left, .after = mid_board.board, .reward = 0, .value = valueOf(&weights, mid_board.board) };
-    const boot1 = tdBootstrap(&weights, trained_next, mid_board, .{ .target = .td1 });
-    const boot2 = tdBootstrap(&weights, trained_next, mid_board, .{ .target = .search2 });
+    const boot1 = tdBootstrap(&weights, trained_next, mid_board, .{ .target = .td1 }, null);
+    const boot2 = tdBootstrap(&weights, trained_next, mid_board, .{ .target = .search2 }, null);
     try std.testing.expectEqual(trained_next.value, boot1);
     try std.testing.expect(@abs(boot2 - boot1) > 1e-6);
 }
@@ -4122,7 +4172,7 @@ test "teacher target equals the mode's search value (#167)" {
     var deep_cache: ValueCache = .{};
     var deep_search: Search = .{ .vfn = vfn, .cache = &deep_cache, .cutoff = 0, .ply = 2 };
     const want_deep = deep_search.value(state, 2, 1);
-    try std.testing.expectEqual(want_deep, tdBootstrap(&weights, next, state, .{ .teacher = .deep }));
+    try std.testing.expectEqual(want_deep, tdBootstrap(&weights, next, state, .{ .teacher = .deep }, null));
     // one own move deeper than `V` of the afterstate: the teacher target carries a searched reward
     try std.testing.expect(@abs(want_deep - next.value) > 1e-6);
 
@@ -4130,18 +4180,18 @@ test "teacher target equals the mode's search value (#167)" {
     var deep3_cache: ValueCache = .{};
     var deep3_search: Search = .{ .vfn = vfn, .cache = &deep3_cache, .cutoff = deep3_cutoff, .ply = 3 };
     const want_deep3 = deep3_search.value(state, 3, 1);
-    try std.testing.expectEqual(want_deep3, tdBootstrap(&weights, next, state, .{ .teacher = .deep3 }));
+    try std.testing.expectEqual(want_deep3, tdBootstrap(&weights, next, state, .{ .teacher = .deep3 }, null));
     try std.testing.expect(std.math.isFinite(want_deep3) and want_deep3 != want_deep);
 
     // the teacher owns the bootstrap: `target` is not consulted any more (a policy/target mismatch is
     // exactly the #135 failure this cell exists to avoid)
-    try std.testing.expectEqual(want_deep, tdBootstrap(&weights, next, state, .{ .teacher = .deep, .target = .search2 }));
-    try std.testing.expectEqual(want_deep3, tdBootstrap(&weights, next, state, .{ .teacher = .deep3, .target = .td1 }));
+    try std.testing.expectEqual(want_deep, tdBootstrap(&weights, next, state, .{ .teacher = .deep, .target = .search2 }, null));
+    try std.testing.expectEqual(want_deep3, tdBootstrap(&weights, next, state, .{ .teacher = .deep3, .target = .td1 }, null));
 
     // no legal move means no search value, whichever teacher asks
     const dead: GameState = .{ .board = dead_board };
-    try std.testing.expectEqual(@as(f64, 0), tdBootstrap(&weights, next, dead, .{ .teacher = .deep }));
-    try std.testing.expectEqual(@as(f64, 0), tdBootstrap(&weights, next, dead, .{ .teacher = .deep3 }));
+    try std.testing.expectEqual(@as(f64, 0), tdBootstrap(&weights, next, dead, .{ .teacher = .deep }, null));
+    try std.testing.expectEqual(@as(f64, 0), tdBootstrap(&weights, next, dead, .{ .teacher = .deep3 }, null));
 }
 
 /// Board hashes of the first `teacher_trace_moves` moves of a game under `opts`, spawned from one rng
@@ -5522,7 +5572,7 @@ test "symmetry=false and lambda=0 reproduce the recorded checksum (5 games, seed
     try std.testing.expectEqual(@as(u32, 3042928886), std.hash.Crc32.hash(std.mem.asBytes(&net)));
 }
 
-test "rsym trains one random dihedral transform and base draws nothing (#271)" {
+test "rsym rotates only the input and base draws nothing (#271)" {
     const board: Board = .{
         .{ 2, 4, 8, 16 },
         .{ 32, 64, 128, 256 },
@@ -5533,7 +5583,9 @@ test "rsym trains one random dihedral transform and base draws nothing (#271)" {
     const rng = prng.random();
     var seen: [symmetry_count]bool = @splat(false);
     for (0..256) |_| {
-        const trained = rsymAfter(board, rng, .{ .rsym = true });
+        const sym = updateSym(rng, .{ .rsym = true });
+        try std.testing.expectEqual(@as(?usize, null), sym.next);
+        const trained = symBoard(board, sym.after);
         var found = false;
         for (0..symmetry_count) |k| if (std.meta.eql(trained, transformBoard(k, board))) {
             seen[k] = true;
@@ -5546,9 +5598,119 @@ test "rsym trains one random dihedral transform and base draws nothing (#271)" {
     // base returns the stored afterstate and consumes no rng, so two identical streams stay aligned
     var a = std.Random.DefaultPrng.init(271);
     var b = std.Random.DefaultPrng.init(271);
-    try std.testing.expectEqual(board, rsymAfter(board, a.random(), .{}));
-    _ = rsymAfter(board, b.random(), .{});
+    try std.testing.expectEqual(board, symBoard(board, updateSym(a.random(), .{}).after));
+    _ = updateSym(b.random(), .{});
     try std.testing.expectEqual(a.random().int(u64), b.random().int(u64));
+}
+
+test "rtgt trains the same transform's afterstate and next board (#273)" {
+    const board: Board = .{
+        .{ 2, 4, 8, 16 },
+        .{ 32, 64, 128, 256 },
+        .{ 2, 0, 4, 0 },
+        .{ 0, 8, 0, 16 },
+    };
+    const next_board: Board = .{
+        .{ 4, 2, 0, 8 },
+        .{ 16, 8, 4, 2 },
+        .{ 0, 0, 16, 4 },
+        .{ 2, 8, 0, 2 },
+    };
+    const FixedK = struct {
+        k: usize,
+
+        fn fill(self: *@This(), buf: []u8) void {
+            // `uintLessThan(usize, 8)` is `(x * 8) >> 64`, so `k << 61` selects exactly k.
+            const x: u64 = @as(u64, @intCast(self.k)) << 61;
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, x, .little);
+            for (buf, 0..) |*byte, i| byte.* = bytes[i % bytes.len];
+        }
+    };
+    const NoCall = struct {
+        fn fill(_: *@This(), _: []u8) void {
+            @panic("rng should not be called");
+        }
+    };
+    var init_rng = std.Random.DefaultPrng.init(273);
+    const start = Net.init(init_rng.random());
+    const reward = 12 / reward_scale;
+    const spawned: GameState = .{ .board = next_board, .score = 0 };
+    const next: Pick = .{ .dir = .left, .after = next_board, .reward = 0, .value = valueOf(&start, next_board) };
+    const p: Pick = .{ .dir = .up, .after = board, .reward = reward, .value = 0 };
+    const lr = 0.003;
+
+    for (0..symmetry_count) |k| {
+        var source = FixedK{ .k = k };
+        var got = start;
+        var got_cache: Cache = .{};
+        var got_trace: Net = std.mem.zeroes(Net);
+        const got_target = tdUpdate(&got, &got_cache, p, next, spawned, lr, std.Random.init(&source, FixedK.fill), .{ .rtgt = true }, &got_trace);
+
+        const want_target = reward + valueOf(&start, transformBoard(k, next_board));
+        var want = start;
+        var want_cache: Cache = .{};
+        var want_trace: Net = std.mem.zeroes(Net);
+        trainStep(&want, &want_cache, transformBoard(k, board), want_target, lr, .{}, &want_trace);
+
+        try std.testing.expectEqual(want_target, got_target);
+        try std.testing.expectEqual(want, got);
+    }
+
+    // k = 0 is the untransformed update, i.e. base's one step; base must not draw
+    var zero = FixedK{ .k = 0 };
+    var got = start;
+    var got_cache: Cache = .{};
+    var got_trace: Net = std.mem.zeroes(Net);
+    const got_target = tdUpdate(&got, &got_cache, p, next, spawned, lr, std.Random.init(&zero, FixedK.fill), .{ .rtgt = true }, &got_trace);
+    var none = NoCall{};
+    var base = start;
+    var base_cache: Cache = .{};
+    var base_trace: Net = std.mem.zeroes(Net);
+    const base_target = tdUpdate(&base, &base_cache, p, next, spawned, lr, std.Random.init(&none, NoCall.fill), .{}, &base_trace);
+    try std.testing.expectEqual(base_target, got_target);
+    try std.testing.expectEqual(base, got);
+}
+
+test "rtgt rotates a terminal input but leaves its target at the reward (#273)" {
+    const board: Board = .{
+        .{ 2, 4, 8, 16 },
+        .{ 32, 64, 128, 256 },
+        .{ 2, 0, 4, 0 },
+        .{ 0, 8, 0, 16 },
+    };
+    const FixedK = struct {
+        k: usize,
+
+        fn fill(self: *@This(), buf: []u8) void {
+            const x: u64 = @as(u64, @intCast(self.k)) << 61;
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, x, .little);
+            for (buf, 0..) |*byte, i| byte.* = bytes[i % bytes.len];
+        }
+    };
+    var init_rng = std.Random.DefaultPrng.init(273);
+    const start = Net.init(init_rng.random());
+    const reward = 12 / reward_scale;
+    const p: Pick = .{ .dir = .up, .after = board, .reward = reward, .value = 0 };
+    const spawned: GameState = .{ .board = board, .score = 0 };
+    const lr = 0.003;
+
+    for (0..symmetry_count) |k| {
+        var source = FixedK{ .k = k };
+        var got = start;
+        var got_cache: Cache = .{};
+        var got_trace: Net = std.mem.zeroes(Net);
+        const got_target = tdTerminalUpdate(&got, &got_cache, p, spawned, lr, std.Random.init(&source, FixedK.fill), .{ .rtgt = true }, &got_trace);
+
+        var want = start;
+        var want_cache: Cache = .{};
+        var want_trace: Net = std.mem.zeroes(Net);
+        trainStep(&want, &want_cache, transformBoard(k, board), reward, lr, .{}, &want_trace);
+
+        try std.testing.expectEqual(reward, got_target);
+        try std.testing.expectEqual(want, got);
+    }
 }
 
 test "sym_leaf=false keeps the single-forward leaf and its own cache entry (#178)" {
