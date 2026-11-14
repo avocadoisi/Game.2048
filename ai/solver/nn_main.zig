@@ -16,6 +16,9 @@ const usage =
     \\  seed_ranges   number of disjoint seed ranges; report mean ± stderr over them (default 1)
     \\  diag          literal "diag": print the TD error / value drop table by empty cells and moves to game over; "-" for none
     \\  variant       base (default), backward (sweep stored afterstates last to first), replay (re-train the last replay_k),
+    \\              tnet    (#262: replay plus a frozen bootstrap net; `par` only. The target is a copy of the
+    \\                       live net refreshed every arg-13 merged batches, default 100. Self-play moves and
+    \\                       the spawn tape still use the live net, only the next-state V in every TD target is frozen)
     \\              priority (#34: 32 extra updates per game sampled from a |TD error| buffer, 50% uniform)
     \\              midgame (#59: 32 extra updates per game from buffer entries with 4..7 empty cells, uniform)
     \\              midmix  (#63: same but 50% uniform over the whole buffer, 50% |TD error| in the 4..7 bucket)
@@ -78,14 +81,14 @@ const usage =
     \\  leaf          (#260) eval-only candidate; rows 2 (`deep`) and 4 (`deep3`) omit the leaf reward
     \\  par           literal "par": train self-play in parallel batches of min(cpu count, 8) games;
     \\                game i uses seed train_seed + i and the batch result is the mean of its games.
-    \\                (#99) as arg 10 it batches any stateless variant (base|backward|replay|sym|symlam|
+    \\                (#99) as arg 10 it batches any stateless variant (base|backward|replay|tnet|sym|symlam|
     \\                nstep|resume); as arg 6 it keeps its old meaning, the plain per-move variant only,
     \\                so replay_k is ignored there but its slot must be filled to reach weights_path.
     \\                Not supported for priority|midgame|midmix (cross-game replay buffer)
     \\                or d2|d3 (#167: the teacher search is the whole cost). t2|p2|tp2 (#158) are plain
     \\                per-move runs, so (#228) they batch like base. "-" here means the same as leaving
     \\                it out, which is how dump_path is reached.
-    \\  replay_k      afterstates re-trained per game for variant replay (default 30)
+    \\  replay_k      afterstates re-trained per game for variant replay|tnet (default 30)
     \\  weights_path  file to load (train_games 0) or write (default ai/solver/nn_weights.bin); use a temp path for variant runs
     \\  train_seed    seed for weight init and self-play games (default 1, omitted = same weights as before #56)
     \\  dump_path     file for the deep-position buffer (#159); required by dump|ft2|restart, after a "-" par slot
@@ -98,9 +101,9 @@ const usage =
     \\  rows          (#203) eval-table rows to run, comma list after batch_scale (`-` = all), e.g.
     \\                "0,2" for 1-ply and 2-ply only; the 3-ply rows dominate a measurement run.
     \\                For variant adam this slot is adam_lr instead (default 0.01), like dist's divisor,
-    \\                tailw's tail_alpha (default 1: twice the step on a full board), clamp's ceiling and
-    \\                clip's cap (default 1, the sym_batch_clip scale). Arg 14 then picks clip's mode,
-    \\                `norm` (default) or `step`.
+    \\                tailw's tail_alpha (default 1: twice the step on a full board), clamp's ceiling,
+    \\                tnet's sync interval in merged batches (default 100) and clip's cap (default 1, the
+    \\                sym_batch_clip scale). Arg 14 then picks clip's mode, `norm` (default) or `step`.
     \\
     \\Weights are written to `weights_path` only when train_games > 0;
     \\train_games = 0 (eval only) never writes.
@@ -454,6 +457,37 @@ fn evalRowSpec(policy: usize) ?EvalRowSpec {
     };
 }
 
+/// (#262) Frozen bootstrap net for `tnet`: a copy of the live net, refreshed only between merged
+/// `par` batches. Every game inside a batch therefore prices its next afterstate from the same
+/// snapshot; the target cannot chase the weights it is training, and no batch sees a mid-batch copy.
+const TargetSync = struct {
+    every: usize,
+    batches: usize = 0,
+    net: nn.Net,
+
+    fn init(net: *const nn.Net, every: usize) TargetSync {
+        return .{ .every = every, .net = net.* };
+    }
+
+    /// One merged batch finished; refresh the snapshot when the interval elapsed.
+    fn afterBatch(self: *TargetSync, net: *const nn.Net) void {
+        self.batches += 1;
+        if (self.batches % self.every == 0) self.net = net.*;
+    }
+};
+
+/// (#262) `tnet` sync interval: merged `par` batches between target snapshots, at the row-spec slot.
+/// 0 would freeze the initial random net forever, so it is refused instead of silently meaning off.
+const default_target_every: usize = 100;
+
+fn parseTargetEvery(args: []const []const u8) !usize {
+    if (args.len <= 13) return default_target_every;
+    if (std.mem.eql(u8, args[13], "-")) return default_target_every;
+    const every = std.fmt.parseInt(usize, args[13], 10) catch return error.InvalidTargetEvery;
+    if (every == 0) return error.InvalidTargetEvery;
+    return every;
+}
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     // `zig build nn` without `--` used to run the defaults (2000 games, write weights_path = the shipped
@@ -509,6 +543,9 @@ pub fn main(init: std.process.Init) !void {
     const is_tailw = std.mem.eql(u8, variant, "tailw");
     // (#234) `par`-compatible: a bounded TD target, so a diverging value cannot bootstrap itself.
     const is_clamp = std.mem.eql(u8, variant, "clamp");
+    // (#262) replay with a frozen bootstrap net: a `par` variable, see `TargetSync`.
+    const is_tnet = std.mem.eql(u8, variant, "tnet");
+    const target_every: usize = if (is_tnet) try parseTargetEvery(args) else 0;
     // (#246) the step ceiling: `norm` bounds the merged `par` delta, `step` every element of a step.
     const is_clip = std.mem.eql(u8, variant, "clip");
     const clip_mode: ClipMode = if (is_clip) try parseClipMode(args) else .norm;
@@ -528,6 +565,9 @@ pub fn main(init: std.process.Init) !void {
     var dump: nn.Dump = .{};
     var priority: nn.Priority = .{};
     var adam: nn.Adam = .{};
+    // (#262) Declared before `opts`, which points at its `net`; initialised from the live net after
+    // `startNet` and refreshed between batches only.
+    var target_sync: TargetSync = undefined;
     // `nn.Teachers` is ~40 MB (32 dumps worth, #207), so it is heap allocated, unlike the small buffers.
     const teachers = try init.gpa.create(nn.Teachers);
     defer init.gpa.destroy(teachers);
@@ -545,6 +585,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .backward = true }
     else if (std.mem.eql(u8, variant, "replay"))
         .{ .replay_k = replay_k }
+    else if (is_tnet)
+        .{ .replay_k = replay_k, .target_net = &target_sync.net }
     else if (std.mem.eql(u8, variant, "priority"))
         .{ .priority = &priority }
     else if (std.mem.eql(u8, variant, "midgame"))
@@ -584,8 +626,7 @@ pub fn main(init: std.process.Init) !void {
     else if (is_clip) switch (clip_mode) {
         .norm => .{ .grad_clip = try parseStepCap(args) },
         .step => .{ .step_clip = try parseStepCap(args) },
-    }
-    else if (std.mem.eql(u8, variant, "d2"))
+    } else if (std.mem.eql(u8, variant, "d2"))
         .{ .teacher = .deep }
     else if (std.mem.eql(u8, variant, "d3"))
         .{ .teacher = .deep3 }
@@ -615,10 +656,10 @@ pub fn main(init: std.process.Init) !void {
     // `dump` is the shared layout plus one slot: index 11 carries the dump path.
     // `par` runs may carry the #137 batch_scale at index 12, after the `-` dump slot.
     // (#203) index 13 narrows the eval table to the rows a measurement needs (`0,2`); `dist`/`dson`
-    // already own 13 as the teacher lr divisor, `adam` as its step size, and `pairw` returns before the
-    // table is built.
-    const row_spec: ?[]const u8 = if (is_dist or is_dson or is_adam or is_tailw or is_clamp or is_clip or is_pairw or is_pair or is_pairleaf or is_pairrow) null else if (args.len > 13) args[13] else null;
-    const max_args: usize = if (is_clip) 15 else if (is_dist or is_dson or is_adam or is_tailw or is_clamp) 14 else if (row_spec != null) 14 else if (is_ft2 or is_tch) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw or is_pairleaf) 12 else if (is_pairrow) 13 else 11;
+    // already own 13 as the teacher lr divisor, `adam` as its step size, `tnet` as the target sync
+    // interval, and `pairw` returns before the table is built.
+    const row_spec: ?[]const u8 = if (is_dist or is_dson or is_adam or is_tailw or is_clamp or is_tnet or is_clip or is_pairw or is_pair or is_pairleaf or is_pairrow) null else if (args.len > 13) args[13] else null;
+    const max_args: usize = if (is_clip) 15 else if (is_dist or is_dson or is_adam or is_tailw or is_clamp or is_tnet) 14 else if (row_spec != null) 14 else if (is_ft2 or is_tch) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw or is_pairleaf) 12 else if (is_pairrow) 13 else 11;
     if (args.len > max_args or seed_ranges == 0 or (uses_dump and dump_path == null) or ((is_pairleaf or is_leaf or is_pairrow) and train_games != 0)) {
         std.debug.print("{s}", .{usage});
         return;
@@ -636,6 +677,11 @@ pub fn main(init: std.process.Init) !void {
     }
     // (#246) the norm ceiling is on the delta one merged batch builds, which only `par` has.
     if (is_clip and clip_mode == .norm and !use_par) {
+        std.debug.print("{s}", .{usage});
+        return;
+    }
+    // (#262) the frozen snapshot is per merged batch, so the serial loop has no equivalent interval.
+    if (is_tnet and !use_par) {
         std.debug.print("{s}", .{usage});
         return;
     }
@@ -658,9 +704,10 @@ pub fn main(init: std.process.Init) !void {
     else
         try startNet(&net, init.io, init.gpa, train_games, use_resume, train_seed, weights_path);
     if (loaded) std.debug.print("loaded {s}\n", .{weights_path});
+    // (#262) The initial snapshot is the starting net; the first batch trains against it.
+    if (is_tnet) target_sync = TargetSync.init(&net, target_every);
     // Optimistic initialization (#107) only rescales the random init, so it stays out of `nn.Options`.
-    if (std.mem.eql(u8, variant, "oi")) nn.scaleInit(&net, 4)
-    else if (std.mem.eql(u8, variant, "oi16")) nn.scaleInit(&net, 16);
+    if (std.mem.eql(u8, variant, "oi")) nn.scaleInit(&net, 4) else if (std.mem.eql(u8, variant, "oi16")) nn.scaleInit(&net, 16);
     if (is_tch) {
         // #175 teacher pass: price every stored deep afterstate once, write `<dump_path>.tch`, train nothing.
         // #207 `tchadd` appends to that file instead of replacing it, so N dumps give one N x 65,536 teacher.
@@ -717,6 +764,9 @@ pub fn main(init: std.process.Init) !void {
                 // so stop on the first capped game instead of waiting for the other seven.
                 if (batch.capped_game) |i| return moveCap(g + i + 1, train_games, batch.capped_moves, opts.move_cap, weights_path);
                 if (!nn.weightsFinite(&net)) return diverged(g + games, train_games, weights_path);
+                // (#262) Refresh only after the merged batch is complete: every game in it saw the
+                // same target, and no thread observed a half-written copy.
+                if (is_tnet) target_sync.afterBatch(&net);
                 if ((g + games) % 5000 == 0) {
                     std.debug.print("train {d}/{d} last game score {d}\n", .{ g + games, train_games, last_score });
                     try nn.save(&net, init.io, weights_path); // checkpoint
@@ -740,7 +790,7 @@ pub fn main(init: std.process.Init) !void {
         const elapsed = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
         const variant_label = label: {
             // (#246) `clip` has two ceilings, so the log names the one that ran.
-            const base_label = if (is_clip) try std.fmt.allocPrint(init.arena.allocator(), "{s}:{s}", .{ variant, @tagName(clip_mode) }) else variant;
+            const base_label = if (is_clip) try std.fmt.allocPrint(init.arena.allocator(), "{s}:{s}", .{ variant, @tagName(clip_mode) }) else if (is_tnet) try std.fmt.allocPrint(init.arena.allocator(), "tnet:{d}", .{target_every}) else variant;
             break :label if (par_tail) try std.fmt.allocPrint(init.arena.allocator(), "{s}+par", .{base_label}) else base_label;
         };
         std.debug.print("trained {d} games, {d} moves in {d:.1} s (lr={d}, seed={d}, variant={s})\n", .{
@@ -1217,6 +1267,41 @@ test "clip variant reads its step ceiling and mode from args 13 and 14 (#246)" {
 test "usage text lists the clip variant and its mode slot (#246)" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "clip    (#246") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "`norm` (default)") != null);
+}
+
+test "tnet sync interval defaults to 100 and rejects zero (#262)" {
+    const omitted = [_][]const u8{ "nn", "2000", "0", "1", "0.003", "-", "tnet", "30", "/tmp/w.bin", "1", "par" };
+    try std.testing.expectEqual(default_target_every, try parseTargetEvery(&omitted));
+    const dash = [_][]const u8{ "nn", "2000", "0", "1", "0.003", "-", "tnet", "30", "/tmp/w.bin", "1", "par", "-", "-", "-" };
+    try std.testing.expectEqual(default_target_every, try parseTargetEvery(&dash));
+    const thousand = [_][]const u8{ "nn", "2000", "0", "1", "0.003", "-", "tnet", "30", "/tmp/w.bin", "1", "par", "-", "-", "1000" };
+    try std.testing.expectEqual(@as(usize, 1000), try parseTargetEvery(&thousand));
+    const zero = [_][]const u8{ "nn", "2000", "0", "1", "0.003", "-", "tnet", "30", "/tmp/w.bin", "1", "par", "-", "-", "0" };
+    try std.testing.expectError(error.InvalidTargetEvery, parseTargetEvery(&zero));
+}
+
+test "frozen target snapshot refreshes only on the interval (#262)" {
+    var live = std.mem.zeroes(nn.Net);
+    var next = live;
+    next.b3 = 1;
+    var sync = TargetSync.init(&live, 2);
+    try std.testing.expectEqual(@as(f64, 0), sync.net.b3);
+    sync.afterBatch(&next);
+    // between refreshes the snapshot must not chase the live net
+    try std.testing.expectEqual(@as(f64, 0), sync.net.b3);
+    sync.afterBatch(&next);
+    try std.testing.expectEqual(@as(f64, 1), sync.net.b3);
+    // a change inside the next interval is invisible until its end
+    next.b3 = 2;
+    sync.afterBatch(&next);
+    try std.testing.expectEqual(@as(f64, 1), sync.net.b3);
+    sync.afterBatch(&next);
+    try std.testing.expectEqual(@as(f64, 2), sync.net.b3);
+}
+
+test "usage text lists the frozen target variant and its sync slot (#262)" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "tnet    (#262") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "sync interval") != null);
 }
 
 test "rows argument keeps the listed eval rows and rejects junk (#203)" {
