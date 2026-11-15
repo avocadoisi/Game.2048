@@ -4059,3 +4059,97 @@ zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_we
 
 コスト: 3 行 42 局を 8 並列で約 14,300 s。#237 の tape を使うペア比較は 1 局 25 分かかるため、この
 検証では同一 seed の非ペア比較（spawn tape は seed ごとに同じ）で代用し、既定方針は変えない。
+
+### 1e-3 の spawn カットは 20 局でも既定の 1e-2 に勝たない（#256）
+
+`deep3` の spawn カットは 1e-2 が既定で、1e-3 は探索を広げる代わりにコストが 1.4 倍前後になる。
+#263 は 1e-3 を #237 の tape を使うペア比較 20 局で検証し、10 勝 10 敗・平均差 −14,324.4 点
+（mean − 2*stderr = −37,473.5）で採用条件を満たさないと結論した。ただし非ペアの 40 局は未計測で、
+row 16 はその再測定用に残してあった。ここでは同梱 128/32 net、seed 9000–9019 の 20 局（ゲーム i の
+seed は 9000+i）を row 15（既定 1e-2）と row 16（1e-3）で打ち比べた。
+
+| row | spawn cut | avg score | avg moves | reach8192 | leaves/move | ms/move | node hit rate |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 15 | 1e-2（既定） | 140,438.2 | 5,918.9 | 17/20 | 10,574.3 | 86.05 | 19.9% |
+| 16 | 1e-3 | 133,123.0 | 5,598.6 | 16/20 | 15,349.4 | 131.56 | 21.4% |
+
+同じ 20 seed で対応させると row 16 は −7,315.2 ± 8,842.7 点（8 勝 9 敗 3 分、mean − 2*stderr = −25,000.5）。
+leaves/move は 10,574.3 → 15,349.4（+45.2%）で、ms/move は 86.05 → 131.56（8 並列なので比だけ: 1.53 倍）。
+#263 のペア比較と同じ向きで、非ペア 20 局でも勝ち目がない。
+
+seed 9100 側は row 15 が 4 局（111,228.0、2/4）までしか進んでおらず、40 局は揃っていない。この 20 局は
+#263 のペア比較とは独立なゲーム列（同じ seed 列・同じ net）で、結論は変わらない。
+
+判定: 不採用。既定の 1e-2 を維持する。row 16 は再現用に残すが、既定方針・同梱重みは変えない。
+
+再現:
+```
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 15
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 16
+```
+
+コスト: 2 行 40 局を 8 並列で約 25,000 s。
+
+### phase_h1 は同梱 net で 3-ply にスコアでもコストでも勝てない（#259）
+
+phase_h1 は空き 8 以上を 2-ply、8 未満を 3-ply で打つ段階的な深さで、深さ 3 の一部を 2-ply に置き
+換えて同じ手数あたりのコストを下げる狙いだった。しかし #157 の時点で deep3 に対する速度利得は
+出ておらず、同梱 128/32 net では測り直していなかった。
+
+同梱 net、seed 9000–9019 の 20 局（ゲーム i の seed は 9000+i）を row 2 (`deep`)、row 15
+(`deep3` + node TT)、row 5 (`phase_h1`) で打ち比べた。node TT は 3-ply 以上のパートで on。
+
+| row | policy | avg score | avg moves | reach8192 | leaves/move | ms/move | node hit rate |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 2 | `deep` | 113,682.2 | 4,918.9 | 11/20 | 996.2 | 7.54 | — |
+| 15 | `deep3` + TT（既定） | 140,438.2 | 5,918.9 | 17/20 | 10,574.3 | 86.05 | 19.9% |
+| 5 | `phase_h1` | 130,887.8 | 5,577.9 | 13/20 | 10,014.3 | 100.61 | 19.4% |
+
+row 5 は row 15 に対して −9,550.4 ± 10,052.8 点（7 勝 9 敗 4 分、mean − 2*stderr = −29,656.0）。
+leaves/move は 10,014.3 で 5.3% 少ないだけ、ms/move は 100.61 で row 15 より遅い（8 並列なので比だけ:
+1.17 倍）。空き 8 以上の 2-ply パートは、ゲームの大部分を占める空き 8 未満の 3-ply パートのコストに
+埋もれ、深さ 3 の一部を 2-ply に置き換えても探索木はほとんど小さくならない。
+
+判定: 不採用。既定方針は deep3 のまま。seed 9100 は row 5 が 2 局だけ（127,040.0、1/2）で、40 局は
+揃っていない。
+
+再現:
+```
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 2
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 15
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 5
+```
+
+コスト: 3 行 60 局を 8 並列で約 22,150 s。
+
+### phase_h2/h3 を同梱 net で測り直すと 3-ply を安定して上回らない（#257）
+
+phase_h2/h3 は空きマス数に応じて 2-ply と 3-ply（h3 は 4-ply も）を切り替える段階的な深さで、
+#157 の時点では h2 110,843 / h3 108,901 対 deep3 100,728（3 局、当時の net）と、3-ply をわずかに
+上回る数字が出ていた。ただし 3 局だけで、同梱 128/32 net では測っていなかった。
+
+同梱 net、seed 9000–9003 の 4 局を row 15 (`deep3` + node TT)、row 6 (`phase_h2`)、row 7 (`phase_h3`)
+で打ち比べた（一次判定）。node TT は 3-ply 以上のパートで on。
+
+| row | policy | avg score | avg moves | reach8192 | leaves/move | ms/move | node hit rate |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 15 | `deep3` + TT（既定） | 129,335.0 | 5,503.5 | 3/4 | 10,978.5 | 61.79 | 20.1% |
+| 6 | `phase_h2` | 130,215.0 | 5,543.2 | 3/4 | 11,639.1 | 95.63 | 19.6% |
+| 7 | `phase_h3` | 144,060.0 | 6,041.0 | 4/4 | 13,065.3 | 111.61 | 20.1% |
+
+同じ 4 seed で対応させると row 6 は +880.0 ± 21,438.0（2 勝 2 敗）、row 7 は +14,725.0 ± 27,938.9
+（2 勝 1 敗 1 分）。leaves/move は row 6 が +6.0%、row 7 が +19.0% で、h3 はスコアが伸びる可能性は
+あるがコストも増える。4 局では stderr が点差より大きく、採用条件（ペア比較で mean − 2*stderr > 0）は
+満たさない。
+
+判定: 一次判定では h2 は横ばい、h3 はプラスの可能性があるが確定に足りない。既定方針は deep3 のまま。
+40 局の確定は未実施（この環境では 1 局 20 分超で、#281 の screening と同じ 10 局に届かなかった）。
+
+再現:
+```
+zig build nn -Doptimize=ReleaseFast -- 0 4 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 15
+zig build nn -Doptimize=ReleaseFast -- 0 4 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 6
+zig build nn -Doptimize=ReleaseFast -- 0 4 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 7
+```
+
+コスト: 3 行 12 局を 15 並列の一部で約 6,180 s。
