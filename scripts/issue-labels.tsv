@@ -1,0 +1,142 @@
+# issue 番号 -> area / kind の対応表（#282 の埋め戻し記録）
+#
+# number<TAB>area<TAB>kind<TAB>note
+#
+# 埋め戻し時点の分類をそのまま残す履歴。新しい issue は GitHub 側で
+# `gh issue create -l area:nn,kind:explore` のように付けるので、ここへの追記は任意。
+# 定義は docs/issues.md。付与は scripts/label-issues.sh。
+# note は「タイトルだけでは系統が決まらない」ものに理由を残すためのもの。
+281	solver	explore
+278	nn	explore
+277	nn	implement
+275	nn	explore
+273	nn	explore
+271	nn	explore
+267	solver	explore
+266	solver	implement
+263	solver	implement
+262	nn	implement
+261	solver	explore
+260	solver	explore
+259	solver	measure
+258	solver	measure
+257	solver	measure
+256	solver	explore
+255	solver	measure	pref なし: 深い探索の測り直し
+254	nn	explore
+252	nn	explore
+251	nn	explore
+250	nn	measure
+249	nn	measure
+247	nn	explore
+246	nn	implement
+245	nn	explore
+244	nn	explore
+242	nn	implement
+241	nn	explore
+237	eval	fix	pref なし: pairw の spawn tape の偏りを直す
+236	nn	explore
+235	eval	measure
+234	nn	explore
+233	nn	explore
+232	nn	explore
+231	nn	explore
+230	nn	explore
+228	nn	explore
+220	nn	explore	pref なし: 容量の掃引（変更は #205 で導入済み）
+210	eval	implement
+208	nn	fix
+207	nn	explore
+206	nn	implement
+205	nn	explore
+204	nn	implement
+203	nn	explore
+189	solver	explore
+188	solver	explore
+187	solver	explore
+186	nn	explore
+185	nn	explore
+184	nn	explore
+183	solver	implement
+182	solver	implement
+181	nn	explore
+180	nn	explore
+179	nn	explore
+178	nn	implement	pref 推論: 葉評価の 8 対称平均
+175	nn	explore
+171	solver	explore
+170	nn	implement	pref 配布: 重み形式の量子化
+169	nn	explore
+168	eval	implement
+167	nn	explore
+161	web	implement
+160	core	implement	pref なし: row_table の縮小（サイズの内訳から始まった issue）
+159	nn	explore
+158	nn	explore
+157	solver	explore
+156	eval	implement
+154	web	implement
+152	web	implement
+149	web	fix	pref なし: deploy-pages.sh が 204 を失敗扱いする
+147	web	implement	pref なし: Pages への手動デプロイ
+145	web	fix	pref なし: wasm の clock が止まり深化しない
+143	web	implement
+141	solver	implement	pref refactor: 重複の解消（挙動不変）
+139	solver	implement	pref 定期リファクタ 第1弾: 手書きの重複を潰す
+138	eval	fix	pref なし: ranking がコンパイルできない
+137	nn	fix	pref なし: par の実効学習率の希釈
+136	eval	fix	pref なし: preview の ranking 表が重みに追随しない
+135	nn	explore
+133	nn	implement	pref なし: 既定の重みを差し替え
+131	solver	explore
+129	solver	implement
+124	docs	docs	pref なし: README の整理
+117	solver	explore
+115	solver	explore
+114	solver	explore
+113	solver	explore
+112	solver	explore
+111	eval	implement	pref 評価実験基盤: evalab
+108	solver	implement	pref nn2 の探索を深める: 3-ply 化
+107	nn	explore
+106	solver	implement
+105	solver	explore	pref なし: 重みのメタ最適化の検証
+104	solver	implement
+101	solver	explore
+99	nn	implement
+98	nn	implement
+97	nn	explore
+96	docs	docs	pref skill
+92	solver	explore	pref 盤面評価: 段階でペナルティを変調
+89	eval	implement
+88	solver	implement
+87	solver	implement
+84	nn	implement
+83	solver	explore
+82	solver	explore
+73	solver	explore
+72	nn	implement
+71	core	implement	pref 高速盤面: 行 LUT
+70	solver	implement
+69	solver	implement	pref nn: 探索を 2-ply に深くする
+68	web	implement
+66	nn	explore
+63	nn	explore
+62	nn	explore
+61	nn	explore
+59	nn	explore
+56	nn	measure
+55	web	fix
+53	docs	docs
+41	eval	implement	pref なし: ベンチ結果の docs 追記スクリプト
+40	eval	implement	pref なし: 評価ループの並列化
+39	solver	implement	pref なし: pickMove の forward 再計算の削減
+38	eval	measure	pref なし: 時間予算で条件を揃える
+37	eval	measure	pref なし: seed / run 数を増やして分散を落とす
+36	nn	implement	pref なし: 重みファイル形式と docs の整備
+35	nn	implement
+34	nn	explore
+33	nn	explore
+32	nn	implement
+30	docs	docs	pref workflow skill
+28	nn	explore
