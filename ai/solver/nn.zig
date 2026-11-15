@@ -1808,6 +1808,13 @@ pub const Options = struct {
     /// transition. A terminal target is the reward alone and is not rotated. Draws one rng value per
     /// update, the same as `rsym`; `base` draws nothing. See docs/solver-history.md.
     rtgt: bool = false,
+    /// Candidate (#277): potential-based reward shaping with the empty-cell potential
+    /// `Phi(board) = shape_c * countEmpty(board) / 15`. With gamma = 1 the non-terminal target becomes
+    /// `reward + Phi(next.after) - Phi(p.after) + V(next.after)` and the terminal target
+    /// `reward - Phi(p.after)`. `0` (the default) returns the historical raw reward through a branch,
+    /// not `reward + 0.0`, so `base`/`par` stay bit-identical. Only the per-move `td1` + `greedy1`
+    /// path implements it; `validateOptions` refuses combinations that would silently drop the shape.
+    shape_c: f64 = 0,
     /// Candidate (#101): reward every move with -1 and sweep the afterstates backward at game over, so
     /// the value learns V ≈ -(moves to game over) and the self-play policy plays the fastest game over
     /// (a death net). Backward full return instead of per-move TD(0): with -1 per move the TD target is
@@ -1938,6 +1945,22 @@ pub const Options = struct {
     /// the teacher regression alone is stable, given that the parameters are shared with the early game.
     distill_only: bool = false,
 };
+
+/// (#277) Shape is implemented only by the per-move `td1` + `greedy1` TD(0) update. The variants
+/// below re-train afterstates after the game, use another target, or own a different update path, so
+/// they would silently ignore the shaped reward. Refuse them explicitly instead of falling back to
+/// the raw reward. `shape_c == 0` is always allowed and takes the untouched historical path.
+pub const OptionsError = error{ShapeRequiresPlainTd1};
+
+pub fn validateOptions(opts: Options) OptionsError!void {
+    if (opts.shape_c == 0) return;
+    if (opts.nstep > 0 or opts.backward or opts.replay_k != 0 or opts.priority != null or
+        opts.target_net != null or opts.death or opts.teacher != null or
+        opts.distill != null or opts.distill_only or opts.deep_mix or opts.dump_record or opts.restart or
+        opts.rsym or opts.rtgt or opts.lambda > 0 or
+        opts.target != .td1 or opts.selfplay != .greedy1)
+        return error.ShapeRequiresPlainTd1;
+}
 
 /// Prioritized replay (issue #34): ring buffer of recent TD updates. After each game, `m` extra updates
 /// are drawn from the buffer: with probability `uniform_share` uniformly, otherwise with probability
@@ -2360,13 +2383,20 @@ const NStepWindow = struct {
 /// Target for the previous afterstate = its scaled reward + V(next afterstate); 0 after game over.
 /// `diag` (optional) records each step's TD error and value change; it does not touch the rng or the update.
 pub fn trainGame(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag) u32 {
-    return trainGameOpts(net, rng, lr, diag, .{}).score;
+    return trainGameOptsUnchecked(net, rng, lr, diag, .{}).score;
 }
 
 pub const GameResult = struct { score: u32, moves: u32, capped: bool = false };
 
 /// `trainGame` with options. `diag` is only recorded on the default path (`opts` all off).
-pub fn trainGameOpts(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
+/// (#277) Returns `error.ShapeRequiresPlainTd1` rather than silently dropping a shaped reward on a
+/// path that does not implement it.
+pub fn trainGameOpts(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) OptionsError!GameResult {
+    try validateOptions(opts);
+    return trainGameOptsUnchecked(net, rng, lr, diag, opts);
+}
+
+fn trainGameOptsUnchecked(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
     if (opts.nstep > 0) return trainGameNStep(net, rng, lr, opts.nstep, opts.move_cap);
     if (opts.priority != null and !opts.death) return trainGamePerMove(net, rng, lr, diag, opts);
     if (!opts.backward and opts.replay_k == 0 and !opts.death) return trainGamePerMove(net, rng, lr, diag, opts);
@@ -2465,6 +2495,27 @@ fn tailWeight(opts: Options, board: Board, lr: f64) f64 {
     return lr * (1 + opts.tail_alpha * (15 - empty) / 15);
 }
 
+/// (#277) Empty-cell potential `Phi(board) = shape_c * countEmpty(board) / 15`: 0 on a full board,
+/// `shape_c` on the empty board. It is dimensionless per empty cell, so `shape_c` sets the reward scale.
+fn shapePotential(board: Board, shape_c: f64) f64 {
+    const empty: f64 = @floatFromInt(core.countEmpty(board));
+    return shape_c * empty / 15;
+}
+
+/// (#277) Shaped reward of one non-terminal TD transition. The `shape_c == 0` branch returns the raw
+/// reward itself (not `raw + 0.0`), keeping `base`/`par` bit-identical.
+fn shapedReward(p: Pick, next: Pick, opts: Options) f64 {
+    if (opts.shape_c == 0) return p.reward;
+    return p.reward + shapePotential(next.after, opts.shape_c) - shapePotential(p.after, opts.shape_c);
+}
+
+/// (#277) Shaped reward of the last transition: the terminal afterstate has no empty cell, so its
+/// potential is 0 and only `-Phi(p.after)` remains.
+fn shapedTerminalReward(p: Pick, opts: Options) f64 {
+    if (opts.shape_c == 0) return p.reward;
+    return p.reward - shapePotential(p.after, opts.shape_c);
+}
+
 test "tail weight scales only the nearly full boards (#232)" {
     var open: Board = std.mem.zeroes(Board);
     open[0][0] = 1;
@@ -2537,17 +2588,20 @@ fn symState(state: GameState, k: ?usize) GameState {
 /// (this move has not been applied yet), the board the `search2` and `teacher` targets evaluate.
 fn tdUpdate(net: *Net, cache: *Cache, p: Pick, next: Pick, spawned: GameState, lr: f64, rng: std.Random, opts: Options, trace: *Net) f64 {
     const sym = updateSym(rng, opts);
-    const target = clampTarget(p.reward + tdBootstrap(net, next, spawned, opts, sym.next), opts);
+    const reward = shapedReward(p, next, opts);
+    const target = clampTarget(reward + tdBootstrap(net, next, spawned, opts, sym.next), opts);
     trainStep(net, cache, symBoard(p.after, sym.after), target, tailWeight(opts, spawned.board, lr), opts, trace);
     return target;
 }
 
-/// The last update of a game (#273): a terminal transition has no next board, so its target is the
-/// reward alone and is never rotated; the input afterstate still gets the update's one draw.
+/// The last update of a game (#273, #277): a terminal transition has no next board, so its target is
+/// the (possibly shaped) reward alone and is never rotated; the input afterstate still gets the
+/// update's one draw.
 fn tdTerminalUpdate(net: *Net, cache: *Cache, p: Pick, spawned: GameState, lr: f64, rng: std.Random, opts: Options, trace: *Net) f64 {
     const sym = updateSym(rng, opts);
-    trainStep(net, cache, symBoard(p.after, sym.after), p.reward, tailWeight(opts, spawned.board, lr), opts, trace);
-    return p.reward;
+    const reward = shapedTerminalReward(p, opts);
+    trainStep(net, cache, symBoard(p.after, sym.after), reward, tailWeight(opts, spawned.board, lr), opts, trace);
+    return reward;
 }
 
 fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
@@ -2760,7 +2814,7 @@ fn runBatchGame(ctx: BatchGameCtx, i: usize) BatchGame {
     const game = ctx.first_game + i;
     var result: BatchGame = .{ .net = ctx.net, .score = 0, .moves = 0 };
     var rng = std.Random.DefaultPrng.init(trainingSeed(ctx.seed, game));
-    const trained = trainGameOpts(&result.net, rng.random(), ctx.lr, if (ctx.want_diag) &result.diag else null, ctx.opts);
+    const trained = trainGameOptsUnchecked(&result.net, rng.random(), ctx.lr, if (ctx.want_diag) &result.diag else null, ctx.opts);
     result.score = trained.score;
     result.moves = trained.moves;
     result.capped = trained.capped;
@@ -2797,12 +2851,14 @@ fn mergeDiag(dst: *Diag, src: *const Diag) void {
 /// `net` to net_start + (1/games) * sum_i (net_after_i - net_start), summed in game order.
 /// Each game i uses `trainingSeed(seed, first_game + i)`, so the result is the same for any thread count.
 pub fn trainBatch(net: *Net, seed: u64, first_game: usize, games: usize, lr: f64, diag: ?*Diag) BatchOutcome {
-    return trainBatchOpts(net, seed, first_game, games, lr, diag, .{});
+    return trainBatchOpts(net, seed, first_game, games, lr, diag, .{}) catch unreachable;
 }
 
 /// `trainBatch` with options: every game trains with `trainGameOpts(.., opts)`, so any stateless
 /// variant (`backward`, `replay`, `sym`, `symlam`, `nstep`) batches the same way `base` does.
-pub fn trainBatchOpts(net: *Net, seed: u64, first_game: usize, games: usize, lr: f64, diag: ?*Diag, opts: Options) BatchOutcome {
+/// (#277) Refuses a shaped run that the per-move path cannot implement, like `trainGameOpts`.
+pub fn trainBatchOpts(net: *Net, seed: u64, first_game: usize, games: usize, lr: f64, diag: ?*Diag, opts: Options) OptionsError!BatchOutcome {
+    try validateOptions(opts);
     std.debug.assert(games >= 1 and games <= parallel.max_threads);
     // the priority buffer is cross-game state shared by pointer: batching it would be a data race
     std.debug.assert(opts.priority == null);
@@ -4217,7 +4273,7 @@ fn spawnTrace(net: *const Net, seed: u64, opts: Options) [teacher_trace_moves]u6
 fn frozenGame(net: *const Net, seed: u64, opts: Options) GameResult {
     var copy = net.*;
     var rng = std.Random.DefaultPrng.init(seed);
-    return trainGameOpts(&copy, rng.random(), 0, null, opts);
+    return trainGameOpts(&copy, rng.random(), 0, null, opts) catch unreachable;
 }
 
 test "teacher self-play matches the deep2 spawn sequence (#167)" {
@@ -4353,7 +4409,7 @@ test "death training drives values toward minus moves to game over (#101)" {
     var net = Net.init(init_rng.random());
     var train_rng = std.Random.DefaultPrng.init(12);
     // 200 games at the 128/32 default (#233): at 64 games the values had barely moved off 0
-    for (0..200) |_| _ = trainGameOpts(&net, train_rng.random(), 0.02, null, .{ .death = true });
+    for (0..200) |_| _ = try trainGameOpts(&net, train_rng.random(), 0.02, null, .{ .death = true });
 
     var play_rng = std.Random.DefaultPrng.init(13);
     const rng = play_rng.random();
@@ -4720,12 +4776,12 @@ test "dump_record leaves the weights and the rng consumption unchanged" {
     var b = a;
     var rng_a = std.Random.DefaultPrng.init(12);
     var rng_b = std.Random.DefaultPrng.init(12);
-    const plain = trainGameOpts(&a, rng_a.random(), 0.003, null, .{});
+    const plain = try trainGameOpts(&a, rng_a.random(), 0.003, null, .{});
     var dump: Dump = .{};
     var c = b;
     var rng_c = std.Random.DefaultPrng.init(12);
-    const recorded = trainGameOpts(&b, rng_b.random(), 0.003, null, .{ .dump_record = true, .dump = &dump });
-    const again = trainGameOpts(&c, rng_c.random(), 0.003, null, .{ .dump_record = true, .dump = &dump });
+    const recorded = try trainGameOpts(&b, rng_b.random(), 0.003, null, .{ .dump_record = true, .dump = &dump });
+    const again = try trainGameOpts(&c, rng_c.random(), 0.003, null, .{ .dump_record = true, .dump = &dump });
     try std.testing.expectEqual(plain.score, recorded.score);
     try std.testing.expectEqual(plain.moves, recorded.moves);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
@@ -4741,11 +4797,11 @@ test "explore plays random legal moves and explore 0 keeps the greedy game (#224
     const start = Net.init(init_rng.random());
     var plain_net = start;
     var plain_rng = std.Random.DefaultPrng.init(22);
-    const plain = trainGameOpts(&plain_net, plain_rng.random(), 0.003, null, .{});
+    const plain = try trainGameOpts(&plain_net, plain_rng.random(), 0.003, null, .{});
 
     var zero_net = start;
     var zero_rng = std.Random.DefaultPrng.init(22);
-    const zero = trainGameOpts(&zero_net, zero_rng.random(), 0.003, null, .{ .explore = 0 });
+    const zero = try trainGameOpts(&zero_net, zero_rng.random(), 0.003, null, .{ .explore = 0 });
     try std.testing.expectEqual(plain.score, zero.score);
     try std.testing.expectEqual(plain.moves, zero.moves);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&plain_net), std.mem.asBytes(&zero_net));
@@ -4753,14 +4809,14 @@ test "explore plays random legal moves and explore 0 keeps the greedy game (#224
     // explore = 1 never follows the policy, so the walk leaves the greedy game
     var wild_net = start;
     var wild_rng = std.Random.DefaultPrng.init(22);
-    const wild = trainGameOpts(&wild_net, wild_rng.random(), 0.003, null, .{ .explore = 1 });
+    const wild = try trainGameOpts(&wild_net, wild_rng.random(), 0.003, null, .{ .explore = 1 });
     try std.testing.expect(wild.moves != plain.moves or wild.score != plain.score);
     try std.testing.expect(wild.moves > 0);
 
     // the random moves come from the game rng, so the same seed replays the same game
     var again_net = start;
     var again_rng = std.Random.DefaultPrng.init(22);
-    const again = trainGameOpts(&again_net, again_rng.random(), 0.003, null, .{ .explore = 1 });
+    const again = try trainGameOpts(&again_net, again_rng.random(), 0.003, null, .{ .explore = 1 });
     try std.testing.expectEqual(wild.moves, again.moves);
     try std.testing.expectEqual(wild.score, again.score);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&wild_net), std.mem.asBytes(&again_net));
@@ -4771,18 +4827,18 @@ test "warm_open skips training for the random opening and still trains the rest 
     const start = Net.init(init_rng.random());
     var plain_net = start;
     var plain_rng = std.Random.DefaultPrng.init(32);
-    const plain = trainGameOpts(&plain_net, plain_rng.random(), 0.003, null, .{});
+    const plain = try trainGameOpts(&plain_net, plain_rng.random(), 0.003, null, .{});
 
     var warm_net = start;
     var warm_rng = std.Random.DefaultPrng.init(32);
-    const warm = trainGameOpts(&warm_net, warm_rng.random(), 0.003, null, .{ .warm_open = 8 });
+    const warm = try trainGameOpts(&warm_net, warm_rng.random(), 0.003, null, .{ .warm_open = 8 });
     try std.testing.expect(warm.moves != plain.moves or warm.score != plain.score);
     // the opening trains nothing, the greedy tail does: the net still moves away from `start`
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&start), std.mem.asBytes(&warm_net)));
 
     var again_net = start;
     var again_rng = std.Random.DefaultPrng.init(32);
-    const again = trainGameOpts(&again_net, again_rng.random(), 0.003, null, .{ .warm_open = 8 });
+    const again = try trainGameOpts(&again_net, again_rng.random(), 0.003, null, .{ .warm_open = 8 });
     try std.testing.expectEqual(warm.moves, again.moves);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&warm_net), std.mem.asBytes(&again_net));
 }
@@ -4805,9 +4861,9 @@ test "ft2 mixes one deep draw per self-play step and is deterministic" {
     var rng_a = std.Random.DefaultPrng.init(12);
     var rng_b = std.Random.DefaultPrng.init(12);
     var rng_plain = std.Random.DefaultPrng.init(12);
-    const game = trainGameOpts(&a, rng_a.random(), 0.001, null, .{ .deep_mix = true, .dump = &dump });
-    const again = trainGameOpts(&b, rng_b.random(), 0.001, null, .{ .deep_mix = true, .dump = &dump });
-    _ = trainGameOpts(&plain_net, rng_plain.random(), 0.001, null, .{});
+    const game = try trainGameOpts(&a, rng_a.random(), 0.001, null, .{ .deep_mix = true, .dump = &dump });
+    const again = try trainGameOpts(&b, rng_b.random(), 0.001, null, .{ .deep_mix = true, .dump = &dump });
+    _ = try trainGameOpts(&plain_net, rng_plain.random(), 0.001, null, .{});
 
     // one deep draw per self-play step, and no draw at all without the dump: 50% self-play / 50% deep
     try std.testing.expectEqual(@as(u64, game.moves) * 2, dump.draws);
@@ -4855,9 +4911,9 @@ test "restart games are deterministic and start from a deep position" {
     var rng_a = std.Random.DefaultPrng.init(12);
     var rng_b = std.Random.DefaultPrng.init(12);
     var rng_plain = std.Random.DefaultPrng.init(12);
-    const game = trainGameOpts(&a, rng_a.random(), 0.001, null, .{ .restart = true, .dump = &dump });
-    const again = trainGameOpts(&b, rng_b.random(), 0.001, null, .{ .restart = true, .dump = &dump });
-    const plain = trainGameOpts(&plain_net, rng_plain.random(), 0.001, null, .{});
+    const game = try trainGameOpts(&a, rng_a.random(), 0.001, null, .{ .restart = true, .dump = &dump });
+    const again = try trainGameOpts(&b, rng_b.random(), 0.001, null, .{ .restart = true, .dump = &dump });
+    const plain = try trainGameOpts(&plain_net, rng_plain.random(), 0.001, null, .{});
 
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
     try std.testing.expectEqual(game.moves, again.moves);
@@ -4899,7 +4955,7 @@ test "trainGameOpts with default options equals trainGame" {
     var rng_a = std.Random.DefaultPrng.init(12);
     var rng_b = std.Random.DefaultPrng.init(12);
     _ = trainGame(&a, rng_a.random(), 0.003, null);
-    _ = trainGameOpts(&b, rng_b.random(), 0.003, null, .{});
+    _ = try trainGameOpts(&b, rng_b.random(), 0.003, null, .{});
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
 }
 
@@ -4912,8 +4968,8 @@ test "td1 + greedy1 is the default self-play path, bit for bit (#158)" {
     var rng_b = std.Random.DefaultPrng.init(12);
     var rng_c = std.Random.DefaultPrng.init(12);
     const plain = trainGame(&base, rng_a.random(), 0.003, null);
-    const with_default = trainGameOpts(&default_opts, rng_b.random(), 0.003, null, .{}).score;
-    const with_td1 = trainGameOpts(&explicit, rng_c.random(), 0.003, null, .{ .target = .td1, .selfplay = .greedy1 }).score;
+    const with_default = (try trainGameOpts(&default_opts, rng_b.random(), 0.003, null, .{})).score;
+    const with_td1 = (try trainGameOpts(&explicit, rng_c.random(), 0.003, null, .{ .target = .td1, .selfplay = .greedy1 })).score;
     try std.testing.expectEqual(plain, with_default);
     try std.testing.expectEqual(plain, with_td1);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&base), std.mem.asBytes(&default_opts));
@@ -4931,7 +4987,7 @@ test "search2, deep2 and tp2 train one game without NaN (#158)" {
     for (variants) |opts| {
         var net = init;
         var rng = std.Random.DefaultPrng.init(12);
-        const result = trainGameOpts(&net, rng.random(), 0.003, null, opts);
+        const result = try trainGameOpts(&net, rng.random(), 0.003, null, opts);
         try std.testing.expect(result.score > 0);
         for (flat(&net)) |w| try std.testing.expect(std.math.isFinite(w));
         // the variant has to actually move the weights, otherwise it silently fell back to the default path
@@ -4979,8 +5035,8 @@ test "nstep = 1 reproduces TD(0) byte for byte" {
     var one = base;
     var rng_a = std.Random.DefaultPrng.init(12);
     var rng_b = std.Random.DefaultPrng.init(12);
-    const td0 = trainGameOpts(&base, rng_a.random(), 0.003, null, .{});
-    const nstep = trainGameOpts(&one, rng_b.random(), 0.003, null, .{ .nstep = 1 });
+    const td0 = try trainGameOpts(&base, rng_a.random(), 0.003, null, .{});
+    const nstep = try trainGameOpts(&one, rng_b.random(), 0.003, null, .{ .nstep = 1 });
     try std.testing.expectEqual(td0, nstep);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&base), std.mem.asBytes(&one));
 }
@@ -4994,9 +5050,9 @@ test "nstep = 4 changes the weights, stays finite and is deterministic" {
     var rng_a = std.Random.DefaultPrng.init(12);
     var rng_b = std.Random.DefaultPrng.init(12);
     var rng_c = std.Random.DefaultPrng.init(12);
-    _ = trainGameOpts(&plain, rng_a.random(), 0.003, null, .{});
-    _ = trainGameOpts(&four, rng_b.random(), 0.003, null, .{ .nstep = 4 });
-    _ = trainGameOpts(&again, rng_c.random(), 0.003, null, .{ .nstep = 4 });
+    _ = try trainGameOpts(&plain, rng_a.random(), 0.003, null, .{});
+    _ = try trainGameOpts(&four, rng_b.random(), 0.003, null, .{ .nstep = 4 });
+    _ = try trainGameOpts(&again, rng_c.random(), 0.003, null, .{ .nstep = 4 });
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&plain), std.mem.asBytes(&four)));
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&four), std.mem.asBytes(&again));
     for (std.mem.bytesAsSlice(f64, std.mem.asBytes(&four))) |w| try std.testing.expect(std.math.isFinite(w));
@@ -5008,8 +5064,8 @@ test "nstep = 0 equals the default path" {
     var off = base;
     var rng_a = std.Random.DefaultPrng.init(12);
     var rng_b = std.Random.DefaultPrng.init(12);
-    _ = trainGameOpts(&base, rng_a.random(), 0.003, null, .{});
-    _ = trainGameOpts(&off, rng_b.random(), 0.003, null, .{ .nstep = 0 });
+    _ = try trainGameOpts(&base, rng_a.random(), 0.003, null, .{});
+    _ = try trainGameOpts(&off, rng_b.random(), 0.003, null, .{ .nstep = 0 });
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&base), std.mem.asBytes(&off));
 }
 
@@ -5020,7 +5076,7 @@ test "backward sweep changes the weights" {
     var rng_a = std.Random.DefaultPrng.init(12);
     var rng_b = std.Random.DefaultPrng.init(12);
     _ = trainGame(&base, rng_a.random(), 0.003, null);
-    _ = trainGameOpts(&back, rng_b.random(), 0.003, null, .{ .backward = true });
+    _ = try trainGameOpts(&back, rng_b.random(), 0.003, null, .{ .backward = true });
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&base), std.mem.asBytes(&back)));
 }
 
@@ -5033,8 +5089,8 @@ test "replay tail changes the weights and K=0 is off" {
     var rng_b = std.Random.DefaultPrng.init(12);
     var rng_c = std.Random.DefaultPrng.init(12);
     _ = trainGame(&base, rng_a.random(), 0.003, null);
-    _ = trainGameOpts(&replay, rng_b.random(), 0.003, null, .{ .replay_k = 30 });
-    _ = trainGameOpts(&off, rng_c.random(), 0.003, null, .{ .replay_k = 0 });
+    _ = try trainGameOpts(&replay, rng_b.random(), 0.003, null, .{ .replay_k = 30 });
+    _ = try trainGameOpts(&off, rng_c.random(), 0.003, null, .{ .replay_k = 0 });
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&base), std.mem.asBytes(&replay)));
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&base), std.mem.asBytes(&off));
 }
@@ -5069,8 +5125,8 @@ test "frozen target leaves the live policy and spawn tape unchanged" {
     var live = base;
     var rng_a = std.Random.DefaultPrng.init(12);
     var rng_b = std.Random.DefaultPrng.init(12);
-    const a = trainGameOpts(&with_target, rng_a.random(), 0, null, .{ .target_net = &target });
-    const b = trainGameOpts(&live, rng_b.random(), 0, null, .{});
+    const a = try trainGameOpts(&with_target, rng_a.random(), 0, null, .{ .target_net = &target });
+    const b = try trainGameOpts(&live, rng_b.random(), 0, null, .{});
     try std.testing.expectEqual(b.score, a.score);
     try std.testing.expectEqual(b.moves, a.moves);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&base), std.mem.asBytes(&with_target));
@@ -5091,24 +5147,24 @@ test "frozen target changes the online and replay updates without being mutated"
     var plain_without = base;
     var rng_a = std.Random.DefaultPrng.init(12);
     var rng_b = std.Random.DefaultPrng.init(12);
-    _ = trainGameOpts(&plain_with, rng_a.random(), 0.003, null, .{ .target_net = &target });
-    _ = trainGameOpts(&plain_without, rng_b.random(), 0.003, null, .{});
+    _ = try trainGameOpts(&plain_with, rng_a.random(), 0.003, null, .{ .target_net = &target });
+    _ = try trainGameOpts(&plain_without, rng_b.random(), 0.003, null, .{});
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&plain_with), std.mem.asBytes(&plain_without)));
 
     var online_with = base;
     var online_without = base;
     var rng_c = std.Random.DefaultPrng.init(13);
     var rng_d = std.Random.DefaultPrng.init(13);
-    _ = trainGameOpts(&online_with, rng_c.random(), 0.003, null, .{ .target_net = &target, .replay_k = 30, .replay_lr_scale = 0 });
-    _ = trainGameOpts(&online_without, rng_d.random(), 0.003, null, .{ .replay_k = 30, .replay_lr_scale = 0 });
+    _ = try trainGameOpts(&online_with, rng_c.random(), 0.003, null, .{ .target_net = &target, .replay_k = 30, .replay_lr_scale = 0 });
+    _ = try trainGameOpts(&online_without, rng_d.random(), 0.003, null, .{ .replay_k = 30, .replay_lr_scale = 0 });
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&online_with), std.mem.asBytes(&online_without)));
 
     var replay_with = base;
     var replay_without = base;
     var rng_e = std.Random.DefaultPrng.init(14);
     var rng_f = std.Random.DefaultPrng.init(14);
-    _ = trainGameOpts(&replay_with, rng_e.random(), 0.003, null, .{ .target_net = &target, .replay_k = 30 });
-    _ = trainGameOpts(&replay_without, rng_f.random(), 0.003, null, .{ .replay_k = 30 });
+    _ = try trainGameOpts(&replay_with, rng_e.random(), 0.003, null, .{ .target_net = &target, .replay_k = 30 });
+    _ = try trainGameOpts(&replay_without, rng_f.random(), 0.003, null, .{ .replay_k = 30 });
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&replay_with), std.mem.asBytes(&replay_without)));
 
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&target_before), std.mem.asBytes(&target));
@@ -5141,7 +5197,7 @@ test "priority pass changes the weights" {
     var rng_b = std.Random.DefaultPrng.init(12);
     var pr: Priority = .{};
     _ = trainGame(&base, rng_a.random(), 0.003, null);
-    _ = trainGameOpts(&prio, rng_b.random(), 0.003, null, .{ .priority = &pr });
+    _ = try trainGameOpts(&prio, rng_b.random(), 0.003, null, .{ .priority = &pr });
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&base), std.mem.asBytes(&prio)));
     try std.testing.expect(pr.len > 0);
 }
@@ -5260,7 +5316,7 @@ test "parallel training batch matches a serial run of the same game seeds" {
     for (0..games) |i| {
         var rng = std.Random.DefaultPrng.init(77 + i);
         var u = base;
-        serial_moves += trainGameOpts(&u, rng.random(), 0.001, null, .{}).moves;
+        serial_moves += (try trainGameOpts(&u, rng.random(), 0.001, null, .{})).moves;
     }
     try std.testing.expectEqual(serial_moves, par_out.moves);
 }
@@ -5290,12 +5346,12 @@ test "batch_scale multiplies the merged delta so a batch does the work of its ga
     for (flat(&scaled_serial), start, sums) |*w, s, sum| w.* = s + sum;
 
     var par = base;
-    _ = trainBatchOpts(&par, 77, 0, games, 0.001, null, .{ .batch_scale = @floatFromInt(games) });
+    _ = try trainBatchOpts(&par, 77, 0, games, 0.001, null, .{ .batch_scale = @floatFromInt(games) });
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&scaled_serial), std.mem.asBytes(&par));
 
     // 1.0 stays the historical mean (the plain batch test above pins the bytes).
     var unscaled = base;
-    _ = trainBatchOpts(&unscaled, 77, 0, games, 0.001, null, .{ .batch_scale = 1.0 });
+    _ = try trainBatchOpts(&unscaled, 77, 0, games, 0.001, null, .{ .batch_scale = 1.0 });
     var mean_serial = base;
     for (flat(&mean_serial), start, sums) |*w, s, sum| w.* = s + sum / games;
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&mean_serial), std.mem.asBytes(&unscaled));
@@ -5321,11 +5377,11 @@ test "a zero step ceiling leaves serial and batch training bit-identical (#246)"
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&plain), std.mem.asBytes(&zero));
 
     // the default Options carry both zeros, so an explicit zero batch is the historical batch
-    const games = 2;
+    const games = 3;
     var history = base;
     _ = trainBatch(&history, 246, 0, games, 0.003, null);
     var explicit = base;
-    _ = trainBatchOpts(&explicit, 246, 0, games, 0.003, null, .{ .grad_clip = 0, .step_clip = 0 });
+    _ = try trainBatchOpts(&explicit, 246, 0, games, 0.003, null, .{ .grad_clip = 0, .step_clip = 0 });
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&history), std.mem.asBytes(&explicit));
 }
 
@@ -5360,7 +5416,7 @@ test "grad clip bounds the L2 norm of one merged batch step (#246)" {
     const base = Net.init(init_rng.random());
 
     var plain = base;
-    _ = trainBatchOpts(&plain, 246, 0, games, 0.003, null, .{});
+    _ = try trainBatchOpts(&plain, 246, 0, games, 0.003, null, .{});
     var norm2: f64 = 0;
     for (flat(&plain), flatConst(&base)) |a, b| norm2 += (a - b) * (a - b);
     const norm = @sqrt(norm2);
@@ -5368,7 +5424,7 @@ test "grad clip bounds the L2 norm of one merged batch step (#246)" {
 
     const cap = norm / 4;
     var capped = base;
-    _ = trainBatchOpts(&capped, 246, 0, games, 0.003, null, .{ .grad_clip = cap });
+    _ = try trainBatchOpts(&capped, 246, 0, games, 0.003, null, .{ .grad_clip = cap });
     const scale = cap / norm;
     var capped_norm2: f64 = 0;
     for (flat(&capped), flat(&plain), flatConst(&base)) |a, p, b| {
@@ -5417,7 +5473,7 @@ test "par + Adam takes one bounded step per batch (#231)" {
     var base = Net.init(init_rng.random());
     var state: Adam = .{};
     var net = base;
-    _ = trainBatchOpts(&net, 77, 0, games, 0.003, null, .{ .adam = &state, .adam_lr = 0.01 });
+    _ = try trainBatchOpts(&net, 77, 0, games, 0.003, null, .{ .adam = &state, .adam_lr = 0.01 });
     try std.testing.expectEqual(@as(u64, 1), state.t);
     for (flat(&net)) |w| try std.testing.expect(std.math.isFinite(w));
     // the gradient scale never enters the step: |dw| <= adam_lr whatever the batch delta was
@@ -5437,7 +5493,7 @@ test "parallel training batch with variant opts matches a serial run of the same
         for (&units, 0..) |*u, i| {
             u.* = base;
             var rng = std.Random.DefaultPrng.init(77 + i);
-            _ = trainGameOpts(u, rng.random(), 0.001, null, opts);
+            _ = try trainGameOpts(u, rng.random(), 0.001, null, opts);
         }
         const flat_len = @sizeOf(Net) / @sizeOf(f64);
         var sums: [flat_len]f64 = @splat(0);
@@ -5449,7 +5505,7 @@ test "parallel training batch with variant opts matches a serial run of the same
         for (flat(&serial), start, sums) |*w, s, sum| w.* = s + sum / games;
 
         var par = base;
-        _ = trainBatchOpts(&par, 77, 0, games, 0.001, null, opts);
+        _ = try trainBatchOpts(&par, 77, 0, games, 0.001, null, opts);
         try std.testing.expectEqualSlices(u8, std.mem.asBytes(&serial), std.mem.asBytes(&par));
     }
 }
@@ -5462,13 +5518,13 @@ test "move cap leaves a normal game bit-identical and stops a long one (#242)" {
     // including the rng draws left after the game (same spawn tape, same training, same `moves`).
     var plain_net = start;
     var plain_rng = std.Random.DefaultPrng.init(243);
-    const plain = trainGameOpts(&plain_net, plain_rng.random(), 0.003, null, .{});
+    const plain = try trainGameOpts(&plain_net, plain_rng.random(), 0.003, null, .{});
     try std.testing.expect(!plain.capped);
     try std.testing.expect(plain.moves < default_move_cap);
 
     var same_net = start;
     var same_rng = std.Random.DefaultPrng.init(243);
-    const same = trainGameOpts(&same_net, same_rng.random(), 0.003, null, .{ .move_cap = default_move_cap });
+    const same = try trainGameOpts(&same_net, same_rng.random(), 0.003, null, .{ .move_cap = default_move_cap });
     try std.testing.expectEqual(plain.score, same.score);
     try std.testing.expectEqual(plain.moves, same.moves);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&plain_net), std.mem.asBytes(&same_net));
@@ -5479,7 +5535,7 @@ test "move cap leaves a normal game bit-identical and stops a long one (#242)" {
     const cap: u32 = @max(1, frozen.moves / 2);
     var short_net = start;
     var short_rng = std.Random.DefaultPrng.init(243);
-    const short = trainGameOpts(&short_net, short_rng.random(), 0, null, .{ .move_cap = cap });
+    const short = try trainGameOpts(&short_net, short_rng.random(), 0, null, .{ .move_cap = cap });
     try std.testing.expect(short.capped);
     try std.testing.expectEqual(cap, short.moves);
     // 0 disables the cap, so the same game runs to its normal end
@@ -5495,7 +5551,7 @@ test "the parallel batch reports and aggregates the capped game (#242)" {
     const base = Net.init(init_rng.random());
 
     var par = base;
-    const out = trainBatchOpts(&par, 242, 0, games, 0.003, null, .{ .move_cap = cap });
+    const out = try trainBatchOpts(&par, 242, 0, games, 0.003, null, .{ .move_cap = cap });
 
     // Same games serially: one capped game must not hide the other games' moves from the batch.
     var serial_moves: u64 = 0;
@@ -5504,7 +5560,7 @@ test "the parallel batch reports and aggregates the capped game (#242)" {
     for (0..games) |i| {
         var unit = base;
         var rng = std.Random.DefaultPrng.init(trainingSeed(242, i));
-        const game = trainGameOpts(&unit, rng.random(), 0.003, null, .{ .move_cap = cap });
+        const game = try trainGameOpts(&unit, rng.random(), 0.003, null, .{ .move_cap = cap });
         serial_moves += game.moves;
         if (game.capped and capped_game == null) {
             capped_game = i;
@@ -5568,7 +5624,7 @@ test "symmetry=false and lambda=0 reproduce the recorded checksum (5 games, seed
     var init_rng = std.Random.DefaultPrng.init(11);
     var net = Net.init(init_rng.random());
     var rng = std.Random.DefaultPrng.init(12);
-    for (0..5) |_| _ = trainGameOpts(&net, rng.random(), 0.003, null, .{ .symmetry = false, .lambda = 0 });
+    for (0..5) |_| _ = try trainGameOpts(&net, rng.random(), 0.003, null, .{ .symmetry = false, .lambda = 0 });
     try std.testing.expectEqual(@as(u32, 3042928886), std.hash.Crc32.hash(std.mem.asBytes(&net)));
 }
 
@@ -5978,9 +6034,9 @@ test "symmetry and symlam change the weights (smoke)" {
     var rng_a = std.Random.DefaultPrng.init(12);
     var rng_b = std.Random.DefaultPrng.init(12);
     var rng_c = std.Random.DefaultPrng.init(12);
-    _ = trainGameOpts(&plain, rng_a.random(), 0.003, null, .{});
-    _ = trainGameOpts(&sym, rng_b.random(), 0.003, null, .{ .symmetry = true });
-    _ = trainGameOpts(&symlam, rng_c.random(), 0.003, null, .{ .symmetry = true, .lambda = 0.7 });
+    _ = try trainGameOpts(&plain, rng_a.random(), 0.003, null, .{});
+    _ = try trainGameOpts(&sym, rng_b.random(), 0.003, null, .{ .symmetry = true });
+    _ = try trainGameOpts(&symlam, rng_c.random(), 0.003, null, .{ .symmetry = true, .lambda = 0.7 });
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&plain), std.mem.asBytes(&sym)));
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&sym), std.mem.asBytes(&symlam)));
     for (std.mem.bytesAsSlice(f64, std.mem.asBytes(&symlam))) |w| try std.testing.expect(std.math.isFinite(w));
@@ -6509,8 +6565,8 @@ test "dist takes one regression step per self-play step on average (#175)" {
     var rng_b = std.Random.DefaultPrng.init(11);
     var a = net;
     var b = net;
-    const game = trainGameOpts(&a, rng_a.random(), 0.001, null, opts);
-    const again = trainGameOpts(&b, rng_b.random(), 0.001, null, opts);
+    const game = try trainGameOpts(&a, rng_a.random(), 0.001, null, opts);
+    const again = try trainGameOpts(&b, rng_b.random(), 0.001, null, opts);
     try std.testing.expectEqual(game.moves, again.moves);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
     // the mix is observable and is not the plain path: draws > 0 and the net moved
@@ -6523,7 +6579,7 @@ test "dist takes one regression step per self-play step on average (#175)" {
     // per move for the teacher step, so only the net is comparable, not the move count)
     var plain = net;
     var rng_c = std.Random.DefaultPrng.init(11);
-    _ = trainGameOpts(&plain, rng_c.random(), 0.001, null, .{});
+    _ = try trainGameOpts(&plain, rng_c.random(), 0.001, null, .{});
     try std.testing.expectEqual(game.moves * 2, buffer.draws);
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&a), std.mem.asBytes(&plain)));
 }
@@ -6540,7 +6596,7 @@ test "distill_every thins the teacher mix and distill_lr does not change the TD 
     thinned.append(board, 2.0);
     var thinned_net = net;
     var rng_a = std.Random.DefaultPrng.init(11);
-    const thinned_game = trainGameOpts(&thinned_net, rng_a.random(), 0.001, null, .{ .distill = thinned, .distill_every = 4 });
+    const thinned_game = try trainGameOpts(&thinned_net, rng_a.random(), 0.001, null, .{ .distill = thinned, .distill_every = 4 });
     try std.testing.expect(thinned.draws > 0);
     try std.testing.expect(thinned.draws <= thinned_game.moves);
     // every = 1 is the dense mix, so the same game draws strictly more teacher steps than every = 4
@@ -6549,7 +6605,7 @@ test "distill_every thins the teacher mix and distill_lr does not change the TD 
     dense.append(board, 2.0);
     var dense_net = net;
     var rng_b = std.Random.DefaultPrng.init(11);
-    const dense_game = trainGameOpts(&dense_net, rng_b.random(), 0.001, null, .{ .distill = dense, .distill_every = 1 });
+    const dense_game = try trainGameOpts(&dense_net, rng_b.random(), 0.001, null, .{ .distill = dense, .distill_every = 1 });
     try std.testing.expectEqual(dense_game.moves, dense.draws);
     try std.testing.expect(dense.draws > thinned.draws);
     // `distill_lr` only rescales the teacher step: with a teacher buffer that is never drawn the TD half
@@ -6560,8 +6616,8 @@ test "distill_every thins the teacher mix and distill_lr does not change the TD 
     var b = net;
     var rng_c = std.Random.DefaultPrng.init(11);
     var rng_d = std.Random.DefaultPrng.init(11);
-    _ = trainGameOpts(&a, rng_c.random(), 0.001, null, .{ .distill = empty });
-    _ = trainGameOpts(&b, rng_d.random(), 0.001, null, .{ .distill = empty, .distill_lr = 1e-5 });
+    _ = try trainGameOpts(&a, rng_c.random(), 0.001, null, .{ .distill = empty });
+    _ = try trainGameOpts(&b, rng_d.random(), 0.001, null, .{ .distill = empty, .distill_lr = 1e-5 });
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
 }
 
@@ -6743,4 +6799,122 @@ test "global features are normalised and describe the board (#226)" {
     mid[2] = .{ 64, 8, 128, 2 };
     mid[3] = .{ 1024, 32, 2, 4 };
     for (featureValues(mid)) |f| try std.testing.expect(f >= 0 and f <= 1);
+}
+
+test "empty-cell potential has the #277 endpoints and scale" {
+    try std.testing.expectEqual(@as(f64, 0), shapePotential(boardWithEmpties(0), 1));
+    try std.testing.expectEqual(@as(f64, 1), shapePotential(boardWithEmpties(15), 1));
+    try std.testing.expectApproxEqAbs(@as(f64, 0.2), shapePotential(boardWithEmpties(3), 1), 1e-15);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), shapePotential(boardWithEmpties(3), 1.25), 1e-15);
+}
+
+test "shaped non-terminal and terminal targets follow the potential formula (#277)" {
+    var init_rng = std.Random.DefaultPrng.init(277);
+    var net = Net.init(init_rng.random());
+    var cache: Cache = .{};
+    var trace = net;
+    var rng = std.Random.DefaultPrng.init(278);
+    const c = 0.75;
+    const p: Pick = .{ .dir = .left, .after = boardWithEmpties(8), .reward = 0.25, .value = 1 };
+    const next: Pick = .{ .dir = .right, .after = boardWithEmpties(5), .reward = 0.5, .value = 3.5 };
+    const spawned: GameState = .{ .board = boardWithEmpties(6) };
+
+    // #277: reward + Phi(next.after) - Phi(p.after) + V(next.after), with V = next.value on td1/greedy1.
+    const want_nonterminal = p.reward + shapePotential(next.after, c) - shapePotential(p.after, c) + next.value;
+    const got_nonterminal = tdUpdate(&net, &cache, p, next, spawned, 0, rng.random(), .{ .shape_c = c }, &trace);
+    try std.testing.expectApproxEqAbs(want_nonterminal, got_nonterminal, 1e-12);
+
+    // The terminal afterstate has no next board: its potential is 0, leaving reward - Phi(p.after).
+    const want_terminal = p.reward - shapePotential(p.after, c);
+    const got_terminal = tdTerminalUpdate(&net, &cache, p, spawned, 0, rng.random(), .{ .shape_c = c }, &trace);
+    try std.testing.expectApproxEqAbs(want_terminal, got_terminal, 1e-12);
+}
+
+test "shape_c zero keeps the raw reward bit-identical (#277)" {
+    var init_rng = std.Random.DefaultPrng.init(277);
+    var net = Net.init(init_rng.random());
+    var cache: Cache = .{};
+    var trace = net;
+    var rng = std.Random.DefaultPrng.init(279);
+    const p: Pick = .{ .dir = .left, .after = boardWithEmpties(8), .reward = 0.25, .value = 1 };
+    const next: Pick = .{ .dir = .right, .after = boardWithEmpties(5), .reward = 0.5, .value = 3.5 };
+    const spawned: GameState = .{ .board = boardWithEmpties(6) };
+
+    const plain = tdUpdate(&net, &cache, p, next, spawned, 0, rng.random(), .{}, &trace);
+    const zero = tdUpdate(&net, &cache, p, next, spawned, 0, rng.random(), .{ .shape_c = 0 }, &trace);
+    try std.testing.expectEqual(plain, zero);
+    try std.testing.expectEqual(p.reward + next.value, zero);
+
+    const plain_terminal = tdTerminalUpdate(&net, &cache, p, spawned, 0, rng.random(), .{}, &trace);
+    const zero_terminal = tdTerminalUpdate(&net, &cache, p, spawned, 0, rng.random(), .{ .shape_c = 0 }, &trace);
+    try std.testing.expectEqual(plain_terminal, zero_terminal);
+    try std.testing.expectEqual(p.reward, zero_terminal);
+}
+
+test "par accepts shape and matches the serial games (#277)" {
+    const games = 2;
+    const opts = Options{ .shape_c = 0.5 };
+    var init_rng = std.Random.DefaultPrng.init(277);
+    var base = Net.init(init_rng.random());
+
+    var units: [games]Net = undefined;
+    for (&units, 0..) |*u, i| {
+        u.* = base;
+        var rng = std.Random.DefaultPrng.init(277 + i);
+        _ = try trainGameOpts(u, rng.random(), 0.001, null, opts);
+    }
+    const flat_len = @sizeOf(Net) / @sizeOf(f64);
+    var sums: [flat_len]f64 = @splat(0);
+    const start = flat(&base);
+    for (&units) |*u| {
+        for (flat(u), start, 0..) |v, s, k| sums[k] += v - s;
+    }
+    var serial = base;
+    for (flat(&serial), start, sums) |*w, s, sum| w.* = s + sum / games;
+
+    var par = base;
+    _ = try trainBatchOpts(&par, 277, 0, games, 0.001, null, opts);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&serial), std.mem.asBytes(&par));
+}
+
+test "explicit shape_c zero trains exactly like base, serial and par (#277)" {
+    var init_rng = std.Random.DefaultPrng.init(277);
+    const base = Net.init(init_rng.random());
+
+    var plain = base;
+    var zero = base;
+    for (0..2) |i| {
+        var plain_rng = std.Random.DefaultPrng.init(277 + i);
+        var zero_rng = std.Random.DefaultPrng.init(277 + i);
+        _ = trainGame(&plain, plain_rng.random(), 0.001, null);
+        _ = try trainGameOpts(&zero, zero_rng.random(), 0.001, null, .{ .shape_c = 0 });
+    }
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&plain), std.mem.asBytes(&zero));
+
+    var plain_par = base;
+    var zero_par = base;
+    _ = trainBatch(&plain_par, 277, 0, 3, 0.001, null);
+    _ = try trainBatchOpts(&zero_par, 277, 0, 3, 0.001, null, .{ .shape_c = 0 });
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&plain_par), std.mem.asBytes(&zero_par));
+}
+
+test "shape refuses variants that would drop the shaped reward (#277)" {
+    var init_rng = std.Random.DefaultPrng.init(277);
+    try validateOptions(.{});
+    try validateOptions(.{ .shape_c = 0, .replay_k = 30, .backward = true });
+    try std.testing.expectError(error.ShapeRequiresPlainTd1, validateOptions(.{ .shape_c = 1, .replay_k = 30 }));
+    try std.testing.expectError(error.ShapeRequiresPlainTd1, validateOptions(.{ .shape_c = 1, .nstep = 4 }));
+    var target_net = Net.init(init_rng.random());
+    try std.testing.expectError(error.ShapeRequiresPlainTd1, validateOptions(.{ .shape_c = 1, .target_net = &target_net }));
+    try std.testing.expectError(error.ShapeRequiresPlainTd1, validateOptions(.{ .shape_c = 1, .teacher = .deep }));
+    try std.testing.expectError(error.ShapeRequiresPlainTd1, validateOptions(.{ .shape_c = 1, .backward = true }));
+    try std.testing.expectError(error.ShapeRequiresPlainTd1, validateOptions(.{ .shape_c = 1, .death = true }));
+    try std.testing.expectError(error.ShapeRequiresPlainTd1, validateOptions(.{ .shape_c = 1, .rsym = true }));
+    try std.testing.expectError(error.ShapeRequiresPlainTd1, validateOptions(.{ .shape_c = 1, .lambda = 0.7 }));
+    try std.testing.expectError(error.ShapeRequiresPlainTd1, validateOptions(.{ .shape_c = 1, .target = .search2 }));
+    try std.testing.expectError(error.ShapeRequiresPlainTd1, validateOptions(.{ .shape_c = 1, .selfplay = .deep2 }));
+
+    var net = Net.init(init_rng.random());
+    var rng = std.Random.DefaultPrng.init(280);
+    try std.testing.expectError(error.ShapeRequiresPlainTd1, trainGameOpts(&net, rng.random(), 0.001, null, .{ .shape_c = 1, .replay_k = 30 }));
 }

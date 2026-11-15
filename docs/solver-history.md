@@ -3921,3 +3921,37 @@ scripts/eval-net.sh /tmp/w128_64_300k_s1.bin --shipped /tmp/ship128_64.bin --h1 
 
 コスト: 学習 4,923.5 s（awake、wall 8,303 s）、pairw 1,163.5 s、非ペア 1 本 111〜118 s。
 `scripts/eval-net.sh` の判定基準に当てはめると REJECT（score/reach/ms の全項目で fail）。
+
+## 空きマス potential による reward shaping を opt-in で実装（#277）
+
+報酬系の次の候補として、空きマス数だけを使う potential-based reward shaping を実装した。盤面
+`b` の potential を `Phi(b) = shape_c * empties(b) / 15` とし、非終端の TD 目標を
+`reward + Phi(next.after) - Phi(p.after) + V(next.after)`、終端を `reward - Phi(p.after)` にする
+（γ=1、終端の potential は 0）。`shape_c` は `nn.Options.shape_c`（既定 0）で、CLI では variant
+`shape` の row-spec slot（arg 13）に係数を置く。既定と `-` は 1、0 は `base` と同じ実行になるため
+拒否する。負の係数は potential shaping として有効なので許可する。
+
+`shape_c == 0` は `shapedReward` / `shapedTerminalReward` の先頭で生の報酬を返す分岐にし、
+`reward + 0.0` のような演算を挟まない。これにより既存の `base` / `par` の学習結果は
+bit-identical のまま。`base` と `shape_c=0`、および `par` と `shape_c=0` の全重み一致をテストで
+固定し、既存の 5 局 checksum（seeds 11/12、Crc32 `3042928886`）も変更していない。
+
+potential shaping を実装していない経路（replay、tnet、teacher、nstep、death、backward、priority、
+distill、rsym、rtgt、lambda、td1/greedy1 以外の target/selfplay など）は `validateOptions` が
+`error.ShapeRequiresPlainTd1` で明示的に拒否する。後から afterstate を再学習したり別の target を
+使う経路で生の報酬に黙って落ちると、shape を指定した意味が消えるため。`par` は同じ
+`trainGameOptsUnchecked` を各ゲームで走らせるので `shape` に対応する。
+
+正しさ: `Phi` の empties 0/15 と係数、非終端・終端の目標式、`shape_c=0` の生報酬一致、
+`shape` の `par` 実行、未対応 variant の拒否をテストした。CLI は係数の省略・`-`・明示・負値・
+0/非有限/typo をテストし、usage に `shape` を追加した。
+
+**まだ avg score は測っていない。** 既定 policy・`ai/solver/nn_weights.bin`・採用レシピは変更せず、
+`shape` は再現用の opt-in variant として残す。次の比較は同じ 128/32・300k レシピで
+`shape 1`（係数 1）を `base` と pairw で測る。実行例:
+
+```
+zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 300000 0 9000 0.003 1 shape 30 /tmp/shape.bin 1 par
+```
+
+`zig build test` は既存 checksum を含めて全通過（実装時点）。
