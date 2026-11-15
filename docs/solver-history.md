@@ -4153,3 +4153,60 @@ zig build nn -Doptimize=ReleaseFast -- 0 4 9000 0.003 1 base 30 ai/solver/nn_wei
 ```
 
 コスト: 3 行 12 局を 15 並列の一部で約 6,180 s。
+
+### deep3 の刈り枝を浅く補完する row 20 を同梱 net で再計測（#261）
+
+`.deep3` は spawn の確率が 1e-2 未満の枝を捨て、残りを再正規化する。`.deep3_recover` は保持枝を元の
+深さで探索し、捨てる枝も実際に spawn した子盤面から自分の手・報酬を一段浅く評価して、全 spawn を
+元の確率で加重する。確率質量を捨てずに評価する一方、異なる深さの V の較正差で悪化する可能性もある。
+候補は opt-in の row 20、現行の既定は row 15（`deep3` + node TT）。同梱 128/32 net の SHA-256 は
+`c98ea27cf723cc96258173bd7be74630e80c2f1f358777c5ddaec059ec19a6c1`。
+
+まず、seed 9000–9019 の 20 局を現行の row 15 / row 20 で再測定した。1 局 1 プロセスで実行し、各局は
+同じ seed を使う。これは同じ spawn stream を対応させる比較だが、#237 の 32-bit tape を使う `pairrow`
+比較ではない。
+
+| row | policy | avg score | avg moves | reach8192 | leaves/move | ms/move | node hit rate |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 15 | `deep3` + TT（現行既定） | 140,438.2 | 5,918.9 | 17/20 | 10,574.3 | 86.05 | 19.9% |
+| 20 | `deep3_recover` + TT | 147,891.4 | 6,225.6 | 16/20 | 10,625.9 | 116.45 | 23.1% |
+
+同じ 20 seed で個別ゲームの score を対応させると、row 20 は +7,453.2 点（12 勝 / 8 敗、標準誤差
+10,695.1、mean − 2×stderr = −13,937.0）。この差は採用目安の 0 を超えず、有意な改善とは言えない。
+leaves/move はほぼ同じ（+0.5%）、reach8192 は 17/20 から 16/20。ms/move は row 20 が大きいが、長時間の
+8 並列計測中にホストの性能低下が進んだため、絶対値・比とも厳密な速度比較には使えない。
+
+この 20 局の row 15 / row 20 の score と到達数は、2026-11-12 に記録した seed 9000 の非ペア測定と一致する。
+当時の測定（TT-off、当時の row 4=`deep3` / row 15=`deep3_recover`）では、seed 9100 も各 20 局実施済み:
+
+| 方策 | seed 9000 score / reach8192 / ms/move / leaves/move | seed 9100 score / reach8192 / ms/move / leaves/move | 40局 avg score / reach8192 / pooled ms/move / leaves/move |
+|---|---:|---:|---:|
+| `deep3` | 140,438.2 / 17/20 / 21.38 / 19,028.7 | 134,245.0 / 16/20 / 24.13 / 19,455.2 | 137,341.6 / 33/40 / 22.73 / 19,237.4 |
+| `deep3_recover` | 147,891.4 / 16/20 / 22.26 / 18,867.3 | 131,919.8 / 15/20 / 23.62 / 20,011.7 | 139,905.6 / 31/40 / 22.90 / 19,408.2 |
+
+旧測定では row 20 相当は 40 局平均で +2,564 点だが、seed 9100 では −2,325.2 点、8192 到達は 2 局減、
+pooled ms/move は約 0.8% 増。seed ごとに 1 範囲だけの非ペア値であり、これだけでは有意差を示さない。
+2026-11-12 の tape 比較（A=`deep3`、B=`deep3_recover`、seed 9000、20 局）は mean diff
+**+17,141.2 ± 12,838.7**、B勝 / A勝 / 同点 = **10 / 9 / 1**、mean − 2×stderr = **−8,536.1**。
+これも採用目安 `mean − 2×stderr > 0` を満たさない。旧 pair は row 20 追加前の `pairdeep3` 経路で、今回
+の現行 row 15 / 20 を使った同一 tape の再測定ではない。
+
+判定: `.deep3_recover` は opt-in の row 20 として残すが、既定への採用は見送る。paired の下限が負で、
+40 局評価でも seed 間で方向が揃わず、reach8192 は減り、コストの確かな改善もない。既定方針・同梱重みは
+変更しない。
+
+再現（現行 CLI。row 15=`deep3` + TT、row 20=`deep3_recover` + TT）:
+```
+# 20 局の同一 seed 列（1 局 1 プロセス）
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 15
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 20
+# 32-bit spawn tape による現行 paired 比較（この再計測では実行していない）
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 pairrow 30 ai/solver/nn_weights.bin 1 - 15 20
+# seed 9100 の現行 baseline / 候補
+zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 15
+zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 20
+```
+
+`zig build test-nn -Dtest-filter='fallback'`、`zig build test-nn-main -Dtest-filter='recovered cut branch'` と
+`zig build nn -Doptimize=ReleaseFast` は通過済み。テストは合成木で全 spawn の確率総和、刈った子の浅い評価、
+全枝 cut、cutoff 無効時の一致、終局値を確認する。
