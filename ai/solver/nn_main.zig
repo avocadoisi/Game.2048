@@ -472,6 +472,8 @@ fn evalRowSpec(policy: usize) ?EvalRowSpec {
         15 => .{ .mode = .deep3, .opts = .{} }, // #266 default node TT
         16 => .{ .mode = .deep3, .opts = .{ .cutoff = 1e-3 } },
         17 => .{ .mode = .deep4, .opts = .{ .node_tt = true } }, // #267
+        18 => .{ .mode = .deep3, .opts = .{ .cutoff = 0.02, .node_tt = true } }, // #281
+        19 => .{ .mode = .deep3, .opts = .{ .cutoff = 0.05, .node_tt = true } }, // #281
         else => null,
     };
 }
@@ -888,6 +890,10 @@ pub fn main(init: std.process.Init) !void {
         // #267: `deep4`, one more own move and spawn layer than row 15 at the same 1e-2 cut, with the
         // node table on. A/B against row 15 answers whether the saved time buys a deeper tree.
         .{ .name = "nn 4-ply + node TT (#267)", .policy = 17 },
+        // #281: row 15 with a higher spawn cut, so the 4 branches at empty cells >= 6 (0.02) or >= 3
+        // (0.05) are dropped. A/B against row 15 measures whether the saved leaves buy a better score.
+        .{ .name = "nn 3-ply cutoff 0.02 + node TT (#281)", .policy = 18 },
+        .{ .name = "nn 3-ply cutoff 0.05 + node TT (#281)", .policy = 19 },
     };
     // Rows are all on by default; `rows` (arg 13, #203) keeps the two a measurement needs
     // (0 = 1-ply, 2 = 2-ply) instead of paying for the 3-ply rows twice over. A stray token is a
@@ -1074,6 +1080,9 @@ pub fn main(init: std.process.Init) !void {
                 16 => nn.playValueOpts(c.vfn, prng.random(), .deep3, .{ .cutoff = 1e-3 }),
                 // #267: one more ply than row 15 at the same cut, node TT explicitly on
                 17 => nn.playValueOpts(c.vfn, prng.random(), .deep4, .{ .node_tt = true }),
+                // #281: row 15 with only the 4 branches at empty cells >= 6 / >= 3 kept
+                18 => nn.playValueOpts(c.vfn, prng.random(), .deep3, .{ .cutoff = 0.02, .node_tt = true }),
+                19 => nn.playValueOpts(c.vfn, prng.random(), .deep3, .{ .cutoff = 0.05, .node_tt = true }),
                 else => unreachable,
             };
         }
@@ -1139,6 +1148,17 @@ test "pairrow reads two eval row indices and maps row 17 to deep4 (#267)" {
     try std.testing.expectEqual(nn.Mode.deep4, evalRowSpec(17).?.mode);
     try std.testing.expectEqual(@as(?bool, true), evalRowSpec(17).?.opts.node_tt);
     try std.testing.expect(evalRowSpec(3) == null);
+}
+
+test "high spawn-cut rows 18 and 19 keep the default row 15 path (#281)" {
+    try std.testing.expectEqual(nn.Mode.deep3, evalRowSpec(15).?.mode);
+    try std.testing.expectEqual(@as(?f64, null), evalRowSpec(15).?.opts.cutoff);
+    try std.testing.expectEqual(nn.Mode.deep3, evalRowSpec(18).?.mode);
+    try std.testing.expectEqual(@as(?f64, 0.02), evalRowSpec(18).?.opts.cutoff);
+    try std.testing.expectEqual(@as(?bool, true), evalRowSpec(18).?.opts.node_tt);
+    try std.testing.expectEqual(nn.Mode.deep3, evalRowSpec(19).?.mode);
+    try std.testing.expectEqual(@as(?f64, 0.05), evalRowSpec(19).?.opts.cutoff);
+    try std.testing.expectEqual(@as(?bool, true), evalRowSpec(19).?.opts.node_tt);
 }
 
 test "usage text lists the pairrow variant (#267)" {
