@@ -468,7 +468,7 @@ pub const Stats = struct { leaves: u64 = 0, hits: u64 = 0, node_probes: u64 = 0,
 /// `cutoff` (`0` keeps every branch) and dropping the lowest-probability branches up to a share
 /// `mass_cutoff` of each chance node's mass (#182, `0` keeps every branch). Part of the value-cache
 /// key (#157), because a phase game asks for the same board at two depths.
-pub const Depth = struct { ply: u8 = 0, cutoff: f64 = 0, mass_cutoff: f64 = 0, risk_weight: f64 = 0, omit_leaf_reward: bool = false };
+pub const Depth = struct { ply: u8 = 0, cutoff: f64 = 0, mass_cutoff: f64 = 0, risk_weight: f64 = 0, omit_leaf_reward: bool = false, recover_cut_branches: bool = false };
 
 /// A completed search node: its value and whether that value is a direct leaf (#260). The node table
 /// stores both, because the parent of a direct leaf omits that move's reward.
@@ -695,6 +695,24 @@ const spawn_tiles = [_]struct { value: core.Tile, p: f64 }{ .{ .value = 2, .p = 
 /// `cprob * spawn.p`. Collected in board order, which is also the tie-break of the mass cut.
 const ChanceBranch = struct { r: usize, c: usize, tile: core.Tile, p: f64 };
 
+fn spawnProbability(tile: core.Tile) f64 {
+    for (spawn_tiles) |spawn| if (spawn.value == tile) return spawn.p;
+    unreachable;
+}
+
+/// The cutoff fallback keeps a cut branch's board and drops exactly one own-move layer.
+fn spawnBranchDepth(depth: u8, cut: bool, recover_cut_branches: bool) u8 {
+    return if (cut and recover_cut_branches and depth > 1) depth - 1 else depth;
+}
+
+/// Expected value over a complete chance node, with each branch's local probability as its weight.
+fn weightedChanceValue(values: []const f64, probabilities: []const f64) f64 {
+    std.debug.assert(values.len == probabilities.len);
+    var total: f64 = 0;
+    for (values, probabilities) |value, probability| total += value * probability;
+    return total;
+}
+
 /// A full board's worth of branches: at most one spawn pair per cell.
 const max_chance_branches = core.BoardSize * core.BoardSize * spawn_tiles.len;
 
@@ -788,6 +806,8 @@ const Search = struct {
     ply: u8 = 0,
     /// #260: omit the reward of a move whose following chance node resolves directly to a leaf.
     omit_leaf_reward: bool = false,
+    /// #261: evaluate cutoff spawn children one own-move layer shallower instead of dropping their mass.
+    recover_cut_branches: bool = false,
     /// #178: average every leaf over the 8 dihedral transforms instead of one forward pass.
     sym_leaf: bool = false,
     /// #183: `leaf` calls this search may still make (cache hits count too). Unbounded by default, so
@@ -939,8 +959,37 @@ const Search = struct {
         // the mass cut drops the smallest branches first, the fixed cut its usual depth > 1 way
         var dropped: [max_chance_branches]bool = @splat(false);
         _ = massCutMask(branches[0..count], self.mass_cutoff, &dropped);
-        // pass 2: the kept branches, with their values kept for the #187 tail (cheap: at most
-        // `max_chance_branches` of them, and only read when `risk_weight` is nonzero)
+        // #261: if the fixed cutoff removes any branch, evaluate every spawn from its real child
+        // board. Kept branches retain this depth; cut branches lose one own-move/reward layer. Their
+        // local probabilities sum to 1, so no mass is discarded or renormalized.
+        var has_cut_branch = false;
+        if (self.recover_cut_branches) {
+            for (branches[0..count], 0..) |branch, i| {
+                if (!dropped[i] and depth > 1 and branch.p / empties < self.cutoff) {
+                    has_cut_branch = true;
+                    break;
+                }
+            }
+        }
+        if (has_cut_branch) {
+            var values: [max_chance_branches]f64 = undefined;
+            var probabilities: [max_chance_branches]f64 = undefined;
+            var evaluated: usize = 0;
+            for (branches[0..count], 0..) |branch, i| {
+                if (dropped[i]) continue;
+                const cut = depth > 1 and branch.p / empties < self.cutoff;
+                var child = state;
+                child.board[branch.r][branch.c] = branch.tile;
+                const result = self.valueResult(child, spawnBranchDepth(depth, cut, true), branch.p);
+                values[evaluated] = result.value;
+                probabilities[evaluated] = spawnProbability(branch.tile) / empties;
+                evaluated += 1;
+            }
+            return .{ .value = riskScore(weightedChanceValue(values[0..evaluated], probabilities[0..evaluated]), values[0..evaluated], probabilities[0..evaluated], self.risk_weight) };
+        }
+
+        // Legacy full/cut path: unchanged when there are no fallback branches. Retained branches
+        // are averaged over their own mass, preserving the existing deep3 behavior bit for bit.
         var total: f64 = 0;
         var mass: f64 = 0;
         var kept_values: [max_chance_branches]f64 = undefined;
@@ -1067,6 +1116,7 @@ fn newSearch(vfn: Value, cache: *ValueCache, nodes: ?*NodeCache, depth: Depth, s
         .mass_cutoff = depth.mass_cutoff,
         .ply = depth.ply,
         .omit_leaf_reward = depth.omit_leaf_reward,
+        .recover_cut_branches = depth.recover_cut_branches,
         .sym_leaf = sym_leaf,
         // a phase row may carry its own #187 weight; the caller's option is the one every other row uses
         .risk_weight = if (depth.risk_weight != 0) depth.risk_weight else risk_weight,
@@ -1107,7 +1157,7 @@ fn deepMoveId(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, n
     var best_ply: u8 = 0;
     var ply: u8 = @max(start.ply, 2);
     while (ply <= max_id_ply) : (ply += 1) {
-        var search = newSearch(vfn, cache, nodes, .{ .ply = ply, .cutoff = start.cutoff, .mass_cutoff = start.mass_cutoff, .omit_leaf_reward = start.omit_leaf_reward }, sym_leaf, risk_weight);
+        var search = newSearch(vfn, cache, nodes, .{ .ply = ply, .cutoff = start.cutoff, .mass_cutoff = start.mass_cutoff, .omit_leaf_reward = start.omit_leaf_reward, .recover_cut_branches = start.recover_cut_branches }, sym_leaf, risk_weight);
         // what this iteration may still spend: the budget minus every iteration before it
         search.nodes_left = budget -| @as(usize, @intCast(spent));
         const root = rootMove(&search, state, order, rerank);
@@ -1244,6 +1294,8 @@ pub const Mode = enum {
     deep3,
     /// 4-ply: `deep3` plus one more own move and spawn layer at the same 1e-2 cut (#267).
     deep4,
+    /// #261: `deep3` with cutoff spawn children evaluated one own-move layer shallower.
+    deep3_recover,
     /// 2-ply with the cumulative-mass cut of #182 instead of the fixed probability cut: the same tree as
     /// `deep`, minus the lowest-probability spawn branches up to `mass2_ply_cutoff` of each node's mass.
     deep_mass,
@@ -1285,6 +1337,8 @@ const phase_schedules = struct {
     /// #267: one row, `deep3` plus one more own move and spawn layer at the same cut, so the only
     /// difference from `deep3` is the extra ply.
     const deep4 = [_]Phase{.{ .min_empty = 0, .ply = 4, .cutoff = deep3_cutoff }};
+    /// #261: the `deep3` tree with the cut spawn children evaluated one own-move layer shallower.
+    const deep3_recover = [_]Phase{.{ .min_empty = 0, .ply = 3, .cutoff = deep3_cutoff }};
     /// #182: one row, the `deep` tree with the cumulative-mass cut
     const deep_mass = [_]Phase{.{ .min_empty = 0, .ply = 2, .cutoff = full_width_cutoff, .mass_cutoff = mass2_ply_cutoff }};
     const phase_h1 = [_]Phase{
@@ -1317,6 +1371,7 @@ fn schedule(mode: Mode) []const Phase {
         .deep => &phase_schedules.deep,
         .deep3 => &phase_schedules.deep3,
         .deep4 => &phase_schedules.deep4,
+        .deep3_recover => &phase_schedules.deep3_recover,
         .deep_mass => &phase_schedules.deep_mass,
         .phase_h1 => &phase_schedules.phase_h1,
         .phase_h2 => &phase_schedules.phase_h2,
@@ -1348,6 +1403,7 @@ fn phaseDepth(mode: Mode, board: Board) Depth {
             .cutoff = searchCutoff(row.cutoff),
             .mass_cutoff = searchMassCutoff(row.mass_cutoff),
             .risk_weight = row.risk_weight,
+            .recover_cut_branches = mode == .deep3_recover,
         };
     }
     unreachable; // every schedule ends with min_empty = 0
@@ -1414,7 +1470,7 @@ pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stat
     if (opts.id_budget) |budget| {
         const dir = switch (mode) {
             .greedy, .chance => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
-            .deep, .deep3, .deep4, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMoveId(vfn, state, stats, cache, nodes, depth, budget, opts.sym_leaf, opts.rerank, opts.risk_weight, opts.id_margin).dir,
+            .deep, .deep3, .deep4, .deep3_recover, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMoveId(vfn, state, stats, cache, nodes, depth, budget, opts.sym_leaf, opts.rerank, opts.risk_weight, opts.id_margin).dir,
         };
         // a budget too small for one full iteration still has to answer with a legal move
         return dir orelse firstLegalMove(state);
@@ -1423,7 +1479,7 @@ pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stat
         .greedy => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
         .chance => chanceMove(vfn, state),
         // every search mode takes its (ply, cutoff, mass cutoff) for this board from the phase table (#157)
-        .deep, .deep3, .deep4, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, nodes, depth, opts.sym_leaf, opts.rerank, opts.risk_weight),
+        .deep, .deep3, .deep4, .deep3_recover, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, nodes, depth, opts.sym_leaf, opts.rerank, opts.risk_weight),
     };
 }
 
@@ -3659,12 +3715,104 @@ test "deep3 keeps the value within 5% of the unpruned 3-ply search" {
     try std.testing.expect(@abs(cut - plain) <= 0.05 * @abs(plain));
 }
 
+test "shallow fallback tree preserves each spawn probability and shallow-evaluates cut children" {
+    const branches = [_]struct { p: f64, cut: bool, deep: f64, shallow: f64 }{
+        .{ .p = 0.45, .cut = false, .deep = 10, .shallow = 1 },
+        .{ .p = 0.05, .cut = true, .deep = 20, .shallow = 2 },
+        .{ .p = 0.45, .cut = false, .deep = 30, .shallow = 3 },
+        .{ .p = 0.05, .cut = true, .deep = 40, .shallow = 4 },
+    };
+    var probabilities: [branches.len]f64 = undefined;
+    var values: [branches.len]f64 = undefined;
+    var probability_sum: f64 = 0;
+    for (branches, 0..) |branch, i| {
+        probabilities[i] = branch.p;
+        probability_sum += branch.p;
+        const depth = spawnBranchDepth(3, branch.cut, true);
+        try std.testing.expectEqual(if (branch.cut) @as(u8, 2) else @as(u8, 3), depth);
+        values[i] = if (depth == 2) branch.shallow else branch.deep;
+    }
+    try std.testing.expectApproxEqAbs(@as(f64, 1), probability_sum, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 18.3), weightedChanceValue(&values, &probabilities), 1e-12);
+    try std.testing.expectEqual(@as(u8, 1), spawnBranchDepth(1, true, true));
+    try std.testing.expectEqual(@as(u8, 3), spawnBranchDepth(3, true, false));
+}
+
+test "all-cut fallback evaluates every child one ply shallower" {
+    const probabilities = [_]f64{ 0.45, 0.05, 0.45, 0.05 };
+    const shallow_values = [_]f64{ 1, 2, 3, 4 };
+    for (0..probabilities.len) |_| try std.testing.expectEqual(@as(u8, 2), spawnBranchDepth(3, true, true));
+    try std.testing.expectApproxEqAbs(@as(f64, 2.1), weightedChanceValue(&shallow_values, &probabilities), 1e-12);
+}
+
+test "shallow fallback evaluates actual spawned boards at full and reduced depth" {
+    var prng = std.Random.DefaultPrng.init(2610);
+    const net = Net.init(prng.random());
+    const vfn: Value = .{ .single = &net };
+    const empties = countEmpty(late_board.board);
+    var expected_cache: ValueCache = .{};
+    var expected_search: Search = .{ .vfn = vfn, .cache = &expected_cache };
+
+    var recovered_cache: ValueCache = .{};
+    var recovered: Search = .{ .vfn = vfn, .cache = &recovered_cache, .cutoff = 0.1, .recover_cut_branches = true };
+    var expected: f64 = 0;
+    for (0..core.BoardSize) |r| for (0..core.BoardSize) |c| {
+        if (late_board.board[r][c] != 0) continue;
+        for (spawn_tiles) |spawn| {
+            var child = late_board;
+            child.board[r][c] = spawn.value;
+            const cut = spawn.p / @as(f64, @floatFromInt(empties)) < recovered.cutoff;
+            expected += spawn.p / @as(f64, @floatFromInt(empties)) * expected_search.value(child, if (cut) 1 else 2, spawn.p);
+        }
+    };
+    try std.testing.expectApproxEqAbs(expected, recovered.chance(late_board, 2, 1), 1e-10);
+}
+
+test "all-cut fallback uses shallow child search and complete local spawn mass" {
+    var prng = std.Random.DefaultPrng.init(2611);
+    const net = Net.init(prng.random());
+    const vfn: Value = .{ .single = &net };
+    const empties = countEmpty(late_board.board);
+    var expected_cache: ValueCache = .{};
+    var expected_search: Search = .{ .vfn = vfn, .cache = &expected_cache };
+    var recovered_cache: ValueCache = .{};
+    var recovered: Search = .{ .vfn = vfn, .cache = &recovered_cache, .cutoff = 1, .recover_cut_branches = true };
+    var expected: f64 = 0;
+    for (0..core.BoardSize) |r| for (0..core.BoardSize) |c| {
+        if (late_board.board[r][c] != 0) continue;
+        for (spawn_tiles) |spawn| {
+            var child = late_board;
+            child.board[r][c] = spawn.value;
+            expected += spawn.p / @as(f64, @floatFromInt(empties)) * expected_search.value(child, 1, spawn.p);
+        }
+    };
+    try std.testing.expectApproxEqAbs(expected, recovered.chance(late_board, 2, 1), 1e-10);
+}
+
+test "disabled cutoff fallback is identical to deep3 and terminal values remain zero" {
+    var prng = std.Random.DefaultPrng.init(261);
+    const net = Net.init(prng.random());
+    var full_cache: ValueCache = .{};
+    var full: Search = .{ .vfn = .{ .single = &net }, .cache = &full_cache, .ply = 3 };
+    var recover_cache: ValueCache = .{};
+    var recover: Search = .{ .vfn = .{ .single = &net }, .cache = &recover_cache, .ply = 3, .recover_cut_branches = true };
+    try std.testing.expectEqual(full.value(mid_board, 3, 1), recover.value(mid_board, 3, 1));
+
+    const dead: GameState = .{ .board = .{
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+    } };
+    try std.testing.expectEqual(@as(f64, 0), recover.value(dead, 3, 1));
+}
+
 test "mass cutoff is off at 0 and full width at 1 (#182)" {
     var prng = std.Random.DefaultPrng.init(182);
     const net = Net.init(prng.random());
     const vfn: Value = .{ .single = &net };
     // (a) the phase rows carry no mass cut, so `.deep` / `.deep3` search what they searched before
-    for ([_]Mode{ .deep, .deep3, .deep4, .phase_h1, .phase_h2, .phase_h3, .phase_h4 }) |mode| {
+    for ([_]Mode{ .deep, .deep3, .deep4, .deep3_recover, .phase_h1, .phase_h2, .phase_h3, .phase_h4 }) |mode| {
         try std.testing.expectEqual(@as(f64, 0), phaseDepth(mode, mid_board.board).mass_cutoff);
     }
     var plain_cache: ValueCache = .{};
@@ -3737,7 +3885,7 @@ test "risk weight 0 is the plain expectation, bit for bit (#187)" {
     const net = Net.init(prng.random());
     const vfn: Value = .{ .single = &net };
     // every existing phase row carries no risk weight, so the phase table is unchanged
-    for ([_]Mode{ .deep, .deep3, .deep4, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 }) |mode| {
+    for ([_]Mode{ .deep, .deep3, .deep4, .deep3_recover, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 }) |mode| {
         try std.testing.expectEqual(@as(f64, 0), phaseDepth(mode, mid_board.board).risk_weight);
     }
     var plain_cache: ValueCache = .{};
@@ -3941,6 +4089,7 @@ test "phase_h4 leaves the earlier schedules alone (#171)" {
         const board = boardWithEmpties(empties);
         try std.testing.expectEqual(Depth{ .ply = 2, .cutoff = 0 }, phaseDepth(.deep, board));
         try std.testing.expectEqual(Depth{ .ply = 3, .cutoff = deep3_cutoff }, phaseDepth(.deep3, board));
+        try std.testing.expectEqual(Depth{ .ply = 3, .cutoff = deep3_cutoff, .recover_cut_branches = true }, phaseDepth(.deep3_recover, board));
         const h1: Depth = if (empties >= 8) .{ .ply = 2, .cutoff = 0 } else .{ .ply = 3, .cutoff = deep3_cutoff };
         try std.testing.expectEqual(h1, phaseDepth(.phase_h1, board));
         const h2: Depth = if (empties >= 8)
