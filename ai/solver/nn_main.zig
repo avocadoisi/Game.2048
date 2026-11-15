@@ -72,6 +72,10 @@ const usage =
     \\                       the late game takes up to `1 + tail_alpha` times the step of an open board)
     \\              clamp   (#234: bounds the TD target at +/- `clamp` (default 200, i.e. score 200,000) so a
     \\                       diverging value cannot bootstrap itself; `par` compatible)
+    \\              shape   (#277: potential-based reward shaping with the empty-cell potential
+    \\                       Phi = shape_c * empties / 15, so the target is reward + Phi(after) -
+    \\                       Phi(before) + V(after); `par` compatible, coefficient in the row-spec slot,
+    \\                       default 1, 0 refused. Only the per-move td1 + greedy1 path)
     \\              clip    (#246: bounds the update itself, cap in the row-spec slot, mode at arg 14:
     \\                       `norm` (default, `par` only) scales the merged batch delta to an L2 norm of
     \\                       the cap; `step` caps every |dw| of a step at the cap; `par` compatible)
@@ -246,6 +250,17 @@ fn parseTailAlpha(args: []const []const u8) !f64 {
     const alpha = std.fmt.parseFloat(f64, args[13]) catch return error.InvalidTailAlpha;
     if (!(alpha > 0)) return error.InvalidTailAlpha;
     return alpha;
+}
+
+/// (#277) `shape_c` for variant `shape`, at the same row-spec slot as Adam's step size, `tailw`'s
+/// alpha, `clamp`'s target bound and `clip`'s cap. The default and `-` are 1; 0 would make the variant
+/// a plain `base` run, so it is refused. Negative coefficients are valid potential shaping.
+fn parseShapeC(args: []const []const u8) !f64 {
+    if (args.len <= 13) return 1;
+    if (std.mem.eql(u8, args[13], "-")) return 1;
+    const shape_c = std.fmt.parseFloat(f64, args[13]) catch return error.InvalidShapeC;
+    if (!std.math.isFinite(shape_c) or shape_c == 0) return error.InvalidShapeC;
+    return shape_c;
 }
 
 /// (#246) Which ceiling the `clip` variant applies: the L2 norm of one merged `par` batch delta
@@ -547,6 +562,8 @@ pub fn main(init: std.process.Init) !void {
     const is_tailw = std.mem.eql(u8, variant, "tailw");
     // (#234) `par`-compatible: a bounded TD target, so a diverging value cannot bootstrap itself.
     const is_clamp = std.mem.eql(u8, variant, "clamp");
+    // (#277) `par`-compatible: potential-based shaping with the empty-cell potential.
+    const is_shape = std.mem.eql(u8, variant, "shape");
     // (#262) replay with a frozen bootstrap net: a `par` variable, see `TargetSync`.
     const is_tnet = std.mem.eql(u8, variant, "tnet");
     const target_every: usize = if (is_tnet) try parseTargetEvery(args) else 0;
@@ -631,6 +648,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .tail_alpha = try parseTailAlpha(args) }
     else if (is_clamp)
         .{ .clamp = try parseClamp(args) }
+    else if (is_shape)
+        .{ .shape_c = try parseShapeC(args) }
     else if (is_clip) switch (clip_mode) {
         .norm => .{ .grad_clip = try parseStepCap(args) },
         .step => .{ .step_clip = try parseStepCap(args) },
@@ -661,13 +680,20 @@ pub fn main(init: std.process.Init) !void {
     // (#137) the merge multiplier applies to every variant that reached a batched path; the branch above
     // only set it for the plain ones, so `dist`/`sym`/`replay` silently ran with the struct default 1.0.
     opts.batch_scale = batch_scale;
+    // (#277) Refuse a shaped run mixed with a variant that retrains afterstates later or replaces the
+    // TD target: those paths do not implement the shaped reward, and silently training on the raw
+    // reward would hide the mistake.
+    nn.validateOptions(opts) catch {
+        std.debug.print("{s}", .{usage});
+        return;
+    };
     // `dump` is the shared layout plus one slot: index 11 carries the dump path.
     // `par` runs may carry the #137 batch_scale at index 12, after the `-` dump slot.
     // (#203) index 13 narrows the eval table to the rows a measurement needs (`0,2`); `dist`/`dson`
     // already own 13 as the teacher lr divisor, `adam` as its step size, `tnet` as the target sync
     // interval, and `pairw` returns before the table is built.
-    const row_spec: ?[]const u8 = if (is_dist or is_dson or is_adam or is_tailw or is_clamp or is_tnet or is_clip or is_pairw or is_pair or is_pairleaf or is_pairrow) null else if (args.len > 13) args[13] else null;
-    const max_args: usize = if (is_clip) 15 else if (is_dist or is_dson or is_adam or is_tailw or is_clamp or is_tnet) 14 else if (row_spec != null) 14 else if (is_ft2 or is_tch) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw or is_pairleaf) 12 else if (is_pairrow) 13 else 11;
+    const row_spec: ?[]const u8 = if (is_dist or is_dson or is_adam or is_tailw or is_clamp or is_shape or is_tnet or is_clip or is_pairw or is_pair or is_pairleaf or is_pairrow) null else if (args.len > 13) args[13] else null;
+    const max_args: usize = if (is_clip) 15 else if (is_dist or is_dson or is_adam or is_tailw or is_clamp or is_shape or is_tnet) 14 else if (row_spec != null) 14 else if (is_ft2 or is_tch) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw or is_pairleaf) 12 else if (is_pairrow) 13 else 11;
     if (args.len > max_args or seed_ranges == 0 or (uses_dump and dump_path == null) or ((is_pairleaf or is_leaf or is_pairrow) and train_games != 0)) {
         std.debug.print("{s}", .{usage});
         return;
@@ -765,7 +791,7 @@ pub fn main(init: std.process.Init) !void {
             while (g < train_games) : (g += @min(batch_size, train_games - g)) {
                 const games = @min(batch_size, train_games - g);
                 const frac = @as(f64, @floatFromInt(g)) / @as(f64, @floatFromInt(train_games));
-                const batch = nn.trainBatchOpts(&net, train_seed, g, games, learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null, opts);
+                const batch = try nn.trainBatchOpts(&net, train_seed, g, games, learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null, opts);
                 last_score = batch.score;
                 total_moves += batch.moves;
                 // (#242) One pathological game stalls the whole batch (seed 3 spent 53 min in one at 60k),
@@ -784,7 +810,7 @@ pub fn main(init: std.process.Init) !void {
             for (0..train_games) |g| {
                 // linear decay to 10% of the start rate: big steps early, fine tuning late
                 const frac = @as(f64, @floatFromInt(g)) / @as(f64, @floatFromInt(train_games));
-                const game = nn.trainGameOpts(&net, rng.random(), learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null, opts);
+                const game = try nn.trainGameOpts(&net, rng.random(), learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null, opts);
                 last_score = game.score;
                 total_moves += game.moves;
                 if (game.capped) return moveCap(g + 1, train_games, game.moves, opts.move_cap, weights_path);
@@ -1462,4 +1488,27 @@ test "usage says no arguments must not retrain the shipped weights (#207)" {
 
 test "usage text lists the tchadd variant (#207)" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "tchadd  (#207") != null);
+}
+
+test "shape variant reads its coefficient from the row-spec slot (#277)" {
+    const omitted = [_][]const u8{ "nn", "2000", "0", "2000", "0.003", "-", "shape", "30", "x.bin", "3", "par" };
+    try std.testing.expectEqual(@as(f64, 1), try parseShapeC(&omitted));
+    const dash = [_][]const u8{ "nn", "2000", "0", "2000", "0.003", "-", "shape", "30", "x.bin", "3", "par", "-", "-", "-" };
+    try std.testing.expectEqual(@as(f64, 1), try parseShapeC(&dash));
+    const explicit = [_][]const u8{ "nn", "2000", "0", "2000", "0.003", "-", "shape", "30", "x.bin", "3", "par", "-", "-", "0.5" };
+    try std.testing.expectEqual(@as(f64, 0.5), try parseShapeC(&explicit));
+    // negative potential shaping is still potential-based shaping
+    const negative = [_][]const u8{ "nn", "2000", "0", "2000", "0.003", "-", "shape", "30", "x.bin", "3", "par", "-", "-", "-0.25" };
+    try std.testing.expectEqual(@as(f64, -0.25), try parseShapeC(&negative));
+    const zero = [_][]const u8{ "nn", "2000", "0", "2000", "0.003", "-", "shape", "30", "x.bin", "3", "par", "-", "-", "0" };
+    try std.testing.expectError(error.InvalidShapeC, parseShapeC(&zero));
+    const infinite = [_][]const u8{ "nn", "2000", "0", "2000", "0.003", "-", "shape", "30", "x.bin", "3", "par", "-", "-", "inf" };
+    try std.testing.expectError(error.InvalidShapeC, parseShapeC(&infinite));
+    const typo = [_][]const u8{ "nn", "2000", "0", "2000", "0.003", "-", "shape", "30", "x.bin", "3", "par", "-", "-", "two" };
+    try std.testing.expectError(error.InvalidShapeC, parseShapeC(&typo));
+}
+
+test "usage text lists the shape variant and its coefficient slot (#277)" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "shape   (#277") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "empty-cell potential") != null);
 }
