@@ -474,6 +474,7 @@ fn evalRowSpec(policy: usize) ?EvalRowSpec {
         17 => .{ .mode = .deep4, .opts = .{ .node_tt = true } }, // #267
         18 => .{ .mode = .deep3, .opts = .{ .cutoff = 0.02, .node_tt = true } }, // #281
         19 => .{ .mode = .deep3, .opts = .{ .cutoff = 0.05, .node_tt = true } }, // #281
+        20 => .{ .mode = .deep3_recover, .opts = .{} }, // #261
         else => null,
     };
 }
@@ -894,6 +895,9 @@ pub fn main(init: std.process.Init) !void {
         // (0.05) are dropped. A/B against row 15 measures whether the saved leaves buy a better score.
         .{ .name = "nn 3-ply cutoff 0.02 + node TT (#281)", .policy = 18 },
         .{ .name = "nn 3-ply cutoff 0.05 + node TT (#281)", .policy = 19 },
+        // #261: the `deep3` tree, but a spawn branch under the fixed cut is evaluated on its real
+        // child board one own-move/reward layer shallower instead of being dropped and renormalized.
+        .{ .name = "nn 3-ply cut branches recovered 1 ply shallow (#261)", .policy = 20 },
     };
     // Rows are all on by default; `rows` (arg 13, #203) keeps the two a measurement needs
     // (0 = 1-ply, 2 = 2-ply) instead of paying for the 3-ply rows twice over. A stray token is a
@@ -1083,6 +1087,8 @@ pub fn main(init: std.process.Init) !void {
                 // #281: row 15 with only the 4 branches at empty cells >= 6 / >= 3 kept
                 18 => nn.playValueOpts(c.vfn, prng.random(), .deep3, .{ .cutoff = 0.02, .node_tt = true }),
                 19 => nn.playValueOpts(c.vfn, prng.random(), .deep3, .{ .cutoff = 0.05, .node_tt = true }),
+                // #261: cut branches evaluated one layer shallower instead of dropped
+                20 => nn.playValueOpts(c.vfn, prng.random(), .deep3_recover, .{}),
                 else => unreachable,
             };
         }
@@ -1159,6 +1165,12 @@ test "high spawn-cut rows 18 and 19 keep the default row 15 path (#281)" {
     try std.testing.expectEqual(nn.Mode.deep3, evalRowSpec(19).?.mode);
     try std.testing.expectEqual(@as(?f64, 0.05), evalRowSpec(19).?.opts.cutoff);
     try std.testing.expectEqual(@as(?bool, true), evalRowSpec(19).?.opts.node_tt);
+}
+
+test "recovered cut branch row 20 stays the default deep3 path (#261)" {
+    try std.testing.expectEqual(nn.Mode.deep3_recover, evalRowSpec(20).?.mode);
+    try std.testing.expectEqual(@as(?f64, null), evalRowSpec(20).?.opts.cutoff);
+    try std.testing.expect(evalRowSpec(21) == null);
 }
 
 test "usage text lists the pairrow variant (#267)" {
