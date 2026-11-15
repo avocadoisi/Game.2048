@@ -3946,12 +3946,69 @@ distill、rsym、rtgt、lambda、td1/greedy1 以外の target/selfplay など）
 `shape` の `par` 実行、未対応 variant の拒否をテストした。CLI は係数の省略・`-`・明示・負値・
 0/非有限/typo をテストし、usage に `shape` を追加した。
 
-**まだ avg score は測っていない。** 既定 policy・`ai/solver/nn_weights.bin`・採用レシピは変更せず、
-`shape` は再現用の opt-in variant として残す。次の比較は同じ 128/32・300k レシピで
-`shape 1`（係数 1）を `base` と pairw で測る。実行例:
+**avg score は #278 で測った。** 既定 policy・`ai/solver/nn_weights.bin`・採用レシピは変更せず、
+`shape` は再現用の opt-in variant として残す。#278 は同じ 128/32 の 100k で `shape_c=0.5` を
+`base` と比べ、Gate 1 で不採用（下の #278）。300k は回していない。当時の実行例:
 
 ```
 zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 300000 0 9000 0.003 1 shape 30 /tmp/shape.bin 1 par
 ```
 
 `zig build test` は既存 checksum を含めて全通過（実装時点）。
+
+## 空きマス potential shaping は 100k の一次判定で対照に負ける（#278）
+
+#277 で opt-in 実装した空きマス potential shaping を、同じ 128/32・100k レシピの `base` 対照と
+`shape_c=0.5` 候補で比べた。`Phi = 0.5 * empties / 15` は 1 空きあたり 0.0333 で、平均
+score_delta/1000（約 0.03〜0.04）と同じ桁。300k は Gate 1 を通った場合だけ回す計画だった。
+
+学習（train seed 1、lr 0.003、`par`、batch_scale 2.8284271247461903、replay_k=30）:
+
+| run | games | moves | 学習時間 | 最終局 | 重み | SHA-256 |
+|---|---:|---:|---:|---:|---:|---|
+| 対照 `base` | 100,000 | 134,574,330 | 777.1 s | 54,340 | 296,472 B | `5cd1ffc6f54f7d81db07595ee366247a9ecea35da09e28f811ffa5d52fd09148` |
+| 候補 `shape 0.5` | 100,000 | 122,551,827 | 743.5 s | 36,144 | 296,472 B | `14ca7e0e1c218759759dcaec5c58e41af64049c223983ff384327361d3ead16b` |
+
+発散・move cap 停止はどちらもなし。候補は同じ 100,000 局で moves が 8.9% 少なく、1 局が短い。
+
+Gate 1 評価（2-ply `deep`、20 局）:
+
+- `pairw` A=対照 B=候補、seed 9000: mean diff **−12,442.4 ± 6,702.5**（B の勝ち 7 / 負け 13、
+  574.4 s）。mean−2σ = **−25,847.4** で採用バー +0 に届かない。
+- 非ペア:
+
+| net | seed | avg score | avg moves | 8192 | ms/move |
+|---|---:|---:|---:|---:|---:|
+| 対照 | 9000 | 83,796.0 | 3,729.1 | 4/20 | 0.93 |
+| 対照 | 9100 | 93,993.4 | 4,138.0 | 5/20 | 0.91 |
+| 候補 | 9000 | 75,298.0 | 3,407.8 | 1/20 | 0.85 |
+| 候補 | 9100 | 80,757.2 | 3,631.3 | 2/20 | 0.86 |
+
+候補は対照比 −8,498.0（seed 9000、89.9%）/ −13,236.2（seed 9100、85.9%）で、8192 到達も
+4→1 / 5→2 と落ちる。ms/move は候補の方が速い（`shape_c` は学習時だけ効く）。
+
+**判定: Gate 1 不採用。** `mean diff − 2*stderr > 0` を満たさず、非ペアの avg score と reach8192 が
+両 seed で悪化しているため、300k（Gate 2）は回さない。`ai/solver/nn_weights.bin` と既定 policy・
+既存の評価値は変更しない。
+
+解釈: γ=1・終端 `Phi=0` の potential shaping はエピソード収益を定数 `−Phi(start)` だけずらすので、
+厳密な最適方策は変わらない。しかし TD 目標は状態ごとに `V − Phi` へ移り、空きマス数は候補手の
+afterstate 間で異なるため、近似 `V` では greedy の順位が変わる。実際に学習中の 1 局が短くなり
+（moves 134.6M→122.6M）、評価でも avg moves が 3,729→3,408 / 4,138→3,631 と短命化して
+score と裾が落ちた。空きマス入力が 100k で差を失うという #226 の観察とも整合し、この方向は
+100k で打ち切る。
+
+再現:
+```sh
+# 対照
+zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 100000 0 9000 0.003 1 base 30 /tmp/w_base_100k_s1.bin 1 par
+# 候補
+zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 100000 0 9000 0.003 1 shape 30 /tmp/w_shape05_100k_s1.bin 1 par - 2.8284271247461903 0.5
+# pairw + 非ペア表（score/reach/ms）
+scripts/eval-net.sh /tmp/w_shape05_100k_s1.bin --shipped /tmp/w_base_100k_s1.bin
+# 非ペアの avg moves は生の row から（seed を 9100 に替えて 4 本）
+zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 0 20 9000 0.003 1 resume 30 /tmp/w_shape05_100k_s1.bin 1 - - - 0,2
+```
+
+コスト: 学習 2 本で 1,520.6 s、`eval-net.sh` 1 回 2,660 s（pairw 574.4 s + 非ペア 4 行）、
+avg moves 用の非ペア 4 本。コード・重みを変更しないため `zig build test` は実行していない。
