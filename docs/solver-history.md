@@ -4013,7 +4013,7 @@ zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 0 20 9000 0.003 1 resume
 コスト: 学習 2 本で 1,520.6 s、`eval-net.sh` 1 回 2,660 s（pairw 574.4 s + 非ペア 4 行）、
 avg moves 用の非ペア 4 本。コード・重みを変更しないため `zig build test` は実行していない。
 
-### spawn カット 0.02 は 3-ply と同じスコアを半分の葉で打つ（#281）
+### spawn カット 0.02 は葉を半減するが平均スコアは改善しない（#281）
 
 `deep3` は spawn の枝を確率 1e-2 未満で切り捨て、残った枝の確率を再正規化して評価する。空きマスが
 多い盤面では 4 種の spawn のうち 1〜2 種がこのカットに掛かるため、カットを 0.02 / 0.05 に上げると
@@ -4021,44 +4021,50 @@ avg moves 用の非ペア 4 本。コード・重みを変更しないため `zi
 同梱 128/32 net で 3 行を同じ seed 列で打ち比べた。
 
 row 15 は既定の 3-ply（cut 1e-2、node TT on）、row 18 は同じ探索で cut 0.02、row 19 は cut 0.05。
-seed 9000–9019 の 20 局を 1 局 1 プロセスで打たせた（ゲーム i の seed は 9000+i なので、20 局 range
-実行と同じゲーム列）。node TT は 3 行とも on。
+seed 9000–9019 は row 15/18 各20局、row 19 は screening の2局で停止。seed 9100–9119 は row 15/18 各20局を追加した。
+node TT は全行で on。row 19 は seed 9000 の初期2局がともに 8192 に届かず約8万点だったため、残りを回さなかった。
 
-| row | spawn cut | avg score | avg moves | reach8192 | leaves/move | ms/move | node hit rate |
-|---|---|---:|---:|---:|---:|---:|---:|
-| 15 | 1e-2（既定） | 140,438.2 | 5,918.9 | 17/20 | 10,574.3 | 86.05 | 19.9% |
-| 18 | 0.02 | 141,353.0 | 5,964.7 | 16/20 | 5,173.7 | 32.83 | 16.7% |
-| 19 | 0.05 | 79,854.0（2局） | 3,684.0 | 0/2 | 4,072.5 | 30.89 | 17.3% |
+| seed range | row | spawn cut | avg score | avg moves | reach8192 | leaves/move | ms/move | node hit rate |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| 9000–9019 | 15 | 1e-2（既定） | 140,438.2 | 5,918.9 | 17/20 | 10,574.3 | 86.05 | 19.9% |
+| 9000–9019 | 18 | 0.02 | 141,353.0 | 5,964.7 | 16/20 | 5,173.7 | 32.83 | 16.7% |
+| 9000–9001 | 19 | 0.05 | 79,854.0 | 3,684.0 | 0/2 | 4,072.5 | 30.89 | 17.3% |
+| 9100–9119 | 15 | 1e-2（既定） | 134,245.0 | 5,678.2 | 16/20 | 10,786.4 | 10.19 | 19.9% |
+| 9100–9119 | 18 | 0.02 | 128,816.6 | 5,420.5 | 14/20 | 5,232.9 | 5.92 | 16.7% |
 
-同じ 20 seed で row 18 と row 15 を対応させると +914.8 ± 11,605.3 点（row 18 が 12 勝 8 敗、
-mean − 2*stderr = −22,295.9）。スコアは同等で、leaves/move は 10,574.3 → 5,173.7（−51.1%）。
-ms/move は 86.05 → 32.83 だが、8 並列の同時実行なので絶対値は参考で、比（約 2.6 倍速い）だけが
-意味を持つ。node hit rate は 19.9% → 16.7% で、木が小さいぶん再利用も減る。
+同じ seed 範囲の非ペア平均では row 18−15 は seed 9000 で +914.8 点、seed 9100 で −5,428.4 点。
+40局平均は row 15 が 137,341.6 点・33/40 reach8192、row 18 が 135,084.8 点・30/40 reach8192 で、差は
+−2,256.8 点。leaves/move は seed 9000 で 10,574.3→5,173.7（−51.1%）、seed 9100 で 10,786.4→5,232.9
+（−51.5%）。ms/move の比は seed 9000 で約2.62倍、seed 9100 で約1.72倍速い。node hit rate は両 seed とも
+19.9%→16.7% で、木が小さいぶん再利用も減る。
+
+seed 9000 の #237 common-spawn `pairrow` 20局では row 15 を A、row 18 を B とし、B−A は
+−9,258.4 ± 15,571.7 点（Bが8勝、Aが12勝、mean − 2*stderr = −40,401.8）。A は avg 142,778.8 / reach8192
+17/20、B は avg 133,520.4 / reach8192 12/20 だった。ペア比較の採用条件 `mean − 2*stderr > 0` は満たさない。
 
 0.05 は最初の 2 局がどちらも 8192 に届かず約 8 万点で終わった。#263 で 1e-3 に広げたときに 5 局が
 8 万点まで落ちたのと逆方向の失敗で、切り捨てが大きすぎると探索が別の手を選んで悪いゲームに入る。
 10 局 screening の残りは回さず、2 局で打ち切った。
 
-seed 9100 側は row 18 だけ 16 局（121,118.0、10/16、leaves/move 5,247.9）まで進めた。row 15 の同 seed
-側は 4 局（111,228.0、2/4）で、時間の都合により 40 局は揃っていない。
+seed 9100 の row 15/18 も各20局まで完了した。row 19 は既定 cutoff に戻すべきという screening 結果のため、追加計測していない。
 
-判定: 0.02 はスコアを保ったまま葉を半減させるので、既定 1e-2 を変えずに opt-in の row 18 として
-残す。0.05 は不採用。採用条件（ペア比較で mean − 2*stderr > 0）は満たしていないため、既定方針・
-同梱重みは変えない。engine 側で探索予算を配分するときの候補として、row 18 のコスト半分は材料になる。
+判定: row 18 は葉を約半減し、同seedの ms/move も下がるが、40局平均スコアと reach8192 は row 15 より低く、
+common-spawn pair も正の改善を示さなかった。既定 cutoff 1e-2 を維持する。row 19 は2局とも低スコアで不採用。
+評価用 row 18/19 は比較再現のため残すが、既定方針・同梱重みは変更しない。
 
-再現（weights は同梱ファイル。20 局 range で 1 本ずつ。1 局 1 プロセスで回すとスコアは同じで
-ms/move だけが並列度に応じて伸びる）:
+再現（weights は同梱ファイル）:
 ```
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 15
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 18
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 19
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 15,18
+zig build nn -Doptimize=ReleaseFast -- 0 2 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 19
+zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 15,18
+zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 pairrow 30 ai/solver/nn_weights.bin 1 - 15 18
 ```
 
 `zig build test-nn-main -Dtest-filter='high spawn-cut rows'` で row 18/19 が row 15 と同じ `deep3` の
 まま cutoff と node TT だけを変えることを確認する。
 
-コスト: 3 行 42 局を 8 並列で約 14,300 s。#237 の tape を使うペア比較は 1 局 25 分かかるため、この
-検証では同一 seed の非ペア比較（spawn tape は seed ごとに同じ）で代用し、既定方針は変えない。
+コスト: 既存 seed 9000 の screening を含む非ペア測定は約14,300 s。追加した seed 9100 の row 15/18 は
+1,799.3 s、seed 9000 の20局 pairrow は 6,649.5 s（合計約22,749 s）。
 
 ### 1e-3 の spawn カットは 40 局で平均スコアを改善しない（#256）
 
