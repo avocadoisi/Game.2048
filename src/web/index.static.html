@@ -5,26 +5,27 @@
 <title>2048</title>
 <style>
   body { font-family: system-ui, sans-serif; text-align: center; background: #faf8ef; color: #776e65; }
-  #grid { display: grid; grid-template-columns: repeat(4, 90px); gap: 10px; background: #bbada0; padding: 10px; width: max-content; margin: 16px auto; border-radius: 6px; }
-  .cell { width: 90px; height: 90px; line-height: 90px; font-size: 28px; font-weight: bold; border-radius: 4px; background: #cdc1b4; }
+  :root { --tile-size: min(110px, calc(22vw - 8px)); --tile-gap: clamp(8px, 2.4vw, 12px); }
+  #grid { display: grid; grid-template-columns: repeat(4, var(--tile-size)); gap: var(--tile-gap); background: #bbada0; padding: var(--tile-gap); width: max-content; margin: 16px auto; border-radius: 6px; }
+  .cell { width: var(--tile-size); height: var(--tile-size); line-height: var(--tile-size); font-size: clamp(22px, 6.4vw, 34px); font-weight: bold; border-radius: 4px; background: #cdc1b4; }
   .v2 { background: #eee4da; } .v4 { background: #ede0c8; } .v8 { background: #f2b179; color: #fff; }
   .v16 { background: #f59563; color: #fff; } .v32 { background: #f67c5f; color: #fff; } .v64 { background: #f65e3b; color: #fff; }
-  .big { background: #edc22e; color: #fff; font-size: 22px; }
-  .cell.changed { animation: tile-pop 220ms ease-out; }
+  .big { background: #edc22e; color: #fff; font-size: clamp(18px, 5.2vw, 26px); }
+  .animations-enabled .cell.changed { animation: tile-pop 220ms ease-out; }
   @keyframes tile-pop {
     0% { transform: scale(.82); box-shadow: 0 0 0 4px #f4cd42; }
     55% { transform: scale(1.08); box-shadow: 0 0 0 2px #f4cd42; }
     100% { transform: scale(1); box-shadow: 0 0 0 0 transparent; }
   }
   @media (prefers-reduced-motion: reduce) {
-    .cell.changed { animation: none; }
+    .animations-enabled .cell.changed { animation: none; }
   }
   button { font-size: 16px; padding: 6px 14px; margin: 4px; }
   #msg { min-height: 1.5em; font-weight: bold; }
   #policy-desc { font-size: 12px; line-height: 1.4; color: #8f857d; max-width: 34em; margin: 0 auto; }
 </style>
 </head>
-<body>
+<body class="animations-enabled">
 <h1>2048</h1>
 <div>score: <span id="score">0</span> — best tile: <span id="best">0</span></div>
 <div id="grid"></div>
@@ -39,6 +40,7 @@
   <button id="new">New game</button>
   <button id="step">Solver: 1 step</button>
   <button id="auto">Solver: auto</button>
+  <label><input id="animation-toggle" type="checkbox" checked> Tile animation</label>
 </p>
 <p>
   <label>policy <select id="policy"></select></label>
@@ -54,6 +56,10 @@
 // Exports follow src/wasm.zig: move returns 0 no change, 1 moved, 2 game over.
 const CODES = { ArrowUp: 0, KeyW: 0, ArrowLeft: 1, KeyA: 1, ArrowDown: 2, KeyS: 2, ArrowRight: 3, KeyD: 3 };
 const NO_CHANGE = 0, MOVED = 1, GAME_OVER = 2;
+const animationToggle = document.getElementById("animation-toggle");
+animationToggle.addEventListener("change", () => {
+  document.body.classList.toggle("animations-enabled", animationToggle.checked);
+});
 
 let w; // wasm exports
 let gameOver = false;
