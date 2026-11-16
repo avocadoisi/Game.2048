@@ -10,6 +10,15 @@
   .v2 { background: #eee4da; } .v4 { background: #ede0c8; } .v8 { background: #f2b179; color: #fff; }
   .v16 { background: #f59563; color: #fff; } .v32 { background: #f67c5f; color: #fff; } .v64 { background: #f65e3b; color: #fff; }
   .big { background: #edc22e; color: #fff; font-size: 22px; }
+  .cell.changed { animation: tile-pop 220ms ease-out; }
+  @keyframes tile-pop {
+    0% { transform: scale(.82); box-shadow: 0 0 0 4px #f4cd42; }
+    55% { transform: scale(1.08); box-shadow: 0 0 0 2px #f4cd42; }
+    100% { transform: scale(1); box-shadow: 0 0 0 0 transparent; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .cell.changed { animation: none; }
+  }
   button { font-size: 16px; padding: 6px 14px; margin: 4px; }
   #msg { min-height: 1.5em; font-weight: bold; }
   #policy-desc { font-size: 12px; line-height: 1.4; color: #8f857d; max-width: 34em; margin: 0 auto; }
@@ -48,17 +57,20 @@ const NO_CHANGE = 0, MOVED = 1, GAME_OVER = 2;
 
 let w; // wasm exports
 let gameOver = false;
+let previousBoard = null;
 
 function render() {
   const board = new Uint32Array(w.memory.buffer, w.board_ptr(), 16);
   const grid = document.getElementById("grid");
   grid.innerHTML = "";
-  for (const v of board) {
+  for (const [i, v] of board.entries()) {
     const c = document.createElement("div");
-    c.className = "cell " + (v === 0 ? "" : v > 64 ? "big" : "v" + v);
+    const changed = previousBoard !== null && previousBoard[i] !== v && v !== 0;
+    c.className = "cell " + (v === 0 ? "" : v > 64 ? "big" : "v" + v) + (changed ? " changed" : "");
     c.textContent = v === 0 ? "" : v;
     grid.appendChild(c);
   }
+  previousBoard = Array.from(board);
   document.getElementById("score").textContent = w.score();
   document.getElementById("best").textContent = w.best_tile();
   document.getElementById("msg").textContent = gameOver ? "Game over — press New game" : "";
@@ -78,6 +90,7 @@ function newGame() {
   const seed = crypto.getRandomValues(new Uint32Array(2));
   w.init(seed[0], seed[1]);
   gameOver = false;
+  previousBoard = null;
   render();
 }
 
