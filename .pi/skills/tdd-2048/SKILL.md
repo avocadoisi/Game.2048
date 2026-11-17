@@ -12,7 +12,7 @@ Cycle and test discipline: `dev-philosophy`. Order of a change: `dev-workflow`.
 
 - `zig build test` — unit tests of 15 targets: core, exe, solver, bench, ranking, parallel, evalab, probe, nn, nn_main, ntuple, ntuple_main, ga-rl, tune, cmaes
 - `zig build run` — play · `zig build run -- serve 8080` — HTTP server
-- Zig **0.17** (`build.zig` uses `addPassthruArgs`; `std.Io`). `zig version` before building
+- Zig **0.17.1** (`build.zig` uses `addPassthruArgs`; `std.Io`). `zig version` before building
 - `nix develop` when zig is not on PATH
 
 ## Files
