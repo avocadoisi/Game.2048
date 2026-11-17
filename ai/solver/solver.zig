@@ -255,7 +255,7 @@ pub fn chooseOne(comptime policy: Policy, state: GameState, rng: std.Random, dep
         .expectimax => return bestMove(state, depth),
         .mcts => return mctsMove(state, rng),
         .beam => return beamMove(state),
-        .expectimax_tt => return bestMoveTT(state, 3),
+        .expectimax_tt => return bestMoveTT(false, state, 3, 0, ttWorkspace()),
         // `depth` carries the time budget in ms for this policy (0 = the shipped `id_budget_ms`),
         // the way `depth` is per-policy elsewhere: bench/ranking/solve pass it through.
         .expectimax_id => return bestMoveID(state, if (depth == 0) id_budget_ms else depth),
@@ -605,8 +605,22 @@ const TTEntry = struct {
     valid: bool,
 };
 
-fn bestMoveTT(state: GameState, depth: u8) ?Direction {
-    return bestMoveTTWith(state, depth, ttWorkspace());
+/// One expectimax search, specialized at comptime: `cut = false` is the full-width tree and
+/// `cut = true` drops chance branches below `cutoff`, renormalizing the kept mass (issue #298).
+/// `cutoff` is only read when `cut` is true; the two specializations keep the hot loop branch-free.
+fn bestMoveTT(comptime cut: bool, state: GameState, depth: u8, cutoff: f64, table: *[tt_entry_count]TTEntry) ?Direction {
+    var best: ?Direction = null;
+    var best_value = lost_score;
+    for ([_]Direction{ .up, .left, .down, .right }) |d| {
+        var next = state;
+        if (!next.slide(d).changed) continue;
+        const value = chanceValueTT(cut, next, depth, 1, cutoff, table);
+        if (best == null or value > best_value) {
+            best = d;
+            best_value = value;
+        }
+    }
+    return best;
 }
 
 /// Per-thread table reused across moves and games (issue #88). An entry is only returned on a
@@ -629,21 +643,6 @@ fn freshTable() [tt_entry_count]TTEntry {
     return table;
 }
 
-fn bestMoveTTWith(state: GameState, depth: u8, table: *[tt_entry_count]TTEntry) ?Direction {
-    var best: ?Direction = null;
-    var best_value = lost_score;
-    for ([_]Direction{ .up, .left, .down, .right }) |d| {
-        var next = state;
-        if (!next.slide(d).changed) continue;
-        const value = chanceValueTT(next, depth, table);
-        if (best == null or value > best_value) {
-            best = d;
-            best_value = value;
-        }
-    }
-    return best;
-}
-
 fn ttSlot(board: Board, depth: u8, kind: TTKind) usize {
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(std.mem.asBytes(&board));
@@ -662,42 +661,68 @@ fn ttPut(board: Board, depth: u8, kind: TTKind, value: f64, table: *[tt_entry_co
     table[ttSlot(board, depth, kind)] = .{ .board = board, .value = value, .depth = depth, .kind = kind, .valid = true };
 }
 
-fn maxValueTT(state: GameState, depth: u8, table: *[tt_entry_count]TTEntry) f64 {
+fn maxValueTT(comptime cut: bool, state: GameState, depth: u8, cutoff: f64, table: *[tt_entry_count]TTEntry) f64 {
+    const kind: TTKind = if (cut) .max_pruned else .max;
     if (depth == 0) return evaluateState(state);
-    if (ttGet(state.board, depth, .max, table)) |value| return value;
+    if (ttGet(state.board, depth, kind, table)) |value| return value;
     var best: f64 = lost_score;
     var any_move = false;
     for ([_]Direction{ .up, .left, .down, .right }) |d| {
         var next = state;
         if (!next.slide(d).changed) continue;
         any_move = true;
-        best = @max(best, chanceValueTT(next, depth, table));
+        best = @max(best, chanceValueTT(cut, next, depth, 1, cutoff, table));
     }
     if (!any_move) best = lost_score;
-    ttPut(state.board, depth, .max, best, table);
+    ttPut(state.board, depth, kind, best, table);
     return best;
 }
 
-fn chanceValueTT(state: GameState, depth: u8, table: *[tt_entry_count]TTEntry) f64 {
-    if (ttGet(state.board, depth, .chance, table)) |value| return value;
+/// Chance node of the one search. `cut = false` averages every spawn; `cut = true` drops the
+/// branches below `cutoff` and divides by the kept `mass`, so the value keeps a full average's scale.
+/// The last chance node (depth 1) keeps every branch, because cutting next to the leaves bends the value.
+/// The TT key leaves the path probability out, so the first board+depth pair to be stored wins (the
+/// approximation nneonneo's table makes); `.chance_pruned` keeps these values from ever mixing with
+/// the full-width `.chance` entries.
+fn chanceValueTT(comptime cut: bool, state: GameState, depth: u8, cprob: f64, cutoff: f64, table: *[tt_entry_count]TTEntry) f64 {
+    const kind: TTKind = if (cut) .chance_pruned else .chance;
+    if (ttGet(state.board, depth, kind, table)) |value| return value;
     var total: f64 = 0;
-    var empties: f64 = 0;
+    var empties: usize = 0;
+    for (0..core.BoardSize) |r| {
+        for (0..core.BoardSize) |c| {
+            if (state.board[r][c] == 0) empties += 1;
+        }
+    }
+    if (empties == 0) {
+        const value = evaluateState(state);
+        ttPut(state.board, depth, kind, value, table);
+        return value;
+    }
+    var mass: f64 = 0;
+    const cell_prob = if (cut) cprob / @as(f64, @floatFromInt(empties)) else 0;
     for (0..core.BoardSize) |r| {
         for (0..core.BoardSize) |c| {
             if (state.board[r][c] != 0) continue;
-            empties += 1;
             for ([_]struct { value: core.Tile, p: f64 }{
                 .{ .value = 2, .p = 0.9 },
                 .{ .value = 4, .p = 0.1 },
             }) |spawn| {
+                const p = if (cut) cell_prob * spawn.p else spawn.p;
+                if (cut and depth > 1 and p < cutoff) continue;
                 var next = state;
                 next.board[r][c] = spawn.value;
-                total += spawn.p * maxValueTT(next, depth - 1, table);
+                total += p * maxValueTT(cut, next, depth - 1, cutoff, table);
+                if (cut) mass += p;
             }
         }
     }
-    const value = if (empties == 0) evaluateState(state) else total / empties;
-    ttPut(state.board, depth, .chance, value, table);
+    // every branch cut (the node itself is already this unlikely): fall back to the leaf rule
+    const value = if (cut)
+        (if (mass == 0) evaluateState(state) else total / mass)
+    else
+        total / @as(f64, @floatFromInt(empties));
+    ttPut(state.board, depth, kind, value, table);
     return value;
 }
 
@@ -723,11 +748,11 @@ pub threadlocal var id_depth_reached: u8 = 0;
 pub fn bestMoveID(state: GameState, budget_ms: u32) ?Direction {
     const table = ttWorkspace();
     const start = clockNow();
-    var best = bestMoveTTPruned(state, id_min_depth, prob_cutoff, table);
+    var best = bestMoveTT(true, state, id_min_depth, prob_cutoff, table);
     id_depth_reached = @max(id_depth_reached, id_min_depth);
     var depth: u8 = id_min_depth;
     while (best != null and shouldDeepen(depth, budget_ms, clock_available, elapsedMs(start))) {
-        const move = bestMoveTTPruned(state, depth + 1, prob_cutoff, table);
+        const move = bestMoveTT(true, state, depth + 1, prob_cutoff, table);
         if (move == null) break;
         best = move;
         depth += 1;
@@ -761,81 +786,6 @@ const clockNow = if (clock_available) struct {
 
 fn elapsedMs(start: std.Io.Timestamp) i96 {
     return @divTrunc(start.durationTo(clockNow()).nanoseconds, std.time.ns_per_ms);
-}
-
-fn bestMoveTTPruned(state: GameState, depth: u8, cutoff: f64, table: *[tt_entry_count]TTEntry) ?Direction {
-    var best: ?Direction = null;
-    var best_value = lost_score;
-    for ([_]Direction{ .up, .left, .down, .right }) |d| {
-        var next = state;
-        if (!next.slide(d).changed) continue;
-        const value = chanceValueTTPruned(next, depth, 1, cutoff, table);
-        if (best == null or value > best_value) {
-            best = d;
-            best_value = value;
-        }
-    }
-    return best;
-}
-
-/// `maxValueTT` of the pruned search. The TT key leaves the path probability out, so the first
-/// board+depth pair to be stored wins (the approximation nneonneo's table makes); `.max_pruned` keeps
-/// these values from ever mixing with the full-width `.max` entries.
-fn maxValueTTPruned(state: GameState, depth: u8, cutoff: f64, table: *[tt_entry_count]TTEntry) f64 {
-    if (depth == 0) return evaluateState(state);
-    if (ttGet(state.board, depth, .max_pruned, table)) |value| return value;
-    var best: f64 = lost_score;
-    var any_move = false;
-    for ([_]Direction{ .up, .left, .down, .right }) |d| {
-        var next = state;
-        if (!next.slide(d).changed) continue;
-        any_move = true;
-        best = @max(best, chanceValueTTPruned(next, depth, 1, cutoff, table));
-    }
-    if (!any_move) best = lost_score;
-    ttPut(state.board, depth, .max_pruned, best, table);
-    return best;
-}
-
-/// `chanceValueTT` with the probability cut: branches below `cutoff` are dropped and the kept ones
-/// are renormalized by their summed probability, so the value keeps the scale of a full average.
-/// The last chance node (depth 1) keeps every branch, because cutting next to the leaves bends the value.
-fn chanceValueTTPruned(state: GameState, depth: u8, cprob: f64, cutoff: f64, table: *[tt_entry_count]TTEntry) f64 {
-    if (ttGet(state.board, depth, .chance_pruned, table)) |value| return value;
-    var total: f64 = 0;
-    var mass: f64 = 0;
-    var empties: usize = 0;
-    for (0..core.BoardSize) |r| {
-        for (0..core.BoardSize) |c| {
-            if (state.board[r][c] == 0) empties += 1;
-        }
-    }
-    if (empties == 0) {
-        const value = evaluateState(state);
-        ttPut(state.board, depth, .chance_pruned, value, table);
-        return value;
-    }
-    const cell_prob = cprob / @as(f64, @floatFromInt(empties));
-    for (0..core.BoardSize) |r| {
-        for (0..core.BoardSize) |c| {
-            if (state.board[r][c] != 0) continue;
-            for ([_]struct { value: core.Tile, p: f64 }{
-                .{ .value = 2, .p = 0.9 },
-                .{ .value = 4, .p = 0.1 },
-            }) |spawn| {
-                const p = cell_prob * spawn.p;
-                if (depth > 1 and p < cutoff) continue;
-                var next = state;
-                next.board[r][c] = spawn.value;
-                total += p * maxValueTTPruned(next, depth - 1, cutoff, table);
-                mass += p;
-            }
-        }
-    }
-    // every branch cut (the node itself is already this unlikely): fall back to the leaf rule
-    const value = if (mass == 0) evaluateState(state) else total / mass;
-    ttPut(state.board, depth, .chance_pruned, value, table);
-    return value;
 }
 
 /// Snake path 1..16: row 0 left to right, row 1 right to left, and so on.
@@ -1302,8 +1252,8 @@ test "reused TT returns the same moves as a fresh table across games (#88)" {
         for (0..40) |_| {
             var fresh: [tt_entry_count]TTEntry = undefined;
             for (&fresh) |*entry| entry.valid = false;
-            const fresh_move = bestMoveTTWith(state_b, 3, &fresh);
-            const warm_move = bestMoveTTWith(state_a, 3, warm);
+            const fresh_move = bestMoveTT(false, state_b, 3, 0, &fresh);
+            const warm_move = bestMoveTT(false, state_a, 3, 0, warm);
             try std.testing.expectEqual(fresh_move, warm_move);
             const dir = warm_move orelse break;
             _ = state_a.move(dir, rng_a.random());
@@ -1361,8 +1311,8 @@ test "probability cut drops the 4-spawn and renormalizes the kept branches" {
     first.board[3][2] = 2;
     var second = state;
     second.board[3][3] = 2;
-    const want = (maxValueTT(first, 1, &full_table) + maxValueTT(second, 1, &full_table)) / 2;
-    try std.testing.expectApproxEqRel(want, chanceValueTTPruned(state, 2, 1, 0.06, &pruned_table), 1e-9);
+    const want = (maxValueTT(false, first, 1, 0, &full_table) + maxValueTT(false, second, 1, 0, &full_table)) / 2;
+    try std.testing.expectApproxEqRel(want, chanceValueTT(true, state, 2, 1, 0.06, &pruned_table), 1e-9);
 }
 
 test "probability cut keeps the value within 5% of the full-width search" {
@@ -1374,8 +1324,8 @@ test "probability cut keeps the value within 5% of the full-width search" {
     } };
     var pruned_table = freshTable();
     var full_table = freshTable();
-    const full = chanceValueTT(state, 4, &full_table);
-    const pruned = chanceValueTTPruned(state, 4, 1, prob_cutoff, &pruned_table);
+    const full = chanceValueTT(false, state, 4, 1, 0, &full_table);
+    const pruned = chanceValueTT(true, state, 4, 1, prob_cutoff, &pruned_table);
     try std.testing.expectApproxEqRel(full, pruned, 0.05);
 }
 
@@ -1411,30 +1361,47 @@ test "expectimax full and pruned searches pin their fixed-board moves and values
         .{ .full_move = .down, .full_max = -391.12806666666665, .full_chance = -391.12806666666665, .pruned_move = .down, .pruned_max = -391.12806666666665, .pruned_chance = -391.12806666666665 },
         .{ .full_move = .right, .full_max = -203.6155598722222, .full_chance = -203.6155598722222, .pruned_move = .right, .pruned_max = -203.61555987222224, .pruned_chance = -203.61555987222224 },
     };
+    // prob_cutoff (1e-4) is below every chance branch on a 4x4 board, so pin a cutoff that
+    // actually prunes: 0.5 drops the 4-spawn everywhere and the 2-spawn too once two or more
+    // cells are empty, leaving either a mass-normalized value or the leaf fallback.
+    const cut_expected = [_]struct { move: ?Direction, max: f64 }{
+        .{ .move = .down, .max = 108 },
+        .{ .move = .down, .max = 108 },
+        .{ .move = .down, .max = 130 },
+        .{ .move = .down, .max = 130 },
+        .{ .move = .right, .max = -520.2180000000001 },
+        .{ .move = .right, .max = -520.2180000000001 },
+        .{ .move = .down, .max = -1000000000 },
+        .{ .move = .down, .max = -1000000000 },
+        .{ .move = .right, .max = 160 },
+        .{ .move = .right, .max = 160 },
+        .{ .move = .down, .max = -383.24399999999997 },
+        .{ .move = .down, .max = -359.044 },
+    };
     for (boards, 0..) |board, board_index| {
         var state = GameState.initEmpty();
         state.board = board;
         for ([_]u8{ 2, 3 }) |depth| {
             const want = expected[board_index * 2 + depth - 2];
             var full_table = freshTable();
-            const full_move = bestMoveTTWith(state, depth, &full_table);
-            const full_max = maxValueTT(state, depth, &full_table);
+            const full_move = bestMoveTT(false, state, depth, 0, &full_table);
+            const full_max = maxValueTT(false, state, depth, 0, &full_table);
             const full_chance = if (full_move) |move| blk: {
                 var next = state;
                 _ = next.slide(move);
-                break :blk chanceValueTT(next, depth, &full_table);
+                break :blk chanceValueTT(false, next, depth, 1, 0, &full_table);
             } else 0;
             try std.testing.expectEqual(want.full_move, full_move);
             try std.testing.expectEqual(want.full_max, full_max);
             try std.testing.expectEqual(want.full_chance, full_chance);
 
             var pruned_table = freshTable();
-            const pruned_move = bestMoveTTPruned(state, depth, prob_cutoff, &pruned_table);
-            const pruned_max = maxValueTTPruned(state, depth, prob_cutoff, &pruned_table);
+            const pruned_move = bestMoveTT(true, state, depth, prob_cutoff, &pruned_table);
+            const pruned_max = maxValueTT(true, state, depth, prob_cutoff, &pruned_table);
             const pruned_chance = if (pruned_move) |move| blk: {
                 var next = state;
                 _ = next.slide(move);
-                break :blk chanceValueTTPruned(next, depth, 1, prob_cutoff, &pruned_table);
+                break :blk chanceValueTT(true, next, depth, 1, prob_cutoff, &pruned_table);
             } else 0;
             try std.testing.expectEqual(want.pruned_move, pruned_move);
             try std.testing.expectEqual(want.pruned_max, pruned_max);
@@ -1442,10 +1409,17 @@ test "expectimax full and pruned searches pin their fixed-board moves and values
 
             // cutoff 0 keeps every branch, so the pruned specialization must agree with the full one.
             var zero_table = freshTable();
-            const zero_move = bestMoveTTPruned(state, depth, 0, &zero_table);
-            const zero_max = maxValueTTPruned(state, depth, 0, &zero_table);
+            const zero_move = bestMoveTT(true, state, depth, 0, &zero_table);
+            const zero_max = maxValueTT(true, state, depth, 0, &zero_table);
             try std.testing.expectEqual(full_move, zero_move);
             try std.testing.expectApproxEqRel(full_max, zero_max, 1e-12);
+
+            const cut_want = cut_expected[board_index * 2 + depth - 2];
+            var cut_table = freshTable();
+            const cut_move = bestMoveTT(true, state, depth, 0.5, &cut_table);
+            const cut_max = maxValueTT(true, state, depth, 0.5, &cut_table);
+            try std.testing.expectEqual(cut_want.move, cut_move);
+            try std.testing.expectEqual(cut_want.max, cut_max);
         }
     }
 }
@@ -1475,7 +1449,7 @@ test "iterative deepening with a zero budget returns the depth 2 move" {
         _ = state.move(direction, rng);
     }
     var table = freshTable();
-    try std.testing.expectEqual(bestMoveTTPruned(state, id_min_depth, prob_cutoff, &table), bestMoveID(state, 0));
+    try std.testing.expectEqual(bestMoveTT(true, state, id_min_depth, prob_cutoff, &table), bestMoveID(state, 0));
     try std.testing.expectEqual(id_min_depth, id_depth_reached);
 }
 
