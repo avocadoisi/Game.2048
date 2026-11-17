@@ -4,7 +4,7 @@
 
 Zig で書いた 2048。ゲームロジックを `2048.core` として切り出し、CLI / HTTP サーバー / WASM / solver AI が同じコアを使う。
 
-- Zig **0.17**（`std.Io` / `std.process.Init` 系 API）
+- Zig **0.17.1**（`std.Io` / `std.process.Init` 系 API）
 - `zig build test` で全ユニットテストが通ること
 - 乱数は注入式で、seed 固定なら同じゲーム・同じ solver の手順が再現する
 
