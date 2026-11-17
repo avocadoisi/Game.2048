@@ -1379,6 +1379,77 @@ test "probability cut keeps the value within 5% of the full-width search" {
     try std.testing.expectApproxEqRel(full, pruned, 0.05);
 }
 
+test "expectimax full and pruned searches pin their fixed-board moves and values (#298)" {
+    const boards = [_]Board{
+        .{ .{ 2, 4, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 } },
+        .{ .{ 2, 2, 4, 8 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 } },
+        .{ .{ 2, 4, 8, 16 }, .{ 32, 64, 128, 0 }, .{ 0, 2, 4, 0 }, .{ 0, 0, 0, 0 } },
+        .{ .{ 2, 4, 8, 16 }, .{ 32, 64, 128, 256 }, .{ 512, 1024, 2048, 4096 }, .{ 8192, 16384, 32768, 0 } },
+        .{ .{ 4, 4, 4, 4 }, .{ 4, 4, 4, 4 }, .{ 4, 4, 4, 4 }, .{ 4, 4, 4, 0 } },
+        .{ .{ 2, 4, 2, 4 }, .{ 4, 2, 4, 2 }, .{ 2, 4, 2, 4 }, .{ 4, 2, 4, 0 } },
+    };
+    // Recorded from the two-search implementation before #298 folded it into one comptime
+    // specialization: rows are board 0 depth 2, board 0 depth 3, board 1 depth 2, ...
+    const expected = [_]struct {
+        full_move: ?Direction,
+        full_max: f64,
+        full_chance: f64,
+        pruned_move: ?Direction,
+        pruned_max: f64,
+        pruned_chance: f64,
+    }{
+        .{ .full_move = .right, .full_max = 56.14053298273156, .full_chance = 56.14053298273156, .pruned_move = .right, .pruned_max = 56.14053298273157, .pruned_chance = 56.14053298273157 },
+        .{ .full_move = .right, .full_max = 68.79521103218931, .full_chance = 68.79521103218931, .pruned_move = .right, .pruned_max = 68.79521103218937, .pruned_chance = 68.79521103218937 },
+        .{ .full_move = .left, .full_max = 70.64758930966468, .full_chance = 70.64758930966468, .pruned_move = .left, .pruned_max = 70.64758930966478, .pruned_chance = 70.64758930966478 },
+        .{ .full_move = .left, .full_max = 73.19099247604508, .full_chance = 73.19099247604508, .pruned_move = .left, .pruned_max = 73.19099247604518, .pruned_chance = 73.19099247604518 },
+        .{ .full_move = .right, .full_max = -560.8146355102042, .full_chance = -560.8146355102042, .pruned_move = .right, .pruned_max = -560.8146355102043, .pruned_chance = -560.8146355102043 },
+        .{ .full_move = .right, .full_max = -508.9508691666343, .full_chance = -508.9508691666343, .pruned_move = .right, .pruned_max = -508.9508691666344, .pruned_chance = -508.9508691666344 },
+        .{ .full_move = .down, .full_max = -1000000000, .full_chance = -1000000000, .pruned_move = .down, .pruned_max = -1000000000, .pruned_chance = -1000000000 },
+        .{ .full_move = .down, .full_max = -1000000000, .full_chance = -1000000000, .pruned_move = .down, .pruned_max = -1000000000, .pruned_chance = -1000000000 },
+        .{ .full_move = .up, .full_max = 54.314689, .full_chance = 54.314689, .pruned_move = .up, .pruned_max = 54.31468900000002, .pruned_chance = 54.31468900000002 },
+        .{ .full_move = .up, .full_max = 40.732194048177234, .full_chance = 40.732194048177234, .pruned_move = .up, .pruned_max = 40.73219404817724, .pruned_chance = 40.73219404817724 },
+        .{ .full_move = .down, .full_max = -391.12806666666665, .full_chance = -391.12806666666665, .pruned_move = .down, .pruned_max = -391.12806666666665, .pruned_chance = -391.12806666666665 },
+        .{ .full_move = .right, .full_max = -203.6155598722222, .full_chance = -203.6155598722222, .pruned_move = .right, .pruned_max = -203.61555987222224, .pruned_chance = -203.61555987222224 },
+    };
+    for (boards, 0..) |board, board_index| {
+        var state = GameState.initEmpty();
+        state.board = board;
+        for ([_]u8{ 2, 3 }) |depth| {
+            const want = expected[board_index * 2 + depth - 2];
+            var full_table = freshTable();
+            const full_move = bestMoveTTWith(state, depth, &full_table);
+            const full_max = maxValueTT(state, depth, &full_table);
+            const full_chance = if (full_move) |move| blk: {
+                var next = state;
+                _ = next.slide(move);
+                break :blk chanceValueTT(next, depth, &full_table);
+            } else 0;
+            try std.testing.expectEqual(want.full_move, full_move);
+            try std.testing.expectEqual(want.full_max, full_max);
+            try std.testing.expectEqual(want.full_chance, full_chance);
+
+            var pruned_table = freshTable();
+            const pruned_move = bestMoveTTPruned(state, depth, prob_cutoff, &pruned_table);
+            const pruned_max = maxValueTTPruned(state, depth, prob_cutoff, &pruned_table);
+            const pruned_chance = if (pruned_move) |move| blk: {
+                var next = state;
+                _ = next.slide(move);
+                break :blk chanceValueTTPruned(next, depth, 1, prob_cutoff, &pruned_table);
+            } else 0;
+            try std.testing.expectEqual(want.pruned_move, pruned_move);
+            try std.testing.expectEqual(want.pruned_max, pruned_max);
+            try std.testing.expectEqual(want.pruned_chance, pruned_chance);
+
+            // cutoff 0 keeps every branch, so the pruned specialization must agree with the full one.
+            var zero_table = freshTable();
+            const zero_move = bestMoveTTPruned(state, depth, 0, &zero_table);
+            const zero_max = maxValueTTPruned(state, depth, 0, &zero_table);
+            try std.testing.expectEqual(full_move, zero_move);
+            try std.testing.expectApproxEqRel(full_max, zero_max, 1e-12);
+        }
+    }
+}
+
 test "iterative deepening returns a legal move on random boards" {
     var prng = std.Random.DefaultPrng.init(41);
     const rng = prng.random();
