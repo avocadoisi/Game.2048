@@ -4233,3 +4233,14 @@ zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 base 30 ai/solver/nn_we
 `zig build test-nn -Dtest-filter='fallback'`、`zig build test-nn-main -Dtest-filter='recovered cut branch'` と
 `zig build nn -Doptimize=ReleaseFast` は通過済み。テストは合成木で全 spawn の確率総和、刈った子の浅い評価、
 全枝 cut、cutoff 無効時の一致、終局値を確認する。
+
+### 2026 extended-TD 論文の入手性判定（#291、2026-11-17）
+
+対象は Wang・Matsuzaki, “Refining Evaluation Functions for Game 2048 by Extended Temporal Difference Learning,”
+*IEEE Transactions on Games*, 18(1), 56–65 (2026), DOI [10.1109/TG.2025.3606517](https://doi.org/10.1109/TG.2025.3606517)。
+IEEE Xplore の [論文ページ](https://ieeexplore.ieee.org/document/11151781) では abstract と導入冒頭だけが表示され、続きは “Sign in to Continue Reading” となる。
+調査時点で Crossref の全文リンク先 PDF は取得できず、OpenAlex は `best_oa_location: null`、Semantic Scholar の `openAccessPdf.url` は空、arXiv と著者所属機関の検索でも著者版を確認できなかった。よって、公開アクセス可能な全文・著者稿はこの環境では得られていない。
+
+Abstract は二つの refinement algorithm を述べ、NN / n-tuple のスコア向上値を報告するが、更新則・前提・評価条件の詳細は得られない。これらの別実装の数値を本プロジェクトの期待値にはしない。#107 の optimistic initialization / multi-stage TD、#231 の Adam と混同しないためにも、方法を推測して実装するのは不適切と判断した。
+
+判定: **no-go（全文未入手のため実装・評価しない）**。既定方針・重みは変更しない。合法な全文または著者稿が入手できた場合は、方法と互換性を確認して再検討する。
