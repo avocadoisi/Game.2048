@@ -322,7 +322,7 @@ expectimax に 2 つ足した（`Policy.expectimax_id`, `zig build solve` の po
 約 25 倍かかるので、chance node に枝刈りを足した。
 
 - `Search.cutoff`: 経路確率（`cprob * spawn.p / 空きマス`）が `deep3_cutoff = 1e-2` 未満の spawn を落とし、
-  残った枝の確率和で再正規化する（`solver.zig` の `chanceValueTTPruned` と同じ式）。空きマス 11 以上では
+  残った枝の確率和で再正規化する（`solver.zig` の `chanceValueTT` の `cut = true` と同じ式）。空きマス 11 以上では
   第 1 層の 4 出現とその下の第 2 層が落ち、葉の直前の層は全幅のまま。全枝が切れたノードは afterstate の
   葉値で代用する。`cutoff = 0` が枝刈り無効で、`.deep`（= `nn2`）はこの経路（golden の checksum は不変）。
 - `solver.Policy.nn3` として `zig build solve` / `/api/solve?algo=nn3` / wasm から選べる。1 局 2.5 分なので
