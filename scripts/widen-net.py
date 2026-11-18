@@ -7,18 +7,22 @@ hidden units get zero weights, so their activation is `relu(0) = 0` and they con
 the widened file computes the same value as the original, bit for bit.
 
     scripts/widen-net.py ai/solver/nn_weights.bin /tmp/ship128.bin --h1 128 --h2 128
-    zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=128 -- 0 20 9000 0.003 1 pairw 30 /tmp/ship128.bin 1 - /tmp/cand.bin
+    zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=128 -- \
+      0 20 9000 0.003 1 pairw 30 /tmp/ship128.bin 1 - /tmp/cand.bin
 
 Layout (little endian, `ai/solver/nn.zig`): 16-byte header (8-byte magic `2048-NN`, u32 version,
 u32 endian marker 0x01020304), then f64 weights in struct order:
 `w1[256][h1]`, `b1[h1]`, `w2[h2][h1]`, `b2[h2]`, `w3[h2]`, `b3`, then the `-Dfeat` global rows
 `wf[feat][h1]` (absent when the source build has no features; `--feat` pads them with zeros).
 """
+
 import argparse
 import struct
 import sys
+from pathlib import Path
 
 INPUTS = 256  # BoardCellCount * levels, see nn.zig
+HEADER_LEN = 16
 
 
 def dims(count: int):
@@ -51,12 +55,12 @@ def main() -> int:
     )
     a = ap.parse_args()
 
-    raw = open(a.src, "rb").read()
-    if len(raw) < 16 or raw[:8] != b"2048-NN\0":
+    raw = Path(a.src).read_bytes()
+    if len(raw) < HEADER_LEN or raw[:8] != b"2048-NN\0":
         sys.exit(f"{a.src}: not a value net (bad magic)")
-    version, marker = struct.unpack("<II", raw[8:16])
-    body = raw[16:]
-    values = list(struct.unpack("<%dd" % (len(body) // 8), body))
+    version, marker = struct.unpack("<II", raw[8:HEADER_LEN])
+    body = raw[HEADER_LEN:]
+    values = list(struct.unpack(f"<{len(body) // 8}d", body))
     if a.src_h1 and a.src_h2:
         h1o, h2o = a.src_h1, a.src_h2
         if len(values) != INPUTS * h1o + h1o + h2o * h1o + h2o + h2o + 1:
@@ -98,9 +102,9 @@ def main() -> int:
     # nothing, so the padded file computes the same value as the original.
     out += [0.0] * (a.feat * h1n)
 
-    with open(a.dst, "wb") as f:
+    with Path(a.dst).open("wb") as f:
         f.write(b"2048-NN\0" + struct.pack("<II", version, marker))
-        f.write(struct.pack("<%dd" % len(out), *out))
+        f.write(struct.pack(f"<{len(out)}d", *out))
     extra = f", feat {a.feat}" if a.feat else ""
     print(f"{a.src} ({h1o}/{h2o}) -> {a.dst} ({h1n}/{h2n}{extra}), {len(out)} values")
     return 0

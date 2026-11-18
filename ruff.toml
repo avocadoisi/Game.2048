@@ -1,0 +1,20 @@
+# Strict preset: every rule is on. A rule comes off only with the reason below.
+line-length = 120
+target-version = "py310"
+
+[lint]
+select = ["ALL"]
+ignore = [
+    "ANN",     # these are small CLIs, not importable APIs; annotations buy nothing here
+    "CPY001",  # the licence lives in LICENSE / NOTICE, not in every file header
+    "COM812",  # ruff format owns trailing commas; keeping both makes them fight
+    "D",       # module docstrings carry the usage; per-function docstrings are noise
+    "ERA001",  # the "rest = ..." comment documents the layout; it is not dead code
+    "PLR0915", # main() is a straight-line CLI; splitting it would hide the steps
+    "RUF001",  # full-width Japanese punctuation is deliberate
+    "RUF002",  # same, in docstrings
+    "S101",    # asserts guard internal invariants in these scripts
+    "S603",    # subprocess arguments are literals, not user input
+    "S607",    # gh is resolved from PATH by design
+    "T201",    # print is the output of these CLIs
+]

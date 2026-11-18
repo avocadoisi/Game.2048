@@ -57,13 +57,12 @@ def load_table():
 
 
 def issues():
-    out = gh("issue", "list", "--state", "all", "--limit", "1000",
-             "--json", "number,title,labels").stdout
+    out = gh("issue", "list", "--state", "all", "--limit", "1000", "--json", "number,title,labels").stdout
     return json.loads(out)
 
 
 def ensure_labels(apply):
-    have = {l["name"] for l in json.loads(gh("label", "list", "--limit", "200", "--json", "name").stdout)}
+    have = {label["name"] for label in json.loads(gh("label", "list", "--limit", "200", "--json", "name").stdout)}
     for name, color, desc in LABELS:
         if name in have:
             continue
@@ -74,7 +73,7 @@ def ensure_labels(apply):
 
 def main():
     apply = "--apply" in sys.argv
-    unknown = [a for a in sys.argv[1:] if a not in ("--apply",)]
+    unknown = [a for a in sys.argv[1:] if a != "--apply"]
     if unknown:
         sys.exit(f"unknown argument: {unknown[0]} (usage: label-issues.py [--apply])")
 
@@ -85,7 +84,7 @@ def main():
     todo, unlabeled, unmapped = 0, 0, []
     for it in items:
         num = it["number"]
-        have = {l["name"] for l in it["labels"]}
+        have = {label["name"] for label in it["labels"]}
         if not have:
             unlabeled += 1
         if num not in rows:

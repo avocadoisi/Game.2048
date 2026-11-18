@@ -5,22 +5,39 @@
 set -u
 
 if [ "${1:-}" = "--selftest" ]; then
-  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
   printf '# history\n' > "$tmp/h.md"
-  "$0" --doc "$tmp/h.md" -- echo selftest-output-line >/dev/null
+  "$0" --doc "$tmp/h.md" -- echo selftest-output-line > /dev/null
   block=$(cat "$tmp/h.md")
   fail=0
+  # shellcheck disable=SC2016 # the expected block contains literal backticks
   for want in '## Bench run' '- command: `echo selftest-output-line`' '- commit: ' '- date: ' '- exit: 0' 'selftest-output-line'; do
-    case "$block" in *"$want"*) ;; *) echo "selftest FAIL: missing '$want'" >&2; fail=1 ;; esac
+    case "$block" in *"$want"*) ;; *)
+      echo "selftest FAIL: missing '$want'" >&2
+      fail=1
+      ;;
+    esac
   done
-  [ "$fail" = 0 ] && echo "selftest PASS" || { echo "selftest FAILED" >&2; exit 1; }
+  if [ "$fail" = 0 ]; then
+    echo "selftest PASS"
+  else
+    echo "selftest FAILED" >&2
+    exit 1
+  fi
   exit "$fail"
 fi
 
 doc=docs/solver-history.md
-if [ "${1:-}" = "--doc" ]; then doc=$2; shift 2; fi
+if [ "${1:-}" = "--doc" ]; then
+  doc=$2
+  shift 2
+fi
 [ "${1:-}" = "--" ] && shift
-[ $# -gt 0 ] || { echo "usage: $0 [--doc FILE] -- <command...>" >&2; exit 2; }
+[ $# -gt 0 ] || {
+  echo "usage: $0 [--doc FILE] -- <command...>" >&2
+  exit 2
+}
 
 # Refuse when the trained weights have uncommitted changes.
 if [ -n "$(git status --porcelain -- ai/solver/nn_weights.bin)" ]; then
@@ -29,9 +46,11 @@ if [ -n "$(git status --porcelain -- ai/solver/nn_weights.bin)" ]; then
 fi
 
 cmd="$*"
-commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
+commit=$(git rev-parse --short HEAD 2> /dev/null || echo unknown)
 date_str=$(date '+%Y-%m-%d %H:%M:%S %z')
-out=$("$@" 2>&1); code=$?
+out=$("$@" 2>&1)
+code=$?
+# shellcheck disable=SC2016 # printf format: %s is a placeholder, not shell expansion
 printf '\n## Bench run %s\n\n- command: `%s`\n- commit: %s\n- date: %s\n- exit: %s\n\n```text\n%s\n```\n' \
   "$date_str" "$cmd" "$commit" "$date_str" "$code" "$out" >> "$doc"
 printf '%s\n' "$out"

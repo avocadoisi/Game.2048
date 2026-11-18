@@ -28,12 +28,23 @@
         };
       in {
         devShells.default = pkgs.mkShell {
-          packages =
-            [ pkgs.zig ]
-            ++ pkgs.lib.optionals (pkgs ? zls) [ pkgs.zls ];
+          packages = [
+            pkgs.zig
+            pkgs.shellcheck
+            pkgs.ruff
+            pkgs.shfmt
+            pkgs.nodejs_22
+            pkgs.python3
+          ] ++ pkgs.lib.optionals (pkgs ? zls) [ pkgs.zls ];
 
           shellHook = ''
             export ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-global-cache"
+            if command -v git >/dev/null 2>&1 && [ -d .git ]; then
+              if [ "$(git config --get core.hooksPath || true)" != ".githooks" ]; then
+                git config core.hooksPath .githooks
+                echo "hooks: core.hooksPath=.githooks"
+              fi
+            fi
             echo "Entered Game.2048 devShell (zig: $(zig version))"
           '';
         };

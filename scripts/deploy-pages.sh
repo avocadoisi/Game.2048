@@ -20,7 +20,10 @@ for arg in "$@"; do
     --dry-run) dry_run=1 ;;
     --skip-smoke) run_smoke=0 ;;
     --enable) enable=1 ;;
-    -h | --help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help)
+      sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
     *)
       echo "unknown option: $arg" >&2
       exit 2
@@ -56,7 +59,7 @@ else
   echo "==> --skip-smoke: the module was NOT checked against wasm.policies"
 fi
 
-size=$(wc -c <zig-out/web/game2048.wasm | tr -d ' ')
+size=$(wc -c < zig-out/web/game2048.wasm | tr -d ' ')
 # Which policies went in is config (`wasm.policies`), so put it in the log: the deployed page offers
 # exactly these, nothing else (#154). Inline comments (`nn2 # fast`) are stripped here too.
 policies=$(sed -e 's/#.*//' wasm.policies | tr -s '[:space:],' ' ' | sed -e 's/^ *//' -e 's/ *$//')
@@ -85,8 +88,8 @@ if ((enable)); then
   # builds POST: a push to gh-pages triggers the build, and that endpoint answers 204 (empty
   # body), which `gh` cannot parse as JSON (issue #149).
   gh api -X POST "repos/${repo}/pages" \
-    -f "source[branch]=gh-pages" -f "source[path]=/" >/dev/null 2>&1 || true
-  if ! status=$(gh api "repos/${repo}/pages" -q '.status + "  " + .html_url' 2>/dev/null); then
+    -f "source[branch]=gh-pages" -f "source[path]=/" > /dev/null 2>&1 || true
+  if ! status=$(gh api "repos/${repo}/pages" -q '.status + "  " + .html_url' 2> /dev/null); then
     echo "Pages is not enabled — is the repository public (or the plan Pro+)?" >&2
     exit 1
   fi

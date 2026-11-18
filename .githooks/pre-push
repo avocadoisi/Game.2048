@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Everything before a push. CI repeats it on the PR, so --no-verify is safe for WIP.
+set -euo pipefail
+exec scripts/gate.sh all
