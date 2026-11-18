@@ -466,11 +466,32 @@ fn chanceMove(vfn: Value, state: GameState) ?Direction {
 /// interior-node lookups of the transposition table (#263; both counters stay 0 when it is off).
 pub const Stats = struct { leaves: u64 = 0, hits: u64 = 0, node_probes: u64 = 0, node_hits: u64 = 0 };
 
+/// #320: the default seed of the per-chance-node spawn sampler. Any fixed value does; it only has to
+/// make a sampled run reproducible, so an A/B on the same spawn tape sees only the policy difference.
+pub const default_sample_seed: u64 = 0x9e3779b97f4a7c15;
+
 /// Depth one search runs at: `ply` own moves deep, dropping spawn branches under path probability
 /// `cutoff` (`0` keeps every branch) and dropping the lowest-probability branches up to a share
 /// `mass_cutoff` of each chance node's mass (#182, `0` keeps every branch). Part of the value-cache
 /// key (#157), because a phase game asks for the same board at two depths.
-pub const Depth = struct { ply: u8 = 0, cutoff: f64 = 0, mass_cutoff: f64 = 0, risk_weight: f64 = 0, omit_leaf_reward: bool = false, recover_cut_branches: bool = false };
+pub const Depth = struct {
+    ply: u8 = 0,
+    cutoff: f64 = 0,
+    mass_cutoff: f64 = 0,
+    risk_weight: f64 = 0,
+    omit_leaf_reward: bool = false,
+    recover_cut_branches: bool = false,
+    /// #320: at most this many spawn branches per chance node, drawn by weighted sampling without
+    /// replacement. `0` (the default) keeps every branch, bit for bit as before.
+    sample: usize = 0,
+    /// #320: the seed of that sampler. Same board, depth and seed give the same spawns, so a re-search
+    /// (or the interior-node table) is consistent with a fresh one.
+    sample_seed: u64 = default_sample_seed,
+    /// #320: the shallowest chance node the sample applies to. `1` samples every spawn layer; `2` keeps
+    /// the layer directly above the leaves at full width, so the spawn that decides whether the last
+    /// move survives is never thinned (K=2 + min depth 2 costs the same as K=3 at every layer).
+    sample_min_depth: u8 = 1,
+};
 
 /// A completed search node: its value and whether that value is a direct leaf (#260). The node table
 /// stores both, because the parent of a direct leaf omits that move's reward.
@@ -513,7 +534,10 @@ pub const ValueCache = struct {
         h = (h ^ @as(u64, depth.ply)) *% 0x100000001b3;
         h = (h ^ @as(u64, @bitCast(depth.cutoff))) *% 0x100000001b3;
         // the mass cut (#182) changes the value too, so it is part of the key as well; a zero mass
-        // cut does not mix, which keeps every pre-#182 key (and the recorded golden values) as is
+        // cut does not mix, which keeps every pre-#182 key (and the recorded golden values) as is.
+        // The #320 spawn sample stays out on purpose: a leaf is the net's exact V whatever the sample
+        // size, and this table holds leaves only. Sampled interior values live in the per-search node
+        // table, which is cleared before every top-level search, so its config cannot leak across runs.
         if (depth.mass_cutoff == 0) return h;
         return (h ^ @as(u64, @bitCast(depth.mass_cutoff))) *% 0x100000001b3;
     }
@@ -787,6 +811,56 @@ fn massCutMask(branches: []const ChanceBranch, mass_cutoff: f64, dropped: *[max_
     return dropped_p / all_p;
 }
 
+/// #320: a deterministic uniform in (0, 1) for one branch of one chance node. The node's board hash,
+/// depth and the branch's index in board order are hashed with the run seed, so the same node under
+/// the same seed always proposes the same spawns. `cprob` is deliberately not an input: it scales
+/// every branch weight of a node equally, which leaves a weighted sample unchanged.
+fn sampleUniform(seed: u64, board_hash: u64, depth: u8, index: usize) f64 {
+    var h = seed ^ board_hash;
+    h ^= @as(u64, depth) *% 0x9e3779b97f4a7c15;
+    h +%= @as(u64, @intCast(index)) *% 0x165667b19e3779f9;
+    // splitmix64 finalizer
+    h ^= h >> 30;
+    h *%= 0xbf58476d1ce4e5b9;
+    h ^= h >> 27;
+    h *%= 0x94d049bb133111eb;
+    h ^= h >> 31;
+    // 53 random bits, shifted off both ends so the result is never exactly 0 (log would be -inf) or 1
+    return (@as(f64, @floatFromInt(h >> 11)) + 0.5) / 9007199254740992.0;
+}
+
+/// #320: marks all but `keep` branches of one chance node as dropped, choosing them by weighted
+/// sampling without replacement (Efraimidis-Spirakis: keep the largest `u^(1/p)`, equivalently the
+/// smallest `-ln(u)/p`). Probabilities are the same `cprob * spawn.p` the full enumeration averages
+/// with, so a kept set still renormalizes over its own mass below and the 2/4 ratio is preserved.
+/// Every key depends only on the node identity and the branch index, so the choice is deterministic
+/// for a seed. `keep` at or above the branch count drops nothing, and branches already dropped by the
+/// mass cut are never brought back.
+fn sampleMask(branches: []const ChanceBranch, keep: usize, seed: u64, board_hash: u64, depth: u8, dropped: *[max_chance_branches]bool) void {
+    if (keep == 0) return;
+    var available: usize = 0;
+    for (branches, 0..) |_, i| {
+        if (!dropped[i]) available += 1;
+    }
+    if (keep >= available) return;
+    var keys: [max_chance_branches]f64 = undefined;
+    var taken: [max_chance_branches]bool = @splat(false);
+    for (branches, 0..) |branch, i| {
+        keys[i] = if (dropped[i]) std.math.inf(f64) else -@log(sampleUniform(seed, board_hash, depth, i)) / branch.p;
+    }
+    for (0..keep) |_| {
+        var best: ?usize = null;
+        for (branches, 0..) |_, i| {
+            if (taken[i] or dropped[i]) continue;
+            if (best == null or keys[i] < keys[best.?]) best = i;
+        }
+        taken[best.?] = true;
+    }
+    for (branches, 0..) |_, i| {
+        if (!taken[i]) dropped[i] = true;
+    }
+}
+
 /// Depth-limited expectimax: our moves and every spawn (2 at 0.9, 4 at 0.1), no RNG.
 /// The caller owns the value cache so a game can reuse one workspace for all of its moves.
 const Search = struct {
@@ -812,6 +886,13 @@ const Search = struct {
     recover_cut_branches: bool = false,
     /// #178: average every leaf over the 8 dihedral transforms instead of one forward pass.
     sym_leaf: bool = false,
+    /// #320: at most this many spawn branches per chance node (0 keeps every branch). The draw is a
+    /// pure function of the node's board, its depth and `sample_seed`, so the search still never
+    /// touches the game's spawn RNG.
+    sample: usize = 0,
+    sample_seed: u64 = default_sample_seed,
+    /// #320: chance nodes shallower than this keep every branch (see `Depth.sample_min_depth`).
+    sample_min_depth: u8 = 1,
     /// #183: `leaf` calls this search may still make (cache hits count too). Unbounded by default, so
     /// every pre-#183 tree is searched exactly as before; the iterative deepening sets it per iteration.
     nodes_left: usize = std.math.maxInt(usize),
@@ -961,6 +1042,13 @@ const Search = struct {
         // the mass cut drops the smallest branches first, the fixed cut its usual depth > 1 way
         var dropped: [max_chance_branches]bool = @splat(false);
         _ = massCutMask(branches[0..count], self.mass_cutoff, &dropped);
+        // #320: keep only a finite weighted sample of this node's spawns. The dropped branches follow
+        // the cut path below, so the kept ones renormalize over their own mass exactly as a cut node
+        // does and the value keeps the scale of a full average. Not combined with the #261 recovery:
+        // that row evaluates every branch one layer shallower, which sampling would silently undo.
+        if (self.sample > 0 and depth >= self.sample_min_depth and !self.recover_cut_branches) {
+            sampleMask(branches[0..count], self.sample, self.sample_seed, ValueCache.keyOf(state.board), depth, &dropped);
+        }
         // #261: if the fixed cutoff removes any branch, evaluate every spawn from its real child
         // board. Kept branches retain this depth; cut branches lose one own-move/reward layer. Their
         // local probabilities sum to 1, so no mass is discarded or renormalized.
@@ -1120,6 +1208,9 @@ fn newSearch(vfn: Value, cache: *ValueCache, nodes: ?*NodeCache, depth: Depth, s
         .omit_leaf_reward = depth.omit_leaf_reward,
         .recover_cut_branches = depth.recover_cut_branches,
         .sym_leaf = sym_leaf,
+        .sample = depth.sample,
+        .sample_seed = depth.sample_seed,
+        .sample_min_depth = depth.sample_min_depth,
         // a phase row may carry its own #187 weight; the caller's option is the one every other row uses
         .risk_weight = if (depth.risk_weight != 0) depth.risk_weight else risk_weight,
     };
@@ -1159,7 +1250,7 @@ fn deepMoveId(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, n
     var best_ply: u8 = 0;
     var ply: u8 = @max(start.ply, 2);
     while (ply <= max_id_ply) : (ply += 1) {
-        var search = newSearch(vfn, cache, nodes, .{ .ply = ply, .cutoff = start.cutoff, .mass_cutoff = start.mass_cutoff, .omit_leaf_reward = start.omit_leaf_reward, .recover_cut_branches = start.recover_cut_branches }, sym_leaf, risk_weight);
+        var search = newSearch(vfn, cache, nodes, .{ .ply = ply, .cutoff = start.cutoff, .mass_cutoff = start.mass_cutoff, .omit_leaf_reward = start.omit_leaf_reward, .recover_cut_branches = start.recover_cut_branches, .sample = start.sample, .sample_seed = start.sample_seed, .sample_min_depth = start.sample_min_depth }, sym_leaf, risk_weight);
         // what this iteration may still spend: the budget minus every iteration before it
         search.nodes_left = budget -| @as(usize, @intCast(spent));
         const root = rootMove(&search, state, order, rerank);
@@ -1317,7 +1408,7 @@ pub const Mode = enum {
 /// own moves deep, dropping spawn branches under path probability `cutoff` (`full_width_cutoff` keeps
 /// every branch) and dropping the lowest-probability branches up to `mass_cutoff` of a chance node's
 /// mass (#182, 0 keeps every branch).
-pub const Phase = struct { min_empty: u8, ply: u8, cutoff: f64, mass_cutoff: f64 = 0, risk_weight: f64 = 0 };
+pub const Phase = struct { min_empty: u8, ply: u8, cutoff: f64, mass_cutoff: f64 = 0, risk_weight: f64 = 0, sample: usize = 0, sample_min_depth: u8 = 1 };
 
 /// A row cutoff that keeps every spawn branch: no branch probability ever reaches 1.
 const full_width_cutoff: f64 = 1;
@@ -1406,6 +1497,8 @@ fn phaseDepth(mode: Mode, board: Board) Depth {
             .mass_cutoff = searchMassCutoff(row.mass_cutoff),
             .risk_weight = row.risk_weight,
             .recover_cut_branches = mode == .deep3_recover,
+            .sample = row.sample,
+            .sample_min_depth = row.sample_min_depth,
         };
     }
     unreachable; // every schedule ends with min_empty = 0
@@ -1456,6 +1549,9 @@ pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stat
         else => {
             depth = searchDepth(mode, state.board, opts.omit_leaf_reward);
             if (opts.cutoff) |cutoff| depth.cutoff = cutoff;
+            if (opts.sample) |sample| depth.sample = sample;
+            depth.sample_seed = opts.sample_seed;
+            depth.sample_min_depth = opts.sample_min_depth;
             searching = true;
         },
     }
@@ -1976,6 +2072,17 @@ pub const Options = struct {
     /// Override the spawn-probability cut the mode's phase row would use (`null` = the row's cutoff).
     /// A measurement needs e.g. `.deep3` at 1e-3 instead of 1e-2 without a second mode (#263/#256).
     cutoff: ?f64 = null,
+    /// Candidate (#320): at most this many spawn branches per chance node, drawn by weighted sampling
+    /// without replacement from the node's 0.9/0.1 spawn probabilities. `null` (the default) keeps
+    /// every branch, bit for bit as before; with a finite budget a 4-ply tree then fits a 3-ply cost.
+    /// The draw is deterministic in the node's board, its depth and `sample_seed`, and never consumes
+    /// the game's spawn RNG or the value cache (a leaf is the net's exact V whatever the sample size).
+    sample: ?usize = null,
+    /// Candidate (#320): seed of that sampler, so the same board and seed sample the same spawns.
+    sample_seed: u64 = default_sample_seed,
+    /// Candidate (#320): shallowest chance node to sample (`1` = every spawn layer). At `2` the spawn
+    /// layer above the leaves keeps every branch, which keeps the last move's death risk exact.
+    sample_min_depth: u8 = 1,
     /// Candidate (#183): leaf-evaluation budget of an iterative deepening search, `null` = off. When
     /// set, `bestMoveWithCacheValueOpts` searches depth 2, 3, ... and keeps the best move of the last
     /// iteration that finished inside the budget (`mode` only sets the first depth and the spawn cut).
@@ -4101,6 +4208,110 @@ test "deep4 searches one row at 4-ply and the deep3 cutoff (#267)" {
     _ = bestMoveWithStats(&net, midgame, .deep3, &deep3_stats);
     try std.testing.expect(deep4_move != null);
     try std.testing.expect(deep4_stats.leaves > deep3_stats.leaves);
+}
+
+test "spawn sampler is deterministic, bounded and full-width safe (#320)" {
+    // four empty cells = eight branches, the same board order `chanceResult` builds
+    var branches: [max_chance_branches]ChanceBranch = undefined;
+    var count: usize = 0;
+    for (0..2) |r| for (0..2) |c| for (spawn_tiles) |spawn| {
+        branches[count] = .{ .r = r, .c = c, .tile = spawn.value, .p = spawn.p };
+        count += 1;
+    };
+    const hash = ValueCache.keyOf(mid_board.board);
+
+    // `keep` at the branch count, and above it, is the full-width search
+    for ([_]usize{ count, count + 1, count + 10 }) |keep| {
+        var dropped: [max_chance_branches]bool = @splat(false);
+        sampleMask(branches[0..count], keep, default_sample_seed, hash, 4, &dropped);
+        for (dropped[0..count]) |d| try std.testing.expect(!d);
+    }
+
+    // a finite sample keeps exactly `keep` branches, deterministically per seed and node
+    for ([_]usize{ 1, 2, 3, 6 }) |keep| {
+        var a: [max_chance_branches]bool = @splat(false);
+        var b: [max_chance_branches]bool = @splat(false);
+        sampleMask(branches[0..count], keep, 7, hash, 4, &a);
+        sampleMask(branches[0..count], keep, 7, hash, 4, &b);
+        var kept: usize = 0;
+        for (a[0..count], b[0..count]) |x, y| {
+            try std.testing.expectEqual(x, y);
+            if (!x) kept += 1;
+        }
+        try std.testing.expectEqual(keep, kept);
+    }
+
+    // another seed samples another set (the 8-branch case has room to differ)
+    var same: [max_chance_branches]bool = @splat(false);
+    var other: [max_chance_branches]bool = @splat(false);
+    sampleMask(branches[0..count], 2, 7, hash, 4, &same);
+    sampleMask(branches[0..count], 2, 8, hash, 4, &other);
+    try std.testing.expect(!std.mem.eql(bool, same[0..count], other[0..count]));
+
+    // the mass cut's drops survive the sample
+    var cut: [max_chance_branches]bool = @splat(false);
+    cut[0] = true;
+    sampleMask(branches[0..count], 1, 7, hash, 4, &cut);
+    try std.testing.expect(cut[0]);
+}
+
+test "spawn sample above a node's width is the plain search (#320)" {
+    const weights = try parse(@embedFile("nn_weights.bin"));
+    const vfn: Value = .{ .single = &weights };
+    // a depth-1 chance node has no deeper chance node, so a sample at or above its branch count
+    // (mid_board: 6 empties = 12 branches) must reproduce the unsampled value bit for bit
+    var cache: ValueCache = .{};
+    var plain: Search = .{ .vfn = vfn, .cache = &cache, .ply = 1, .cutoff = deep3_cutoff };
+    var sampled: Search = .{ .vfn = vfn, .cache = &cache, .ply = 1, .cutoff = deep3_cutoff, .sample = 12 };
+    const expected = plain.chance(mid_board, 1, 1);
+    try std.testing.expectEqual(expected, sampled.chance(mid_board, 1, 1));
+    // and exactly that width: one fewer branch is a different (sampled) node
+    var narrower: Search = .{ .vfn = vfn, .cache = &cache, .ply = 1, .cutoff = deep3_cutoff, .sample = 11 };
+    try std.testing.expect(narrower.chance(mid_board, 1, 1) != expected);
+}
+
+test "sample_min_depth 2 keeps the last spawn layer exact (#320)" {
+    const weights = try parse(@embedFile("nn_weights.bin"));
+    const vfn: Value = .{ .single = &weights };
+    var cache: ValueCache = .{};
+    var plain: Search = .{ .vfn = vfn, .cache = &cache, .ply = 1, .cutoff = deep3_cutoff };
+    var sampled: Search = .{ .vfn = vfn, .cache = &cache, .ply = 1, .cutoff = deep3_cutoff, .sample = 2 };
+    var last_full: Search = .{ .vfn = vfn, .cache = &cache, .ply = 1, .cutoff = deep3_cutoff, .sample = 2, .sample_min_depth = 2 };
+    // a depth-1 chance node sits directly above the leaves; min depth 2 must leave it bit-identical
+    const expected = plain.chance(mid_board, 1, 1);
+    try std.testing.expectEqual(expected, last_full.chance(mid_board, 1, 1));
+    try std.testing.expect(sampled.chance(mid_board, 1, 1) != expected);
+    // a depth-2 chance node is inside the sample in both settings, but the layer below it is not
+    try std.testing.expect(sampled.chance(mid_board, 2, 1) != plain.chance(mid_board, 2, 1));
+    try std.testing.expect(last_full.chance(mid_board, 2, 1) != plain.chance(mid_board, 2, 1));
+}
+
+test "sampled 4-ply is deterministic and cheaper (#320)" {
+    const weights = try parse(@embedFile("nn_weights.bin"));
+    const vfn: Value = .{ .single = &weights };
+    var a: Stats = .{};
+    var b: Stats = .{};
+    var cache_a: ValueCache = .{};
+    var cache_b: ValueCache = .{};
+    const first = bestMoveWithCacheValueOpts(vfn, late_board, .deep4, &a, &cache_a, .{ .sample = 3 });
+    const second = bestMoveWithCacheValueOpts(vfn, late_board, .deep4, &b, &cache_b, .{ .sample = 3 });
+    try std.testing.expect(first != null);
+    try std.testing.expectEqual(first, second);
+    try std.testing.expectEqual(a.leaves, b.leaves);
+    // the seed is a real knob: a different one may pick another sample, never an illegal move
+    var c: Stats = .{};
+    var cache_c: ValueCache = .{};
+    const third = bestMoveWithCacheValueOpts(vfn, late_board, .deep4, &c, &cache_c, .{ .sample = 3, .sample_seed = 42 });
+    try std.testing.expect(third != null);
+    // keeping the last spawn layer full width costs leaves but must stay deterministic too
+    var d: Stats = .{};
+    var e: Stats = .{};
+    var cache_d: ValueCache = .{};
+    var cache_e: ValueCache = .{};
+    const fourth = bestMoveWithCacheValueOpts(vfn, late_board, .deep4, &d, &cache_d, .{ .sample = 2, .sample_min_depth = 2 });
+    const fifth = bestMoveWithCacheValueOpts(vfn, late_board, .deep4, &e, &cache_e, .{ .sample = 2, .sample_min_depth = 2 });
+    try std.testing.expectEqual(fourth, fifth);
+    try std.testing.expectEqual(d.leaves, e.leaves);
 }
 
 test "phase_h4 leaves the earlier schedules alone (#171)" {

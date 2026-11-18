@@ -447,6 +447,15 @@ const all_rows = [_]EvalRow{
     // #261: the `deep3` tree, but a spawn branch under the fixed cut is evaluated on its real
     // child board one own-move/reward layer shallower instead of being dropped and renormalized.
     .{ .name = "nn 3-ply cut branches recovered 1 ply shallow (#261)", .spec = .{ .nn = .{ .mode = .deep3_recover } } },
+    // #320: `deep4`'s extra ply, paid for by keeping only a finite weighted sample of each chance
+    // node's spawns (0.9/0.1 kept, deterministic seed). A/B against row 15 answers whether the deeper
+    // tree beats the full-width 3-ply at a comparable leaf budget.
+    .{ .name = "nn 4-ply spawn sample 2 + node TT (#320)", .spec = .{ .nn = .{ .mode = .deep4, .opts = .{ .sample = 2 } } } },
+    .{ .name = "nn 4-ply spawn sample 3 + node TT (#320)", .spec = .{ .nn = .{ .mode = .deep4, .opts = .{ .sample = 3 } } } },
+    .{ .name = "nn 4-ply spawn sample 4 + node TT (#320)", .spec = .{ .nn = .{ .mode = .deep4, .opts = .{ .sample = 4 } } } },
+    .{ .name = "nn 4-ply spawn sample 6 + node TT (#320)", .spec = .{ .nn = .{ .mode = .deep4, .opts = .{ .sample = 6 } } } },
+    .{ .name = "nn 4-ply spawn sample 2, full last spawn layer (#320)", .spec = .{ .nn = .{ .mode = .deep4, .opts = .{ .sample = 2, .sample_min_depth = 2 } } } },
+    .{ .name = "nn 4-ply spawn sample 3, full last spawn layer (#320)", .spec = .{ .nn = .{ .mode = .deep4, .opts = .{ .sample = 3, .sample_min_depth = 2 } } } },
 };
 
 const Eval = struct {
@@ -1151,10 +1160,30 @@ test "recovered cut branch row 20 stays the default deep3 path (#261)" {
 }
 
 test "eval row table is the single row source (#310)" {
-    try std.testing.expectEqual(@as(usize, 21), all_rows.len);
+    try std.testing.expectEqual(@as(usize, 27), all_rows.len);
     try std.testing.expectEqualStrings("nn 1-ply", all_rows[0].name);
     try std.testing.expectEqualStrings("nn 3-ply + node TT default (#266)", all_rows[15].name);
     try std.testing.expectEqualStrings("nn 3-ply cut branches recovered 1 ply shallow (#261)", all_rows[20].name);
+    try std.testing.expectEqualStrings("nn 4-ply spawn sample 2, full last spawn layer (#320)", all_rows[25].name);
+}
+
+test "spawn-sample rows 21..26 only change the sample (#320)" {
+    for ([_]usize{ 2, 3, 4, 6 }, 0..) |sample, i| {
+        const row = all_rows[21 + i].spec.nn;
+        try std.testing.expectEqual(nn.Mode.deep4, row.mode);
+        try std.testing.expectEqual(@as(?usize, sample), row.opts.sample);
+        try std.testing.expectEqual(@as(u8, 1), row.opts.sample_min_depth);
+        // the cut and the node table are the ones `deep4` already uses
+        try std.testing.expectEqual(@as(?f64, null), row.opts.cutoff);
+        try std.testing.expectEqual(@as(?bool, null), row.opts.node_tt);
+    }
+    // rows 25/26 spend the same budget on the two deepest layers and keep the last spawn layer exact
+    for ([_]usize{ 2, 3 }, 0..) |sample, i| {
+        const row = all_rows[25 + i].spec.nn;
+        try std.testing.expectEqual(nn.Mode.deep4, row.mode);
+        try std.testing.expectEqual(@as(?usize, sample), row.opts.sample);
+        try std.testing.expectEqual(@as(u8, 2), row.opts.sample_min_depth);
+    }
 }
 
 test "leaf keeps its omit-leaf override on rows 2 and 4 (#260)" {

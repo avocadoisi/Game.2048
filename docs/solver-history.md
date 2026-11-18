@@ -4280,3 +4280,88 @@ eligibility trace での **TD(λ)**（backward view）に置き換えた。#72 �
 
 判定: **no-go（replay 掃引の TD(λ) は既定にしない）**。`sweep_lambda` は既定 0 の opt-in として残し、再現用に variant とテストだけ置く。
 `ai/solver/nn_weights.bin` は変更しない。次に試すなら λ ではなく、収束済み net を壊さない target（凍結 bootstrap / teacher label）側。
+
+### 4-ply の spawn を有限個サンプルすると同じ予算で deep3 に勝てない（#320、2026-11-19）
+
+#267 で full-width の `deep4` は `deep3` の約 26 倍の葉を読み、実測でも負けた。そこで #320 は、
+評価関数と合法手を変えずに **chance node の spawn だけを有限個サンプル**し、4-ply を 3-ply と同じ
+時間予算に収める案を試した。ここでは実装・スクリーニング・ペア測定・判定を記録する。
+既定方策と `nn_weights.bin` は変更していない。
+
+**実装（`ai/solver/nn.zig` の `Search` / `Depth` / `Options`、`ai/solver/nn_main.zig` の row 21–26）**
+
+- 各 chance node で branch を **重み付き・非復元抽出**する。重みは従来どおり `cprob × spawn.p`
+  （2 タイル 0.9 / 4 タイル 0.1 を empty セルに均等）。Efraimidis–Spirakis の key
+  `-log(u)/p` を全 branch について計算し、小さい順に K 個を残す（`sampleMask`）。
+- 残した branch の確率で **残存 mass に再正規化**する。分母は「残した branch の p の和」なので、
+  サンプル後も kept 内の 2:4 の比は 0.9:0.1 のまま。cut で落ちた branch と同じ経路を通るため、
+  値のスケールは full-width の平均と揃う。
+- **復元抽出ではない**。同じ branch が二度選ばれることはなく、K はそのまま葉の分岐数になる。
+- 乱数は **ゲームの spawn tape を消費しない**。node の board hash・chance depth・`sample_seed`
+  （既定 `0x9e3779b97f4a7c15`）から splitmix64 で作る per-branch の一様乱数なので、同じ盤面・
+  同じ深さ・同じ seed は常に同じサンプルになる。したがって
+  (a) 同じ探索のやり直しは同じ手を返し、(b) node TT の内部値は再探索と一致し、
+  (c) `pairrow` の A/B は同じ tape のまま比較できる。`cprob` は key に混ぜない（全重みを同倍する
+  だけなのでサンプル集合も再正規化値も変わらない）。
+- `ValueCache` の key は変えていない。葉はサンプルに関係なく net の exact な V だから。
+- `sample = 0`（既定）は分岐も key も従来と同一で、bit-identical。
+- 深さの knob は `sample_min_depth`（既定 1 = すべての spawn 層）。`2` にすると **葉の直上の
+  spawn 層だけ full width** になる。最後の 1 手が死ぬかどうかを決める層を正確に残したまま、
+  2 spawn 先より深い層だけを間引く配分で、K=2 + min depth 2 は K=3・全層とほぼ同じコストになる。
+
+**スクリーニング（1 局 seed 9000、同梱 net、`0 1 9000 0.003 1 base 30 <net> 1 - - - 15,21,22,23`）**
+
+| 方策 | row | avg score | moves | best | leaves/move | ms/move |
+|---|---:|---:|---:|---:|---:|---:|
+| `deep3` + node TT（既定） | 15 | 80,708 | 3,747 | 4096 | 11,914.3 | 42.69 |
+| 4-ply, K=2・全層 | 21 | 71,420 | 3,262 | 4096 | 2,938.7 | 10.47 |
+| 4-ply, K=3・全層 | 22 | 79,540 | 3,647 | 4096 | 8,500.2 | 30.46 |
+| 4-ply, K=4・全層 | 23 | 168,352 | 6,998 | 8192 | 16,161.9 | 57.80 |
+
+K=3 が deep3 の 0.71 倍の葉・0.71 倍の時間で、同程度の予算に最も近い。K=4 は 1.36 倍で予算超過
+（この 1 局は 8192 に到達したが、1 局では判断しない）。よって以後は **K=3・全層（row 22）** を
+本命、**K=2・min depth 2（row 25）** を「最後の spawn 層を正確に残す」対照として測った。
+
+**ペア測定（row 15 = A、row 22 = K=3 = B。seed 9000 の同じ tape、12 局）**
+
+| 方策 | row | avg score | 10 万点超 | leaves/move | ms/move |
+|---|---:|---:|---:|---:|---:|
+| `deep3` + node TT（既定） | 15 | 153,229 | 10/12 | 11,914.3* | 39.94 |
+| 4-ply, K=3・全層 | 22 | 105,217 | 4/12 | 8,500.2* | 31.16 |
+
+\* leaves/move は上のスクリーニング 1 局の値（同じプロセスで葉と時間を数えたもの）。ms/move は
+12 ペアの平均で、B/A = 0.78。
+
+- ペア差の平均は **−48,012.3 点**（stderr 21,388.0、2 勝 10 敗）。採用目安 `mean − 2×stderr > 0` は
+  −90,788 で満たさず、むしろ `mean + 2×stderr = −5,236 < 0` で **95% 水準でも deep3 より悪い**。
+- B の負け方は揃っている。12 局中 8 局が 75,560–80,488 点（4096 止まり、約 3,500–3,700 手）に密集し、
+  A が 10 局で 10 万点を超えたのに対して B は 4 局。長時間の計画が続かない。
+- 直接の原因はサンプルが **死ぬ枝を消す**こと。空き 6 セルのノードは 12 branch で、4 タイル branch の
+  重みは 0.1/6。K=3 の非復元抽出では 1 本の 4 タイル branch が入る確率は約 5%、6 本のどれかが入る
+  確率でも 25% 前後しかない。残り 3/4 のノードは 4 タイル spawn を見ないまま「安全」と再正規化され、
+  さらに max はノイズの乗った推定の上振れを選ぶ（sparse sampling の optimism）。3-ply が full width で
+  守っていた「最後の 1 手が死ぬ確率」を、サンプルは層ごとに薄くしてしまう。
+- 最後の spawn 層だけ full width にしても戻らなかった。row 25（K=2・min depth 2）は 4 ペアの
+  スクリーニングで **0 勝 4 敗、平均 −100,932 点**（sd 85,815、B の score は 59,544–79,716）。
+  深い 2 層を K=2 まで削ると、今度は 3 手先の読み自体がノイズになる。
+
+**判定: 不採用**。row 21–26 は再現と将来の改良用に opt-in で残すが、既定 policy・`nn_weights.bin`・
+`all_rows` の既存行は変えない。次に試すなら、サンプル数を増やすのではなく
+「4 タイル branch を必ず 1 本残す層化サンプル」か「root の各手で同じサンプル集合を共有する
+common random numbers」で、比較ノイズと tail の欠落を分けて潰す必要がある（本 issue では
+「deep3 と同予算で K を 1 つ決める」に絞ったため未実施）。
+
+再現（スクリーニング 1 局。rows 21=K2、22=K3、23=K4、25=K2/min depth 2）:
+```
+zig build nn -Doptimize=ReleaseFast -- 0 1 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 15,21,22,23
+zig build nn -Doptimize=ReleaseFast -- 0 1 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 15,25
+```
+再現（ペア。A = row 15、B = row 22。`eval_games` を 12 にすると上の 12 局）:
+```
+zig build nn -Doptimize=ReleaseFast -- 0 12 9000 0.003 1 pairrow 30 ai/solver/nn_weights.bin 1 - 15 22
+zig build nn -Doptimize=ReleaseFast -- 0 4 9000 0.003 1 pairrow 30 ai/solver/nn_weights.bin 1 - 15 25
+```
+テストは `zig build test`、`zig build test-nn -Dtest-filter='#320'`、
+`zig build test-nn-main -Dtest-filter='spawn-sample'`。サンプルが seed と node の純関数であること、
+K 本ちょうど残ること、幅以上の K が full-width と bit-identical であること、`sample_min_depth = 2` が
+depth 1 の chance を変えないこと、4-ply サンプルが決定的であることを固定した。
