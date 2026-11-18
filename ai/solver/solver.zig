@@ -90,18 +90,7 @@ pub fn bestMove(state: GameState, depth: u8) ?Direction {
 
 /// Expectimax best move with custom evaluation weights; same tie rule as `rank` (earlier direction wins).
 pub fn bestMoveW(state: GameState, depth: u8, w: Weights) ?Direction {
-    var best: ?Direction = null;
-    var best_value: f64 = 0;
-    for ([_]Direction{ .up, .left, .down, .right }) |d| {
-        var next = state;
-        if (!next.slide(d).changed) continue;
-        const value = chanceValueW(next, depth, w);
-        if (best == null or value > best_value) {
-            best = d;
-            best_value = value;
-        }
-    }
-    return best;
+    return bestMoveSearch(false, .weighted, state, depth, 0, null, w);
 }
 
 /// Move-choosing policies compared in the ranking (`zig build ranking`).
@@ -605,22 +594,44 @@ const TTEntry = struct {
     valid: bool,
 };
 
+/// Leaf evaluator of the one expectimax search, chosen at comptime. Only `plain` may use the TT:
+/// a slot keyed by board + depth cannot tell two `Weights` apart, so a weighted value would poison
+/// the plain search (issue #312).
+const Leaf = enum { plain, weighted };
+
+fn usesTT(comptime leaf: Leaf) bool {
+    return leaf == .plain;
+}
+
+fn leafValue(comptime leaf: Leaf, state: GameState, w: Weights) f64 {
+    return switch (leaf) {
+        .plain => evaluateState(state),
+        .weighted => evaluateStateW(state, w),
+    };
+}
+
 /// One expectimax search, specialized at comptime: `cut = false` is the full-width tree and
 /// `cut = true` drops chance branches below `cutoff`, renormalizing the kept mass (issue #298).
 /// `cutoff` is only read when `cut` is true; the two specializations keep the hot loop branch-free.
-fn bestMoveTT(comptime cut: bool, state: GameState, depth: u8, cutoff: f64, table: *[tt_entry_count]TTEntry) ?Direction {
+/// `leaf` picks the leaf values and whether the TT is touched at all (issue #312): `table` is null
+/// exactly when `leaf` is `.weighted`, so its search compiles without any TT access.
+fn bestMoveSearch(comptime cut: bool, comptime leaf: Leaf, state: GameState, depth: u8, cutoff: f64, table: ?*[tt_entry_count]TTEntry, w: Weights) ?Direction {
     var best: ?Direction = null;
-    var best_value = lost_score;
+    var best_value: f64 = 0;
     for ([_]Direction{ .up, .left, .down, .right }) |d| {
         var next = state;
         if (!next.slide(d).changed) continue;
-        const value = chanceValueTT(cut, next, depth, 1, cutoff, table);
+        const value = chanceValueSearch(cut, leaf, next, depth, 1, cutoff, table, w);
         if (best == null or value > best_value) {
             best = d;
             best_value = value;
         }
     }
     return best;
+}
+
+fn bestMoveTT(comptime cut: bool, state: GameState, depth: u8, cutoff: f64, table: *[tt_entry_count]TTEntry) ?Direction {
+    return bestMoveSearch(cut, .plain, state, depth, cutoff, table, baseline);
 }
 
 /// Per-thread table reused across moves and games (issue #88). An entry is only returned on a
@@ -661,21 +672,27 @@ fn ttPut(board: Board, depth: u8, kind: TTKind, value: f64, table: *[tt_entry_co
     table[ttSlot(board, depth, kind)] = .{ .board = board, .value = value, .depth = depth, .kind = kind, .valid = true };
 }
 
-fn maxValueTT(comptime cut: bool, state: GameState, depth: u8, cutoff: f64, table: *[tt_entry_count]TTEntry) f64 {
+fn maxValueSearch(comptime cut: bool, comptime leaf: Leaf, state: GameState, depth: u8, cutoff: f64, table: ?*[tt_entry_count]TTEntry, w: Weights) f64 {
     const kind: TTKind = if (cut) .max_pruned else .max;
-    if (depth == 0) return evaluateState(state);
-    if (ttGet(state.board, depth, kind, table)) |value| return value;
+    if (depth == 0) return leafValue(leaf, state, w);
+    if (comptime usesTT(leaf)) {
+        if (ttGet(state.board, depth, kind, table.?)) |value| return value;
+    }
     var best: f64 = lost_score;
     var any_move = false;
     for ([_]Direction{ .up, .left, .down, .right }) |d| {
         var next = state;
         if (!next.slide(d).changed) continue;
         any_move = true;
-        best = @max(best, chanceValueTT(cut, next, depth, 1, cutoff, table));
+        best = @max(best, chanceValueSearch(cut, leaf, next, depth, 1, cutoff, table, w));
     }
     if (!any_move) best = lost_score;
-    ttPut(state.board, depth, kind, best, table);
+    if (comptime usesTT(leaf)) ttPut(state.board, depth, kind, best, table.?);
     return best;
+}
+
+fn maxValueTT(comptime cut: bool, state: GameState, depth: u8, cutoff: f64, table: *[tt_entry_count]TTEntry) f64 {
+    return maxValueSearch(cut, .plain, state, depth, cutoff, table, baseline);
 }
 
 /// Chance node of the one search. `cut = false` averages every spawn; `cut = true` drops the
@@ -684,9 +701,11 @@ fn maxValueTT(comptime cut: bool, state: GameState, depth: u8, cutoff: f64, tabl
 /// The TT key leaves the path probability out, so the first board+depth pair to be stored wins (the
 /// approximation nneonneo's table makes); `.chance_pruned` keeps these values from ever mixing with
 /// the full-width `.chance` entries.
-fn chanceValueTT(comptime cut: bool, state: GameState, depth: u8, cprob: f64, cutoff: f64, table: *[tt_entry_count]TTEntry) f64 {
+fn chanceValueSearch(comptime cut: bool, comptime leaf: Leaf, state: GameState, depth: u8, cprob: f64, cutoff: f64, table: ?*[tt_entry_count]TTEntry, w: Weights) f64 {
     const kind: TTKind = if (cut) .chance_pruned else .chance;
-    if (ttGet(state.board, depth, kind, table)) |value| return value;
+    if (comptime usesTT(leaf)) {
+        if (ttGet(state.board, depth, kind, table.?)) |value| return value;
+    }
     var total: f64 = 0;
     var empties: usize = 0;
     for (0..core.BoardSize) |r| {
@@ -695,8 +714,8 @@ fn chanceValueTT(comptime cut: bool, state: GameState, depth: u8, cprob: f64, cu
         }
     }
     if (empties == 0) {
-        const value = evaluateState(state);
-        ttPut(state.board, depth, kind, value, table);
+        const value = leafValue(leaf, state, w);
+        if (comptime usesTT(leaf)) ttPut(state.board, depth, kind, value, table.?);
         return value;
     }
     var mass: f64 = 0;
@@ -712,18 +731,22 @@ fn chanceValueTT(comptime cut: bool, state: GameState, depth: u8, cprob: f64, cu
                 if (cut and depth > 1 and p < cutoff) continue;
                 var next = state;
                 next.board[r][c] = spawn.value;
-                total += p * maxValueTT(cut, next, depth - 1, cutoff, table);
+                total += p * maxValueSearch(cut, leaf, next, depth - 1, cutoff, table, w);
                 if (cut) mass += p;
             }
         }
     }
     // every branch cut (the node itself is already this unlikely): fall back to the leaf rule
     const value = if (cut)
-        (if (mass == 0) evaluateState(state) else total / mass)
+        (if (mass == 0) leafValue(leaf, state, w) else total / mass)
     else
         total / @as(f64, @floatFromInt(empties));
-    ttPut(state.board, depth, kind, value, table);
+    if (comptime usesTT(leaf)) ttPut(state.board, depth, kind, value, table.?);
     return value;
+}
+
+fn chanceValueTT(comptime cut: bool, state: GameState, depth: u8, cprob: f64, cutoff: f64, table: *[tt_entry_count]TTEntry) f64 {
+    return chanceValueSearch(cut, .plain, state, depth, cprob, cutoff, table, baseline);
 }
 
 /// shortcut: cut a branch when its probability along the path falls under this. 1e-4 keeps the
@@ -1001,39 +1024,12 @@ pub fn evaluateStateW(state: GameState, w: Weights) f64 {
 }
 
 fn maxValueW(state: GameState, depth: u8, w: Weights) f64 {
-    if (depth == 0) return evaluateStateW(state, w);
-    var best: f64 = lost_score;
-    var any_move = false;
-    for ([_]Direction{ .up, .left, .down, .right }) |d| {
-        var next = state;
-        if (!next.slide(d).changed) continue;
-        any_move = true;
-        best = @max(best, chanceValueW(next, depth, w));
-    }
-    if (!any_move) return lost_score;
-    return best;
+    return maxValueSearch(false, .weighted, state, depth, 0, null, w);
 }
 
 /// Average over the random spawn: each empty cell gets 2 (p=0.9) or 4 (p=0.1).
 fn chanceValueW(state: GameState, depth: u8, w: Weights) f64 {
-    var total: f64 = 0;
-    var empties: f64 = 0;
-    for (0..core.BoardSize) |r| {
-        for (0..core.BoardSize) |c| {
-            if (state.board[r][c] != 0) continue;
-            empties += 1;
-            for ([_]struct { value: core.Tile, p: f64 }{
-                .{ .value = 2, .p = 0.9 },
-                .{ .value = 4, .p = 0.1 },
-            }) |spawn| {
-                var next = state;
-                next.board[r][c] = spawn.value;
-                total += spawn.p * maxValueW(next, depth - 1, w);
-            }
-        }
-    }
-    if (empties == 0) return evaluateStateW(state, w);
-    return total / empties;
+    return chanceValueSearch(false, .weighted, state, depth, 1, 0, null, w);
 }
 
 test "baseline weights reproduce evaluate on a hand-computed board" {
@@ -1421,6 +1417,119 @@ test "expectimax full and pruned searches pin their fixed-board moves and values
             try std.testing.expectEqual(cut_want.max, cut_max);
         }
     }
+}
+
+test "weighted search pins fixed-board moves and values (#312)" {
+    const boards = [_]Board{
+        .{ .{ 2, 4, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 } },
+        .{ .{ 2, 2, 4, 8 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 } },
+        .{ .{ 2, 4, 8, 16 }, .{ 32, 64, 128, 0 }, .{ 0, 2, 4, 0 }, .{ 0, 0, 0, 0 } },
+        .{ .{ 2, 4, 8, 16 }, .{ 32, 64, 128, 256 }, .{ 512, 1024, 2048, 4096 }, .{ 8192, 16384, 32768, 0 } },
+        .{ .{ 4, 4, 4, 4 }, .{ 4, 4, 4, 4 }, .{ 4, 4, 4, 4 }, .{ 4, 4, 4, 0 } },
+        .{ .{ 2, 4, 2, 4 }, .{ 4, 2, 4, 2 }, .{ 2, 4, 2, 4 }, .{ 4, 2, 4, 0 } },
+    };
+    // baseline, ga_weights, then a set where every move is negative
+    const sets = [_]Weights{
+        baseline,
+        ga_weights,
+        .{ .empty = -100, .order_penalty = 0, .order_penalty_late = 0, .merge = -50 },
+    };
+    const expected = [_]struct { move: ?Direction, max: f64, chance: f64 }{
+        .{ .move = .right, .max = 56.14053298273156, .chance = 56.14053298273156 },
+        .{ .move = .right, .max = 60.3497262480377, .chance = 60.3497262480377 },
+        .{ .move = .down, .max = -1212.2390109890111, .chance = -1212.2390109890111 },
+        .{ .move = .right, .max = 68.79521103218931, .chance = 68.79521103218931 },
+        .{ .move = .right, .max = 77.48971550966932, .chance = 77.48971550966932 },
+        .{ .move = .down, .max = -1138.4065581854047, .chance = -1138.4065581854047 },
+        .{ .move = .left, .max = 70.64758930966468, .chance = 70.64758930966468 },
+        .{ .move = .left, .max = 80.59340177514795, .chance = 80.59340177514795 },
+        .{ .move = .down, .max = -1097.7929292929296, .chance = -1097.7929292929296 },
+        .{ .move = .left, .max = 73.19099247604508, .chance = 73.19099247604508 },
+        .{ .move = .left, .max = 76.89946896492515, .chance = 76.89946896492515 },
+        .{ .move = .down, .max = -1016.4884053604225, .chance = -1016.4884053604225 },
+        .{ .move = .right, .max = -560.8146355102042, .chance = -560.8146355102042 },
+        .{ .move = .right, .max = -242.58487496598636, .chance = -242.58487496598636 },
+        .{ .move = .left, .max = -515.4404761904763, .chance = -515.4404761904763 },
+        .{ .move = .right, .max = -508.9508691666343, .chance = -508.9508691666343 },
+        .{ .move = .right, .max = -218.3168186121477, .chance = -218.3168186121477 },
+        .{ .move = .down, .max = -439.0438492063492, .chance = -439.0438492063492 },
+        .{ .move = .down, .max = -1000000000, .chance = -1000000000 },
+        .{ .move = .down, .max = -1000000000, .chance = -1000000000 },
+        .{ .move = .down, .max = -1000000000, .chance = -1000000000 },
+        .{ .move = .down, .max = -1000000000, .chance = -1000000000 },
+        .{ .move = .down, .max = -1000000000, .chance = -1000000000 },
+        .{ .move = .down, .max = -1000000000, .chance = -1000000000 },
+        .{ .move = .up, .max = 54.314689, .chance = 54.314689 },
+        .{ .move = .up, .max = 60.12488899999999, .chance = 60.12488899999999 },
+        .{ .move = .up, .max = -951.4124999999999, .chance = -951.4124999999999 },
+        .{ .move = .up, .max = 40.732194048177234, .chance = 40.732194048177234 },
+        .{ .move = .up, .max = 51.593740205454544, .chance = 51.593740205454544 },
+        .{ .move = .left, .max = -843.1802582070709, .chance = -843.1802582070709 },
+        .{ .move = .down, .max = -391.12806666666665, .chance = -391.12806666666665 },
+        .{ .move = .right, .max = -238.6628, .chance = -238.6628 },
+        .{ .move = .down, .max = -363.25, .chance = -363.25 },
+        .{ .move = .right, .max = -203.6155598722222, .chance = -203.6155598722222 },
+        .{ .move = .right, .max = -111.79236098333334, .chance = -111.79236098333334 },
+        .{ .move = .down, .max = -304.51944444444445, .chance = -304.51944444444445 },
+    };
+    var i: usize = 0;
+    for (boards) |board| {
+        var state = GameState.initEmpty();
+        state.board = board;
+        for ([_]u8{ 2, 3 }) |depth| {
+            for (sets) |w| {
+                const want = expected[i];
+                i += 1;
+                const move = bestMoveW(state, depth, w);
+                const max = maxValueW(state, depth, w);
+                const chance = if (move) |m| blk: {
+                    var next = state;
+                    _ = next.slide(m);
+                    break :blk chanceValueW(next, depth, w);
+                } else 0;
+                try std.testing.expectEqual(want.move, move);
+                try std.testing.expectEqual(want.max, max);
+                try std.testing.expectEqual(want.chance, chance);
+            }
+        }
+    }
+    try std.testing.expectEqual(expected.len, i);
+}
+
+test "weighted search never reads or writes the TT (#312)" {
+    const board: Board = .{
+        .{ 2, 4, 8, 16 },
+        .{ 32, 64, 128, 0 },
+        .{ 0, 2, 4, 0 },
+        .{ 0, 0, 0, 0 },
+    };
+    var state = GameState.initEmpty();
+    state.board = board;
+    var table: [tt_entry_count]TTEntry = undefined;
+    for (&table) |*entry| entry.* = .{
+        .board = std.mem.zeroes(Board),
+        .value = 12345,
+        .depth = 2,
+        .kind = .chance,
+        .valid = true,
+    };
+    // every entry a TT-enabled search would look up first: a wrong read returns -1e9 below
+    ttPut(board, 2, .max, -1e9, &table);
+    for ([_]Direction{ .up, .left, .down, .right }) |d| {
+        var next = state;
+        if (!next.slide(d).changed) continue;
+        ttPut(next.board, 2, .chance, -1e9, &table);
+    }
+    const before = std.hash.Wyhash.hash(0, std.mem.asBytes(&table));
+    const move = bestMoveSearch(false, .weighted, state, 2, 0, &table, baseline);
+    const max = maxValueSearch(false, .weighted, state, 2, 0, &table, baseline);
+    var next = state;
+    _ = next.slide(.right);
+    const chance = chanceValueSearch(false, .weighted, next, 2, 1, 0, &table, baseline);
+    try std.testing.expectEqual(@as(?Direction, .right), move);
+    try std.testing.expectEqual(@as(f64, -560.8146355102042), max);
+    try std.testing.expectEqual(@as(f64, -560.8146355102042), chance);
+    try std.testing.expectEqual(before, std.hash.Wyhash.hash(0, std.mem.asBytes(&table)));
 }
 
 test "iterative deepening returns a legal move on random boards" {
