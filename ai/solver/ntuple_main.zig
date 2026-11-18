@@ -5,6 +5,7 @@ const ntuple = @import("ntuple");
 const parallel = @import("parallel");
 const cli = @import("args.zig");
 const bench = @import("bench.zig");
+const stats = @import("stats");
 
 const usage =
     \\usage: ntuple [train_games] [eval_games] [eval_seed] [learning_rate] [variant] [table_path] [train_seed]
@@ -45,20 +46,6 @@ const Eval = struct {
     leaves: u64 = 0,
     elapsed_ns: i96 = 0,
 };
-
-const MeanErr = struct { mean: f64, stderr: f64 };
-
-/// Same shape as `nn.meanStderr`: mean and sample standard error of the seed-range averages.
-fn meanStderr(xs: []const f64) MeanErr {
-    const n: f64 = @floatFromInt(xs.len);
-    var sum: f64 = 0;
-    for (xs) |x| sum += x;
-    const mean = sum / n;
-    if (xs.len < 2) return .{ .mean = mean, .stderr = 0 };
-    var ss: f64 = 0;
-    for (xs) |x| ss += (x - mean) * (x - mean);
-    return .{ .mean = mean, .stderr = @sqrt(ss / (n - 1) / n) };
-}
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
@@ -157,25 +144,13 @@ pub fn main(init: std.process.Init) !void {
         const res_all = try init.arena.allocator().alloc(ntuple.PlayResult, games);
         const start = std.Io.Clock.awake.now(init.io);
         parallel.map(ntuple.PlayResult, res_all, EvalCtx{ .net = &net, .policy = idx, .eval_seed = eval_seed }, playGame);
-        var total_moves: u64 = 0;
-        for (0..seed_ranges) |range| {
-            var total_score: u64 = 0;
-            for (res_all[range * eval_games ..][0..eval_games]) |res| {
-                total_score += res.score;
-                r.total_score += res.score;
-                r.leaves += res.leaves;
-                total_moves += res.moves;
-                r.best_tile = @max(r.best_tile, res.max_tile);
-            }
-            r.range_scores[range] = @as(f64, @floatFromInt(total_score)) / @as(f64, @floatFromInt(eval_games));
-        }
+        stats.rangeTotals(ntuple.PlayResult, Eval, r, res_all, eval_games);
         r.elapsed_ns = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
-        r.avg_moves = @as(f64, @floatFromInt(total_moves)) / @as(f64, @floatFromInt(games));
     }
     const last_seed = eval_seed + seed_ranges * eval_games - 1;
     std.debug.print("eval: games={d}/range ranges={d} seeds={d}..{d}\n", .{ eval_games, seed_ranges, eval_seed, last_seed });
     for (results) |r| {
-        const st = meanStderr(r.range_scores);
+        const st = stats.meanStderr(r.range_scores);
         // Same row as `zig build nn`: `avg_score` holds the mean over seed ranges (#141).
         bench.printEvalRow(r.name, st.stderr, seed_ranges, .{
             .games = games,

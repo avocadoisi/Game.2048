@@ -5,6 +5,7 @@ const nn = @import("nn");
 const parallel = @import("parallel");
 const cli = @import("args.zig");
 const bench = @import("bench.zig");
+const stats = @import("stats");
 
 const usage =
     \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate] [seed_ranges|diag] [variant|par] [replay_k] [weights_path] [train_seed] [par|-] [dump_path]
@@ -1098,32 +1099,13 @@ pub fn main(init: std.process.Init) !void {
         const res_all = try init.arena.allocator().alloc(nn.PlayResult, games);
         const start = std.Io.Clock.awake.now(init.io);
         parallel.map(nn.PlayResult, res_all, EvalCtx{ .vfn = eval_value, .policy = r.policy, .eval_seed = eval_seed, .opts = opts }, playGame);
-        var total_moves: u64 = 0;
-        for (0..seed_ranges) |range| {
-            var total_score: u64 = 0;
-            for (res_all[range * eval_games ..][0..eval_games]) |res| {
-                total_score += res.score;
-                r.total_score += res.score;
-                total_moves += res.moves;
-                r.leaves += res.leaves;
-                r.node_probes += res.node_probes;
-                r.node_hits += res.node_hits;
-                r.best_tile = @max(r.best_tile, res.max_tile);
-                if (res.max_tile >= 4096) r.reach_4096 += 1;
-                if (res.max_tile >= 8192) r.reach_8192 += 1;
-                if (res.max_tile >= 16384) r.reach_16384 += 1;
-                if (res.max_tile < 2048) r.dead_below_2048 += 1;
-            }
-            r.range_scores[range] = @as(f64, @floatFromInt(total_score)) / @as(f64, @floatFromInt(eval_games));
-        }
+        stats.rangeTotals(nn.PlayResult, Eval, r, res_all, eval_games);
         r.elapsed_ns = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
-        const n: f64 = @floatFromInt(games);
-        r.avg_moves = @as(f64, @floatFromInt(total_moves)) / n;
     }
     const last_seed = eval_seed + seed_ranges * eval_games - 1;
     std.debug.print("eval: games={d}/range ranges={d} seeds={d}..{d}\n", .{ eval_games, seed_ranges, eval_seed, last_seed });
     for (results) |r| {
-        const st = nn.meanStderr(r.range_scores);
+        const st = stats.meanStderr(r.range_scores);
         // `avg score` is the mean over seed ranges (not the pooled average), which is exactly what
         // `avg_score` of the shared row holds. The reach counts are this runner's own tail (#141).
         bench.printEvalRow(r.name, st.stderr, seed_ranges, .{
