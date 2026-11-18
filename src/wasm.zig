@@ -134,7 +134,7 @@ fn chooseAt(algo: u32, rng: std.Random, depth: u32) ?core.Direction {
 /// take a horizon (`expectimax`, `ga`), which a deploy can add through `wasm.policies`.
 export fn solve(algo: u32, depth: u32) i32 {
     const dir = chooseAt(algo, prng.random(), @min(depth, 255)) orelse return -1;
-    return @intFromEnum(dir);
+    return @backingInt(dir);
 }
 
 export fn board_ptr() [*]const u32 {

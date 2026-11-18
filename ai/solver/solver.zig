@@ -158,7 +158,7 @@ comptime {
     if (policy_info.len != @typeInfo(Policy).@"enum".field_names.len)
         @compileError("policy_info must list every Policy variant");
     for (policy_info, 0..) |info, i| {
-        if (@intFromEnum(info.policy) != i)
+        if (@backingInt(info.policy) != i)
             @compileError("policy_info must be in Policy order (indexed by @intFromEnum)");
         if (info.description.len == 0)
             @compileError("policy " ++ @tagName(info.policy) ++ " has no description");
@@ -170,7 +170,7 @@ comptime {
 
 /// Metadata for `policy`; total because `policy_info` covers every variant, in order.
 pub fn policyInfo(policy: Policy) PolicyInfo {
-    return policy_info[@intFromEnum(policy)];
+    return policy_info[@backingInt(policy)];
 }
 
 /// Weights evolved by `zig build ga-rl` (holdout +4%, see docs/solver-history.md). 3 decimals as printed.
@@ -884,10 +884,9 @@ fn baseCell(layout: Layout, i: usize) core.Position {
 /// so their order is irrelevant.
 const flex: [core.BoardCellCount]core.Position = .{
     .{ .row = 1, .col = 3 }, .{ .row = 2, .col = 2 }, .{ .row = 2, .col = 3 }, .{ .row = 2, .col = 0 },
-    .{ .row = 3, .col = 2 }, .{ .row = 3, .col = 0 }, .{ .row = 3, .col = 3 },
-    .{ .row = 0, .col = 0 }, .{ .row = 0, .col = 1 }, .{ .row = 0, .col = 2 }, .{ .row = 0, .col = 3 },
-    .{ .row = 1, .col = 0 }, .{ .row = 1, .col = 1 }, .{ .row = 1, .col = 2 }, .{ .row = 2, .col = 1 },
-    .{ .row = 3, .col = 1 },
+    .{ .row = 3, .col = 2 }, .{ .row = 3, .col = 0 }, .{ .row = 3, .col = 3 }, .{ .row = 0, .col = 0 },
+    .{ .row = 0, .col = 1 }, .{ .row = 0, .col = 2 }, .{ .row = 0, .col = 3 }, .{ .row = 1, .col = 0 },
+    .{ .row = 1, .col = 1 }, .{ .row = 1, .col = 2 }, .{ .row = 2, .col = 1 }, .{ .row = 3, .col = 1 },
 };
 
 /// Cells of one 2x2 block in walk order: top-left, top-right, bottom-right, bottom-left.
@@ -1900,7 +1899,7 @@ fn goldenPlay(policy: Policy, seed: u64, depth: u8) Golden {
     var checksum: u64 = 0xcbf29ce484222325;
     var moves: u32 = 0;
     while (choose(policy, state, rng, depth)) |d| {
-        checksum = (checksum ^ @intFromEnum(d)) *% 0x100000001b3;
+        checksum = (checksum ^ @backingInt(d)) *% 0x100000001b3;
         _ = state.move(d, rng);
         moves += 1;
     }
