@@ -33,6 +33,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Cursor over little-endian bytes, shared by the file formats (#302/#303).
+    const blob_mod = b.addModule("blob", .{
+        .root_source_file = b.path("ai/solver/blob.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const nn_mod = b.addModule("nn", .{
         .root_source_file = b.path("ai/solver/nn.zig"),
         .target = target,
@@ -41,6 +48,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core", .module = core_mod },
             .{ .name = "parallel", .module = parallel_mod },
             .{ .name = "stats", .module = stats_mod },
+            .{ .name = "blob", .module = blob_mod },
             .{ .name = "nn_width", .module = width_opts.createModule() },
         },
     });
@@ -228,6 +236,9 @@ pub fn build(b: *std.Build) void {
 
     const stats_tests = b.addTest(.{ .filters = test_filters, .root_module = stats_mod });
     const run_stats_tests = b.addRunArtifact(stats_tests);
+
+    const blob_tests = b.addTest(.{ .filters = test_filters, .root_module = blob_mod });
+    const run_blob_tests = b.addRunArtifact(blob_tests);
 
     const nn_exe = b.addExecutable(.{
         .name = "nn",
@@ -442,6 +453,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_bench_tests.step);
     test_step.dependOn(&run_nn_tests.step);
     test_step.dependOn(&run_stats_tests.step);
+    test_step.dependOn(&run_blob_tests.step);
     test_step.dependOn(&run_nn_main_tests.step);
     test_step.dependOn(&run_ntuple_tests.step);
     test_step.dependOn(&run_ntuple_main_tests.step);
