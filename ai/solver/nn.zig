@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const core = @import("core");
 const parallel = @import("parallel");
 const eval_stats = @import("stats");
+const blob = @import("blob");
 /// Hidden layer widths (#205). Compile-time because the net is an `extern struct` whose layout is the
 /// weights file; `zig build nn -Dh1=… -Dh2=…` gives a capacity sweep without three edited copies.
 const width = @import("nn_width");
@@ -326,10 +327,9 @@ pub const Staged = struct {
     pub fn saveFile(self: *const Staged, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
         const bytes = try gpa.alloc(u8, staged_file_len);
         defer gpa.free(bytes);
-        @memcpy(bytes[0..8], staged_file_magic);
-        std.mem.writeInt(u32, bytes[8..12], file_version, .little);
-        std.mem.writeInt(u32, bytes[12..16], endian_marker, .little);
-        for (0..stage_count) |k| writeWeights(bytes[header_len + k * @sizeOf(Net) ..][0..@sizeOf(Net)], &self.nets[k]);
+        var w = blob.Writer.init(bytes);
+        blob.writeHeader(&w, staged_file_magic, file_version);
+        for (0..stage_count) |k| writeWeights(&w, &self.nets[k]);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
     }
 
@@ -341,12 +341,13 @@ pub const Staged = struct {
 
     fn parseStaged(self: *Staged, bytes: []const u8) !void {
         if (bytes.len != staged_file_len) return error.WrongWeightFileSize;
-        try checkVersionedHeader(bytes, staged_file_magic, file_version, .{
+        var r = blob.Reader.init(bytes);
+        try blob.readHeader(&r, staged_file_magic, file_version, .{
             .magic = error.BadWeightMagic,
             .version = error.UnsupportedWeightVersion,
             .endian = error.WrongWeightEndianness,
         });
-        for (0..stage_count) |k| self.nets[k] = readWeights(bytes[header_len + k * @sizeOf(Net) ..][0..@sizeOf(Net)]);
+        for (0..stage_count) |k| self.nets[k] = try readWeights(&r);
     }
 };
 
@@ -2148,6 +2149,26 @@ pub const dump_cap: usize = 1 << 16;
 pub const dump_header_len = 12;
 pub const dump_entry_len = core.BoardCellCount;
 
+/// One board as `Dump` and `Teachers` store it: row-major log2 per cell, 0 for empty. Tiles are powers
+/// of two, so `decodeBoard` restores the board exactly.
+fn encodeBoard(board: Board) [dump_entry_len]u8 {
+    var out: [dump_entry_len]u8 = undefined;
+    for (0..core.BoardCellCount) |cell| {
+        const value = board[cell / core.BoardSize][cell % core.BoardSize];
+        out[cell] = if (value == 0) 0 else @intCast(std.math.log2_int(core.Tile, value));
+    }
+    return out;
+}
+
+fn decodeBoard(cells: *const [dump_entry_len]u8) Board {
+    var out: Board = undefined;
+    for (0..core.BoardCellCount) |cell| {
+        const level = cells[cell];
+        out[cell / core.BoardSize][cell % core.BoardSize] = if (level == 0) 0 else @as(core.Tile, 1) << @intCast(level);
+    }
+    return out;
+}
+
 pub const Dump = struct {
     entries: [dump_cap][dump_entry_len]u8 = undefined,
     len: usize = 0,
@@ -2169,21 +2190,13 @@ pub const Dump = struct {
 
     pub fn append(self: *Dump, board: Board) void {
         std.debug.assert(self.len < dump_cap);
-        for (0..core.BoardCellCount) |cell| {
-            const value = board[cell / core.BoardSize][cell % core.BoardSize];
-            self.entries[self.len][cell] = if (value == 0) 0 else @intCast(std.math.log2_int(core.Tile, value));
-        }
+        self.entries[self.len] = encodeBoard(board);
         self.len += 1;
     }
 
     /// The `index`-th stored afterstate, decoded back to tiles.
     pub fn boardAt(self: *const Dump, index: usize) Board {
-        var out: Board = undefined;
-        for (0..core.BoardCellCount) |cell| {
-            const level = self.entries[index][cell];
-            out[cell / core.BoardSize][cell % core.BoardSize] = if (level == 0) 0 else @as(core.Tile, 1) << @intCast(level);
-        }
-        return out;
+        return decodeBoard(&self.entries[index]);
     }
 
     /// Uniform draw of one stored afterstate, counted so the 50/50 mix of `ft2` is observable.
@@ -2195,9 +2208,10 @@ pub const Dump = struct {
     }
 
     fn encodeInto(self: *const Dump, bytes: []u8) void {
-        @memcpy(bytes[0..8], dump_magic);
-        std.mem.writeInt(u32, bytes[8..12], @intCast(self.len), .little);
-        @memcpy(bytes[dump_header_len..], std.mem.sliceAsBytes(self.entries[0..self.len]));
+        var w = blob.Writer.init(bytes);
+        w.raw(dump_magic);
+        w.writeU32(@intCast(self.len));
+        w.raw(std.mem.sliceAsBytes(self.entries[0..self.len]));
     }
 
     pub fn save(self: *const Dump, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
@@ -2211,11 +2225,12 @@ pub const Dump = struct {
         self.len = 0;
         self.dropped = 0;
         if (bytes.len < dump_header_len) return error.DumpTooShort;
-        try checkMagic(bytes, dump_magic, error.BadDumpMagic);
-        const count = std.mem.readInt(u32, bytes[8..12], .little);
+        var r = blob.Reader.init(bytes);
+        if (!std.mem.eql(u8, try r.take(dump_magic.len), dump_magic)) return error.BadDumpMagic;
+        const count = try r.readU32();
         if (count > dump_cap) return error.DumpTooLarge;
         if (bytes.len != dump_header_len + @as(usize, count) * dump_entry_len) return error.WrongDumpFileSize;
-        @memcpy(std.mem.sliceAsBytes(self.entries[0..count]), bytes[dump_header_len..]);
+        try r.raw(std.mem.sliceAsBytes(self.entries[0..count]));
         self.len = count;
     }
 
@@ -2254,10 +2269,7 @@ pub const Teachers = struct {
 
     pub fn append(self: *Teachers, board: Board, target: f64) void {
         std.debug.assert(self.len < teacher_cap);
-        for (0..core.BoardCellCount) |cell| {
-            const value = board[cell / core.BoardSize][cell % core.BoardSize];
-            self.entries[self.len][cell] = if (value == 0) 0 else @intCast(std.math.log2_int(core.Tile, value));
-        }
+        self.entries[self.len] = encodeBoard(board);
         self.targets[self.len] = @floatCast(target);
         self.len += 1;
     }
@@ -2276,12 +2288,7 @@ pub const Teachers = struct {
     }
 
     pub fn boardAt(self: *const Teachers, index: usize) Board {
-        var out: Board = undefined;
-        for (0..core.BoardCellCount) |cell| {
-            const level = self.entries[index][cell];
-            out[cell / core.BoardSize][cell % core.BoardSize] = if (level == 0) 0 else @as(core.Tile, 1) << @intCast(level);
-        }
-        return out;
+        return decodeBoard(&self.entries[index]);
     }
 
     pub fn targetAt(self: *const Teachers, index: usize) f64 {
@@ -2289,12 +2296,12 @@ pub const Teachers = struct {
     }
 
     fn encodeInto(self: *const Teachers, bytes: []u8) void {
-        @memcpy(bytes[0..8], teacher_magic);
-        std.mem.writeInt(u32, bytes[8..12], @intCast(self.len), .little);
+        var w = blob.Writer.init(bytes);
+        w.raw(teacher_magic);
+        w.writeU32(@intCast(self.len));
         for (0..self.len) |i| {
-            const base = teacher_header_len + i * teacher_entry_len;
-            @memcpy(bytes[base..][0..dump_entry_len], &self.entries[i]);
-            std.mem.writeInt(u32, bytes[base + dump_entry_len ..][0..4], @bitCast(self.targets[i]), .little);
+            w.raw(&self.entries[i]);
+            w.writeF32(self.targets[i]);
         }
     }
 
@@ -2309,14 +2316,14 @@ pub const Teachers = struct {
         self.len = 0;
         self.draws = 0;
         if (bytes.len < teacher_header_len) return error.TeacherTooShort;
-        try checkMagic(bytes, teacher_magic, error.BadTeacherMagic);
-        const count = std.mem.readInt(u32, bytes[8..12], .little);
+        var r = blob.Reader.init(bytes);
+        if (!std.mem.eql(u8, try r.take(teacher_magic.len), teacher_magic)) return error.BadTeacherMagic;
+        const count = try r.readU32();
         if (count > teacher_cap) return error.TeacherTooLarge;
         if (bytes.len != teacher_header_len + @as(usize, count) * teacher_entry_len) return error.WrongTeacherFileSize;
         for (0..count) |i| {
-            const base = teacher_header_len + i * teacher_entry_len;
-            @memcpy(&self.entries[i], bytes[base..][0..dump_entry_len]);
-            self.targets[i] = @bitCast(std.mem.readInt(u32, bytes[base + dump_entry_len ..][0..4], .little));
+            try r.raw(&self.entries[i]);
+            self.targets[i] = try r.readF32();
         }
         self.len = count;
     }
@@ -3030,17 +3037,13 @@ pub const file_len = header_len + @sizeOf(Net);
 pub const staged_file_magic = "2048-MS\x00";
 pub const staged_file_len = header_len + @sizeOf(Net) * stage_count;
 
-fn writeWeights(out: []u8, net: *const Net) void {
-    for (std.mem.bytesAsSlice(f64, std.mem.asBytes(net)), 0..) |w, i| {
-        std.mem.writeInt(u64, out[i * 8 ..][0..8], @bitCast(w), .little);
-    }
+fn writeWeights(w: *blob.Writer, net: *const Net) void {
+    for (std.mem.bytesAsSlice(f64, std.mem.asBytes(net))) |weight| w.writeF64(weight);
 }
 
-fn readWeights(bytes: []const u8) Net {
+fn readWeights(r: *blob.Reader) !Net {
     var net: Net = undefined;
-    for (std.mem.bytesAsSlice(f64, std.mem.asBytes(&net)), 0..) |*w, i| {
-        w.* = @bitCast(std.mem.readInt(u64, bytes[i * 8 ..][0..8], .little));
-    }
+    for (std.mem.bytesAsSlice(f64, std.mem.asBytes(&net))) |*weight| weight.* = try r.readF64();
     return net;
 }
 
@@ -3049,7 +3052,8 @@ pub fn encode(net: *const Net) [file_len]u8 {
     @memcpy(out[0..8], file_magic);
     std.mem.writeInt(u32, out[8..12], file_version, .little);
     std.mem.writeInt(u32, out[12..16], endian_marker, .little);
-    writeWeights(out[header_len..], net);
+    var w = blob.Writer.init(out[header_len..]);
+    writeWeights(&w, net);
     return out;
 }
 
@@ -3065,7 +3069,8 @@ pub fn parse(bytes: []const u8) !Net {
         .version = error.UnsupportedWeightVersion,
         .endian = error.WrongWeightEndianness,
     });
-    return readWeights(bytes[header_len..]);
+    var r = blob.Reader.init(bytes[header_len..]);
+    return readWeights(&r);
 }
 
 pub fn save(net: *const Net, io: std.Io, path: []const u8) !void {
@@ -4898,6 +4903,45 @@ test "Dump writes the header and log2 cells, and load reads them back byte for b
     try std.testing.expectEqual(second, loaded.boardAt(1));
 }
 
+test "Dump encodes the fixed boards to the same bytes as before the refactor" {
+    var dump: Dump = .{};
+    var first: Board = @splat(@splat(0));
+    first[0][0] = 4096;
+    first[3][3] = 2;
+    var second: Board = @splat(@splat(0));
+    second[1][2] = 8192;
+    second[2][0] = 128;
+    dump.append(first);
+    dump.append(second);
+
+    // `2048-DMP`, count 2, then 12 at cell 0 and 1 at cell 15 of the first board, 13 at cell 6 and
+    // 7 at cell 8 of the second (log2, row-major) — recorded before the cursor refactor.
+    const golden = [_]u8{
+        0x32, 0x30, 0x34, 0x38, 0x2d, 0x44, 0x4d, 0x50, 0x02, 0x00, 0x00, 0x00,
+        0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0d, 0x00,
+        0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    var bytes: [golden.len]u8 = undefined;
+    dump.encodeInto(&bytes);
+    try std.testing.expectEqualSlices(u8, &golden, &bytes);
+}
+
+test "encodeBoard and decodeBoard round-trip every tile a board can hold" {
+    var full: Board = undefined;
+    for (0..core.BoardCellCount) |cell| {
+        full[cell / core.BoardSize][cell % core.BoardSize] = @as(core.Tile, 2) << @intCast(cell);
+    }
+    try std.testing.expectEqual(full, decodeBoard(&encodeBoard(full)));
+
+    var holes: Board = @splat(@splat(0));
+    holes[0][0] = 1 << 17;
+    holes[1][2] = 8192;
+    holes[2][0] = 128;
+    holes[3][3] = 2;
+    try std.testing.expectEqual(holes, decodeBoard(&encodeBoard(holes)));
+}
+
 test "Dump parse rejects a wrong magic and a truncated file" {
     var dump: Dump = .{};
     var bytes: [dump_header_len]u8 = @splat(0);
@@ -6703,6 +6747,33 @@ test "Teachers round-trips boards and targets through the file format (#175)" {
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqual(teacher_header_len + 2 * teacher_entry_len, bytes.len);
     try std.testing.expectEqualStrings(teacher_magic, bytes[0..8]);
+}
+
+test "Teachers encodes the fixed boards and targets to the same bytes as before the refactor" {
+    const teachers = try std.testing.allocator.create(Teachers);
+    defer std.testing.allocator.destroy(teachers);
+    teachers.* = .{};
+    var board_a: Board = @splat(@splat(0));
+    board_a[0][0] = 4096;
+    board_a[3][3] = 512;
+    var board_b: Board = @splat(@splat(0));
+    board_b[1][2] = 8192;
+    board_b[1][3] = 2;
+    teachers.append(board_a, 1.5);
+    teachers.append(board_b, -0.25);
+
+    // magic, count 2, then each 16-byte log2 board with the f32 target after it — recorded before the
+    // cursor refactor (1.5 = 0x3fc00000, -0.25 = 0xbe800000).
+    const golden = [_]u8{
+        0x32, 0x30, 0x34, 0x38, 0x2d, 0x54, 0x43, 0x48, 0x02, 0x00, 0x00, 0x00,
+        0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0xc0, 0x3f, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x0d, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x80, 0xbe,
+    };
+    var bytes: [golden.len]u8 = undefined;
+    teachers.encodeInto(&bytes);
+    try std.testing.expectEqualSlices(u8, &golden, &bytes);
 }
 
 /// `Teachers` is ~40 MB (32 dumps, #207), so tests heap allocate it, like `nn_main` does.
