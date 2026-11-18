@@ -117,20 +117,24 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const test_filters: []const []const u8 = if (b.option([]const u8, "test-filter", "only run tests whose name contains this substring")) |f| &.{f} else &.{};
-    const core_tests = b.addTest(.{ .filters = test_filters,
+    const core_tests = b.addTest(.{
+        .filters = test_filters,
         .root_module = core_mod,
     });
     const run_core_tests = b.addRunArtifact(core_tests);
 
-    const exe_tests = b.addTest(.{ .filters = test_filters,
+    const exe_tests = b.addTest(.{
+        .filters = test_filters,
         .root_module = exe.root_module,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
-    const solver_tests = b.addTest(.{ .filters = test_filters,
+    const solver_tests = b.addTest(.{
+        .filters = test_filters,
         .root_module = solver_mod,
     });
-    const bench_tests = b.addTest(.{ .filters = test_filters,
+    const bench_tests = b.addTest(.{
+        .filters = test_filters,
         .root_module = b.createModule(.{
             .root_source_file = b.path("ai/solver/bench.zig"),
             .target = target,
@@ -177,7 +181,8 @@ pub fn build(b: *std.Build) void {
     const ranking_cmd = b.addRunArtifact(ranking_exe);
     ranking_cmd.addPassthruArgs();
 
-    const ranking_tests = b.addTest(.{ .filters = test_filters,
+    const ranking_tests = b.addTest(.{
+        .filters = test_filters,
         .root_module = ranking_exe.root_module,
     });
     const run_ranking_tests = b.addRunArtifact(ranking_tests);
@@ -185,7 +190,8 @@ pub fn build(b: *std.Build) void {
     const ranking_step = b.step("ranking", "Compare policies and print JSON ranking");
     ranking_step.dependOn(&ranking_cmd.step);
 
-    const parallel_tests = b.addTest(.{ .filters = test_filters, .root_module = parallel_mod });    const run_parallel_tests = b.addRunArtifact(parallel_tests);
+    const parallel_tests = b.addTest(.{ .filters = test_filters, .root_module = parallel_mod });
+    const run_parallel_tests = b.addRunArtifact(parallel_tests);
 
     const evalab_exe = b.addExecutable(.{
         .name = "evalab",
@@ -327,7 +333,8 @@ pub fn build(b: *std.Build) void {
     const ga_step = b.step("ga-rl", "Evolve evaluation weights with a GA and compare on holdout seeds");
     ga_step.dependOn(&ga_cmd.step);
 
-    const ga_tests = b.addTest(.{ .filters = test_filters,
+    const ga_tests = b.addTest(.{
+        .filters = test_filters,
         .root_module = ga_exe.root_module,
     });
     const run_ga_tests = b.addRunArtifact(ga_tests);
@@ -353,7 +360,8 @@ pub fn build(b: *std.Build) void {
     const tune_step = b.step("tune", "Optimise the evaluation weights with CMA-ES");
     tune_step.dependOn(&tune_cmd.step);
 
-    const cmaes_tests = b.addTest(.{ .filters = test_filters,
+    const cmaes_tests = b.addTest(.{
+        .filters = test_filters,
         .root_module = b.createModule(.{
             .root_source_file = b.path("ai/solver/cmaes.zig"),
             .target = target,
