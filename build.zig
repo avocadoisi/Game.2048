@@ -25,6 +25,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Shared eval aggregation (#304). A named module, not a relative import: `nn` is a module and
+    // the CLIs are separate roots, and Zig refuses to put one file in both modules.
+    const stats_mod = b.addModule("stats", .{
+        .root_source_file = b.path("ai/solver/stats.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const nn_mod = b.addModule("nn", .{
         .root_source_file = b.path("ai/solver/nn.zig"),
         .target = target,
@@ -32,6 +40,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core", .module = core_mod },
             .{ .name = "parallel", .module = parallel_mod },
+            .{ .name = "stats", .module = stats_mod },
             .{ .name = "nn_width", .module = width_opts.createModule() },
         },
     });
@@ -217,6 +226,9 @@ pub fn build(b: *std.Build) void {
     const nn_tests = b.addTest(.{ .filters = test_filters, .root_module = nn_mod });
     const run_nn_tests = b.addRunArtifact(nn_tests);
 
+    const stats_tests = b.addTest(.{ .filters = test_filters, .root_module = stats_mod });
+    const run_stats_tests = b.addRunArtifact(stats_tests);
+
     const nn_exe = b.addExecutable(.{
         .name = "nn",
         .root_module = b.createModule(.{
@@ -228,6 +240,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "solver", .module = solver_mod },
                 .{ .name = "nn", .module = nn_mod },
                 .{ .name = "parallel", .module = parallel_mod },
+                .{ .name = "stats", .module = stats_mod },
             },
         }),
     });
@@ -272,6 +285,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "solver", .module = solver_mod },
                 .{ .name = "ntuple", .module = ntuple_mod },
                 .{ .name = "parallel", .module = parallel_mod },
+                .{ .name = "stats", .module = stats_mod },
             },
         }),
     });
@@ -411,9 +425,10 @@ pub fn build(b: *std.Build) void {
     wasm_step.dependOn(&install_wasm.step);
     wasm_step.dependOn(&install_static_html.step);
 
-    // Per-target test steps: `zig build test` compiles all 15 targets in Debug (5-10 min), which is
+    // Per-target test steps: `zig build test` compiles all 16 targets in Debug (5-10 min), which is
     // too slow to verify one module and makes an agent look hung. These build one target only.
     b.step("test-nn", "Run the nn unit tests only").dependOn(&run_nn_tests.step);
+    b.step("test-stats", "Run the eval aggregation unit tests only").dependOn(&run_stats_tests.step);
     b.step("test-nn-main", "Run the nn CLI unit tests only").dependOn(&run_nn_main_tests.step);
     b.step("test-core", "Run the core unit tests only").dependOn(&run_core_tests.step);
     b.step("test-solver", "Run the solver unit tests only").dependOn(&run_solver_tests.step);
@@ -426,6 +441,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_solver_tests.step);
     test_step.dependOn(&run_bench_tests.step);
     test_step.dependOn(&run_nn_tests.step);
+    test_step.dependOn(&run_stats_tests.step);
     test_step.dependOn(&run_nn_main_tests.step);
     test_step.dependOn(&run_ntuple_tests.step);
     test_step.dependOn(&run_ntuple_main_tests.step);

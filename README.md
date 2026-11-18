@@ -159,7 +159,7 @@ zig build ga-rl  -- 16 15 8 2 1 500 100                                  # popul
 | `src/wasm.zig` | WASM の C ABI（ゲーム + solver、`@embedFile` で NN 重みを同梱） |
 | `wasm.policies` | ブラウザ版 wasm に同梱する方針の一覧（ビルド時設定）。編集すると wasm が再ビルドされる |
 | `ai/solver/solver.zig` | expectimax / 評価関数 / 反復深化 |
-| `ai/solver/bench.zig` / `ranking.zig` / `parallel.zig` | ゲーム実行・集計・並列化 |
+| `ai/solver/bench.zig` / `stats.zig` / `ranking.zig` / `parallel.zig` | ゲーム実行・集計・並列化 |
 | `ai/solver/nn.zig` / `ntuple.zig` | TD(0) の価値関数（MLP / パターン表） |
 | `ai/solver/evalab.zig` / `tune.zig` / `probe.zig` / `ga_rl.zig` | 評価関数の比較・調整・分析 |
 | `docs/` / `scripts/` | 実験記録、ベンチ追記、WASM スモークテスト |
