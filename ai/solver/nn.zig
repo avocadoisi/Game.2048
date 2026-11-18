@@ -152,15 +152,35 @@ pub fn features(board: Board) [feature_count]f64 {
     return out;
 }
 
+/// Each lane follows the same row-addition order as the scalar loop.
+fn accumulateRowsSimd(dst: []f64, src: []const f64) void {
+    const V = @Vector(2, f64);
+    var i: usize = 0;
+    while (i + 2 <= dst.len) : (i += 2) {
+        const a: V = dst[i..][0..2].*;
+        const b: V = src[i..][0..2].*;
+        dst[i..][0..2].* = a + b;
+    }
+    while (i < dst.len) : (i += 1) dst[i] += src[i];
+}
+
 /// Afterstate value estimate (scalar, unit-scale). Fills `cache` for a following `train`.
 pub fn forward(net: *const Net, board: Board, cache: *Cache) f64 {
+    return forwardImpl(net, board, cache, width.simd);
+}
+
+fn forwardImpl(net: *const Net, board: Board, cache: *Cache, comptime simd: bool) f64 {
     for (0..core.BoardCellCount) |cell| {
         const value = board[cell / core.BoardSize][cell % core.BoardSize];
         cache.rows[cell] = cell * levels + levelOf(value);
     }
     cache.z1 = net.b1;
     for (cache.rows) |row| {
-        for (0..h1_size) |i| cache.z1[i] += net.w1[row][i];
+        if (comptime simd) {
+            accumulateRowsSimd(&cache.z1, &net.w1[row]);
+        } else {
+            for (0..h1_size) |i| cache.z1[i] += net.w1[row][i];
+        }
     }
     if (comptime feature_count > 0) {
         cache.feat = features(board);
@@ -3490,6 +3510,63 @@ test "parallel nn games match the serial loop over 8 seeds" {
     var out: [8]PlayResult = undefined;
     parallel.map(PlayResult, &out, &net, playSeed);
     for (out, 0..) |res, i| try std.testing.expectEqual(playSeed(&net, i), res);
+}
+
+test "SIMD input accumulation preserves scalar order and handles odd lengths (#317)" {
+    var scalar = [_]f64{ 1.0, -2.0, 1e-12, 4.0, -5.0 };
+    var vector = scalar;
+    const rows = [_][5]f64{
+        .{ 0.1, 0.2, 0.3, 0.4, 0.5 },
+        .{ -0.5, 0.4, -0.3, 0.2, -0.1 },
+        .{ 1e-14, -1e-14, 2e-14, 3e-14, 4e-14 },
+    };
+    for (rows) |row| {
+        for (&scalar, row) |*x, y| x.* += y;
+        accumulateRowsSimd(&vector, &row);
+    }
+    try std.testing.expectEqualSlices(f64, &scalar, &vector);
+}
+
+test "SIMD input forward matches scalar activations on varied boards (#317)" {
+    var prng = std.Random.DefaultPrng.init(317);
+    const rng = prng.random();
+    var init_rng = std.Random.DefaultPrng.init(318);
+    const net = Net.init(init_rng.random());
+    for (0..128) |_| {
+        var board: Board = undefined;
+        for (&board) |*row| for (row) |*tile| {
+            const level = rng.uintLessThan(u5, 17);
+            tile.* = if (level == 0) 0 else @as(u32, 1) << level;
+        };
+        var scalar: Cache = .{};
+        var vector: Cache = .{};
+        const a = forwardImpl(&net, board, &scalar, false);
+        const b = forwardImpl(&net, board, &vector, true);
+        try std.testing.expectEqual(a, b);
+        try std.testing.expectEqualSlices(usize, &scalar.rows, &vector.rows);
+        try std.testing.expectEqualSlices(f64, &scalar.z1, &vector.z1);
+        try std.testing.expectEqualSlices(f64, &scalar.a1, &vector.a1);
+        try std.testing.expectEqualSlices(f64, &scalar.z2, &vector.z2);
+        try std.testing.expectEqualSlices(f64, &scalar.a2, &vector.a2);
+    }
+}
+
+test "SIMD input forward matches scalar with shipped weights (#317)" {
+    if (h1_size != 128 or h2_size != 32 or feature_count != 0) return error.SkipZigTest;
+    const net = try parse(@embedFile("nn_weights.bin"));
+    var prng = std.Random.DefaultPrng.init(3170);
+    for (0..256) |_| {
+        var board: Board = undefined;
+        for (&board) |*row| for (row) |*tile| {
+            const level = prng.random().uintLessThan(u5, 17);
+            tile.* = if (level == 0) 0 else @as(u32, 1) << level;
+        };
+        var scalar: Cache = .{};
+        var vector: Cache = .{};
+        try std.testing.expectEqual(forwardImpl(&net, board, &scalar, false), forwardImpl(&net, board, &vector, true));
+        try std.testing.expectEqualSlices(f64, &scalar.z1, &vector.z1);
+        try std.testing.expectEqualSlices(f64, &scalar.z2, &vector.z2);
+    }
 }
 
 test "forward gives one finite scalar and is deterministic" {

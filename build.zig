@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
     // Hand-engineered global features on top of the one-hot board (#226): 0 (default) keeps today's
     // 256-input net and file format, 1..6 adds that many of `nn.featureNames` to the input layer.
     width_opts.addOption(u32, "feat", b.option(u32, "feat", "global board features 0..6 (default 0)") orelse 0);
+    width_opts.addOption(bool, "simd", b.option(bool, "nn-simd", "experiment with SIMD first-layer accumulation (#317)") orelse false);
 
     const parallel_mod = b.addModule("parallel", .{
         .root_source_file = b.path("ai/solver/parallel.zig"),
@@ -269,6 +270,20 @@ pub fn build(b: *std.Build) void {
 
     const nn_step = b.step("nn", "Train the value MLP (TD(0) self-play) and evaluate it against expectimax depth 2");
     nn_step.dependOn(&nn_cmd.step);
+
+    const forward_bench = b.addExecutable(.{
+        .name = "bench-forward",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("ai/solver/bench_forward.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "nn", .module = nn_mod },
+            },
+        }),
+    });
+    b.step("bench-forward", "Measure shipped NN forward inference").dependOn(&b.addRunArtifact(forward_bench).step);
 
     // The int16 file is a shipping artefact: write it where you like, do not commit it (#170).
     const nn_quant_exe = b.addExecutable(.{
