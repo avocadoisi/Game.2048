@@ -1035,6 +1035,18 @@ const RootBest = struct {
     second_value: f64 = -std.math.inf(f64),
 };
 
+fn rootMoveScore(search: *Search, state: GameState, dir: Direction) ?f64 {
+    var next = state;
+    const moved = next.slide(dir);
+    if (!moved.changed) return null;
+    const continuation = search.chanceResult(next, search.ply, 1);
+    const reward = if (search.omit_leaf_reward and continuation.direct_leaf)
+        0
+    else
+        @as(f64, @floatFromInt(moved.score_delta)) / reward_scale;
+    return reward + continuation.value;
+}
+
 /// The root layer of `deepMove`: max over `order` of reward + expected value after the spawn. `order`
 /// is the fixed one except in iterative deepening (#183), where the previous iteration's best move
 /// goes first; moving a later direction earlier only breaks ties differently if the two scores are
@@ -1043,15 +1055,7 @@ fn rootMove(search: *Search, state: GameState, order: [4]Direction, rerank: ?Rer
     var best: RootBest = .{};
     var second: RootBest = .{};
     for (order) |d| {
-        var next = state;
-        const moved = next.slide(d);
-        if (!moved.changed) continue;
-        const continuation = search.chanceResult(next, search.ply, 1);
-        const reward = if (search.omit_leaf_reward and continuation.direct_leaf)
-            0
-        else
-            @as(f64, @floatFromInt(moved.score_delta)) / reward_scale;
-        const v = reward + continuation.value;
+        const v = rootMoveScore(search, state, d) orelse continue;
         if (best.dir == null or v > best.value) {
             second = best;
             best = .{ .dir = d, .value = v };
@@ -1415,6 +1419,19 @@ fn searchDepth(mode: Mode, board: Board, omit_leaf_reward: bool) Depth {
     var depth = phaseDepth(mode, board);
     depth.omit_leaf_reward = omit_leaf_reward;
     return depth;
+}
+
+/// Score one root branch using the same fixed horizon and cutoff as the serial deep search.
+pub fn scoreRootMove(net: *const Net, state: GameState, mode: Mode, dir: Direction, cache: *ValueCache) ?f64 {
+    if (mode != .deep and mode != .deep3) return null;
+    const depth = searchDepth(mode, state.board, false);
+    const nodes: ?*NodeCache = if (depth.ply >= 3) blk: {
+        const table = sharedNodeCache();
+        table.clear();
+        break :blk table;
+    } else null;
+    var search = newSearch(.{ .single = net }, cache, nodes, depth, false, 0);
+    return rootMoveScore(&search, state, dir);
 }
 
 pub fn bestMove(net: *const Net, state: GameState, mode: Mode) ?Direction {
@@ -3539,6 +3556,39 @@ test "deep3 returns only legal moves on random boards" {
                 var moved = state;
                 try std.testing.expect(!moved.slide(d).changed);
             }
+        }
+    }
+}
+
+test "independent root scores match the serial search including illegal moves (#319)" {
+    var prng = std.Random.DefaultPrng.init(319);
+    const net = Net.init(prng.random());
+    const boards = [_]Board{
+        .{ .{ 2, 4, 8, 16 }, .{ 32, 64, 128, 256 }, .{ 512, 1024, 2048, 4096 }, .{ 8192, 16384, 2, 2 } },
+        .{ .{ 2, 4, 2, 4 }, .{ 4, 2, 4, 2 }, .{ 2, 4, 2, 4 }, .{ 4, 2, 4, 2 } },
+    };
+    for (boards) |board| {
+        const state = GameState{ .board = board };
+        for ([_]Mode{ .deep, .deep3 }) |mode| {
+            var cache: ValueCache = .{};
+            const depth = searchDepth(mode, board, false);
+            var search = newSearch(.{ .single = &net }, &cache, null, depth, false, 0);
+            const best = rootMove(&search, state, dir_order, null);
+            var independent_dir: ?Direction = null;
+            var independent_value = -std.math.inf(f64);
+            var worker_cache: ValueCache = .{};
+            for (dir_order) |dir| {
+                const serial_value = rootMoveScore(&search, state, dir);
+                const worker_value = scoreRootMove(&net, state, mode, dir, &worker_cache);
+                try std.testing.expectEqual(serial_value, worker_value);
+                const value = worker_value orelse continue;
+                if (independent_dir == null or value > independent_value) {
+                    independent_dir = dir;
+                    independent_value = value;
+                }
+            }
+            try std.testing.expectEqual(best.dir, independent_dir);
+            try std.testing.expectEqual(best.value, independent_value);
         }
     }
 }

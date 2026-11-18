@@ -382,6 +382,11 @@ pub fn build(b: *std.Build) void {
         .target = wasm_target,
         .optimize = optimize,
     });
+    const wasm_blob_mod = b.addModule("blob-wasm", .{
+        .root_source_file = b.path("ai/solver/blob.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
     const wasm_nn_mod = b.addModule("nn-wasm", .{
         .root_source_file = b.path("ai/solver/nn.zig"),
         .target = wasm_target,
@@ -389,6 +394,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core", .module = wasm_core_mod },
             .{ .name = "parallel", .module = wasm_parallel_mod },
+            .{ .name = "blob", .module = wasm_blob_mod },
             .{ .name = "nn_width", .module = width_opts.createModule() },
         },
     });
@@ -443,6 +449,8 @@ pub fn build(b: *std.Build) void {
     const wasm_step = b.step("wasm", "Build the WebAssembly module and static site into zig-out/web");
     wasm_step.dependOn(&install_wasm.step);
     wasm_step.dependOn(&install_static_html.step);
+    wasm_step.dependOn(&b.addInstallFileWithDir(b.path("src/web/search-workers.mjs"), .{ .custom = "web" }, "search-workers.mjs").step);
+    wasm_step.dependOn(&b.addInstallFileWithDir(b.path("src/web/solver-worker.mjs"), .{ .custom = "web" }, "solver-worker.mjs").step);
 
     // Per-target test steps: `zig build test` compiles all 16 targets in Debug (5-10 min), which is
     // too slow to verify one module and makes an agent look hung. These build one target only.

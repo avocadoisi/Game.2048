@@ -46,7 +46,8 @@
   </select></label>
 </p>
 <p id="policy-desc"></p>
-<script>
+<script type="module">
+import { RootWorkerPool } from "./search-workers.mjs";
 // Static build: everything runs in WebAssembly, there is no server.
 // Exports follow src/wasm.zig: move returns 0 no change, 1 moved, 2 game over.
 const CODES = { ArrowUp: 0, KeyW: 0, ArrowLeft: 1, KeyA: 1, ArrowDown: 2, KeyS: 2, ArrowRight: 3, KeyD: 3 };
@@ -58,6 +59,9 @@ animationToggle.addEventListener("change", () => {
 });
 
 let w; // wasm exports
+let workerPool = null;
+let revision = 0;
+let autoEpoch = 0;
 let gameOver = false;
 let previousBoard = null;
 
@@ -79,6 +83,7 @@ function render() {
 }
 
 function move(dir, paint = true) {
+  revision++;
   if (gameOver) return false;
   const result = w.move(dir);
   gameOver = result === GAME_OVER;
@@ -94,6 +99,7 @@ function directionFromSwipe(dx, dy) {
 }
 
 function newGame() {
+  revision++;
   // crypto seed when available, fixed mix otherwise
   const seed = crypto.getRandomValues(new Uint32Array(2));
   w.init(seed[0], seed[1]);
@@ -115,14 +121,32 @@ let nextMoveAt = 0;
 
 function policyIndex() { return Number(document.getElementById("policy").value); }
 
-function solverMove() {
-  const dir = w.solve(policyIndex(), 0);
+async function solverMove() {
+  const current = ++revision;
+  const algo = policyIndex();
+  let dir;
+  const policy = document.getElementById("policy").selectedOptions[0]?.textContent;
+  if (workerPool && (policy === "nn2" || policy === "nn3")) {
+    const board = new Uint32Array(w.memory.buffer, w.board_ptr(), 16).slice();
+    try {
+      dir = await workerPool.solve(board, algo);
+    } catch (error) {
+      console.warn("worker solver unavailable; falling back to serial", error);
+      workerPool = null;
+      if (current !== revision) return null;
+      dir = w.solve(algo, 0);
+    }
+  } else {
+    dir = w.solve(algo, 0);
+  }
+  if (current !== revision) return null;
   if (dir < 0) return false;
   return move(dir, false);
 }
 
-function solveStep() {
-  const ok = solverMove();
+async function solveStep() {
+  const ok = await solverMove();
+  if (ok === null) return null;
   render();
   if (!ok) {
     stopAuto();
@@ -135,6 +159,8 @@ function solveStep() {
 // cannot leave two loops scheduling themselves. `nextMoveAt = 0` is in the past for every rAF
 // timestamp, so the next start fires its first move on the first frame.
 function stopAuto() {
+  revision++;
+  autoEpoch++;
   running = false;
   if (autoFrame) { cancelAnimationFrame(autoFrame); autoFrame = 0; }
   nextMoveAt = 0;
@@ -147,30 +173,40 @@ function speedDelay() { return Number(document.getElementById("speed").value); }
 // FRAME_BUDGET_MS of solving per frame so the tab keeps painting and the buttons stay clickable.
 // With a delay, one move per frame at most, and the timer restarts after the solve returns, so a
 // slow policy (nn3 is 0.3 s per move early on) is never charged the delay twice.
-function autoLoop(now) {
+async function autoLoop(now) {
   if (!running) return;
+  const epoch = autoEpoch;
   const delay = speedDelay();
   let moved = false;
   if (delay === 0) {
     const start = performance.now();
-    while (running && performance.now() - start < FRAME_BUDGET_MS) {
-      if (!solverMove()) { stopAuto(); break; }
+    while (running && epoch === autoEpoch && performance.now() - start < FRAME_BUDGET_MS) {
+      const result = await solverMove();
+      if (epoch !== autoEpoch) return;
+      if (result === false) { stopAuto(); break; }
+      if (result === null) break;
       moved = true;
     }
   } else if (now >= nextMoveAt) {
-    moved = solverMove();
-    if (!moved) stopAuto();
+    const result = await solverMove();
+    if (epoch !== autoEpoch) return;
+    if (result === false) stopAuto();
+    moved = result === true;
     nextMoveAt = performance.now() + delay;
   }
-  // Nothing to paint while waiting out a delay; the last move already rendered the board.
   if (moved || !running) render();
-  if (running) autoFrame = requestAnimationFrame(autoLoop);
+  if (running && epoch === autoEpoch) autoFrame = requestAnimationFrame(autoLoop);
 }
 
 (async () => {
   const bytes = await (await fetch("game2048.wasm")).arrayBuffer();
-  const { instance } = await WebAssembly.instantiate(bytes, {});
+  const module = await WebAssembly.compile(bytes);
+  const instance = await WebAssembly.instantiate(module, {});
   w = instance.exports;
+  if (new URLSearchParams(location.search).get("workers") === "1" && typeof Worker !== "undefined") {
+    try { workerPool = new RootWorkerPool(module); }
+    catch (error) { console.warn("worker solver unavailable; using serial", error); }
+  }
 
   // One entry per policy compiled into this module, with its measured average score.
   const text = (ptr, len) => new TextDecoder().decode(new Uint8Array(w.memory.buffer, ptr, len));
@@ -200,7 +236,7 @@ function autoLoop(now) {
     const speed = p.speed ? ` / 1 手 ${p.speed}` : "";
     document.getElementById("policy-desc").textContent = `${p.name}: ${p.score}${speed}`;
   };
-  picker.addEventListener("change", showPolicy);
+  picker.addEventListener("change", () => { revision++; showPolicy(); });
   showPolicy();
 
   const grid = document.getElementById("grid");
@@ -221,7 +257,7 @@ function autoLoop(now) {
     if (swipeStart?.pointerId === event.pointerId) swipeStart = null;
   });
   document.getElementById("new").addEventListener("click", newGame);
-  document.getElementById("step").addEventListener("click", () => solveStep());
+  document.getElementById("step").addEventListener("click", () => { stopAuto(); solveStep(); });
   document.getElementById("auto").addEventListener("click", () => {
     if (running) return stopAuto();
     running = true;
