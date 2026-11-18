@@ -154,8 +154,12 @@ fn parseRows(sel: []bool, spec: []const u8) !void {
 /// Default `par` step multiplier (#203): sqrt of the batch size. The linear rule (= the batch size)
 /// matches serial over 20k games but oversteps on a 100k run at lr 0.003 (three seeds land 26k-68k
 /// behind the shipped net in the paired test), while sqrt stays at the shipped net's level.
+fn batchScaleFor(batch_size: usize) f64 {
+    return @sqrt(@as(f64, @floatFromInt(batch_size)));
+}
+
 fn defaultBatchScale() f64 {
-    return @sqrt(@as(f64, @floatFromInt(nn.trainBatchSize())));
+    return batchScaleFor(nn.trainBatchSize());
 }
 
 /// Positional arg 10, appended after `train_seed`: the literal "par" runs the variant of arg 6 in
@@ -1279,7 +1283,10 @@ test "par flag is off without arg 10 and on with the literal par" {
 test "omitted batch_scale is the sqrt rule, '-' is the old mean (#203)" {
     const omitted = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "base", "30", "x.bin", "3", "par", "-" };
     try std.testing.expectEqual(defaultBatchScale(), try parseBatchScale(&omitted));
-    try std.testing.expectEqual(@as(f64, 2.8284271247461903), defaultBatchScale());
+    // The rule itself is checked at a fixed batch size; trainBatchSize() is host-dependent, so the
+    // default is then checked against whatever this machine reports.
+    try std.testing.expectApproxEqAbs(@as(f64, 2.8284271247461903), batchScaleFor(8), 1e-12);
+    try std.testing.expectEqual(batchScaleFor(nn.trainBatchSize()), defaultBatchScale());
     const dash = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "base", "30", "x.bin", "3", "par", "-", "-" };
     try std.testing.expectEqual(@as(f64, 1), try parseBatchScale(&dash));
     const explicit = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "base", "30", "x.bin", "3", "par", "-", "2.8284" };
