@@ -7,3 +7,4 @@ result
 .pi/subagents/
 .pi/goals/
 .pi/.goals-pool-snapshot.json
+.spin/

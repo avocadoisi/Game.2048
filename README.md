@@ -11,7 +11,7 @@ Zig で書いた 2048。ゲームロジックを `2048.core` として切り出�
 ## クイックスタート
 
 ```bash
-nix develop                      # Zig ツールチェイン (flake.nix)
+nix develop                      # Zig 0.17.1 + lint ツール (flake.nix)
 zig build test
 zig build run                    # 端末で遊ぶ
 zig build run -- serve 8080      # http://127.0.0.1:8080/ でブラウザ UI
@@ -174,6 +174,29 @@ zig build ga-rl  -- 16 15 8 2 1 500 100                                  # popul
 - 学習は 1 試行 4 時間まで。4 時間で打ち切って評価し、効果が無ければ見送って issue を close する。
   打ち切り時点で伸びていて追加学習に価値があれば `train:more` ラベルを付けて残す
   （[docs/measurement.md](docs/measurement.md) の「学習の時間予算」）
+
+### ゲート（format / lint / test）
+
+入口は 1 つだけ。hook・CI・手元はどれも同じコマンドを呼ぶ。
+
+```bash
+nix develop
+scripts/gate.sh fast             # commit 前: format + lint
+scripts/gate.sh all              # push / PR 前: format + lint + zig build test
+scripts/gate.sh format --write   # 直す（zig fmt / shfmt / ruff format）
+scripts/gate.sh install          # nix を使わない場合だけ .githooks を有効化
+```
+
+`nix develop` に入ると `core.hooksPath=.githooks` も設定される（pre-commit = `fast`、pre-push = `all`）。
+WIP の push は `git push --no-verify` で飛ばせるが、PR では GitHub Actions が同じ `scripts/gate.sh all`
+を走らせる。
+
+- format: `zig fmt --check` / `shfmt -d` / `ruff format --check`
+- lint: `shellcheck`（`enable=all`。shfmt が担う SC2250・SC2292 と、意図的な fallback の SC2312 だけ
+  理由付きで off）、`ruff check`（`select=["ALL"]`。例外は `ruff.toml` に理由付き）、`node --check`
+- test: `zig build test`
+- docs と HTML は lint しない。日本語の表を折り返す markdown linter は形を壊すだけで、`src/web/index.html`
+  は `scripts/wasm-smoke.mjs` がビルド後の挙動（方針一覧・既定・応答時間）で検査している
 
 ## ライセンス
 

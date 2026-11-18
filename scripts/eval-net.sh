@@ -28,13 +28,34 @@ h1=128
 h2=32
 while [ $# -gt 0 ]; do
   case "$1" in
-    --games) games="$2"; shift 2 ;;
-    --seed) seed="$2"; shift 2 ;;
-    --shipped) shipped="$2"; shift 2 ;;
-    --h1) h1="$2"; shift 2 ;;
-    --h2) h2="$2"; shift 2 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
-    *) cand="$1"; shift ;;
+    --games)
+      games="$2"
+      shift 2
+      ;;
+    --seed)
+      seed="$2"
+      shift 2
+      ;;
+    --shipped)
+      shipped="$2"
+      shift 2
+      ;;
+    --h1)
+      h1="$2"
+      shift 2
+      ;;
+    --h2)
+      h2="$2"
+      shift 2
+      ;;
+    -h | --help)
+      sed -n '2,20p' "$0"
+      exit 0
+      ;;
+    *)
+      cand="$1"
+      shift
+      ;;
   esac
 done
 
@@ -81,7 +102,7 @@ echo
 # The adoption rule of `docs/measurement.md` has three parts, and all three are checked here: the paired
 # +2*stderr margin (the candidate is better than the shipped net, not noise), the non-paired 2-ply rows
 # on two seeds (no regression in avg_score, in 8192 reach or in ms/move), and more games won than lost.
-python3 - "$table" "$mean" "$err" "$better" "$worse" <<'PY_VERDICT'
+python3 - "$table" "$mean" "$err" "$better" "$worse" << 'PY_VERDICT'
 import sys
 
 table, mean_s, err_s, better_s, worse_s = sys.argv[1:6]

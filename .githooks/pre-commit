@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Fast half of the gate: format + lint. Full tests run on pre-push and in CI.
+set -euo pipefail
+exec scripts/gate.sh fast

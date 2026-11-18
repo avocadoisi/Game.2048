@@ -1,0 +1,64 @@
+name: gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+
+      - name: Cache Zig build
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            .zig-global-cache
+          key: zig-${{ runner.os }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**/*', 'ai/**/*') }}
+          restore-keys: |
+            zig-${{ runner.os }}-
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install shellcheck
+        env:
+          SHELLCHECK_VERSION: 0.11.0
+        run: |
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" | tar -xJ
+          sudo install "shellcheck-v${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+
+      - name: Install shfmt
+        env:
+          SHFMT_VERSION: 3.14.1
+        run: |
+          curl -fsSL "https://github.com/mvdan/sh/releases/download/v${SHFMT_VERSION}/shfmt_v${SHFMT_VERSION}_linux_amd64" -o /tmp/shfmt
+          sudo install /tmp/shfmt /usr/local/bin/shfmt
+
+      - name: Install ruff
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ruff"
+          "$RUNNER_TEMP/ruff/bin/pip" install "ruff==0.17.4"
+          echo "$RUNNER_TEMP/ruff/bin" >> "$GITHUB_PATH"
+
+      - name: Gate
+        run: scripts/gate.sh all
