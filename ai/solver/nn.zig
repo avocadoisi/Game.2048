@@ -594,6 +594,7 @@ pub const NodeCache = struct {
     /// The table lives in thread-local storage like `ValueCache`; wasm gets the smaller one because
     /// the 8K-entry leaf cache already overflowed that stack.
     pub const capacity = if (builtin.target.cpu.arch.isWasm()) 1 << 9 else 1 << 12;
+    const ways: usize = if (width.node_tt_2way) 2 else 1;
     /// `0xff` marks an unused slot; a real cell stores the tile's exponent plus one (1..32, 0 empty),
     /// so no board the game can produce collides with the sentinel.
     const unused_cell = 0xff;
@@ -654,23 +655,37 @@ pub const NodeCache = struct {
         h = (h ^ @as(u64, @backingInt(key.kind))) *% 0x100000001b3;
         h = (h ^ key.depth) *% 0x100000001b3;
         h = (h ^ @as(u64, @bitCast(key.cprob))) *% 0x100000001b3;
-        return @intCast(h & (capacity - 1));
+        return @as(usize, @intCast(h & (capacity / ways - 1))) * ways;
     }
 
-    /// The completed value of this exact node; null on an empty or mismatched slot. `stats` counts
-    /// probes and hits so a measurement can report the table's hit rate.
+    fn matches(a: Key, b: Key) bool {
+        return a.depth == b.depth and a.kind == b.kind and a.cprob == b.cprob and std.mem.eql(u8, &a.cells, &b.cells);
+    }
+
     fn get(self: *const NodeCache, key: Key, stats: *Stats) ?SearchResult {
         stats.node_probes += 1;
-        const entry = self.entries[slotOf(key)];
-        if (entry.key.depth != key.depth or entry.key.kind != key.kind or
-            entry.key.cprob != key.cprob or !std.mem.eql(u8, &entry.key.cells, &key.cells)) return null;
-        stats.node_hits += 1;
-        return entry.result;
+        const slot = slotOf(key);
+        for (self.entries[slot..][0..ways]) |entry| {
+            if (matches(entry.key, key)) {
+                stats.node_hits += 1;
+                return entry.result;
+            }
+        }
+        return null;
     }
 
-    /// Store a completed node; `Search.nodePut` withholds incomplete (budget-exhausted) values.
     fn put(self: *NodeCache, key: Key, result: SearchResult) void {
-        self.entries[slotOf(key)] = .{ .key = key, .result = result };
+        const slot = slotOf(key);
+        if (ways == 2) {
+            for (self.entries[slot..][0..ways]) |*entry| {
+                if (matches(entry.key, key)) {
+                    entry.result = result;
+                    return;
+                }
+            }
+            self.entries[slot + 1] = self.entries[slot];
+        }
+        self.entries[slot] = .{ .key = key, .result = result };
     }
 };
 
@@ -3583,6 +3598,50 @@ test "node cache collision is a miss, never another board's value (#263)" {
     try std.testing.expect(table.get(NodeCache.keyFor(mid_board.board, .value, 2, 0.25), &stats) == null);
     try std.testing.expect(table.get(NodeCache.keyFor(mid_board.board, .chance, 3, 0.25), &stats) == null);
     try std.testing.expect(table.get(NodeCache.keyFor(mid_board.board, .value, 3, 0.5), &stats) == null);
+}
+
+test "node cache retains two colliding keys in the same set (#318)" {
+    if (NodeCache.ways != 2) return error.SkipZigTest;
+    var table: NodeCache = .{};
+    var stats: Stats = .{};
+    const first = NodeCache.keyFor(mid_board.board, .value, 3, 0.25);
+    var second = first;
+    var found = false;
+    for (0..65536) |i| {
+        second.cells[0] = @intCast(i & 255);
+        second.cells[1] = @intCast(i >> 8);
+        if (!std.mem.eql(u8, &first.cells, &second.cells) and NodeCache.slotOf(first) == NodeCache.slotOf(second)) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+    table.put(first, .{ .value = 1 });
+    table.put(second, .{ .value = 2, .direct_leaf = true });
+    try std.testing.expectEqual(@as(f64, 1), table.get(first, &stats).?.value);
+    try std.testing.expectEqual(@as(f64, 2), table.get(second, &stats).?.value);
+    try std.testing.expect(table.get(second, &stats).?.direct_leaf);
+    table.put(first, .{ .value = 3 });
+    try std.testing.expectEqual(@as(f64, 3), table.get(first, &stats).?.value);
+    try std.testing.expectEqual(@as(f64, 2), table.get(second, &stats).?.value);
+    var third = first;
+    found = false;
+    for (0..65536) |i| {
+        third.cells[0] = @intCast(i & 255);
+        third.cells[1] = @intCast(i >> 8);
+        if (!NodeCache.matches(first, third) and !NodeCache.matches(second, third) and NodeCache.slotOf(first) == NodeCache.slotOf(third)) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+    table.put(third, .{ .value = 4 });
+    try std.testing.expect(table.get(first, &stats) == null);
+    try std.testing.expectEqual(@as(f64, 2), table.get(second, &stats).?.value);
+    try std.testing.expectEqual(@as(f64, 4), table.get(third, &stats).?.value);
+    table.clear();
+    try std.testing.expect(table.get(second, &stats) == null);
+    try std.testing.expect(table.get(third, &stats) == null);
 }
 
 test "node cache slot is 48 bytes and the table size follows the capacity (#263)" {

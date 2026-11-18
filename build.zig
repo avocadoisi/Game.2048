@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
     // Hand-engineered global features on top of the one-hot board (#226): 0 (default) keeps today's
     // 256-input net and file format, 1..6 adds that many of `nn.featureNames` to the input layer.
     width_opts.addOption(u32, "feat", b.option(u32, "feat", "global board features 0..6 (default 0)") orelse 0);
+    width_opts.addOption(bool, "node_tt_2way", b.option(bool, "node-tt-2way", "use experimental 2-way node TT (default false)") orelse false);
 
     const parallel_mod = b.addModule("parallel", .{
         .root_source_file = b.path("ai/solver/parallel.zig"),
