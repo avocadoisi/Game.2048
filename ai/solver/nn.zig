@@ -1878,6 +1878,14 @@ pub const Options = struct {
     death: bool = false,
     /// Candidate (#72): TD(lambda) with accumulating eligibility traces over the parameters; 0 = TD(0).
     lambda: f64 = 0,
+    /// Candidate (#300): TD(lambda) eligibility trace over the `replay_k` sweep. The sweep re-trains the
+    /// last K afterstates after the game (`trainAfter` = plain TD(0) today); with `sweep_lambda > 0` it
+    /// instead carries one accumulating trace across the whole sweep and steps with it, so the tail is
+    /// refined by a backward-view TD(lambda) rather than K independent one-step updates. `0` (the
+    /// default) keeps the TD(0) sweep bit for bit; `replay_k = 1` is a single-step trace, i.e. the
+    /// gradient itself, so it matches the TD(0) sweep up to float associativity (#72's `lambda` is the
+    /// online per-move trace, this one is the replay trace).
+    sweep_lambda: f64 = 0,
     /// (#137) Multiplier on the merged batch delta in `trainBatchOpts`. One batch applies a single
     /// SGD step built from `games` per-game deltas, so the mean is `1/games` of the work a serial run
     /// spends on the same number of games; `batch_scale` recovers it (`games` = the linear scaling
@@ -2488,11 +2496,17 @@ fn trainGameOptsUnchecked(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opt
     }
     if (opts.replay_k > 0) {
         const lr_replay = lr * opts.replay_lr_scale;
+        // (#300) One trace for the whole sweep: the TD(lambda) of the replayed tail. Unused (all zeros,
+        // never read) when `sweep_lambda == 0`, which keeps the TD(0) sweep bit for bit.
+        var sweep_trace: Net = std.mem.zeroes(Net);
         var i = n -| @min(opts.replay_k, step_cap);
         while (i < n) : (i += 1) {
             const s = steps[i % step_cap];
             const next = if (i + 1 < n) bootstrapValue(net, opts, steps[(i + 1) % step_cap].after) else 0;
-            trainAfter(net, &cache, s.after, s.reward + next, lr_replay);
+            if (opts.sweep_lambda > 0) {
+                _ = forward(net, s.after, &cache);
+                trainTrace(net, &cache, s.reward + next, lr_replay, &sweep_trace, opts.sweep_lambda);
+            } else trainAfter(net, &cache, s.after, s.reward + next, lr_replay);
         }
     }
     return .{ .score = state.score, .moves = @intCast(n) };
@@ -5215,6 +5229,75 @@ test "nstep = 0 equals the default path" {
     var rng_b = std.Random.DefaultPrng.init(12);
     _ = try trainGameOpts(&base, rng_a.random(), 0.003, null, .{});
     _ = try trainGameOpts(&off, rng_b.random(), 0.003, null, .{ .nstep = 0 });
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&base), std.mem.asBytes(&off));
+}
+
+test "sweep_lambda = 0 keeps the replay sweep's TD(0) step byte for byte (#300)" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    const base = Net.init(init_rng.random());
+    var plain = base;
+    var zero = base;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    _ = try trainGameOpts(&plain, rng_a.random(), 0.003, null, .{ .replay_k = 8 });
+    _ = try trainGameOpts(&zero, rng_b.random(), 0.003, null, .{ .replay_k = 8, .sweep_lambda = 0 });
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&plain), std.mem.asBytes(&zero));
+}
+
+test "a fresh sweep trace applies the plain TD(0) step whatever lambda is (#300)" {
+    // `trainTrace` accumulates `lambda * trace + grad`, so a zeroed trace starts at the gradient itself:
+    // the replay sweep's first step (and a `replay_k = 1` sweep) is the TD(0) step up to associativity.
+    var init_rng = std.Random.DefaultPrng.init(14);
+    const start_net = Net.init(init_rng.random());
+    var plain = start_net;
+    var lam = start_net;
+    var cache_a: Cache = .{};
+    var cache_b: Cache = .{};
+    var trace: Net = std.mem.zeroes(Net);
+    _ = forward(&plain, sample_board, &cache_a);
+    _ = forward(&lam, sample_board, &cache_b);
+    train(&plain, &cache_a, 0.7, 0.01);
+    trainTrace(&lam, &cache_b, 0.7, 0.01, &trace, 0.7);
+    for (flat(&plain), flat(&lam)) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-15);
+}
+
+test "sweep_lambda with replay_k = 1 matches the plain replay sweep (#300)" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    const base = Net.init(init_rng.random());
+    var td0 = base;
+    var lam = base;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    _ = try trainGameOpts(&td0, rng_a.random(), 0.003, null, .{ .replay_k = 1 });
+    _ = try trainGameOpts(&lam, rng_b.random(), 0.003, null, .{ .replay_k = 1, .sweep_lambda = 0.7 });
+    for (flatConst(&td0), flatConst(&lam)) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-12);
+}
+
+test "sweep_lambda = 0.7 changes the weights, stays finite and is deterministic (#300)" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    const base = Net.init(init_rng.random());
+    var td0 = base;
+    var lam = base;
+    var again = base;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    var rng_c = std.Random.DefaultPrng.init(12);
+    _ = try trainGameOpts(&td0, rng_a.random(), 0.003, null, .{ .replay_k = 8 });
+    _ = try trainGameOpts(&lam, rng_b.random(), 0.003, null, .{ .replay_k = 8, .sweep_lambda = 0.7 });
+    _ = try trainGameOpts(&again, rng_c.random(), 0.003, null, .{ .replay_k = 8, .sweep_lambda = 0.7 });
+    try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&td0), std.mem.asBytes(&lam)));
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&lam), std.mem.asBytes(&again));
+    for (std.mem.bytesAsSlice(f64, std.mem.asBytes(&lam))) |w| try std.testing.expect(std.math.isFinite(w));
+}
+
+test "sweep_lambda = 0 leaves a non-replay run unchanged (#300)" {
+    var init_rng = std.Random.DefaultPrng.init(11);
+    var base = Net.init(init_rng.random());
+    var off = base;
+    var rng_a = std.Random.DefaultPrng.init(12);
+    var rng_b = std.Random.DefaultPrng.init(12);
+    _ = try trainGameOpts(&base, rng_a.random(), 0.003, null, .{});
+    _ = try trainGameOpts(&off, rng_b.random(), 0.003, null, .{ .sweep_lambda = 0.7 });
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&base), std.mem.asBytes(&off));
 }
 

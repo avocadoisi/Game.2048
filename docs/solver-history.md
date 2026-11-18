@@ -4244,3 +4244,39 @@ IEEE Xplore の [論文ページ](https://ieeexplore.ieee.org/document/11151781)
 Abstract は二つの refinement algorithm を述べ、NN / n-tuple のスコア向上値を報告するが、更新則・前提・評価条件の詳細は得られない。これらの別実装の数値を本プロジェクトの期待値にはしない。#107 の optimistic initialization / multi-stage TD、#231 の Adam と混同しないためにも、方法を推測して実装するのは不適切と判断した。
 
 判定: **no-go（全文未入手のため実装・評価しない）**。既定方針・重みは変更しない。合法な全文または著者稿が入手できた場合は、方法と互換性を確認して再検討する。
+
+### replay 掃引を TD(λ) にする推測実装（#300、2026-11-18）
+
+#291 の論文は full text が取れず更新則が分からないままなので、既に検証済みの読み方を避けて、まだ空いていた seam を一つだけ埋めた。
+このプロジェクトの「refinement」は 128/32 net の fine-tune で、ゲーム末尾の `replay_k`（=30）局をやり直す掃引が本家の refinement 手順に当たる。
+その掃引は `ai/solver/nn.zig` の `trainAfter` による **TD(0)** だった（1 局ごとに独立の one-step 更新）。ここを 1 本の accumulating
+eligibility trace での **TD(λ)**（backward view）に置き換えた。#72 の `lambda` は online per-move の trace で、掃引側は未着手だった。
+
+実装は opt-in のみ:
+- `nn.Options.sweep_lambda`（既定 0 = 従来の TD(0) 掃引そのまま、bit-identical）。
+- variant `lam`（scratch から `replay_k` + TD(λ) sweep、index 13 = λ、既定 0.7）、`rlam`（同じものを `weights_path` から resume）。
+
+測定（128/32、from scratch、`par`、lr 0.003、`replay_k` 30、train seed 1、評価は同梱 net と同じ
+`nn 0 100 9000 0.003 1 base 30 <net> 1 - - - 1` の row 1 = nn + 1 spawn lookahead、seed 9000..9099 の 100 局）:
+
+| λ | 20,000 games | 100,000 games (seed 1) | 100,000 games (seed 2) |
+|---|---|---|---|
+| 0（TD(0)、従来） | **13,196.0**（782.8 moves） | 16,081.1（920.8） | 18,104.5（1,015.5） |
+| 0.3 | 13,065.1（776.7） | 17,775.5（1,003.0） | 18,029.5（1,013.2） |
+| 0.5 | 12,238.1（735.7） | 13,934.4（808.4） | — |
+| 0.7 | 10,656.5（661.7） | — | — |
+| 0.9 | 10,732.6（660.7） | — | — |
+
+- 20,000 games では λ を上げるほど単調に悪化（λ0.5 で −7.3%、λ0.7/0.9 で −19%）。
+- 100,000 games の λ0.3 は seed 1 で +1,694.4、seed 2 で −75.0（平均 +809.7）。λ0 の seed 間差が ±1,012 なので seed ノイズの内側。
+  λ0.5 は 100,000 でも −2,147（−13.3%、best tile 1024 止まり）。
+- 学習中の総 move 数も λ とともに減る（20k: 7.31M → 5.51M）。trace が末尾の短い trajectory に長く効き、伸ばす方向に働いていない。
+
+副産物として分かったこと: **収束済み net の fine-tune（`rlam`、resume + `replay_k`）は λ に関係なく即発散する**。
+`par` では 2,552/20,000 局、serial では 5/20,000 局で `|w| > 1e6` を検出して停止した。原因は online 側の bootstrap が
+自分の 1-ply `pick.value` で、stale な盤面に replay が乗る形になるため（`ai/solver/nn.zig` の `deepStep` の注記と同じ機構）。
+つまり「収束済み net を refinement する」という論文の前提自体が、今の self-play bootstrap では測れない。測るには
+`tnet` の凍結 bootstrap か teacher label（`tch` / `dist` 系）で target を切る必要がある。
+
+判定: **no-go（replay 掃引の TD(λ) は既定にしない）**。`sweep_lambda` は既定 0 の opt-in として残し、再現用に variant とテストだけ置く。
+`ai/solver/nn_weights.bin` は変更しない。次に試すなら λ ではなく、収束済み net を壊さない target（凍結 bootstrap / teacher label）側。

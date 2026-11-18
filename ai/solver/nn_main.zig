@@ -28,6 +28,11 @@ const usage =
     \\              rtgt    (#273: rsym plus the target's next board rotated by the same transform, so
     \\                       the update is the TD update of a rotated transition; same cost as base)
     \\              symlam  (#72: sym plus TD(lambda) eligibility traces with lambda = 0.7)
+    \\              lam     (#300: `replay_k` from scratch, with the replay sweep itself run as TD(lambda) over one
+    \\                              accumulating trace; index 13 = lambda, default 0.7, `0` = the TD(0) control)
+    \\              rlam    (#300: resume + replay_k, with the replay sweep itself run as TD(lambda) over one
+    \\                       accumulating trace instead of K independent TD(0) steps; lambda at index 13,
+    \\                       default 0.7, `0` is the plain replay sweep = the control for the comparison)
     \\              symbatch (#98: the 8 transformed gradients from one net snapshot, averaged and
     \\                       norm-clipped, applied as a single step instead of eight)
     \\              nstep   (#84: online n-step TD with n = 4 instead of one-step returns)
@@ -239,6 +244,17 @@ fn parseClamp(args: []const []const u8) !f64 {
     const cap = std.fmt.parseFloat(f64, args[13]) catch return error.InvalidClamp;
     if (!(cap > 0)) return error.InvalidClamp;
     return cap;
+}
+
+/// (#300) `sweep_lambda` of the `rlam` variant, at the row-spec slot (index 13). Default 0.7; `0`
+/// restores the plain TD(0) replay sweep, which is the control of the #300 comparison, so 0 is allowed
+/// (unlike `tailw`, where 0 would silently make the variant a plain `base`) but negatives are refused.
+fn parseSweepLambda(args: []const []const u8) !f64 {
+    if (args.len <= 13) return default_sweep_lambda;
+    if (std.mem.eql(u8, args[13], "-")) return default_sweep_lambda;
+    const lambda = std.fmt.parseFloat(f64, args[13]) catch return error.InvalidSweepLambda;
+    if (!(lambda >= 0 and lambda <= 1)) return error.InvalidSweepLambda;
+    return lambda;
 }
 
 /// (#232) `tail_alpha` for variant `tailw`, at the same row-spec slot as Adam's step size: the step of a
@@ -502,6 +518,9 @@ const TargetSync = struct {
 /// 0 would freeze the initial random net forever, so it is refused instead of silently meaning off.
 const default_target_every: usize = 100;
 
+/// (#300) TD(lambda) of the `rlam` replay sweep when index 13 is omitted or `-`.
+const default_sweep_lambda: f64 = 0.7;
+
 fn parseTargetEvery(args: []const []const u8) !usize {
     if (args.len <= 13) return default_target_every;
     if (std.mem.eql(u8, args[13], "-")) return default_target_every;
@@ -576,8 +595,10 @@ pub fn main(init: std.process.Init) !void {
     // (#206) the teacher mix: `distill_every` (arg 12) and the rate divisor (arg 13).
     const dist_mix: DistillMix = if (is_dist or is_dson) try parseDistillMix(args) else .{};
     // #159 variants train from the net in weights_path (the deep positions come from that net), like `resume`
+    const is_lam = std.mem.eql(u8, variant, "lam");
+    const is_rlam = std.mem.eql(u8, variant, "rlam");
     const use_resume = std.mem.eql(u8, variant, "resume") or is_dump or is_ft2 or is_restart or is_dist or is_dson or is_tch or
-        is_t2 or is_p2 or is_tp2;
+        is_t2 or is_p2 or is_tp2 or is_rlam;
     // Variants that take dump_path at index 11: `dump` writes it, `ft2` and `restart` read it.
     const uses_dump = is_dump or is_ft2 or is_restart or is_tch or is_dist or is_dson;
     const replay_k: usize = try cli.argOr(usize, args, 7, default_replay_k);
@@ -609,6 +630,13 @@ pub fn main(init: std.process.Init) !void {
         .{ .backward = true }
     else if (std.mem.eql(u8, variant, "replay"))
         .{ .replay_k = replay_k }
+    else if (is_rlam)
+        // (#300) resume + the replay sweep as TD(lambda); index 13 `0` is the TD(0) control.
+        .{ .replay_k = replay_k, .sweep_lambda = try parseSweepLambda(args) }
+    else if (is_lam)
+        // (#300) the same sweep from scratch: a resumed net blew up (self-play bootstrap + replay), see
+        // the issue, so the score comparison starts from the seed net instead.
+        .{ .replay_k = replay_k, .sweep_lambda = try parseSweepLambda(args) }
     else if (is_tnet)
         .{ .replay_k = replay_k, .target_net = &target_sync.net }
     else if (std.mem.eql(u8, variant, "priority"))
@@ -696,7 +724,7 @@ pub fn main(init: std.process.Init) !void {
     // already own 13 as the teacher lr divisor, `adam` as its step size, `tnet` as the target sync
     // interval, and `pairw` returns before the table is built.
     const row_spec: ?[]const u8 = if (is_dist or is_dson or is_adam or is_tailw or is_clamp or is_shape or is_tnet or is_clip or is_pairw or is_pair or is_pairleaf or is_pairrow) null else if (args.len > 13) args[13] else null;
-    const max_args: usize = if (is_clip) 15 else if (is_dist or is_dson or is_adam or is_tailw or is_clamp or is_shape or is_tnet) 14 else if (row_spec != null) 14 else if (is_ft2 or is_tch) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw or is_pairleaf) 12 else if (is_pairrow) 13 else 11;
+    const max_args: usize = if (is_clip) 15 else if (is_dist or is_dson or is_adam or is_tailw or is_clamp or is_shape or is_tnet or is_lam or is_rlam) 14 else if (row_spec != null) 14 else if (is_ft2 or is_tch) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw or is_pairleaf) 12 else if (is_pairrow) 13 else 11;
     if (args.len > max_args or seed_ranges == 0 or (uses_dump and dump_path == null) or ((is_pairleaf or is_leaf or is_pairrow) and train_games != 0)) {
         std.debug.print("{s}", .{usage});
         return;
