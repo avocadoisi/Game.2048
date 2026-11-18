@@ -171,6 +171,9 @@ zig build ga-rl  -- 16 15 8 2 1 500 100                                  # popul
 - Deterministic: seed 固定で再現可能にする（時間予算を使う `expectimax_id` だけは例外）
 - 変更は issue → worktree → PR。1 行の docs 修正は main へ直接 commit。手順は global の `dev-workflow` skill（`/skill:dev-workflow`）
 - issue は `area:`（系統）と `kind:`（種別）のラベルで分類する。定義と絞り込み方は [docs/issues.md](docs/issues.md)
+- 学習は 1 試行 4 時間まで。4 時間で打ち切って評価し、効果が無ければ見送って issue を close する。
+  打ち切り時点で伸びていて追加学習に価値があれば `train:more` ラベルを付けて残す
+  （[docs/measurement.md](docs/measurement.md) の「学習の時間予算」）
 
 ## ライセンス
 

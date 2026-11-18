@@ -75,3 +75,15 @@ python3 scripts/label-issues.py --apply    # ラベル作成 + 付与。冪等�
   `kind:fix` / `kind:docs` が対応する。過去に付いていた 6 件（#111〜#117）には残っているが、新規には付けない。
 - 分類を変えたくなったら、`gh issue edit <n> --remove-label ... --add-label ...` して
   `scripts/issue-labels.tsv` も直す（次回の `--apply` で戻らないように）。
+
+## 進行タグ `train:more`
+
+`area:` / `kind:` とは別に、**追加学習を回す価値がある**ことを示す進行タグ。
+4 時間の学習予算では ADOPT に届かなかったが、未完走で明確には負けておらず、上向きのときだけ付ける
+（条件は [docs/measurement.md](measurement.md) の「学習の時間予算」）。
+付いていない issue には追加学習を回さない。ADOPT したら外して close する。
+
+```bash
+gh issue edit <n> --add-label train:more
+gh issue list -l train:more --state open
+```
