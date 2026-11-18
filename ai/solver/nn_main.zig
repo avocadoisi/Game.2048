@@ -140,7 +140,7 @@ const default_seed_ranges: u32 = 1;
 const default_train_seed: u64 = 1;
 
 /// (#203) Fill `sel` from the `rows` argument: comma-separated indices, any bad token or an index
-/// past the table is an error, so a typo never silently runs the full 15-row table.
+/// past the table is an error, so a typo never silently runs the full table.
 fn parseRows(sel: []bool, spec: []const u8) !void {
     @memset(sel, false);
     var it = std.mem.splitScalar(u8, spec, ',');
@@ -374,11 +374,81 @@ fn startStaged(staged: *nn.Staged, io: std.Io, gpa: std.mem.Allocator, train_gam
     return false;
 }
 
+/// The search one eval row runs. Every row but the handcrafted expectimax baseline is an NN
+/// search; `pairrow` refuses the expectimax row.
+const NnEvalRow = struct {
+    mode: nn.Mode,
+    opts: nn.Options = .{},
+    /// (#260) The eval-only `leaf` variant reads `omit_leaf_reward` from the run options. Only
+    /// the rows whose leaves it changes set this; the row's other options stay in `opts`.
+    leaf_override: bool = false,
+};
+
+const EvalRowSpec = union(enum) {
+    nn: NnEvalRow,
+    /// Handcrafted expectimax baseline; the payload is its depth.
+    expectimax: u8,
+};
+
+/// One eval row: the name that is printed and the search that produces its numbers. The array index
+/// is the row number used by `rows` and `pairrow`, so this is the only place a row is defined.
+const EvalRow = struct {
+    name: []const u8,
+    spec: EvalRowSpec,
+};
+
+// Every row the binary knows about. `rows` selects the rows a measurement run needs (e.g. 0 and 2)
+// instead of paying for the 3-ply rows twice over.
+const all_rows = [_]EvalRow{
+    .{ .name = "nn 1-ply", .spec = .{ .nn = .{ .mode = .greedy } } },
+    .{ .name = "nn + 1 spawn lookahead", .spec = .{ .nn = .{ .mode = .chance } } },
+    .{ .name = "nn 2-ply (deep)", .spec = .{ .nn = .{ .mode = .deep, .leaf_override = true } } },
+    .{ .name = "expectimax depth 2", .spec = .{ .expectimax = 2 } },
+    .{ .name = "nn 3-ply (deep3, #108)", .spec = .{ .nn = .{ .mode = .deep3, .opts = .{ .node_tt = false }, .leaf_override = true } } },
+    .{ .name = "nn phase h1 (#157)", .spec = .{ .nn = .{ .mode = .phase_h1 } } },
+    .{ .name = "nn phase h2 (#157)", .spec = .{ .nn = .{ .mode = .phase_h2 } } },
+    .{ .name = "nn phase h3 (#157)", .spec = .{ .nn = .{ .mode = .phase_h3 } } },
+    .{ .name = "nn phase h4 (#171)", .spec = .{ .nn = .{ .mode = .phase_h4 } } },
+    // #182: the same 2-ply tree as `nn 2-ply (deep)`, minus each chance node's lowest-probability
+    // spawn branches up to 5% of its mass.
+    .{ .name = "nn 2-ply + mass cutoff (#182)", .spec = .{ .nn = .{ .mode = .deep_mass } } },
+    // #178: the .deep row with every search leaf averaged over the 8 dihedral transforms.
+    .{ .name = "nn 2-ply + sym leaf (#178)", .spec = .{ .nn = .{ .mode = .deep, .opts = .{ .sym_leaf = true } } } },
+    // #183: iterative deepening from the .deep row, stopping at a leaf-evaluation budget instead of
+    // a fixed ply, so a position it can afford searches deeper than 2 and still costs the same.
+    .{ .name = "nn iterative deepening (#183)", .spec = .{ .nn = .{ .mode = .deep, .opts = .{ .id_budget = 200_000 } } } },
+    // #189: the .deep row, reranked between the top two moves by the snake heuristic when the
+    // net's own gap is within 0.05 (NN values are score deltas / reward_scale, so 50 points of
+    // one-move score); the snake score enters at half its `reward_scale` units.
+    .{ .name = "nn 2-ply + rerank (#189)", .spec = .{ .nn = .{ .mode = .deep, .opts = .{ .rerank = .{ .margin = 0.05, .weight = 0.5, .score = &snakeScore } } } } },
+    // #187: the .deep row with every chance node scored 30% by its CVaR below the lower 25%
+    // quantile, so a move that is usually good but sometimes losing ranks below a stable one.
+    .{ .name = "nn 2-ply + downside risk (#187)", .spec = .{ .nn = .{ .mode = .deep, .opts = .{ .risk_weight = 0.3 } } } },
+    // #188: the #183 budget, but a root move that already beats its runner-up by more than 0.05
+    // ends the deepening after the first iteration, so only near-tie positions pay for a deeper tree.
+    .{ .name = "nn deepening on near ties (#188)", .spec = .{ .nn = .{ .mode = .deep, .opts = .{ .id_budget = 200_000, .id_margin = 0.05 } } } },
+    // #263: the .deep3 row with completed interior nodes reused inside one search. #266 made this
+    // the default for 3-ply, so the row passes no options and measures the shipped path; row 4 is
+    // the explicit-off baseline the two are compared on.
+    .{ .name = "nn 3-ply + node TT default (#266)", .spec = .{ .nn = .{ .mode = .deep3 } } },
+    // #263: the same table at a 1e-3 spawn cut: the time the table saved, spent on a wider tree.
+    .{ .name = "nn 3-ply 1e-3 + node TT (#263)", .spec = .{ .nn = .{ .mode = .deep3, .opts = .{ .cutoff = 1e-3 } } } },
+    // #267: `deep4`, one more own move and spawn layer than row 15 at the same 1e-2 cut, with the
+    // node table on. A/B against row 15 answers whether the saved time buys a deeper tree.
+    .{ .name = "nn 4-ply + node TT (#267)", .spec = .{ .nn = .{ .mode = .deep4, .opts = .{ .node_tt = true } } } },
+    // #281: row 15 with a higher spawn cut, so the 4 branches at empty cells >= 6 (0.02) or >= 3
+    // (0.05) are dropped. A/B against row 15 measures whether the saved leaves buy a better score.
+    .{ .name = "nn 3-ply cutoff 0.02 + node TT (#281)", .spec = .{ .nn = .{ .mode = .deep3, .opts = .{ .cutoff = 0.02, .node_tt = true } } } },
+    .{ .name = "nn 3-ply cutoff 0.05 + node TT (#281)", .spec = .{ .nn = .{ .mode = .deep3, .opts = .{ .cutoff = 0.05, .node_tt = true } } } },
+    // #261: the `deep3` tree, but a spawn branch under the fixed cut is evaluated on its real
+    // child board one own-move/reward layer shallower instead of being dropped and renormalized.
+    .{ .name = "nn 3-ply cut branches recovered 1 ply shallow (#261)", .spec = .{ .nn = .{ .mode = .deep3_recover } } },
+};
+
 const Eval = struct {
     name: []const u8,
-    /// Which entry of the `playGame` switch this row runs. Set from the row table below so a
-    /// measurement run can pick a subset (see `selectedRows`) instead of paying for all nine.
-    policy: usize = 0,
+    /// The search this row runs, copied from `all_rows` so eval and `pairrow` cannot drift.
+    spec: EvalRowSpec,
     range_scores: []f64 = &.{},
     avg_moves: f64 = 0,
     best_tile: core.Tile = 0,
@@ -463,37 +533,6 @@ fn parsePairLeafMode(arg: ?[]const u8) ?nn.Mode {
 fn parsePairRow(arg: ?[]const u8) ?usize {
     const text = arg orelse return null;
     return std.fmt.parseInt(usize, std.mem.trim(u8, text, " "), 10) catch null;
-}
-
-/// The search a `pairrow` eval row runs (#267). This mirrors the `playGame` switch, but takes no
-/// training options: the pair is evaluated on the loaded net and the same spawn tape.
-const EvalRowSpec = struct { mode: nn.Mode, opts: nn.Options = .{} };
-
-fn evalRowSpec(policy: usize) ?EvalRowSpec {
-    return switch (policy) {
-        0 => .{ .mode = .greedy },
-        1 => .{ .mode = .chance },
-        2 => .{ .mode = .deep },
-        // row 3 is the expectimax baseline, not an NN search; `pairrow` refuses it
-        4 => .{ .mode = .deep3, .opts = .{ .node_tt = false } }, // #266: explicit TT-off baseline
-        5 => .{ .mode = .phase_h1 },
-        6 => .{ .mode = .phase_h2 },
-        7 => .{ .mode = .phase_h3 },
-        8 => .{ .mode = .phase_h4 },
-        9 => .{ .mode = .deep_mass },
-        10 => .{ .mode = .deep, .opts = .{ .sym_leaf = true } },
-        11 => .{ .mode = .deep, .opts = .{ .id_budget = 200_000 } },
-        12 => .{ .mode = .deep, .opts = .{ .rerank = .{ .margin = 0.05, .weight = 0.5, .score = &snakeScore } } },
-        13 => .{ .mode = .deep, .opts = .{ .risk_weight = 0.3 } },
-        14 => .{ .mode = .deep, .opts = .{ .id_budget = 200_000, .id_margin = 0.05 } },
-        15 => .{ .mode = .deep3, .opts = .{} }, // #266 default node TT
-        16 => .{ .mode = .deep3, .opts = .{ .cutoff = 1e-3 } },
-        17 => .{ .mode = .deep4, .opts = .{ .node_tt = true } }, // #267
-        18 => .{ .mode = .deep3, .opts = .{ .cutoff = 0.02, .node_tt = true } }, // #281
-        19 => .{ .mode = .deep3, .opts = .{ .cutoff = 0.05, .node_tt = true } }, // #281
-        20 => .{ .mode = .deep3_recover, .opts = .{} }, // #261
-        else => null,
-    };
 }
 
 /// (#262) Frozen bootstrap net for `tnet`: a copy of the live net, refreshed only between merged
@@ -881,56 +920,9 @@ pub fn main(init: std.process.Init) !void {
     // `deep3`/iterative-deepening row can cost minutes, so a short training run must be able to skip it.
     if (eval_games == 0) return;
 
-    // Every row the binary knows about. A measurement run edits `row_selection` down to the rows it
-    // needs (e.g. policy 0 and 2) instead of paying for the 3-ply rows twice over.
-    const all_rows = [_]struct { name: []const u8, policy: usize }{
-        .{ .name = "nn 1-ply", .policy = 0 },
-        .{ .name = "nn + 1 spawn lookahead", .policy = 1 },
-        .{ .name = "nn 2-ply (deep)", .policy = 2 },
-        .{ .name = "expectimax depth 2", .policy = 3 },
-        .{ .name = "nn 3-ply (deep3, #108)", .policy = 4 },
-        .{ .name = "nn phase h1 (#157)", .policy = 5 },
-        .{ .name = "nn phase h2 (#157)", .policy = 6 },
-        .{ .name = "nn phase h3 (#157)", .policy = 7 },
-        .{ .name = "nn phase h4 (#171)", .policy = 8 },
-        // #182: the same 2-ply tree as `nn 2-ply (deep)`, minus each chance node's lowest-probability
-        // spawn branches up to 5% of its mass.
-        .{ .name = "nn 2-ply + mass cutoff (#182)", .policy = 9 },
-        // #178: the .deep row with every search leaf averaged over the 8 dihedral transforms.
-        .{ .name = "nn 2-ply + sym leaf (#178)", .policy = 10 },
-        // #183: iterative deepening from the .deep row, stopping at a leaf-evaluation budget instead of
-        // a fixed ply, so a position it can afford searches deeper than 2 and still costs the same.
-        .{ .name = "nn iterative deepening (#183)", .policy = 11 },
-        // #189: the .deep row, reranked between the top two moves by the snake heuristic when the
-        // net's own gap is within 0.05 (NN values are score deltas / reward_scale, so 50 points of
-        // one-move score); the snake score enters at half its `reward_scale` units.
-        .{ .name = "nn 2-ply + rerank (#189)", .policy = 12 },
-        // #187: the .deep row with every chance node scored 30% by its CVaR below the lower 25%
-        // quantile, so a move that is usually good but sometimes losing ranks below a stable one.
-        .{ .name = "nn 2-ply + downside risk (#187)", .policy = 13 },
-        // #188: the #183 budget, but a root move that already beats its runner-up by more than 0.05
-        // ends the deepening after the first iteration, so only near-tie positions pay for a deeper tree.
-        .{ .name = "nn deepening on near ties (#188)", .policy = 14 },
-        // #263: the .deep3 row with completed interior nodes reused inside one search. #266 made this
-        // the default for 3-ply, so the row passes no options and measures the shipped path; row 4 is
-        // the explicit-off baseline the two are compared on.
-        .{ .name = "nn 3-ply + node TT default (#266)", .policy = 15 },
-        // #263: the same table at a 1e-3 spawn cut: the time the table saved, spent on a wider tree.
-        .{ .name = "nn 3-ply 1e-3 + node TT (#263)", .policy = 16 },
-        // #267: `deep4`, one more own move and spawn layer than row 15 at the same 1e-2 cut, with the
-        // node table on. A/B against row 15 answers whether the saved time buys a deeper tree.
-        .{ .name = "nn 4-ply + node TT (#267)", .policy = 17 },
-        // #281: row 15 with a higher spawn cut, so the 4 branches at empty cells >= 6 (0.02) or >= 3
-        // (0.05) are dropped. A/B against row 15 measures whether the saved leaves buy a better score.
-        .{ .name = "nn 3-ply cutoff 0.02 + node TT (#281)", .policy = 18 },
-        .{ .name = "nn 3-ply cutoff 0.05 + node TT (#281)", .policy = 19 },
-        // #261: the `deep3` tree, but a spawn branch under the fixed cut is evaluated on its real
-        // child board one own-move/reward layer shallower instead of being dropped and renormalized.
-        .{ .name = "nn 3-ply cut branches recovered 1 ply shallow (#261)", .policy = 20 },
-    };
     // Rows are all on by default; `rows` (arg 13, #203) keeps the two a measurement needs
     // (0 = 1-ply, 2 = 2-ply) instead of paying for the 3-ply rows twice over. A stray token is a
-    // command-line error, never a silent fallback to the 15-row table.
+    // command-line error, never a silent fallback to the full table.
     var row_selection: [all_rows.len]bool = @splat(true);
     if (row_spec) |spec| {
         if (!std.mem.eql(u8, spec, "-"))
@@ -943,7 +935,7 @@ pub fn main(init: std.process.Init) !void {
     var result_count: usize = 0;
     for (all_rows, 0..) |row, k| {
         if (!row_selection[k]) continue;
-        results_buf[result_count] = .{ .name = row.name, .policy = row.policy };
+        results_buf[result_count] = .{ .name = row.name, .spec = row.spec };
         result_count += 1;
     }
     const results = results_buf[0..result_count];
@@ -965,8 +957,8 @@ pub fn main(init: std.process.Init) !void {
         try nn.load(&net_b, init.io, init.gpa, args[11]);
         break :blk .{ .single = &net_b };
     } else eval_value;
-    var pair_spec_a: ?EvalRowSpec = null;
-    var pair_spec_b: ?EvalRowSpec = null;
+    var pair_spec_a: ?NnEvalRow = null;
+    var pair_spec_b: ?NnEvalRow = null;
     var pair_name_a: []const u8 = "";
     var pair_name_b: []const u8 = "";
     if (is_pairrow) {
@@ -988,13 +980,19 @@ pub fn main(init: std.process.Init) !void {
         }
         pair_name_a = all_rows[row_a].name;
         pair_name_b = all_rows[row_b].name;
-        pair_spec_a = evalRowSpec(all_rows[row_a].policy) orelse {
-            std.debug.print("pairrow row {d} ({s}) is not an NN search row\n{s}", .{ row_a, pair_name_a, usage });
-            return;
+        pair_spec_a = switch (all_rows[row_a].spec) {
+            .nn => |spec| spec,
+            .expectimax => {
+                std.debug.print("pairrow row {d} ({s}) is not an NN search row\n{s}", .{ row_a, pair_name_a, usage });
+                return;
+            },
         };
-        pair_spec_b = evalRowSpec(all_rows[row_b].policy) orelse {
-            std.debug.print("pairrow row {d} ({s}) is not an NN search row\n{s}", .{ row_b, pair_name_b, usage });
-            return;
+        pair_spec_b = switch (all_rows[row_b].spec) {
+            .nn => |spec| spec,
+            .expectimax => {
+                std.debug.print("pairrow row {d} ({s}) is not an NN search row\n{s}", .{ row_b, pair_name_b, usage });
+                return;
+            },
         };
     }
     if (is_pair or is_pairw or is_pairleaf or is_pairrow) {
@@ -1068,57 +1066,23 @@ pub fn main(init: std.process.Init) !void {
         }
         return;
     }
-    const EvalCtx = struct { vfn: nn.Value, policy: usize, eval_seed: u64, opts: nn.Options };
-    // #189 policy 11: the snake heuristic (#117 `baseline` weights) as the foreign rerank score,
-    // divided by `reward_scale` so it lands on the NN value scale.
-    const rerank: nn.Rerank = .{ .margin = 0.05, .weight = 0.5, .score = &snakeScore };
+    const EvalCtx = struct { vfn: nn.Value, spec: EvalRowSpec, eval_seed: u64, opts: nn.Options };
     // Game i uses seed eval_seed + i (= eval_seed + range*eval_games + g); games run in parallel.
     const playGame = struct {
         fn f(c: EvalCtx, i: usize) nn.PlayResult {
             var prng = std.Random.DefaultPrng.init(c.eval_seed + i);
-            return switch (c.policy) {
-                0 => nn.playValue(c.vfn, prng.random(), .greedy),
-                1 => nn.playValue(c.vfn, prng.random(), .chance),
-                2 => nn.playValueOpts(c.vfn, prng.random(), .deep, c.opts),
-                3 => blk: {
-                    const b = solver.playPolicy(prng.random(), .expectimax, 2);
+            return switch (c.spec) {
+                .expectimax => |depth| blk: {
+                    const b = solver.playPolicy(prng.random(), .expectimax, depth);
                     break :blk nn.PlayResult{ .score = b.score, .max_tile = b.max_tile, .moves = b.moves };
                 },
-                // nn3 baseline for the phase rows below (#157): same seeds, so the cost and score compare directly
-                // #263/#266: the TT-less baseline the default (row 15) is compared on
-                4 => blk: {
-                    var no_tt = c.opts;
-                    no_tt.node_tt = false;
-                    break :blk nn.playValueOpts(c.vfn, prng.random(), .deep3, no_tt);
+                .nn => |row| blk: {
+                    var row_opts = row.opts;
+                    // (#260) `leaf` is eval-only: rows 2 and 4 take its omit-leaf option, and row 4
+                    // keeps its TT-off baseline from the table.
+                    if (row.leaf_override) row_opts.omit_leaf_reward = c.opts.omit_leaf_reward;
+                    break :blk nn.playValueOpts(c.vfn, prng.random(), row.mode, row_opts);
                 },
-                5 => nn.playValue(c.vfn, prng.random(), .phase_h1),
-                6 => nn.playValue(c.vfn, prng.random(), .phase_h2),
-                7 => nn.playValue(c.vfn, prng.random(), .phase_h3),
-                8 => nn.playValue(c.vfn, prng.random(), .phase_h4),
-                // #182: the same 2-ply tree with the low-probability chance branches cut
-                9 => nn.playValue(c.vfn, prng.random(), .deep_mass),
-                // #178: the .deep row with every search leaf averaged over the 8 dihedral transforms
-                10 => nn.playValueOpts(c.vfn, prng.random(), .deep, .{ .sym_leaf = true }),
-                // #183: iterative deepening from `.deep`, 200k leaf evaluations per move
-                11 => nn.playValueOpts(c.vfn, prng.random(), .deep, .{ .id_budget = 200_000 }),
-                // #189: .deep with the top two moves reranked by the snake heuristic on near ties
-                12 => nn.playValueOpts(c.vfn, prng.random(), .deep, .{ .rerank = rerank }),
-                // #187: the .deep row with the chance nodes moved 30% toward their CVaR
-                13 => nn.playValueOpts(c.vfn, prng.random(), .deep, .{ .risk_weight = 0.3 }),
-                // #188: deepen (#183) only when the 2-ply root move is within 0.05 of its runner-up
-                14 => nn.playValueOpts(c.vfn, prng.random(), .deep, .{ .id_budget = 200_000, .id_margin = 0.05 }),
-                // #266: the shipped 3-ply path, node TT on by default, so the row passes no options
-                15 => nn.playValueOpts(c.vfn, prng.random(), .deep3, .{}),
-                // #263: the table's saved time spent on a wider spawn cut (1e-3 instead of 1e-2)
-                16 => nn.playValueOpts(c.vfn, prng.random(), .deep3, .{ .cutoff = 1e-3 }),
-                // #267: one more ply than row 15 at the same cut, node TT explicitly on
-                17 => nn.playValueOpts(c.vfn, prng.random(), .deep4, .{ .node_tt = true }),
-                // #281: row 15 with only the 4 branches at empty cells >= 6 / >= 3 kept
-                18 => nn.playValueOpts(c.vfn, prng.random(), .deep3, .{ .cutoff = 0.02, .node_tt = true }),
-                19 => nn.playValueOpts(c.vfn, prng.random(), .deep3, .{ .cutoff = 0.05, .node_tt = true }),
-                // #261: cut branches evaluated one layer shallower instead of dropped
-                20 => nn.playValueOpts(c.vfn, prng.random(), .deep3_recover, .{}),
-                else => unreachable,
             };
         }
     }.f;
@@ -1126,7 +1090,7 @@ pub fn main(init: std.process.Init) !void {
         r.range_scores = try init.arena.allocator().alloc(f64, seed_ranges);
         const res_all = try init.arena.allocator().alloc(nn.PlayResult, games);
         const start = std.Io.Clock.awake.now(init.io);
-        parallel.map(nn.PlayResult, res_all, EvalCtx{ .vfn = eval_value, .policy = r.policy, .eval_seed = eval_seed, .opts = opts }, playGame);
+        parallel.map(nn.PlayResult, res_all, EvalCtx{ .vfn = eval_value, .spec = r.spec, .eval_seed = eval_seed, .opts = opts }, playGame);
         stats.rangeTotals(nn.PlayResult, Eval, r, res_all, eval_games);
         r.elapsed_ns = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
     }
@@ -1160,27 +1124,39 @@ test "pairrow reads two eval row indices and maps row 17 to deep4 (#267)" {
     try std.testing.expectEqual(@as(?usize, 17), parsePairRow(" 17 "));
     try std.testing.expectEqual(@as(?usize, null), parsePairRow("deep4"));
     try std.testing.expectEqual(@as(?usize, null), parsePairRow(null));
-    try std.testing.expectEqual(nn.Mode.deep3, evalRowSpec(15).?.mode);
-    try std.testing.expectEqual(nn.Mode.deep4, evalRowSpec(17).?.mode);
-    try std.testing.expectEqual(@as(?bool, true), evalRowSpec(17).?.opts.node_tt);
-    try std.testing.expect(evalRowSpec(3) == null);
+    try std.testing.expectEqual(nn.Mode.deep3, all_rows[15].spec.nn.mode);
+    try std.testing.expectEqual(nn.Mode.deep4, all_rows[17].spec.nn.mode);
+    try std.testing.expectEqual(@as(?bool, true), all_rows[17].spec.nn.opts.node_tt);
+    try std.testing.expectEqual(@as(u8, 2), all_rows[3].spec.expectimax);
 }
 
 test "high spawn-cut rows 18 and 19 keep the default row 15 path (#281)" {
-    try std.testing.expectEqual(nn.Mode.deep3, evalRowSpec(15).?.mode);
-    try std.testing.expectEqual(@as(?f64, null), evalRowSpec(15).?.opts.cutoff);
-    try std.testing.expectEqual(nn.Mode.deep3, evalRowSpec(18).?.mode);
-    try std.testing.expectEqual(@as(?f64, 0.02), evalRowSpec(18).?.opts.cutoff);
-    try std.testing.expectEqual(@as(?bool, true), evalRowSpec(18).?.opts.node_tt);
-    try std.testing.expectEqual(nn.Mode.deep3, evalRowSpec(19).?.mode);
-    try std.testing.expectEqual(@as(?f64, 0.05), evalRowSpec(19).?.opts.cutoff);
-    try std.testing.expectEqual(@as(?bool, true), evalRowSpec(19).?.opts.node_tt);
+    try std.testing.expectEqual(nn.Mode.deep3, all_rows[15].spec.nn.mode);
+    try std.testing.expectEqual(@as(?f64, null), all_rows[15].spec.nn.opts.cutoff);
+    try std.testing.expectEqual(nn.Mode.deep3, all_rows[18].spec.nn.mode);
+    try std.testing.expectEqual(@as(?f64, 0.02), all_rows[18].spec.nn.opts.cutoff);
+    try std.testing.expectEqual(@as(?bool, true), all_rows[18].spec.nn.opts.node_tt);
+    try std.testing.expectEqual(nn.Mode.deep3, all_rows[19].spec.nn.mode);
+    try std.testing.expectEqual(@as(?f64, 0.05), all_rows[19].spec.nn.opts.cutoff);
+    try std.testing.expectEqual(@as(?bool, true), all_rows[19].spec.nn.opts.node_tt);
 }
 
 test "recovered cut branch row 20 stays the default deep3 path (#261)" {
-    try std.testing.expectEqual(nn.Mode.deep3_recover, evalRowSpec(20).?.mode);
-    try std.testing.expectEqual(@as(?f64, null), evalRowSpec(20).?.opts.cutoff);
-    try std.testing.expect(evalRowSpec(21) == null);
+    try std.testing.expectEqual(nn.Mode.deep3_recover, all_rows[20].spec.nn.mode);
+    try std.testing.expectEqual(@as(?f64, null), all_rows[20].spec.nn.opts.cutoff);
+}
+
+test "eval row table is the single row source (#310)" {
+    try std.testing.expectEqual(@as(usize, 21), all_rows.len);
+    try std.testing.expectEqualStrings("nn 1-ply", all_rows[0].name);
+    try std.testing.expectEqualStrings("nn 3-ply + node TT default (#266)", all_rows[15].name);
+    try std.testing.expectEqualStrings("nn 3-ply cut branches recovered 1 ply shallow (#261)", all_rows[20].name);
+}
+
+test "leaf keeps its omit-leaf override on rows 2 and 4 (#260)" {
+    try std.testing.expect(all_rows[2].spec.nn.leaf_override);
+    try std.testing.expect(all_rows[4].spec.nn.leaf_override);
+    try std.testing.expectEqual(@as(?bool, false), all_rows[4].spec.nn.opts.node_tt);
 }
 
 test "usage text lists the pairrow variant (#267)" {
