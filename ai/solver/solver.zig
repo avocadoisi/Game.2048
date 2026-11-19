@@ -178,6 +178,16 @@ fn nnNet() *const nn.Net {
     return &cached_net.?;
 }
 
+/// Score one NN root branch for a worker; unsupported policies return null.
+pub fn scoreRootMove(policy: Policy, state: GameState, dir: Direction) ?f64 {
+    const mode: nn.Mode = switch (policy) {
+        .nn2 => .deep,
+        .nn3 => .deep3,
+        else => return null,
+    };
+    return nn.scoreRootMove(nnNet(), state, mode, dir, nn.sharedValueCache());
+}
+
 /// Quantized n-tuple table used by `algo=ntuple`; 64.6 MiB, so it is loaded once per thread and
 /// only when that policy is actually chosen (#129). Missing file -> the policy has no move.
 const ntuple_weight_bytes = "ai/solver/ntuple_wide_q16.bin";

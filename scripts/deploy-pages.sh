@@ -6,7 +6,7 @@
 #   scripts/deploy-pages.sh --skip-smoke skip `node scripts/wasm-smoke.mjs`
 #   scripts/deploy-pages.sh --enable     also turn the Pages site on (gh api)
 #
-# The site is the three files in `zig-out/web`; the NN weights are embedded in the
+# The site is built into `zig-out/web`; the NN weights are embedded in the
 # module, and the 64 MiB n-tuple table is not part of the browser build at all.
 set -euo pipefail
 
@@ -39,7 +39,7 @@ branch=$(git rev-parse --abbrev-ref HEAD)
 echo "==> zig build wasm -Doptimize=ReleaseFast"
 zig build wasm -Doptimize=ReleaseFast
 
-for file in index.html game2048.wasm; do
+for file in index.html game2048.wasm search-workers.mjs solver-worker.mjs; do
   test -s "zig-out/web/$file" || {
     echo "missing zig-out/web/$file" >&2
     exit 1

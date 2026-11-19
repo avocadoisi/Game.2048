@@ -24,7 +24,9 @@ zig build run -- help
 - 静的配信: `bash scripts/deploy-pages.sh`（ビルド → スモークテスト → `gh-pages` へ push）。
   手元で見るだけなら `zig build wasm -Doptimize=ReleaseFast` のあと `python3 -m http.server 8000 -d zig-out/web`。
   静的版の方針（既定 `nn3`）と自動再生の速度（既定は最速）は select で選べる。選べる方針は
-  ビルドに同梱したものだけで、その一覧は `wasm.policies` が決める（下記）
+  ビルドに同梱したものだけで、その一覧は `wasm.policies` が決める（下記）。
+  実験的な並列探索は `http://127.0.0.1:8000/?workers=1` で有効にする。`nn2` / `nn3` の
+  候補手を最大 4 worker で探索し、失敗・非対応時は従来の単一スレッドに戻る。
 
 ## サイズ
 
@@ -36,8 +38,8 @@ zig build run -- help
 | 行テーブル | 512 KiB | `src/core.zig` の `row_table`（1 行のマージを引く 65,536 エントリ）。wasm の静的データの大半 |
 | n-tuple 表 | 64.6 MiB | wasm には入れない（native の API 専用） |
 
-ブラウザへ配るのは HTML と wasm の 2 ファイルだけ。NN 系は重み込みでこの中に収まるので、
-サーバーも外部アセットも無しで動く。実測（ReleaseFast、V8 上の wasm、1 手あたり）は `nn2` が
+ブラウザへ配るのは HTML、wasm、worker 用の JavaScript モジュール 2 ファイル。NN 重みも
+wasm に含まれるため、他の外部アセットは要らない。実測（ReleaseFast、V8 上の wasm、1 手あたり）は `nn2` が
 9〜14 ms、`nn3` が序盤 0.3〜0.4 s / 盤面が詰まる終盤 4〜80 ms。`nn3` は 1 手ごとにメイン
 スレッドを掴むので、遅くして眺めたいときだけ速度を選ぶ（既定は遅延なし）。
 

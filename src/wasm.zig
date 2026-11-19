@@ -137,6 +137,17 @@ export fn solve(algo: u32, depth: u32) i32 {
     return @backingInt(dir);
 }
 
+/// One root candidate, or NaN for an illegal direction or unsupported policy.
+export fn solve_root(algo: u32, dir: u32) f64 {
+    const direction = indexToDirection(dir) orelse return std.math.nan(f64);
+    switch (algo) {
+        inline 0...policies.len - 1 => |i| {
+            return solver.scoreRootMove(policies[i], state, direction) orelse std.math.nan(f64);
+        },
+        else => return std.math.nan(f64),
+    }
+}
+
 export fn board_ptr() [*]const u32 {
     return @ptrCast(&state.board);
 }
