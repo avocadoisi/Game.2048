@@ -139,6 +139,151 @@ const default_seed_ranges: u32 = 1;
 /// Appended after `weights_path` so existing command lines keep their meaning.
 const default_train_seed: u64 = 1;
 
+/// Every accepted `variant` string, one tag per variant. The table below owns the facts that used to be
+/// repeated at the three hand-written dispatch sites in `main`.
+const Variant = enum {
+    base,
+    backward,
+    replay,
+    tnet,
+    priority,
+    midgame,
+    midmix,
+    sym,
+    symlam,
+    symbatch,
+    rsym,
+    rtgt,
+    explore,
+    explore20,
+    open8,
+    open16,
+    nstep,
+    death,
+    t2,
+    p2,
+    tp2,
+    d2,
+    d3,
+    dumpp2,
+    tch,
+    tchadd,
+    dist,
+    dson,
+    oi,
+    oi16,
+    @"resume",
+    mstd,
+    dump,
+    ft2,
+    restart,
+    adam,
+    tailw,
+    clamp,
+    shape,
+    clip,
+    pairw,
+    pairleaf,
+    pairrow,
+    leaf,
+    pair,
+    par,
+    lam,
+    rlam,
+    /// Not in `variant_specs`: the placeholder for a name no entry matched. It carries every default
+    /// fact, so dispatch treats it like a variant with no flags and the options chain below reaches
+    /// its own `else` and prints the usage - the same place, and after the same parses, as before the
+    /// table existed. Old code parsed later slots before it noticed the name was unknown.
+    unknown,
+};
+
+/// Which arm of the old `max_args` if-chain a variant used. `rows` is the arm shared by the variants
+/// that read the eval-row slot; the others carry one variant-specific ceiling.
+const MaxArgs = enum { clip, value, rows, ft2_tch, dump, pairw_pairleaf, pairrow };
+
+/// Facts that depend on the variant name. `load_weights` loads `weights_path` before training, `dump`
+/// requires the index-11 dump path, `rows` reads index 13 as eval rows, and `max_args` selects the cap.
+const VariantSpec = struct {
+    variant: Variant,
+    load_weights: bool = false,
+    dump: bool = false,
+    rows: bool = true,
+    max_args: MaxArgs = .rows,
+};
+
+/// One entry per accepted variant. The order is only for readers; lookup uses the tag name.
+const variant_specs = [_]VariantSpec{
+    .{ .variant = .base },
+    .{ .variant = .backward },
+    .{ .variant = .replay },
+    .{ .variant = .tnet, .rows = false, .max_args = .value },
+    .{ .variant = .priority },
+    .{ .variant = .midgame },
+    .{ .variant = .midmix },
+    .{ .variant = .sym },
+    .{ .variant = .symlam },
+    .{ .variant = .symbatch },
+    .{ .variant = .rsym },
+    .{ .variant = .rtgt },
+    .{ .variant = .explore },
+    .{ .variant = .explore20 },
+    .{ .variant = .open8 },
+    .{ .variant = .open16 },
+    .{ .variant = .nstep },
+    .{ .variant = .death },
+    .{ .variant = .t2, .load_weights = true },
+    .{ .variant = .p2, .load_weights = true },
+    .{ .variant = .tp2, .load_weights = true },
+    .{ .variant = .d2 },
+    .{ .variant = .d3 },
+    .{ .variant = .dumpp2, .load_weights = true, .dump = true, .max_args = .dump },
+    .{ .variant = .tch, .load_weights = true, .dump = true, .max_args = .ft2_tch },
+    .{ .variant = .tchadd, .load_weights = true, .dump = true, .max_args = .ft2_tch },
+    .{ .variant = .dist, .load_weights = true, .dump = true, .rows = false, .max_args = .value },
+    .{ .variant = .dson, .load_weights = true, .dump = true, .rows = false, .max_args = .value },
+    .{ .variant = .oi },
+    .{ .variant = .oi16 },
+    .{ .variant = .@"resume", .load_weights = true },
+    .{ .variant = .mstd },
+    .{ .variant = .dump, .load_weights = true, .dump = true, .max_args = .dump },
+    .{ .variant = .ft2, .load_weights = true, .dump = true, .max_args = .ft2_tch },
+    .{ .variant = .restart, .load_weights = true, .dump = true, .max_args = .dump },
+    .{ .variant = .adam, .rows = false, .max_args = .value },
+    .{ .variant = .tailw, .rows = false, .max_args = .value },
+    .{ .variant = .clamp, .rows = false, .max_args = .value },
+    .{ .variant = .shape, .rows = false, .max_args = .value },
+    .{ .variant = .clip, .rows = false, .max_args = .clip },
+    .{ .variant = .pairw, .rows = false, .max_args = .pairw_pairleaf },
+    .{ .variant = .pairleaf, .rows = false, .max_args = .pairw_pairleaf },
+    .{ .variant = .pairrow, .rows = false, .max_args = .pairrow },
+    .{ .variant = .leaf },
+    .{ .variant = .pair, .rows = false },
+    .{ .variant = .par },
+    .{ .variant = .lam, .max_args = .value },
+    .{ .variant = .rlam, .load_weights = true, .max_args = .value },
+};
+
+/// Resolve a command-line variant name exactly once. This is the only variant-name comparison left.
+fn findVariant(name: []const u8) ?VariantSpec {
+    for (variant_specs) |spec| {
+        if (std.mem.eql(u8, name, @tagName(spec.variant))) return spec;
+    }
+    return null;
+}
+
+/// Reproduce the old `max_args` if-chain from the table facts and the two runtime slots that feed it.
+fn maxArgs(spec: VariantSpec, row_spec: ?[]const u8, use_par: bool) usize {
+    return switch (spec.max_args) {
+        .clip => 15,
+        .value => 14,
+        .rows => if (row_spec != null) 14 else if (use_par) 13 else 11,
+        .ft2_tch => if (row_spec != null) 14 else 13,
+        .dump => if (row_spec != null) 14 else 12,
+        .pairw_pairleaf => if (use_par) 13 else 12,
+        .pairrow => 13,
+    };
+}
+
 /// (#203) Fill `sel` from the `rows` argument: comma-separated indices, any bad token or an index
 /// past the table is an error, so a typo never silently runs the full table.
 fn parseRows(sel: []bool, spec: []const u8) !void {
@@ -347,11 +492,6 @@ fn loadTeachers(buffer: *nn.Teachers, io: std.Io, gpa: std.mem.Allocator, path: 
         std.process.exit(1);
     }
     std.debug.print("teacher file {s}: {d} samples\n", .{ path, buffer.len });
-}
-
-/// Whether arg 6 (`variant`) is the `death` reward. Only used to reject `dist` + `death`.
-fn wantsDeath(args: []const []const u8) !bool {
-    return args.len > 6 and std.mem.eql(u8, args[6], "death");
 }
 
 /// Starting net for `main`: `weights_path` when resuming (or eval-only), otherwise a random init
@@ -599,61 +739,84 @@ pub fn main(init: std.process.Init) !void {
     const want_diag = arg5 != null and std.mem.eql(u8, arg5.?, "diag");
     const no_diag = arg5 != null and std.mem.eql(u8, arg5.?, "-");
     const seed_ranges: u32 = if (arg5) |a| (if (want_diag or no_diag) 1 else try std.fmt.parseInt(u32, a, 10)) else default_seed_ranges;
-    const variant = if (args.len > 6) args[6] else "base";
+    const variant_name = if (args.len > 6) args[6] else "base";
     // arg 6 `par` means base + parallel (unchanged); arg 10 `par` batches the variant of arg 6
-    const par_variant = std.mem.eql(u8, variant, "par");
     const par_tail = try parseParFlag(args);
+    const spec = findVariant(variant_name) orelse VariantSpec{ .variant = .unknown };
+    const variant = @tagName(spec.variant);
+    const par_variant = spec.variant == .par;
     const use_par = par_variant or par_tail;
-    const is_mstd = std.mem.eql(u8, variant, "mstd");
+    const is_base = spec.variant == .base;
+    const is_resume = spec.variant == .@"resume";
+    const is_backward = spec.variant == .backward;
+    const is_replay = spec.variant == .replay;
+    const is_priority = spec.variant == .priority;
+    const is_midgame = spec.variant == .midgame;
+    const is_midmix = spec.variant == .midmix;
+    const is_sym = spec.variant == .sym;
+    const is_symlam = spec.variant == .symlam;
+    const is_symbatch = spec.variant == .symbatch;
+    const is_rsym = spec.variant == .rsym;
+    const is_rtgt = spec.variant == .rtgt;
+    const is_explore = spec.variant == .explore;
+    const is_explore20 = spec.variant == .explore20;
+    const is_open8 = spec.variant == .open8;
+    const is_open16 = spec.variant == .open16;
+    const is_nstep = spec.variant == .nstep;
+    const is_mstd = spec.variant == .mstd;
+    const is_death = spec.variant == .death;
+    const is_d2 = spec.variant == .d2;
+    const is_d3 = spec.variant == .d3;
+    const is_oi = spec.variant == .oi;
+    const is_oi16 = spec.variant == .oi16;
     // `dumpp2` records the same buffer as `dump`, but from 2-ply self-play boards: the distribution the
     // 2-ply eval actually visits, which is what the teacher regression is supposed to fix (#175).
-    const is_dumpp2 = std.mem.eql(u8, variant, "dumpp2");
-    const is_dump = std.mem.eql(u8, variant, "dump") or is_dumpp2;
-    const is_ft2 = std.mem.eql(u8, variant, "ft2");
-    const is_restart = std.mem.eql(u8, variant, "restart");
+    const is_dumpp2 = spec.variant == .dumpp2;
+    const is_dump = spec.variant == .dump or is_dumpp2;
+    const is_ft2 = spec.variant == .ft2;
+    const is_restart = spec.variant == .restart;
     // Paired comparison (#168): two policies play the same spawn tape.
-    const is_pair = std.mem.eql(u8, variant, "pair");
+    const is_pair = spec.variant == .pair;
     // Paired comparison of two weight files (#210): A = weights_path, B = the file at index 12, both with
     // the same policy, so a candidate net is judged against the shipped one on identical spawns.
-    const is_pairw = std.mem.eql(u8, variant, "pairw");
-    const is_pairleaf = std.mem.eql(u8, variant, "pairleaf");
-    const is_pairrow = std.mem.eql(u8, variant, "pairrow");
-    const is_leaf = std.mem.eql(u8, variant, "leaf");
+    const is_pairw = spec.variant == .pairw;
+    const is_pairleaf = spec.variant == .pairleaf;
+    const is_pairrow = spec.variant == .pairrow;
+    const is_leaf = spec.variant == .leaf;
     const leaf_mode: nn.Mode = if (is_pairleaf) parsePairLeafMode(if (args.len > 11) args[11] else null) orelse {
         std.debug.print("pairleaf mode must be deep or deep3\\n{s}", .{usage});
         return;
     } else .deep;
-    const is_tch = std.mem.eql(u8, variant, "tch") or std.mem.eql(u8, variant, "tchadd");
-    const is_tchadd = std.mem.eql(u8, variant, "tchadd");
-    const is_dist = std.mem.eql(u8, variant, "dist");
-    const is_dson = std.mem.eql(u8, variant, "dson");
+    const is_tch = spec.variant == .tch or spec.variant == .tchadd;
+    const is_tchadd = spec.variant == .tchadd;
+    const is_dist = spec.variant == .dist;
+    const is_dson = spec.variant == .dson;
     // (#228) the 2-ply-aligned variants: the search per move is priced from `weights_path` too.
-    const is_t2 = std.mem.eql(u8, variant, "t2");
-    const is_p2 = std.mem.eql(u8, variant, "p2");
-    const is_tp2 = std.mem.eql(u8, variant, "tp2");
+    const is_t2 = spec.variant == .t2;
+    const is_p2 = spec.variant == .p2;
+    const is_tp2 = spec.variant == .tp2;
     // (#231) `par` only: Adam steps on the merged batch gradient.
-    const is_adam = std.mem.eql(u8, variant, "adam");
+    const is_adam = spec.variant == .adam;
     // (#232) `par`-compatible: the weight is a per-sample `lr` multiplier, so every game stays independent.
-    const is_tailw = std.mem.eql(u8, variant, "tailw");
+    const is_tailw = spec.variant == .tailw;
     // (#234) `par`-compatible: a bounded TD target, so a diverging value cannot bootstrap itself.
-    const is_clamp = std.mem.eql(u8, variant, "clamp");
+    const is_clamp = spec.variant == .clamp;
     // (#277) `par`-compatible: potential-based shaping with the empty-cell potential.
-    const is_shape = std.mem.eql(u8, variant, "shape");
+    const is_shape = spec.variant == .shape;
     // (#262) replay with a frozen bootstrap net: a `par` variable, see `TargetSync`.
-    const is_tnet = std.mem.eql(u8, variant, "tnet");
+    const is_tnet = spec.variant == .tnet;
     const target_every: usize = if (is_tnet) try parseTargetEvery(args) else 0;
     // (#246) the step ceiling: `norm` bounds the merged `par` delta, `step` every element of a step.
-    const is_clip = std.mem.eql(u8, variant, "clip");
+    const is_clip = spec.variant == .clip;
     const clip_mode: ClipMode = if (is_clip) try parseClipMode(args) else .norm;
     // (#206) the teacher mix: `distill_every` (arg 12) and the rate divisor (arg 13).
     const dist_mix: DistillMix = if (is_dist or is_dson) try parseDistillMix(args) else .{};
     // #159 variants train from the net in weights_path (the deep positions come from that net), like `resume`
-    const is_lam = std.mem.eql(u8, variant, "lam");
-    const is_rlam = std.mem.eql(u8, variant, "rlam");
-    const use_resume = std.mem.eql(u8, variant, "resume") or is_dump or is_ft2 or is_restart or is_dist or is_dson or is_tch or
-        is_t2 or is_p2 or is_tp2 or is_rlam;
+    const is_lam = spec.variant == .lam;
+    const is_rlam = spec.variant == .rlam;
+    const use_resume = spec.load_weights;
     // Variants that take dump_path at index 11: `dump` writes it, `ft2` and `restart` read it.
-    const uses_dump = is_dump or is_ft2 or is_restart or is_tch or is_dist or is_dson;
+    const uses_dump = spec.dump;
     const replay_k: usize = try cli.argOr(usize, args, 7, default_replay_k);
     const weights_path: []const u8 = try cli.argOr([]const u8, args, 8, default_weights_path);
     const train_seed: u64 = try cli.argOr(u64, args, 9, default_train_seed);
@@ -675,13 +838,13 @@ pub fn main(init: std.process.Init) !void {
     const batch_scale: f64 = if (use_par) try parseBatchScale(args) else 1.0;
     // `use_resume` only decides whether `weights_path` is loaded; the variant still has to reach `opts`
     // (before, `dump`/`ft2`/`restart`/`dist` fell into this first branch and their options were dropped).
-    var opts: nn.Options = if (par_variant or is_pair or is_pairw or is_pairleaf or is_pairrow or std.mem.eql(u8, variant, "base") or std.mem.eql(u8, variant, "resume") or is_tch)
+    var opts: nn.Options = if (par_variant or is_pair or is_pairw or is_pairleaf or is_pairrow or is_base or is_resume or is_tch)
         .{ .batch_scale = batch_scale }
     else if (is_leaf)
         .{ .omit_leaf_reward = true }
-    else if (std.mem.eql(u8, variant, "backward"))
+    else if (is_backward)
         .{ .backward = true }
-    else if (std.mem.eql(u8, variant, "replay"))
+    else if (is_replay)
         .{ .replay_k = replay_k }
     else if (is_rlam)
         // (#300) resume + the replay sweep as TD(lambda); index 13 `0` is the TD(0) control.
@@ -692,39 +855,39 @@ pub fn main(init: std.process.Init) !void {
         .{ .replay_k = replay_k, .sweep_lambda = try parseSweepLambda(args) }
     else if (is_tnet)
         .{ .replay_k = replay_k, .target_net = &target_sync.net }
-    else if (std.mem.eql(u8, variant, "priority"))
+    else if (is_priority)
         .{ .priority = &priority }
-    else if (std.mem.eql(u8, variant, "midgame"))
+    else if (is_midgame)
         .{ .priority = &priority, .midgame = true }
-    else if (std.mem.eql(u8, variant, "midmix"))
+    else if (is_midmix)
         .{ .priority = &priority, .midmix = true }
-    else if (std.mem.eql(u8, variant, "sym"))
+    else if (is_sym)
         .{ .symmetry = true }
-    else if (std.mem.eql(u8, variant, "symlam"))
+    else if (is_symlam)
         .{ .symmetry = true, .lambda = 0.7 }
-    else if (std.mem.eql(u8, variant, "symbatch"))
+    else if (is_symbatch)
         .{ .sym_batch = true }
-    else if (std.mem.eql(u8, variant, "rsym"))
+    else if (is_rsym)
         .{ .rsym = true }
-    else if (std.mem.eql(u8, variant, "rtgt"))
+    else if (is_rtgt)
         .{ .rtgt = true }
-    else if (std.mem.eql(u8, variant, "explore"))
+    else if (is_explore)
         .{ .explore = 0.05 }
-    else if (std.mem.eql(u8, variant, "explore20"))
+    else if (is_explore20)
         .{ .explore = 0.20 }
-    else if (std.mem.eql(u8, variant, "open8"))
+    else if (is_open8)
         .{ .warm_open = 8 }
-    else if (std.mem.eql(u8, variant, "open16"))
+    else if (is_open16)
         .{ .warm_open = 16 }
-    else if (std.mem.eql(u8, variant, "nstep"))
+    else if (is_nstep)
         .{ .nstep = 4 }
-    else if (std.mem.eql(u8, variant, "death"))
+    else if (is_death)
         .{ .death = true }
-    else if (std.mem.eql(u8, variant, "t2"))
+    else if (is_t2)
         .{ .target = .search2 }
-    else if (std.mem.eql(u8, variant, "p2"))
+    else if (is_p2)
         .{ .selfplay = .deep2 }
-    else if (std.mem.eql(u8, variant, "tp2"))
+    else if (is_tp2)
         .{ .target = .search2, .selfplay = .deep2 }
     else if (is_adam)
         .{ .adam = &adam, .adam_lr = try parseAdamLr(args) }
@@ -737,9 +900,9 @@ pub fn main(init: std.process.Init) !void {
     else if (is_clip) switch (clip_mode) {
         .norm => .{ .grad_clip = try parseStepCap(args) },
         .step => .{ .step_clip = try parseStepCap(args) },
-    } else if (std.mem.eql(u8, variant, "d2"))
+    } else if (is_d2)
         .{ .teacher = .deep }
-    else if (std.mem.eql(u8, variant, "d3"))
+    else if (is_d3)
         .{ .teacher = .deep3 }
     else if (is_dump)
         .{
@@ -755,7 +918,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .distill = teachers, .distill_every = dist_mix.every, .distill_lr = distillRate(learning_rate, dist_mix.div) }
     else if (is_dson)
         .{ .distill = teachers, .distill_only = true, .distill_every = dist_mix.every, .distill_lr = distillRate(learning_rate, dist_mix.div) }
-    else if (std.mem.eql(u8, variant, "oi") or std.mem.eql(u8, variant, "oi16") or is_mstd)
+    else if (is_oi or is_oi16 or is_mstd)
         .{}
     else {
         std.debug.print("{s}", .{usage});
@@ -773,11 +936,11 @@ pub fn main(init: std.process.Init) !void {
     };
     // `dump` is the shared layout plus one slot: index 11 carries the dump path.
     // `par` runs may carry the #137 batch_scale at index 12, after the `-` dump slot.
-    // (#203) index 13 narrows the eval table to the rows a measurement needs (`0,2`); `dist`/`dson`
-    // already own 13 as the teacher lr divisor, `adam` as its step size, `tnet` as the target sync
-    // interval, and `pairw` returns before the table is built.
-    const row_spec: ?[]const u8 = if (is_dist or is_dson or is_adam or is_tailw or is_clamp or is_shape or is_tnet or is_clip or is_pairw or is_pair or is_pairleaf or is_pairrow) null else if (args.len > 13) args[13] else null;
-    const max_args: usize = if (is_clip) 15 else if (is_dist or is_dson or is_adam or is_tailw or is_clamp or is_shape or is_tnet or is_lam or is_rlam) 14 else if (row_spec != null) 14 else if (is_ft2 or is_tch) 13 else if (uses_dump) 12 else if (use_par) 13 else if (is_pairw or is_pairleaf) 12 else if (is_pairrow) 13 else 11;
+    // (#203) index 13 narrows the eval table to the rows a measurement needs (`0,2`). The variants that
+    // own 13 for another parameter are marked `rows = false` in `variant_specs` (including `lam`/`rlam`,
+    // whose current double-read is deliberately preserved).
+    const row_spec: ?[]const u8 = if (spec.rows and args.len > 13) args[13] else null;
+    const max_args = maxArgs(spec, row_spec, use_par);
     if (args.len > max_args or seed_ranges == 0 or (uses_dump and dump_path == null) or ((is_pairleaf or is_leaf or is_pairrow) and train_games != 0)) {
         std.debug.print("{s}", .{usage});
         return;
@@ -806,7 +969,7 @@ pub fn main(init: std.process.Init) !void {
     // `dist` has no replay / death / restart / dump half to combine with: refuse instead of ignoring.
     // `dist` keeps the plain TD half (so replay applies to it); `dson` has no TD half, so a replay
     // buffer would be dropped on the floor.
-    if ((is_dson and replay_k > 0) or ((is_dist or is_dson) and (try wantsDeath(args) or is_restart or is_dump))) {
+    if ((is_dson and replay_k > 0) or ((is_dist or is_dson) and (is_death or is_restart or is_dump))) {
         std.debug.print("{s}", .{usage});
         return;
     }
@@ -825,7 +988,7 @@ pub fn main(init: std.process.Init) !void {
     // (#262) The initial snapshot is the starting net; the first batch trains against it.
     if (is_tnet) target_sync = TargetSync.init(&net, target_every);
     // Optimistic initialization (#107) only rescales the random init, so it stays out of `nn.Options`.
-    if (std.mem.eql(u8, variant, "oi")) nn.scaleInit(&net, 4) else if (std.mem.eql(u8, variant, "oi16")) nn.scaleInit(&net, 16);
+    if (is_oi) nn.scaleInit(&net, 4) else if (is_oi16) nn.scaleInit(&net, 16);
     if (is_tch) {
         // #175 teacher pass: price every stored deep afterstate once, write `<dump_path>.tch`, train nothing.
         // #207 `tchadd` appends to that file instead of replacing it, so N dumps give one N x 65,536 teacher.
@@ -937,9 +1100,9 @@ pub fn main(init: std.process.Init) !void {
     // (0 = 1-ply, 2 = 2-ply) instead of paying for the 3-ply rows twice over. A stray token is a
     // command-line error, never a silent fallback to the full table.
     var row_selection: [all_rows.len]bool = @splat(true);
-    if (row_spec) |spec| {
-        if (!std.mem.eql(u8, spec, "-"))
-            parseRows(&row_selection, spec) catch {
+    if (row_spec) |rows_arg| {
+        if (!std.mem.eql(u8, rows_arg, "-"))
+            parseRows(&row_selection, rows_arg) catch {
                 std.debug.print("error: rows must be a comma list of row indices (e.g. 0,2)\n{s}", .{usage});
                 return;
             };
@@ -994,14 +1157,14 @@ pub fn main(init: std.process.Init) !void {
         pair_name_a = all_rows[row_a].name;
         pair_name_b = all_rows[row_b].name;
         pair_spec_a = switch (all_rows[row_a].spec) {
-            .nn => |spec| spec,
+            .nn => |nn_spec| nn_spec,
             .expectimax => {
                 std.debug.print("pairrow row {d} ({s}) is not an NN search row\n{s}", .{ row_a, pair_name_a, usage });
                 return;
             },
         };
         pair_spec_b = switch (all_rows[row_b].spec) {
-            .nn => |spec| spec,
+            .nn => |nn_spec| nn_spec,
             .expectimax => {
                 std.debug.print("pairrow row {d} ({s}) is not an NN search row\n{s}", .{ row_b, pair_name_b, usage });
                 return;
@@ -1565,4 +1728,157 @@ test "shape variant reads its coefficient from the row-spec slot (#277)" {
 test "usage text lists the shape variant and its coefficient slot (#277)" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "shape   (#277") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "empty-cell potential") != null);
+}
+
+test "variant table lists every accepted variant name once (#314)" {
+    const names = [_][]const u8{
+        "base",   "backward", "replay",  "tnet", "priority", "midgame",   "midmix", "sym",
+        "symlam", "symbatch", "rsym",    "rtgt", "explore",  "explore20", "open8",  "open16",
+        "nstep",  "death",    "t2",      "p2",   "tp2",      "d2",        "d3",     "dumpp2",
+        "tch",    "tchadd",   "dist",    "dson", "oi",       "oi16",      "resume", "mstd",
+        "dump",   "ft2",      "restart", "adam", "tailw",    "clamp",     "shape",  "clip",
+        "pairw",  "pairleaf", "pairrow", "leaf", "pair",     "par",       "lam",    "rlam",
+    };
+    try std.testing.expectEqual(names.len, variant_specs.len);
+    for (variant_specs, 0..) |spec, i| {
+        try std.testing.expectEqual(spec, findVariant(@tagName(spec.variant)).?);
+        for (variant_specs[0..i]) |prev| {
+            try std.testing.expect(!std.mem.eql(u8, @tagName(spec.variant), @tagName(prev.variant)));
+        }
+    }
+    for (names) |name| try std.testing.expect(findVariant(name) != null);
+    try std.testing.expect(findVariant("no-such-variant") == null);
+}
+
+test "variant table resume and dump sets match the old hand lists (#314)" {
+    const resumes = [_][]const u8{
+        "resume", "dump", "dumpp2", "ft2", "restart", "dist", "dson", "tch", "tchadd", "t2", "p2", "tp2", "rlam",
+    };
+    const dumps = [_][]const u8{
+        "dump", "dumpp2", "ft2", "restart", "tch", "tchadd", "dist", "dson",
+    };
+    var resume_count: usize = 0;
+    var dump_count: usize = 0;
+    for (variant_specs) |spec| {
+        var wants_resume = false;
+        for (resumes) |name| {
+            if (std.mem.eql(u8, name, @tagName(spec.variant))) wants_resume = true;
+        }
+        var wants_dump = false;
+        for (dumps) |name| {
+            if (std.mem.eql(u8, name, @tagName(spec.variant))) wants_dump = true;
+        }
+        try std.testing.expectEqual(wants_resume, spec.load_weights);
+        try std.testing.expectEqual(wants_dump, spec.dump);
+        if (spec.load_weights) resume_count += 1;
+        if (spec.dump) dump_count += 1;
+    }
+    try std.testing.expectEqual(resumes.len, resume_count);
+    try std.testing.expectEqual(dumps.len, dump_count);
+}
+
+test "variant table rows flag matches the old row_spec exclusion (#314)" {
+    const no_rows = [_][]const u8{
+        "dist", "dson", "adam", "tailw", "clamp", "shape", "tnet", "clip", "pairw", "pair", "pairleaf", "pairrow",
+    };
+    var no_rows_count: usize = 0;
+    for (variant_specs) |spec| {
+        var expects_no_rows = false;
+        for (no_rows) |name| {
+            if (std.mem.eql(u8, name, @tagName(spec.variant))) expects_no_rows = true;
+        }
+        try std.testing.expectEqual(!expects_no_rows, spec.rows);
+        if (!spec.rows) no_rows_count += 1;
+    }
+    try std.testing.expectEqual(no_rows.len, no_rows_count);
+}
+
+test "variant table max_args matches the old if-chain (#314)" {
+    const MaxExpect = struct { name: []const u8, no_rows: usize, no_rows_par: usize, rows: ?usize };
+    const expected = [_]MaxExpect{
+        .{ .name = "base", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "backward", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "replay", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "tnet", .no_rows = 14, .no_rows_par = 14, .rows = null },
+        .{ .name = "priority", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "midgame", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "midmix", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "sym", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "symlam", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "symbatch", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "rsym", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "rtgt", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "explore", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "explore20", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "open8", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "open16", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "nstep", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "death", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "t2", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "p2", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "tp2", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "d2", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "d3", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "dumpp2", .no_rows = 12, .no_rows_par = 12, .rows = 14 },
+        .{ .name = "tch", .no_rows = 13, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "tchadd", .no_rows = 13, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "dist", .no_rows = 14, .no_rows_par = 14, .rows = null },
+        .{ .name = "dson", .no_rows = 14, .no_rows_par = 14, .rows = null },
+        .{ .name = "oi", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "oi16", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "resume", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "mstd", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "dump", .no_rows = 12, .no_rows_par = 12, .rows = 14 },
+        .{ .name = "ft2", .no_rows = 13, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "restart", .no_rows = 12, .no_rows_par = 12, .rows = 14 },
+        .{ .name = "adam", .no_rows = 14, .no_rows_par = 14, .rows = null },
+        .{ .name = "tailw", .no_rows = 14, .no_rows_par = 14, .rows = null },
+        .{ .name = "clamp", .no_rows = 14, .no_rows_par = 14, .rows = null },
+        .{ .name = "shape", .no_rows = 14, .no_rows_par = 14, .rows = null },
+        .{ .name = "clip", .no_rows = 15, .no_rows_par = 15, .rows = null },
+        .{ .name = "pairw", .no_rows = 12, .no_rows_par = 13, .rows = null },
+        .{ .name = "pairleaf", .no_rows = 12, .no_rows_par = 13, .rows = null },
+        .{ .name = "pairrow", .no_rows = 13, .no_rows_par = 13, .rows = null },
+        .{ .name = "leaf", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "pair", .no_rows = 11, .no_rows_par = 13, .rows = null },
+        .{ .name = "par", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "lam", .no_rows = 14, .no_rows_par = 14, .rows = 14 },
+        .{ .name = "rlam", .no_rows = 14, .no_rows_par = 14, .rows = 14 },
+    };
+    try std.testing.expectEqual(variant_specs.len, expected.len);
+    for (expected) |e| {
+        const spec = findVariant(e.name).?;
+        try std.testing.expectEqual(e.no_rows, maxArgs(spec, null, false));
+        try std.testing.expectEqual(e.no_rows_par, maxArgs(spec, null, true));
+        if (e.rows) |rows_cap| {
+            try std.testing.expect(spec.rows);
+            try std.testing.expectEqual(rows_cap, maxArgs(spec, "0,2", false));
+            try std.testing.expectEqual(rows_cap, maxArgs(spec, "0,2", true));
+        } else {
+            try std.testing.expect(!spec.rows);
+        }
+    }
+}
+
+test "lam and rlam still read index 13 as rows before lambda (#314)" {
+    var selected: [all_rows.len]bool = @splat(false);
+    for ([_][]const u8{ "lam", "rlam" }) |name| {
+        const spec = findVariant(name).?;
+        const row_spec: ?[]const u8 = if (spec.rows and 14 > 13) "0.7" else null;
+        try std.testing.expectEqual(@as(usize, 14), maxArgs(spec, row_spec, false));
+        try std.testing.expectError(error.InvalidRow, parseRows(&selected, row_spec.?));
+    }
+}
+
+test "an unknown variant keeps the old parse order and usage path (#314)" {
+    // The old code parsed the later slots before it noticed the name was unknown, then printed the
+    // usage from the options chain's final `else`. `.unknown` carries every default fact so dispatch
+    // runs the same path; this pins those facts and the cap the placeholder computes.
+    const spec = VariantSpec{ .variant = .unknown };
+    try std.testing.expect(!spec.load_weights and !spec.dump and spec.rows);
+    try std.testing.expectEqual(@as(usize, 14), maxArgs(spec, "0,2", false));
+    try std.testing.expectEqual(@as(usize, 13), maxArgs(spec, null, true));
+    try std.testing.expectEqual(@as(usize, 11), maxArgs(spec, null, false));
+    // A borrowed name (`unknown`) is not in the table either, so it resolves to the placeholder.
+    try std.testing.expect(findVariant("unknown") == null);
 }
