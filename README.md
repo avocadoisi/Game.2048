@@ -147,6 +147,11 @@ zig build nn-quant -- ai/solver/nn_weights.bin /tmp/nn_weights_q.bin  # f32 -> i
 zig build ga-rl  -- 16 15 8 2 1 500 100                                  # population generations games depth seed holdout_seed holdout_games
 ```
 
+入力層の SIMD は実験用に `-Dnn-simd=true` で有効にできる（既定は scalar）。同梱 128/32 重みの
+forward の局所計測は `zig build bench-forward -Doptimize=ReleaseFast -Dnn-simd=false` と
+`zig build bench-forward -Doptimize=ReleaseFast -Dnn-simd=true` を逐次実行する。12 種の固定盤面を
+順に計 100 万回測る microbench であり、ゲーム全体の速度を示すものではない。
+
 引数の意味は各ランナーの usage（引数なしで実行）に出す。variant の実行では重みを `/tmp` などリポジトリ外へ出す。
 学習 variant（`nn` の `sym` / `nstep` / `death` など、`ntuple` の `light` / `wide`）の一覧と結果は
 [docs/solver-history.md](docs/solver-history.md) を参照。
