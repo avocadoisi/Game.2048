@@ -139,8 +139,8 @@ const default_seed_ranges: u32 = 1;
 /// Appended after `weights_path` so existing command lines keep their meaning.
 const default_train_seed: u64 = 1;
 
-/// Every accepted `variant` string, one tag per variant. The table below owns the facts that used to be
-/// repeated at the three hand-written dispatch sites in `main`.
+/// Every accepted `variant` string, one tag per variant. The table below owns the facts and the options
+/// builder that used to be repeated at the hand-written dispatch sites in `main`.
 const Variant = enum {
     base,
     backward,
@@ -191,9 +191,9 @@ const Variant = enum {
     lam,
     rlam,
     /// Not in `variant_specs`: the placeholder for a name no entry matched. It carries every default
-    /// fact, so dispatch treats it like a variant with no flags and the options chain below reaches
-    /// its own `else` and prints the usage - the same place, and after the same parses, as before the
-    /// table existed. Old code parsed later slots before it noticed the name was unknown.
+    /// fact and no builder, so `main` prints the usage where the old chain's final `else` did - the
+    /// same place, and after the same parses, as before the table existed (the old code parsed later
+    /// slots before it noticed the name was unknown).
     unknown,
 };
 
@@ -201,10 +201,38 @@ const Variant = enum {
 /// that read the eval-row slot; the others carry one variant-specific ceiling.
 const MaxArgs = enum { clip, value, rows, ft2_tch, dump, pairw_pairleaf, pairrow };
 
-/// Facts that depend on the variant name. `load_weights` loads `weights_path` before training, `dump`
-/// requires the index-11 dump path, `rows` reads index 13 as eval rows, and `max_args` selects the cap.
+/// Everything a variant's `nn.Options` builder reads. The buffers the options point at (`adam`,
+/// `priority`, `dump`, `teachers`, the `tnet` snapshot) belong to `main`, so they are borrowed here;
+/// `args` is the raw command line, read only through the `parse*` helpers.
+const BuildCtx = struct {
+    args: []const []const u8,
+    replay_k: usize,
+    learning_rate: f64,
+    adam: *nn.Adam,
+    priority: *nn.Priority,
+    dump: *nn.Dump,
+    teachers: *nn.Teachers,
+    /// `tnet`: the snapshot the next-state value of every TD target is read from.
+    target_net: *const nn.Net,
+    /// parsed in `main`, which also needs it for the `par` rejection and the `clip:<mode>` log.
+    clip_mode: ClipMode,
+    /// parsed in `main` before the options are built, where the old chain parsed it: reading it
+    /// inside the builder would reorder it after `replay_k`/`batch_scale` and turn an `InvalidDistill*`
+    /// on a line with two bad slots into their error.
+    dist_mix: DistillMix,
+};
+
+/// One variant's `nn.Options`, built from the command line. The tail every variant shares
+/// (`batch_scale`, `nn.validateOptions`) stays in `main`.
+const BuildFn = *const fn (*const BuildCtx) anyerror!nn.Options;
+
+/// Facts that depend on the variant name. `build` is the entry's options builder (`null` only for the
+/// `.unknown` placeholder, which exists to print the usage), `load_weights` loads `weights_path`
+/// before training, `dump` requires the index-11 dump path, `rows` reads index 13 as eval rows, and
+/// `max_args` selects the cap.
 const VariantSpec = struct {
     variant: Variant,
+    build: ?BuildFn = null,
     load_weights: bool = false,
     dump: bool = false,
     rows: bool = true,
@@ -213,55 +241,254 @@ const VariantSpec = struct {
 
 /// One entry per accepted variant. The order is only for readers; lookup uses the tag name.
 const variant_specs = [_]VariantSpec{
-    .{ .variant = .base },
-    .{ .variant = .backward },
-    .{ .variant = .replay },
-    .{ .variant = .tnet, .rows = false, .max_args = .value },
-    .{ .variant = .priority },
-    .{ .variant = .midgame },
-    .{ .variant = .midmix },
-    .{ .variant = .sym },
-    .{ .variant = .symlam },
-    .{ .variant = .symbatch },
-    .{ .variant = .rsym },
-    .{ .variant = .rtgt },
-    .{ .variant = .explore },
-    .{ .variant = .explore20 },
-    .{ .variant = .open8 },
-    .{ .variant = .open16 },
-    .{ .variant = .nstep },
-    .{ .variant = .death },
-    .{ .variant = .t2, .load_weights = true },
-    .{ .variant = .p2, .load_weights = true },
-    .{ .variant = .tp2, .load_weights = true },
-    .{ .variant = .d2 },
-    .{ .variant = .d3 },
-    .{ .variant = .dumpp2, .load_weights = true, .dump = true, .max_args = .dump },
-    .{ .variant = .tch, .load_weights = true, .dump = true, .max_args = .ft2_tch },
-    .{ .variant = .tchadd, .load_weights = true, .dump = true, .max_args = .ft2_tch },
-    .{ .variant = .dist, .load_weights = true, .dump = true, .rows = false, .max_args = .value },
-    .{ .variant = .dson, .load_weights = true, .dump = true, .rows = false, .max_args = .value },
-    .{ .variant = .oi },
-    .{ .variant = .oi16 },
-    .{ .variant = .@"resume", .load_weights = true },
-    .{ .variant = .mstd },
-    .{ .variant = .dump, .load_weights = true, .dump = true, .max_args = .dump },
-    .{ .variant = .ft2, .load_weights = true, .dump = true, .max_args = .ft2_tch },
-    .{ .variant = .restart, .load_weights = true, .dump = true, .max_args = .dump },
-    .{ .variant = .adam, .rows = false, .max_args = .value },
-    .{ .variant = .tailw, .rows = false, .max_args = .value },
-    .{ .variant = .clamp, .rows = false, .max_args = .value },
-    .{ .variant = .shape, .rows = false, .max_args = .value },
-    .{ .variant = .clip, .rows = false, .max_args = .clip },
-    .{ .variant = .pairw, .rows = false, .max_args = .pairw_pairleaf },
-    .{ .variant = .pairleaf, .rows = false, .max_args = .pairw_pairleaf },
-    .{ .variant = .pairrow, .rows = false, .max_args = .pairrow },
-    .{ .variant = .leaf },
-    .{ .variant = .pair, .rows = false },
-    .{ .variant = .par },
-    .{ .variant = .lam, .max_args = .value },
-    .{ .variant = .rlam, .load_weights = true, .max_args = .value },
+    .{ .variant = .base, .build = &buildPlain },
+    .{ .variant = .backward, .build = &buildBackward },
+    .{ .variant = .replay, .build = &buildReplay },
+    .{ .variant = .tnet, .build = &buildTnet, .rows = false, .max_args = .value },
+    .{ .variant = .priority, .build = &buildPriority },
+    .{ .variant = .midgame, .build = &buildMidgame },
+    .{ .variant = .midmix, .build = &buildMidmix },
+    .{ .variant = .sym, .build = &buildSym },
+    .{ .variant = .symlam, .build = &buildSymLambda },
+    .{ .variant = .symbatch, .build = &buildSymBatch },
+    .{ .variant = .rsym, .build = &buildRsym },
+    .{ .variant = .rtgt, .build = &buildRtgt },
+    .{ .variant = .explore, .build = &buildExplore },
+    .{ .variant = .explore20, .build = &buildExplore20 },
+    .{ .variant = .open8, .build = &buildOpen8 },
+    .{ .variant = .open16, .build = &buildOpen16 },
+    .{ .variant = .nstep, .build = &buildNstep },
+    .{ .variant = .death, .build = &buildDeath },
+    .{ .variant = .t2, .build = &buildT2, .load_weights = true },
+    .{ .variant = .p2, .build = &buildP2, .load_weights = true },
+    .{ .variant = .tp2, .build = &buildTp2, .load_weights = true },
+    .{ .variant = .d2, .build = &buildD2 },
+    .{ .variant = .d3, .build = &buildD3 },
+    .{ .variant = .dumpp2, .build = &buildDumpP2, .load_weights = true, .dump = true, .max_args = .dump },
+    .{ .variant = .tch, .build = &buildPlain, .load_weights = true, .dump = true, .max_args = .ft2_tch },
+    .{ .variant = .tchadd, .build = &buildPlain, .load_weights = true, .dump = true, .max_args = .ft2_tch },
+    .{ .variant = .dist, .build = &buildDist, .load_weights = true, .dump = true, .rows = false, .max_args = .value },
+    .{ .variant = .dson, .build = &buildDson, .load_weights = true, .dump = true, .rows = false, .max_args = .value },
+    .{ .variant = .oi, .build = &buildPlain },
+    .{ .variant = .oi16, .build = &buildPlain },
+    .{ .variant = .@"resume", .build = &buildPlain, .load_weights = true },
+    .{ .variant = .mstd, .build = &buildPlain },
+    .{ .variant = .dump, .build = &buildDump, .load_weights = true, .dump = true, .max_args = .dump },
+    .{ .variant = .ft2, .build = &buildFt2, .load_weights = true, .dump = true, .max_args = .ft2_tch },
+    .{ .variant = .restart, .build = &buildRestart, .load_weights = true, .dump = true, .max_args = .dump },
+    .{ .variant = .adam, .build = &buildAdam, .rows = false, .max_args = .value },
+    .{ .variant = .tailw, .build = &buildTailw, .rows = false, .max_args = .value },
+    .{ .variant = .clamp, .build = &buildClamp, .rows = false, .max_args = .value },
+    .{ .variant = .shape, .build = &buildShape, .rows = false, .max_args = .value },
+    .{ .variant = .clip, .build = &buildClip, .rows = false, .max_args = .clip },
+    .{ .variant = .pairw, .build = &buildPlain, .rows = false, .max_args = .pairw_pairleaf },
+    .{ .variant = .pairleaf, .build = &buildPlain, .rows = false, .max_args = .pairw_pairleaf },
+    .{ .variant = .pairrow, .build = &buildPlain, .rows = false, .max_args = .pairrow },
+    .{ .variant = .leaf, .build = &buildLeaf },
+    .{ .variant = .pair, .build = &buildPlain, .rows = false },
+    .{ .variant = .par, .build = &buildPlain },
+    .{ .variant = .lam, .build = &buildSweepReplay, .max_args = .value },
+    .{ .variant = .rlam, .build = &buildSweepReplay, .load_weights = true, .max_args = .value },
 };
+
+// One builder per options family: the arms of the options if-chain moved out of `main`, each
+// keeping the variant's `parse*` call next to the field it fills. A builder that ignores the command
+// line takes `_` instead of the context.
+
+/// The plain per-move TD path: `base`, `resume`, `par`, the paired runs and the teacher pass all run
+/// it with the default options, and `oi`/`oi16`/`mstd` differ from it outside `nn.Options`.
+fn buildPlain(_: *const BuildCtx) anyerror!nn.Options {
+    return .{};
+}
+
+/// `leaf` is the eval-only omit-leaf candidate: the rows take the flag up in the eval loop.
+fn buildLeaf(_: *const BuildCtx) anyerror!nn.Options {
+    return .{ .omit_leaf_reward = true };
+}
+
+/// Re-train every stored afterstate from last to first after the game.
+fn buildBackward(_: *const BuildCtx) anyerror!nn.Options {
+    return .{ .backward = true };
+}
+
+/// `replay`: re-train the last `replay_k` afterstates once more after the game.
+fn buildReplay(ctx: *const BuildCtx) anyerror!nn.Options {
+    return .{ .replay_k = ctx.replay_k };
+}
+
+/// `lam` / `rlam`: the replay sweep run as TD(lambda) over one accumulating trace, so index
+/// 13 is the lambda and `0` is the plain TD(0) sweep (the control).
+fn buildSweepReplay(ctx: *const BuildCtx) anyerror!nn.Options {
+    return .{ .replay_k = ctx.replay_k, .sweep_lambda = try parseSweepLambda(ctx.args) };
+}
+
+/// `tnet`: `replay` whose next-state value comes from the frozen snapshot in `TargetSync`.
+fn buildTnet(ctx: *const BuildCtx) anyerror!nn.Options {
+    return .{ .replay_k = ctx.replay_k, .target_net = ctx.target_net };
+}
+
+/// `priority`: 32 extra updates per game drawn from the shared |TD error| buffer.
+fn buildPriority(ctx: *const BuildCtx) anyerror!nn.Options {
+    return .{ .priority = ctx.priority };
+}
+
+/// `midgame`: the buffer's extra updates draw from the 4..7 empty-cell bucket only.
+fn buildMidgame(ctx: *const BuildCtx) anyerror!nn.Options {
+    return .{ .priority = ctx.priority, .midgame = true };
+}
+
+/// `midmix`: uniform over the whole buffer, |TD error| inside the 4..7 bucket.
+fn buildMidmix(ctx: *const BuildCtx) anyerror!nn.Options {
+    return .{ .priority = ctx.priority, .midmix = true };
+}
+
+/// `sym`: every per-move update applied to all 8 dihedral transforms of the afterstate.
+fn buildSym(_: *const BuildCtx) anyerror!nn.Options {
+    return .{ .symmetry = true };
+}
+
+/// `symlam`: `sym` plus TD(lambda) eligibility traces.
+fn buildSymLambda(_: *const BuildCtx) anyerror!nn.Options {
+    return .{ .symmetry = true, .lambda = 0.7 };
+}
+
+/// `symbatch`: the 8 transformed gradients averaged and norm-clipped into one step.
+fn buildSymBatch(_: *const BuildCtx) anyerror!nn.Options {
+    return .{ .sym_batch = true };
+}
+
+/// `rsym`: one update per move, on a uniformly random dihedral transform.
+fn buildRsym(_: *const BuildCtx) anyerror!nn.Options {
+    return .{ .rsym = true };
+}
+
+/// `rtgt`: `rsym` with the TD target's next board rotated by the same transform.
+fn buildRtgt(_: *const BuildCtx) anyerror!nn.Options {
+    return .{ .rtgt = true };
+}
+
+/// `explore`: 5% of the self-play moves are uniformly random instead of greedy.
+fn buildExplore(_: *const BuildCtx) anyerror!nn.Options {
+    return .{ .explore = 0.05 };
+}
+
+fn buildExplore20(_: *const BuildCtx) anyerror!nn.Options {
+    return .{ .explore = 0.20 };
+}
+
+/// `open8`: the first 8 moves are uniformly random and train nothing.
+fn buildOpen8(_: *const BuildCtx) anyerror!nn.Options {
+    return .{ .warm_open = 8 };
+}
+
+fn buildOpen16(_: *const BuildCtx) anyerror!nn.Options {
+    return .{ .warm_open = 16 };
+}
+
+/// `nstep`: online n-step TD with n = 4.
+fn buildNstep(_: *const BuildCtx) anyerror!nn.Options {
+    return .{ .nstep = 4 };
+}
+
+/// `death`: -1 per move plus a backward sweep, so the value learns moves to game over.
+fn buildDeath(_: *const BuildCtx) anyerror!nn.Options {
+    return .{ .death = true };
+}
+
+/// `t2`: the TD target is the eval's 2-ply search value of the post-spawn board.
+fn buildT2(_: *const BuildCtx) anyerror!nn.Options {
+    return .{ .target = .search2 };
+}
+
+/// `p2`: the self-play move is the eval's 2-ply search instead of the 1-ply argmax.
+fn buildP2(_: *const BuildCtx) anyerror!nn.Options {
+    return .{ .selfplay = .deep2 };
+}
+
+/// `tp2`: both sides aligned with the 2-ply eval.
+fn buildTp2(_: *const BuildCtx) anyerror!nn.Options {
+    return .{ .target = .search2, .selfplay = .deep2 };
+}
+
+/// `d2` / `d3`: the per-move target and the self-play move are the deep search's, at 2 or 3 ply.
+fn buildD2(_: *const BuildCtx) anyerror!nn.Options {
+    return .{ .teacher = .deep };
+}
+
+fn buildD3(_: *const BuildCtx) anyerror!nn.Options {
+    return .{ .teacher = .deep3 };
+}
+
+/// `adam`: Adam on the merged batch gradient; `par` is required, checked in `main`.
+fn buildAdam(ctx: *const BuildCtx) anyerror!nn.Options {
+    return .{ .adam = ctx.adam, .adam_lr = try parseAdamLr(ctx.args) };
+}
+
+/// `tailw`: per-sample step weight from the afterstate's empty-cell count.
+fn buildTailw(ctx: *const BuildCtx) anyerror!nn.Options {
+    return .{ .tail_alpha = try parseTailAlpha(ctx.args) };
+}
+
+/// `clamp`: ceiling on the TD target, so a diverging value cannot bootstrap itself.
+fn buildClamp(ctx: *const BuildCtx) anyerror!nn.Options {
+    return .{ .clamp = try parseClamp(ctx.args) };
+}
+
+/// `shape`: potential-based shaping with the empty-cell potential, coefficient at index 13.
+fn buildShape(ctx: *const BuildCtx) anyerror!nn.Options {
+    return .{ .shape_c = try parseShapeC(ctx.args) };
+}
+
+/// `clip`: `norm` caps the L2 norm of one merged batch delta, `step` every |dw| of a step.
+/// Both read the cap at index 13; the mode at index 14 was parsed in `main`, which refuses a `norm`
+/// cap without `par`.
+fn buildClip(ctx: *const BuildCtx) anyerror!nn.Options {
+    var opts: nn.Options = .{};
+    const cap = try parseStepCap(ctx.args);
+    switch (ctx.clip_mode) {
+        .norm => opts.grad_clip = cap,
+        .step => opts.step_clip = cap,
+    }
+    return opts;
+}
+
+/// `dump`: record every afterstate of the plain per-move path whose max tile reached 4096.
+fn buildDump(ctx: *const BuildCtx) anyerror!nn.Options {
+    return .{ .dump_record = true, .dump = ctx.dump, .selfplay = .greedy1 };
+}
+
+/// `dumpp2`: the same buffer from 2-ply self-play boards, the distribution the 2-ply eval
+/// actually visits, which is what the teacher regression is supposed to fix.
+fn buildDumpP2(ctx: *const BuildCtx) anyerror!nn.Options {
+    return .{ .dump_record = true, .dump = ctx.dump, .selfplay = .deep2 };
+}
+
+/// `ft2`: one deep update per `deep_every` self-play moves (that count at index 12).
+fn buildFt2(ctx: *const BuildCtx) anyerror!nn.Options {
+    return .{ .deep_mix = true, .dump = ctx.dump, .deep_every = try parseDeepEvery(ctx.args) };
+}
+
+/// `restart`: every self-play game starts on a deep afterstate of `dump` plus one spawn.
+fn buildRestart(ctx: *const BuildCtx) anyerror!nn.Options {
+    return .{ .restart = true, .dump = ctx.dump };
+}
+
+/// `dist`: the per-move TD plus one teacher regression per `distill_every` steps at
+/// `distillRate` (the TD rate over the index-13 divisor, see ).
+fn buildDist(ctx: *const BuildCtx) anyerror!nn.Options {
+    return .{
+        .distill = ctx.teachers,
+        .distill_every = ctx.dist_mix.every,
+        .distill_lr = distillRate(ctx.learning_rate, ctx.dist_mix.div),
+    };
+}
+
+/// `dson`: the teacher regression alone, with no self-play TD update.
+fn buildDson(ctx: *const BuildCtx) anyerror!nn.Options {
+    var opts = try buildDist(ctx);
+    opts.distill_only = true;
+    return opts;
+}
 
 /// Resolve a command-line variant name exactly once. This is the only variant-name comparison left.
 fn findVariant(name: []const u8) ?VariantSpec {
@@ -474,8 +701,8 @@ fn parSupported(opts: nn.Options, is_mstd: bool) bool {
         (opts.selfplay == .greedy1 or opts.selfplay == .deep2);
 }
 
-/// Foreign rerank score of the eval row: the snake heuristic of `solver.evaluate` on the `baseline`
-/// weights, divided by `nn.reward_scale` so it is on the NN value scale.
+/// Foreign rerank score of the eval row: the snake heuristic of `solver.evaluate` (the
+/// `baseline` weights), divided by `nn.reward_scale` so it is on the NN value scale.
 fn snakeScore(board: core.Board) f64 {
     return solver.evaluate(board) / nn.reward_scale;
 }
@@ -744,35 +971,14 @@ pub fn main(init: std.process.Init) !void {
     const par_tail = try parseParFlag(args);
     const spec = findVariant(variant_name) orelse VariantSpec{ .variant = .unknown };
     const variant = @tagName(spec.variant);
-    const par_variant = spec.variant == .par;
-    const use_par = par_variant or par_tail;
-    const is_base = spec.variant == .base;
-    const is_resume = spec.variant == .@"resume";
-    const is_backward = spec.variant == .backward;
-    const is_replay = spec.variant == .replay;
-    const is_priority = spec.variant == .priority;
-    const is_midgame = spec.variant == .midgame;
-    const is_midmix = spec.variant == .midmix;
-    const is_sym = spec.variant == .sym;
-    const is_symlam = spec.variant == .symlam;
-    const is_symbatch = spec.variant == .symbatch;
-    const is_rsym = spec.variant == .rsym;
-    const is_rtgt = spec.variant == .rtgt;
-    const is_explore = spec.variant == .explore;
-    const is_explore20 = spec.variant == .explore20;
-    const is_open8 = spec.variant == .open8;
-    const is_open16 = spec.variant == .open16;
-    const is_nstep = spec.variant == .nstep;
+    const use_par = spec.variant == .par or par_tail;
     const is_mstd = spec.variant == .mstd;
     const is_death = spec.variant == .death;
-    const is_d2 = spec.variant == .d2;
-    const is_d3 = spec.variant == .d3;
     const is_oi = spec.variant == .oi;
     const is_oi16 = spec.variant == .oi16;
-    // `dumpp2` records the same buffer as `dump`, but from 2-ply self-play boards: the distribution the
-    // 2-ply eval actually visits, which is what the teacher regression is supposed to fix.
-    const is_dumpp2 = spec.variant == .dumpp2;
-    const is_dump = spec.variant == .dump or is_dumpp2;
+    // `dump` and `dumpp2` record the same buffer and are refused under `par` alike; their
+    // options differ in the self-play policy and live in `buildDump`/`buildDumpP2`.
+    const is_dump = spec.variant == .dump or spec.variant == .dumpp2;
     const is_ft2 = spec.variant == .ft2;
     const is_restart = spec.variant == .restart;
     // Paired comparison: two policies play the same spawn tape.
@@ -791,29 +997,19 @@ pub fn main(init: std.process.Init) !void {
     const is_tchadd = spec.variant == .tchadd;
     const is_dist = spec.variant == .dist;
     const is_dson = spec.variant == .dson;
-    // the 2-ply-aligned variants: the search per move is priced from `weights_path` too.
-    const is_t2 = spec.variant == .t2;
-    const is_p2 = spec.variant == .p2;
-    const is_tp2 = spec.variant == .tp2;
-    // `par` only: Adam steps on the merged batch gradient.
+    // `par` only: Adam steps on the merged batch gradient, refused below without it.
     const is_adam = spec.variant == .adam;
-    // `par`-compatible: the weight is a per-sample `lr` multiplier, so every game stays independent.
-    const is_tailw = spec.variant == .tailw;
-    // `par`-compatible: a bounded TD target, so a diverging value cannot bootstrap itself.
-    const is_clamp = spec.variant == .clamp;
-    // `par`-compatible: potential-based shaping with the empty-cell potential.
-    const is_shape = spec.variant == .shape;
     // replay with a frozen bootstrap net: a `par` variable, see `TargetSync`.
     const is_tnet = spec.variant == .tnet;
     const target_every: usize = if (is_tnet) try parseTargetEvery(args) else 0;
     // the step ceiling: `norm` bounds the merged `par` delta, `step` every element of a step.
     const is_clip = spec.variant == .clip;
     const clip_mode: ClipMode = if (is_clip) try parseClipMode(args) else .norm;
-    // the teacher mix: `distill_every` (arg 12) and the rate divisor (arg 13).
+    // the teacher mix: `distill_every` (arg 12) and the rate divisor (arg 13). Handed to the
+    // `dist`/`dson` builder instead of parsed there, to keep the old parse order (see `BuildCtx`).
     const dist_mix: DistillMix = if (is_dist or is_dson) try parseDistillMix(args) else .{};
-    // variants train from the net in weights_path (the deep positions come from that net), like `resume`
-    const is_lam = spec.variant == .lam;
-    const is_rlam = spec.variant == .rlam;
+    // `use_resume` only decides whether `weights_path` is loaded; the variant's options come from its own
+    // builder, never from this flag.
     const use_resume = spec.load_weights;
     // Variants that take dump_path at index 11: `dump` writes it, `ft2` and `restart` read it.
     const uses_dump = spec.dump;
@@ -836,96 +1032,27 @@ pub fn main(init: std.process.Init) !void {
     teachers.draws = 0;
     // `par` merges whole-game deltas into one step; arg 12 scales that step (1 = historical mean).
     const batch_scale: f64 = if (use_par) try parseBatchScale(args) else 1.0;
-    // `use_resume` only decides whether `weights_path` is loaded; the variant still has to reach `opts`
-    // (before, `dump`/`ft2`/`restart`/`dist` fell into this first branch and their options were dropped).
-    var opts: nn.Options = if (par_variant or is_pair or is_pairw or is_pairleaf or is_pairrow or is_base or is_resume or is_tch)
-        .{ .batch_scale = batch_scale }
-    else if (is_leaf)
-        .{ .omit_leaf_reward = true }
-    else if (is_backward)
-        .{ .backward = true }
-    else if (is_replay)
-        .{ .replay_k = replay_k }
-    else if (is_rlam)
-        // resume + the replay sweep as TD(lambda); index 13 `0` is the TD(0) control.
-        .{ .replay_k = replay_k, .sweep_lambda = try parseSweepLambda(args) }
-    else if (is_lam)
-        // the same sweep from scratch: a resumed net blew up (self-play bootstrap + replay), see
-        // the issue, so the score comparison starts from the seed net instead.
-        .{ .replay_k = replay_k, .sweep_lambda = try parseSweepLambda(args) }
-    else if (is_tnet)
-        .{ .replay_k = replay_k, .target_net = &target_sync.net }
-    else if (is_priority)
-        .{ .priority = &priority }
-    else if (is_midgame)
-        .{ .priority = &priority, .midgame = true }
-    else if (is_midmix)
-        .{ .priority = &priority, .midmix = true }
-    else if (is_sym)
-        .{ .symmetry = true }
-    else if (is_symlam)
-        .{ .symmetry = true, .lambda = 0.7 }
-    else if (is_symbatch)
-        .{ .sym_batch = true }
-    else if (is_rsym)
-        .{ .rsym = true }
-    else if (is_rtgt)
-        .{ .rtgt = true }
-    else if (is_explore)
-        .{ .explore = 0.05 }
-    else if (is_explore20)
-        .{ .explore = 0.20 }
-    else if (is_open8)
-        .{ .warm_open = 8 }
-    else if (is_open16)
-        .{ .warm_open = 16 }
-    else if (is_nstep)
-        .{ .nstep = 4 }
-    else if (is_death)
-        .{ .death = true }
-    else if (is_t2)
-        .{ .target = .search2 }
-    else if (is_p2)
-        .{ .selfplay = .deep2 }
-    else if (is_tp2)
-        .{ .target = .search2, .selfplay = .deep2 }
-    else if (is_adam)
-        .{ .adam = &adam, .adam_lr = try parseAdamLr(args) }
-    else if (is_tailw)
-        .{ .tail_alpha = try parseTailAlpha(args) }
-    else if (is_clamp)
-        .{ .clamp = try parseClamp(args) }
-    else if (is_shape)
-        .{ .shape_c = try parseShapeC(args) }
-    else if (is_clip) switch (clip_mode) {
-        .norm => .{ .grad_clip = try parseStepCap(args) },
-        .step => .{ .step_clip = try parseStepCap(args) },
-    } else if (is_d2)
-        .{ .teacher = .deep }
-    else if (is_d3)
-        .{ .teacher = .deep3 }
-    else if (is_dump)
-        .{
-            .dump_record = true,
-            .dump = &dump,
-            .selfplay = if (is_dumpp2) .deep2 else .greedy1,
-        }
-    else if (is_ft2)
-        .{ .deep_mix = true, .dump = &dump, .deep_every = try parseDeepEvery(args) }
-    else if (is_restart)
-        .{ .restart = true, .dump = &dump }
-    else if (is_dist)
-        .{ .distill = teachers, .distill_every = dist_mix.every, .distill_lr = distillRate(learning_rate, dist_mix.div) }
-    else if (is_dson)
-        .{ .distill = teachers, .distill_only = true, .distill_every = dist_mix.every, .distill_lr = distillRate(learning_rate, dist_mix.div) }
-    else if (is_oi or is_oi16 or is_mstd)
-        .{}
-    else {
+    // Every variant owns its `nn.Options`: `findVariant` picked the entry and its `build` reads the
+    // command line and the buffers above. `.unknown` has no builder, so a name no entry matched still
+    // prints the usage here, where the old chain's final `else` did.
+    const build = spec.build orelse {
         std.debug.print("{s}", .{usage});
         return;
     };
-    // the merge multiplier applies to every variant that reached a batched path; the branch above
-    // only set it for the plain ones, so `dist`/`sym`/`replay` silently ran with the struct default 1.0.
+    var opts: nn.Options = try build(&.{
+        .args = args,
+        .replay_k = replay_k,
+        .learning_rate = learning_rate,
+        .adam = &adam,
+        .priority = &priority,
+        .dump = &dump,
+        .teachers = teachers,
+        .target_net = &target_sync.net,
+        .clip_mode = clip_mode,
+        .dist_mix = dist_mix,
+    });
+    // the merge multiplier applies to every variant that reached a batched path; the builders never
+    // set it, so it is assigned once here for all of them.
     opts.batch_scale = batch_scale;
     // Refuse a shaped run mixed with a variant that retrains afterstates later or replaces the
     // TD target: those paths do not implement the shaped reward, and silently training on the raw
@@ -1881,4 +2008,178 @@ test "an unknown variant keeps the old parse order and usage path (#314)" {
     try std.testing.expectEqual(@as(usize, 11), maxArgs(spec, null, false));
     // A borrowed name (`unknown`) is not in the table either, so it resolves to the placeholder.
     try std.testing.expect(findVariant("unknown") == null);
+}
+
+/// Buffers one `BuildCtx` borrows, so a builder test can build options from a command line and compare
+/// them against a literal.
+const BuildFixture = struct {
+    adam: nn.Adam = .{},
+    priority: nn.Priority = .{},
+    dump: nn.Dump = .{},
+    teachers: *nn.Teachers,
+    /// Only the address is read (the `tnet` builder hands it to `nn.Options.target_net`), so a builder
+    /// test never initialises a net it does not train.
+    net: nn.Net = undefined,
+    clip_mode: ClipMode = .norm,
+    dist_mix: DistillMix = .{},
+    replay_k: usize = default_replay_k,
+    learning_rate: f64 = default_learning_rate,
+
+    fn init() !BuildFixture {
+        // `nn.Teachers` is ~40 MB, so it is heap allocated like `main` does.
+        const teachers = try std.testing.allocator.create(nn.Teachers);
+        teachers.len = 0;
+        teachers.draws = 0;
+        return .{ .teachers = teachers };
+    }
+
+    fn deinit(self: *BuildFixture) void {
+        std.testing.allocator.destroy(self.teachers);
+    }
+
+    fn ctx(self: *BuildFixture, args: []const []const u8) BuildCtx {
+        return .{
+            .args = args,
+            .replay_k = self.replay_k,
+            .learning_rate = self.learning_rate,
+            .adam = &self.adam,
+            .priority = &self.priority,
+            .dump = &self.dump,
+            .teachers = self.teachers,
+            .target_net = &self.net,
+            .clip_mode = self.clip_mode,
+            .dist_mix = self.dist_mix,
+        };
+    }
+};
+
+/// An empty command line: every `parse*` helper defaults an absent slot, so a build from this is a
+/// bare `<variant>` invocation. `main`'s shared tail (`batch_scale`, `validateOptions`) is not part of
+/// the build, so the expectations below carry `batch_scale` at its struct default.
+const no_build_args: []const []const u8 = &.{};
+
+test "each variant builds the options of its own branch family (#315)" {
+    var fixture = try BuildFixture.init();
+    defer fixture.deinit();
+    const ctx = fixture.ctx(no_build_args);
+    const Expect = struct { name: []const u8, opts: nn.Options };
+    const expected = [_]Expect{
+        .{ .name = "base", .opts = .{} },
+        .{ .name = "backward", .opts = .{ .backward = true } },
+        .{ .name = "replay", .opts = .{ .replay_k = default_replay_k } },
+        .{ .name = "tnet", .opts = .{ .replay_k = default_replay_k, .target_net = &fixture.net } },
+        .{ .name = "priority", .opts = .{ .priority = &fixture.priority } },
+        .{ .name = "midgame", .opts = .{ .priority = &fixture.priority, .midgame = true } },
+        .{ .name = "midmix", .opts = .{ .priority = &fixture.priority, .midmix = true } },
+        .{ .name = "sym", .opts = .{ .symmetry = true } },
+        .{ .name = "symlam", .opts = .{ .symmetry = true, .lambda = 0.7 } },
+        .{ .name = "symbatch", .opts = .{ .sym_batch = true } },
+        .{ .name = "rsym", .opts = .{ .rsym = true } },
+        .{ .name = "rtgt", .opts = .{ .rtgt = true } },
+        .{ .name = "explore", .opts = .{ .explore = 0.05 } },
+        .{ .name = "explore20", .opts = .{ .explore = 0.20 } },
+        .{ .name = "open8", .opts = .{ .warm_open = 8 } },
+        .{ .name = "open16", .opts = .{ .warm_open = 16 } },
+        .{ .name = "nstep", .opts = .{ .nstep = 4 } },
+        .{ .name = "death", .opts = .{ .death = true } },
+        .{ .name = "t2", .opts = .{ .target = .search2 } },
+        .{ .name = "p2", .opts = .{ .selfplay = .deep2 } },
+        .{ .name = "tp2", .opts = .{ .target = .search2, .selfplay = .deep2 } },
+        .{ .name = "d2", .opts = .{ .teacher = .deep } },
+        .{ .name = "d3", .opts = .{ .teacher = .deep3 } },
+        .{ .name = "dumpp2", .opts = .{ .dump_record = true, .dump = &fixture.dump, .selfplay = .deep2 } },
+        .{ .name = "tch", .opts = .{} },
+        .{ .name = "tchadd", .opts = .{} },
+        .{ .name = "dist", .opts = .{ .distill = fixture.teachers } },
+        .{ .name = "dson", .opts = .{ .distill = fixture.teachers, .distill_only = true } },
+        .{ .name = "oi", .opts = .{} },
+        .{ .name = "oi16", .opts = .{} },
+        .{ .name = "resume", .opts = .{} },
+        .{ .name = "mstd", .opts = .{} },
+        .{ .name = "dump", .opts = .{ .dump_record = true, .dump = &fixture.dump, .selfplay = .greedy1 } },
+        .{ .name = "ft2", .opts = .{ .deep_mix = true, .dump = &fixture.dump, .deep_every = 1 } },
+        .{ .name = "restart", .opts = .{ .restart = true, .dump = &fixture.dump } },
+        .{ .name = "adam", .opts = .{ .adam = &fixture.adam, .adam_lr = 0.01 } },
+        .{ .name = "tailw", .opts = .{ .tail_alpha = 1 } },
+        .{ .name = "clamp", .opts = .{ .clamp = 200 } },
+        .{ .name = "shape", .opts = .{ .shape_c = 1 } },
+        .{ .name = "clip", .opts = .{ .grad_clip = default_clip_cap } },
+        .{ .name = "pairw", .opts = .{} },
+        .{ .name = "pairleaf", .opts = .{} },
+        .{ .name = "pairrow", .opts = .{} },
+        .{ .name = "leaf", .opts = .{ .omit_leaf_reward = true } },
+        .{ .name = "pair", .opts = .{} },
+        .{ .name = "par", .opts = .{} },
+        .{ .name = "lam", .opts = .{ .replay_k = default_replay_k, .sweep_lambda = default_sweep_lambda } },
+        .{ .name = "rlam", .opts = .{ .replay_k = default_replay_k, .sweep_lambda = default_sweep_lambda } },
+    };
+    try std.testing.expectEqual(variant_specs.len, expected.len);
+    for (expected) |e| {
+        const build = findVariant(e.name).?.build.?;
+        try std.testing.expectEqual(e.opts, try build(&ctx));
+    }
+}
+
+test "every table variant resolves and builds without the usage path (#315)" {
+    var fixture = try BuildFixture.init();
+    defer fixture.deinit();
+    const ctx = fixture.ctx(no_build_args);
+    for (variant_specs) |spec| {
+        const resolved = findVariant(@tagName(spec.variant)) orelse {
+            std.debug.print("variant {s} does not resolve\n", .{@tagName(spec.variant)});
+            return error.TestExpectedEqual;
+        };
+        try std.testing.expectEqual(spec.variant, resolved.variant);
+        const build = resolved.build orelse {
+            std.debug.print("variant {s} has no options builder\n", .{@tagName(spec.variant)});
+            return error.TestExpectedEqual;
+        };
+        _ = try build(&ctx);
+    }
+    // `.unknown` is the only variant without an entry, and it must stay builder-less: that `null` is
+    // what makes `main` print the usage for a name no entry matched.
+    try std.testing.expect((VariantSpec{ .variant = .unknown }).build == null);
+}
+
+test "builders take the slots' values and the borrowed buffers from the context (#315)" {
+    var fixture = try BuildFixture.init();
+    defer fixture.deinit();
+    fixture.replay_k = 7;
+    fixture.dist_mix = .{ .every = 4, .div = 10 };
+    const ctx = fixture.ctx(no_build_args);
+    // The ctx fields, not the defaults, reach the options.
+    try std.testing.expectEqual(@as(usize, 7), (try buildReplay(&ctx)).replay_k);
+    const tnet = try buildTnet(&ctx);
+    try std.testing.expectEqual(@as(usize, 7), tnet.replay_k);
+    try std.testing.expect(tnet.target_net.? == &fixture.net);
+    try std.testing.expect((try buildAdam(&ctx)).adam.? == &fixture.adam);
+    try std.testing.expect((try buildPriority(&ctx)).priority.? == &fixture.priority);
+    try std.testing.expect((try buildDump(&ctx)).dump.? == &fixture.dump);
+    try std.testing.expect((try buildFt2(&ctx)).dump.? == &fixture.dump);
+    try std.testing.expect((try buildDist(&ctx)).distill.? == fixture.teachers);
+    const dist = try buildDist(&ctx);
+    try std.testing.expectEqual(@as(u32, 4), dist.distill_every);
+    // The teacher rate is the TD rate over the arg-13 divisor; read the rate at runtime so the
+    // comparison divides in f64 like `main` does, not in comptime precision.
+    const td_rate: f64 = fixture.learning_rate;
+    try std.testing.expectEqual(td_rate / 10, dist.distill_lr);
+    try std.testing.expect((try buildDson(&ctx)).distill_only);
+}
+
+test "clip puts the cap in the field its mode names (#315)" {
+    var fixture = try BuildFixture.init();
+    defer fixture.deinit();
+    // The cap sits at index 13 like Adam's step size, `tailw`'s alpha and `clamp`'s bound; the mode at
+    // index 14 decides whether it bounds the merged batch delta or every element of a step.
+    const args = [_][]const u8{ "nn", "-", "0", "9000", "0.003", "-", "clip", "-", "-", "-", "-", "-", "-", "0.25", "step" };
+    fixture.clip_mode = .step;
+    const step_ctx = fixture.ctx(&args);
+    const step = try buildClip(&step_ctx);
+    try std.testing.expectEqual(@as(f64, 0.25), step.step_clip);
+    try std.testing.expectEqual(@as(f64, 0), step.grad_clip);
+    fixture.clip_mode = .norm;
+    const norm_ctx = fixture.ctx(&args);
+    const norm = try buildClip(&norm_ctx);
+    try std.testing.expectEqual(@as(f64, 0.25), norm.grad_clip);
+    try std.testing.expectEqual(@as(f64, 0), norm.step_clip);
 }

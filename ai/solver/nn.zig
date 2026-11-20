@@ -3371,44 +3371,26 @@ pub fn dequantize(q: *const Quantized, net: *Net) void {
 /// the 18,561 i16 weights in `Net` field order.
 pub fn encodeQuantized(q: *const Quantized) [quant_file_len]u8 {
     var out: [quant_file_len]u8 = undefined;
-    @memcpy(out[0..8], quant_magic);
-    std.mem.writeInt(u32, out[8..12], quant_version, .little);
-    std.mem.writeInt(u32, out[12..16], endian_marker, .little);
-    var pos: usize = 16;
-    for (q.steps) |step| {
-        std.mem.writeInt(u32, out[pos..][0..4], @bitCast(@as(f32, @floatCast(step))), .little);
-        pos += 4;
-    }
-    for (q.a_steps) |step| {
-        std.mem.writeInt(u32, out[pos..][0..4], @bitCast(@as(f32, @floatCast(step))), .little);
-        pos += 4;
-    }
-    for (std.mem.bytesAsSlice(i16, std.mem.asBytes(&q.q)), 0..) |value, i| {
-        std.mem.writeInt(i16, out[pos + i * 2 ..][0..2], value, .little);
-    }
+    var w = blob.Writer.init(&out);
+    blob.writeHeader(&w, quant_magic, quant_version);
+    for (q.steps) |step| w.writeF32(@floatCast(step));
+    for (q.a_steps) |step| w.writeF32(@floatCast(step));
+    for (std.mem.bytesAsSlice(i16, std.mem.asBytes(&q.q))) |value| w.writeI16(value);
     return out;
 }
 
 pub fn parseQuantized(bytes: []const u8) !Quantized {
     if (bytes.len != quant_file_len) return error.WrongQuantFileSize;
-    try checkVersionedHeader(bytes, quant_magic, quant_version, .{
+    var r = blob.Reader.init(bytes);
+    try blob.readHeader(&r, quant_magic, quant_version, .{
         .magic = error.BadQuantMagic,
         .version = error.UnsupportedQuantVersion,
         .endian = error.WrongQuantEndianness,
     });
     var q = Quantized{};
-    var pos: usize = 16;
-    for (&q.steps) |*step| {
-        step.* = @floatCast(@as(f32, @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little))));
-        pos += 4;
-    }
-    for (&q.a_steps) |*step| {
-        step.* = @floatCast(@as(f32, @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little))));
-        pos += 4;
-    }
-    for (std.mem.bytesAsSlice(i16, std.mem.asBytes(&q.q)), 0..) |*value, i| {
-        value.* = std.mem.readInt(i16, bytes[pos + i * 2 ..][0..2], .little);
-    }
+    for (&q.steps) |*step| step.* = @floatCast(try r.readF32());
+    for (&q.a_steps) |*step| step.* = @floatCast(try r.readF32());
+    for (std.mem.bytesAsSlice(i16, std.mem.asBytes(&q.q))) |*value| value.* = try r.readI16();
     return q;
 }
 
@@ -5002,6 +4984,35 @@ test "quantized file is 48 B of header plus 2 B per weight (#170)" {
     for (quant_blocks, 0..) |block, b| {
         if (b > 0) try std.testing.expectEqual(quant_blocks[b - 1].offset + quant_blocks[b - 1].len, block.offset);
     }
+}
+
+test "encodeQuantized writes the int16 weight layout byte for byte (#302)" {
+    var q = Quantized{};
+    for (&q.steps, 0..) |*step, b| {
+        const scale: f64 = @floatFromInt(@as(u32, 1) << @as(u5, @intCast(b)));
+        step.* = 0.5 * scale;
+    }
+    q.a_steps = .{ 32, 64 };
+    for (std.mem.bytesAsSlice(i16, std.mem.asBytes(&q.q)), 0..) |*value, i| {
+        value.* = @intCast(@as(i32, @intCast(i % 2001)) - 1000);
+    }
+
+    const bytes = encodeQuantized(&q);
+    // magic, version, endianness marker, the six block steps (0.5, 1, 2, 4, 8, 16) and a1/a2 (32, 64)
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        '2',  '0',  '4',  '8',  '-',  'N',  'Q',  '1',
+        1,    0,    0,    0,    4,    3,    2,    1,
+        0x00, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x80, 0x3f,
+        0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x80, 0x40,
+        0x00, 0x00, 0x00, 0x41, 0x00, 0x00, 0x80, 0x41,
+        0x00, 0x00, 0x00, 0x42, 0x00, 0x00, 0x80, 0x42,
+    }, bytes[0..quant_header_len]);
+    // the payload starts with -1000, then -999, as i16 little endian
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x18, 0xfc, 0x19, 0xfc, 0x1a, 0xfc, 0x1b, 0xfc }, bytes[quant_header_len..][0..8]);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    try std.testing.expectEqualStrings("a6660a0c97dd859eeab2500cf2008903f118e64d8e63e14e72653f1bb332e8b2", &hex);
 }
 
 test "quantized round trip keeps every weight within its block step (#170)" {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const core = @import("core");
+const blob = @import("blob");
 
 const Board = core.Board;
 
@@ -184,12 +185,150 @@ pub const TupleNet = struct {
         return self.value(indices(board));
     }
 
+    /// Apply a precomputed TD error equally across each active tuple's touched weight.
+    fn applyDelta(self: *TupleNet, idx: Indices, delta: f64, lr: f64) void {
+        const step: f32 = @floatCast(lr * delta / @as(f64, @floatFromInt(self.count)));
+        for (0..self.count) |p| self.storage[offsets[p] + idx[p]] += step;
+    }
+
     /// TD step: move every touched entry by `lr * (target - V) / n_tuples`; returns the TD error.
     pub fn train(self: *TupleNet, idx: Indices, target: f64, lr: f64) f64 {
         const delta = target - self.value(idx);
-        const step: f32 = @floatCast(lr * delta / @as(f64, @floatFromInt(self.count)));
-        for (0..self.count) |p| self.storage[offsets[p] + idx[p]] += step;
+        self.applyDelta(idx, delta, lr);
         return delta;
+    }
+};
+
+/// Paper defaults for the opt-in delayed TD(lambda) learner.
+pub const delayed_td_horizon: usize = 3;
+pub const delayed_td_lambda: f64 = 0.5;
+
+/// Buffer up to h+1 afterstates and their TD errors, then apply one aggregated update per state.
+/// This is the delayed TD(lambda) algorithm: the default TD(0) training path remains separate.
+pub const DelayedTDLambda = struct {
+    net: *TupleNet,
+    lr: f64,
+    states: [delayed_td_horizon + 1]Indices = undefined,
+    deltas: [delayed_td_horizon + 1]f64 = undefined,
+    len: usize = 0,
+
+    pub fn init(net: *TupleNet, lr: f64) DelayedTDLambda {
+        return .{ .net = net, .lr = lr };
+    }
+
+    /// Add one afterstate's TD error; once h future errors are available, update it and discard it.
+    pub fn observe(self: *DelayedTDLambda, idx: Indices, delta: f64) void {
+        self.states[self.len] = idx;
+        self.deltas[self.len] = delta;
+        self.len += 1;
+        if (self.len == delayed_td_horizon + 1) {
+            self.applyOldest();
+            self.dropOldest();
+        }
+    }
+
+    /// Apply the remaining truncated traces at episode end, oldest state first.
+    pub fn finish(self: *DelayedTDLambda) void {
+        while (self.len > 0) {
+            self.applyOldest();
+            self.dropOldest();
+        }
+    }
+
+    fn applyOldest(self: *DelayedTDLambda) void {
+        var delta_sum: f64 = 0;
+        var decay: f64 = 1;
+        for (self.deltas[0..self.len]) |delta| {
+            delta_sum += delta * decay;
+            decay *= delayed_td_lambda;
+        }
+        self.net.applyDelta(self.states[0], delta_sum, self.lr);
+    }
+
+    fn dropOldest(self: *DelayedTDLambda) void {
+        for (1..self.len) |i| {
+            self.states[i - 1] = self.states[i];
+            self.deltas[i - 1] = self.deltas[i];
+        }
+        self.len -= 1;
+    }
+};
+
+pub fn delayedTDLambdaExtraMemoryBytes() usize {
+    return @sizeOf(DelayedTDLambda);
+}
+
+/// TC(λ) horizon and trace decay from the paper's informal parameter search; β uses the existing learning-rate schedule.
+pub const tc_horizon: usize = 3;
+pub const tc_lambda: f64 = 0.5;
+
+/// Per-weight signed/absolute TD-error accumulators plus the current episode's h-step trace.
+pub const TemporalCoherence = struct {
+    net: *TupleNet,
+    errors: []f32,
+    abs_errors: []f32,
+    trace: [tc_horizon + 1]Indices = undefined,
+    trace_len: usize = 0,
+
+    pub fn init(gpa: std.mem.Allocator, net: *TupleNet) !TemporalCoherence {
+        const errors = try gpa.alloc(f32, net.storage.len);
+        errdefer gpa.free(errors);
+        const abs_errors = try gpa.alloc(f32, net.storage.len);
+        errdefer gpa.free(abs_errors);
+        @memset(errors, 0);
+        @memset(abs_errors, 0);
+        return .{ .net = net, .errors = errors, .abs_errors = abs_errors };
+    }
+
+    pub fn deinit(self: *TemporalCoherence, gpa: std.mem.Allocator) void {
+        gpa.free(self.errors);
+        gpa.free(self.abs_errors);
+    }
+
+    pub fn extraMemoryBytes(self: *const TemporalCoherence) usize {
+        return (self.errors.len + self.abs_errors.len) * @sizeOf(f32) + @sizeOf(TemporalCoherence);
+    }
+
+    /// Reset episode-local trace only; per-weight coherence statistics persist through training.
+    pub fn beginEpisode(self: *TemporalCoherence) void {
+        self.trace_len = 0;
+    }
+
+    /// Apply one TD error to the current afterstate and up to `tc_horizon` preceding afterstates (Algorithm 2).
+    pub fn observe(self: *TemporalCoherence, idx: Indices, delta: f64, beta: f64) void {
+        // Drop before appending so `trace_len` never exceeds `tc_horizon` when it indexes `trace`.
+        if (self.trace_len > tc_horizon) self.dropOldest();
+        self.trace[self.trace_len] = idx;
+        self.trace_len += 1;
+
+        var decay: f64 = 1;
+        for (0..self.trace_len) |age| {
+            const trace_idx = self.trace[self.trace_len - 1 - age];
+            self.updateState(trace_idx, delta * decay, delta, beta);
+            decay *= tc_lambda;
+        }
+    }
+
+    fn updateState(self: *TemporalCoherence, idx: Indices, weighted_delta: f64, delta: f64, beta: f64) void {
+        const tuple_count: f64 = @floatFromInt(self.net.count);
+        for (0..self.net.count) |p| {
+            const entry = offsets[p] + idx[p];
+            const accumulated = self.errors[entry];
+            const accumulated_abs = self.abs_errors[entry];
+            const alpha = if (accumulated_abs != 0)
+                @as(f64, @floatCast(@abs(accumulated))) / @as(f64, @floatCast(accumulated_abs))
+            else
+                1;
+            const step: f32 = @floatCast(beta * alpha * weighted_delta / tuple_count);
+            self.net.storage[entry] += step;
+            self.errors[entry] += @floatCast(delta);
+            self.abs_errors[entry] += @floatCast(@abs(delta));
+        }
+    }
+
+    fn dropOldest(self: *TemporalCoherence) void {
+        for (1..self.trace_len) |i| self.trace[i - 1] = self.trace[i];
+        self.trace_len -= 1;
     }
 };
 
@@ -280,49 +419,33 @@ pub fn quantizedFileLen(n: usize) usize {
 /// scales (f64 LE), then the i16 LE payload.
 pub fn encodeQuantized(gpa: std.mem.Allocator, q: *const Quantized) ![]u8 {
     const bytes = try gpa.alloc(u8, quantizedFileLen(q.count));
-    @memcpy(bytes[0..8], quantized_magic);
-    std.mem.writeInt(u32, bytes[8..12], file_version, .little);
-    std.mem.writeInt(u32, bytes[12..16], endian_marker, .little);
-    std.mem.writeInt(u32, bytes[16..20], @intCast(q.count), .little);
-    var pos = header_len;
-    for (0..q.count) |p| {
-        std.mem.writeInt(u32, bytes[pos..][0..4], @intCast(tableLen(p)), .little);
-        pos += 4;
-    }
-    for (0..q.count) |p| {
-        std.mem.writeInt(u64, bytes[pos..][0..8], @bitCast(q.scales[p]), .little);
-        pos += 8;
-    }
-    for (q.storage) |w| {
-        std.mem.writeInt(i16, bytes[pos..][0..2], w, .little);
-        pos += 2;
-    }
+    var w = blob.Writer.init(bytes);
+    blob.writeHeader(&w, quantized_magic, file_version);
+    w.writeU32(@intCast(q.count));
+    for (0..q.count) |p| w.writeU32(@intCast(tableLen(p)));
+    for (0..q.count) |p| w.writeF64(q.scales[p]);
+    for (q.storage) |value| w.writeI16(value);
     return bytes;
 }
 
 pub fn parseQuantized(gpa: std.mem.Allocator, bytes: []const u8) !Quantized {
     if (bytes.len < header_len) return error.WrongTableFileSize;
-    if (!std.mem.eql(u8, bytes[0..8], quantized_magic)) return error.BadTableMagic;
-    if (std.mem.readInt(u32, bytes[8..12], .little) != file_version) return error.UnsupportedTableVersion;
-    if (std.mem.readInt(u32, bytes[12..16], .little) != endian_marker) return error.WrongTableEndianness;
-    const n: usize = std.mem.readInt(u32, bytes[16..20], .little);
+    var r = blob.Reader.init(bytes);
+    try blob.readHeader(&r, quantized_magic, file_version, .{
+        .magic = error.BadTableMagic,
+        .version = error.UnsupportedTableVersion,
+        .endian = error.WrongTableEndianness,
+    });
+    const n: usize = try r.readU32();
     if (n == 0 or n > pattern_count) return error.WrongPatternCount;
     if (bytes.len != quantizedFileLen(n)) return error.WrongTableFileSize;
-    var pos = header_len;
     for (0..n) |p| {
-        if (std.mem.readInt(u32, bytes[pos..][0..4], .little) != tableLen(p)) return error.WrongTableLength;
-        pos += 4;
+        if (try r.readU32() != tableLen(p)) return error.WrongTableLength;
     }
     var q = try Quantized.initCount(gpa, n);
     errdefer q.deinit(gpa);
-    for (0..n) |p| {
-        q.scales[p] = @bitCast(std.mem.readInt(u64, bytes[pos..][0..8], .little));
-        pos += 8;
-    }
-    for (q.storage) |*w| {
-        w.* = std.mem.readInt(i16, bytes[pos..][0..2], .little);
-        pos += 2;
-    }
+    for (0..n) |p| q.scales[p] = try r.readF64();
+    for (q.storage) |*value| value.* = try r.readI16();
     return q;
 }
 
@@ -340,7 +463,6 @@ pub fn loadQuantized(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !Quan
 
 pub const file_magic = "2048-NT\x00";
 pub const file_version: u32 = 1;
-const endian_marker: u32 = 0x01020304;
 const header_len: usize = 8 + 4 + 4 + 4;
 /// File length for `n` tables; `.wide` is `fileLen(pattern_count)`.
 pub fn fileLen(n: usize) usize {
@@ -350,41 +472,31 @@ pub fn fileLen(n: usize) usize {
 /// File: magic, version, endianness marker, pattern count, per-table lengths (u32 LE), then f32 LE payload.
 pub fn encode(gpa: std.mem.Allocator, net: *const TupleNet) ![]u8 {
     const bytes = try gpa.alloc(u8, fileLen(net.count));
-    @memcpy(bytes[0..8], file_magic);
-    std.mem.writeInt(u32, bytes[8..12], file_version, .little);
-    std.mem.writeInt(u32, bytes[12..16], endian_marker, .little);
-    std.mem.writeInt(u32, bytes[16..20], @intCast(net.count), .little);
-    var pos = header_len;
-    for (0..net.count) |p| {
-        std.mem.writeInt(u32, bytes[pos..][0..4], @intCast(tableLen(p)), .little);
-        pos += 4;
-    }
-    for (net.storage) |w| {
-        std.mem.writeInt(u32, bytes[pos..][0..4], @bitCast(w), .little);
-        pos += 4;
-    }
+    var w = blob.Writer.init(bytes);
+    blob.writeHeader(&w, file_magic, file_version);
+    w.writeU32(@intCast(net.count));
+    for (0..net.count) |p| w.writeU32(@intCast(tableLen(p)));
+    for (net.storage) |value| w.writeF32(value);
     return bytes;
 }
 
 pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !TupleNet {
     if (bytes.len < header_len) return error.WrongTableFileSize;
-    if (!std.mem.eql(u8, bytes[0..8], file_magic)) return error.BadTableMagic;
-    if (std.mem.readInt(u32, bytes[8..12], .little) != file_version) return error.UnsupportedTableVersion;
-    if (std.mem.readInt(u32, bytes[12..16], .little) != endian_marker) return error.WrongTableEndianness;
-    const n: usize = std.mem.readInt(u32, bytes[16..20], .little);
+    var r = blob.Reader.init(bytes);
+    try blob.readHeader(&r, file_magic, file_version, .{
+        .magic = error.BadTableMagic,
+        .version = error.UnsupportedTableVersion,
+        .endian = error.WrongTableEndianness,
+    });
+    const n: usize = try r.readU32();
     if (n == 0 or n > pattern_count) return error.WrongPatternCount;
     if (bytes.len != fileLen(n)) return error.WrongTableFileSize;
-    var pos = header_len;
     for (0..n) |p| {
-        if (std.mem.readInt(u32, bytes[pos..][0..4], .little) != tableLen(p)) return error.WrongTableLength;
-        pos += 4;
+        if (try r.readU32() != tableLen(p)) return error.WrongTableLength;
     }
     var net = try TupleNet.initCount(gpa, n);
     errdefer net.deinit(gpa);
-    for (net.storage) |*w| {
-        w.* = @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little));
-        pos += 4;
-    }
+    for (net.storage) |*value| value.* = try r.readF32();
     return net;
 }
 
@@ -417,10 +529,14 @@ pub const Mode = enum {
 /// afterstate on the post-spawn board (`r + max_a V(after(s', a))`, the two-stage target).
 pub const Target = enum { on_policy, max_backup };
 
-/// Runner variant: policy mode, table set, TD target, and whether to load `table_path` first.
+/// Learning algorithm selected by the runner; TD(0) stays the default.
+pub const Learner = enum { td_zero, delayed_td_lambda, temporal_coherence };
+
+/// Runner variant: policy mode, table set, learner, TD target, and whether to load `table_path` first.
 pub const Variant = struct {
     mode: Mode = .greedy,
     set: Set = .full,
+    learner: Learner = .td_zero,
     target: Target = .on_policy,
     resume_from_file: bool = false,
 };
@@ -434,6 +550,9 @@ pub fn parseVariant(name: []const u8) ?Variant {
     if (std.mem.eql(u8, name, "resume")) return .{ .resume_from_file = true };
     if (std.mem.eql(u8, name, "lightresume")) return .{ .resume_from_file = true, .set = .light };
     if (std.mem.eql(u8, name, "wide")) return .{ .set = .wide };
+    if (std.mem.eql(u8, name, "widedelay")) return .{ .set = .wide, .learner = .delayed_td_lambda };
+    if (std.mem.eql(u8, name, "widetc")) return .{ .set = .wide, .learner = .temporal_coherence };
+    if (std.mem.eql(u8, name, "widedeep_tc")) return .{ .mode = .deep, .set = .wide, .learner = .temporal_coherence };
     if (std.mem.eql(u8, name, "maxb")) return .{ .set = .wide, .target = .max_backup };
     if (std.mem.eql(u8, name, "maxbchance")) return .{ .set = .wide, .mode = .chance, .target = .max_backup };
     if (std.mem.eql(u8, name, "maxbdeep")) return .{ .set = .wide, .mode = .deep, .target = .max_backup };
@@ -674,6 +793,50 @@ pub fn trainGameWith(net: *TupleNet, rng: std.Random, lr: f64, mode: Mode, targe
     return .{ .score = state.score, .moves = moves };
 }
 
+/// Opt-in delayed TD(lambda) self-play, with the on-policy afterstate target only.
+pub fn trainGameDelayedTDLambda(net: *TupleNet, rng: std.Random, lr: f64, mode: Mode) GameResult {
+    var state = core.GameState.gameStart(rng);
+    var learner = DelayedTDLambda.init(net, lr);
+    var pending: ?Pick = null;
+    var moves: u32 = 0;
+    var stats: Stats = .{};
+    while (chooseMove(net, state, mode, &stats)) |pick| {
+        moves += 1;
+        if (pending) |p| {
+            // Re-evaluate the pending afterstate: older delayed updates may have touched its weights.
+            const delta = p.reward + pick.value - net.value(p.idx);
+            learner.observe(p.idx, delta);
+        }
+        pending = pick;
+        _ = state.move(pick.dir, rng);
+    }
+    if (pending) |p| learner.observe(p.idx, p.reward - net.value(p.idx));
+    learner.finish();
+    return .{ .score = state.score, .moves = moves };
+}
+
+/// Opt-in on-policy TD(λ) with per-weight Temporal Coherence; the TD(0) path is unchanged.
+pub fn trainGameTemporalCoherence(tc: *TemporalCoherence, rng: std.Random, beta: f64, mode: Mode) GameResult {
+    const net = tc.net;
+    tc.beginEpisode();
+    var state = core.GameState.gameStart(rng);
+    var pending: ?Pick = null;
+    var moves: u32 = 0;
+    var stats: Stats = .{};
+    while (chooseMove(net, state, mode, &stats)) |pick| {
+        moves += 1;
+        if (pending) |p| {
+            // Re-evaluate the pending afterstate because its weights may have changed through the trace.
+            const delta = p.reward + pick.value - net.value(p.idx);
+            tc.observe(p.idx, delta, beta);
+        }
+        pending = pick;
+        _ = state.move(pick.dir, rng);
+    }
+    if (pending) |p| tc.observe(p.idx, p.reward - net.value(p.idx), beta);
+    return .{ .score = state.score, .moves = moves };
+}
+
 // ---------------------------------------------------------------------------
 
 fn testNet() !TupleNet {
@@ -873,6 +1036,116 @@ test "light table file round-trips with its own pattern count" {
     try std.testing.expectEqualSlices(f32, light.storage, back.storage);
 }
 
+test "encode writes the f32 table layout byte for byte (#302)" {
+    const gpa = std.testing.allocator;
+    var net = try TupleNet.initCount(gpa, 1);
+    defer net.deinit(gpa);
+    for (net.storage, 0..) |*value, i| value.* = @floatFromInt(@as(i32, @intCast(i % 11)) - 5);
+
+    const bytes = try encode(gpa, &net);
+    defer gpa.free(bytes);
+    // magic, version, endianness marker, pattern count, then the length of the one 4-tuple table
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        '2', '0', '4', '8', '-', 'N', 'T', 0,
+        1,   0,   0,   0,   4,   3,   2,   1,
+        1,   0,   0,   0,   0,   0,   1,   0,
+    }, bytes[0 .. header_len + 4]);
+    // the payload starts with -5.0, then -4.0, as f32 little endian
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x00, 0xa0, 0xc0, 0x00, 0x00, 0x80, 0xc0 }, bytes[header_len + 4 ..][0..8]);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    try std.testing.expectEqualStrings("378f24e3dca98db88df93c86e20b4fb6727b0990140658edccc15eee93eb7819", &hex);
+}
+
+test "encodeQuantized writes the int16 table layout byte for byte (#302)" {
+    const gpa = std.testing.allocator;
+    var q = try Quantized.initCount(gpa, 1);
+    defer q.deinit(gpa);
+    q.scales[0] = 1.0;
+    for (q.storage, 0..) |*value, i| value.* = @intCast(@as(i32, @intCast(i % 3001)) - 1500);
+
+    const bytes = try encodeQuantized(gpa, &q);
+    defer gpa.free(bytes);
+    // ... and the 8-byte scale (1.0) follows the table length, which starts right after the header
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        '2', '0', '4', '8', '-', 'N', 'Q',  0,
+        1,   0,   0,   0,   4,   3,   2,    1,
+        1,   0,   0,   0,   0,   0,   1,    0,
+        0,   0,   0,   0,   0,   0,   0xf0, 0x3f,
+    }, bytes[0 .. header_len + 12]);
+    // the payload starts with -1500, then -1499, as i16 little endian
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x24, 0xfa, 0x25, 0xfa, 0x26, 0xfa, 0x27, 0xfa }, bytes[header_len + 12 ..][0..8]);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    try std.testing.expectEqualStrings("bdc28ee4d1918a0ccdc3a231c148208b76ccdd2734c1c7e2b06c9b90ded0f936", &hex);
+}
+
+test "parse rejects a foreign magic, another version, a wrong length and a wrong size (#302)" {
+    const gpa = std.testing.allocator;
+    var net = try TupleNet.initCount(gpa, 1);
+    defer net.deinit(gpa);
+    const full = try encode(gpa, &net);
+    defer gpa.free(full);
+
+    try std.testing.expectError(error.WrongTableFileSize, parse(gpa, full[0 .. header_len - 1]));
+    try std.testing.expectError(error.WrongTableFileSize, parse(gpa, full[0 .. full.len - 1]));
+    const oversized = try gpa.alloc(u8, full.len + 1);
+    defer gpa.free(oversized);
+    @memcpy(oversized[0..full.len], full);
+    oversized[full.len] = 0;
+    try std.testing.expectError(error.WrongTableFileSize, parse(gpa, oversized));
+
+    const bytes = try gpa.dupe(u8, full);
+    defer gpa.free(bytes);
+    bytes[0] ^= 0xff;
+    try std.testing.expectError(error.BadTableMagic, parse(gpa, bytes));
+    bytes[0] ^= 0xff;
+    std.mem.writeInt(u32, bytes[8..12], file_version + 1, .little);
+    try std.testing.expectError(error.UnsupportedTableVersion, parse(gpa, bytes));
+    std.mem.writeInt(u32, bytes[8..12], file_version, .little);
+    std.mem.writeInt(u32, bytes[12..16], 0x04030201, .little);
+    try std.testing.expectError(error.WrongTableEndianness, parse(gpa, bytes));
+    std.mem.writeInt(u32, bytes[12..16], blob.endian_marker, .little);
+    std.mem.writeInt(u32, bytes[16..20], 0, .little);
+    try std.testing.expectError(error.WrongPatternCount, parse(gpa, bytes));
+    std.mem.writeInt(u32, bytes[16..20], @intCast(pattern_count + 1), .little);
+    try std.testing.expectError(error.WrongPatternCount, parse(gpa, bytes));
+    std.mem.writeInt(u32, bytes[16..20], 1, .little);
+    std.mem.writeInt(u32, bytes[20..24], @intCast(tableLen(0) + 1), .little);
+    try std.testing.expectError(error.WrongTableLength, parse(gpa, bytes));
+}
+
+test "parseQuantized rejects the same broken headers as parse (#302)" {
+    const gpa = std.testing.allocator;
+    var q = try Quantized.initCount(gpa, 1);
+    defer q.deinit(gpa);
+    q.scales[0] = 1.0;
+    const full = try encodeQuantized(gpa, &q);
+    defer gpa.free(full);
+
+    try std.testing.expectError(error.WrongTableFileSize, parseQuantized(gpa, full[0 .. header_len - 1]));
+    try std.testing.expectError(error.WrongTableFileSize, parseQuantized(gpa, full[0 .. full.len - 1]));
+
+    const bytes = try gpa.dupe(u8, full);
+    defer gpa.free(bytes);
+    bytes[0] ^= 0xff;
+    try std.testing.expectError(error.BadTableMagic, parseQuantized(gpa, bytes));
+    bytes[0] ^= 0xff;
+    std.mem.writeInt(u32, bytes[8..12], file_version + 1, .little);
+    try std.testing.expectError(error.UnsupportedTableVersion, parseQuantized(gpa, bytes));
+    std.mem.writeInt(u32, bytes[8..12], file_version, .little);
+    std.mem.writeInt(u32, bytes[12..16], 0x04030201, .little);
+    try std.testing.expectError(error.WrongTableEndianness, parseQuantized(gpa, bytes));
+    std.mem.writeInt(u32, bytes[12..16], blob.endian_marker, .little);
+    std.mem.writeInt(u32, bytes[16..20], 0, .little);
+    try std.testing.expectError(error.WrongPatternCount, parseQuantized(gpa, bytes));
+    std.mem.writeInt(u32, bytes[16..20], 1, .little);
+    std.mem.writeInt(u32, bytes[20..24], @intCast(tableLen(0) + 1), .little);
+    try std.testing.expectError(error.WrongTableLength, parseQuantized(gpa, bytes));
+}
+
 test "resume keeps learned values instead of reinitialising the table" {
     var net = try testNet();
     defer net.deinit(std.testing.allocator);
@@ -918,6 +1191,15 @@ test "variant names select the mode, the table set and resume" {
     try std.testing.expect(lightresume.resume_from_file);
     try std.testing.expectEqual(Set.light, lightresume.set);
     try std.testing.expectEqual(Set.wide, parseVariant("wide").?.set);
+    const widedelay = parseVariant("widedelay").?;
+    try std.testing.expectEqual(Set.wide, widedelay.set);
+    try std.testing.expectEqual(Learner.delayed_td_lambda, widedelay.learner);
+    try std.testing.expectEqual(Target.on_policy, widedelay.target);
+    const widetc = parseVariant("widetc").?;
+    try std.testing.expectEqual(Learner.temporal_coherence, widetc.learner);
+    const widedeep_tc = parseVariant("widedeep_tc").?;
+    try std.testing.expectEqual(Mode.deep, widedeep_tc.mode);
+    try std.testing.expectEqual(Learner.temporal_coherence, widedeep_tc.learner);
     try std.testing.expectEqual(Mode.deep, parseVariant("widedeep").?.mode);
     try std.testing.expectEqual(Set.wide, parseVariant("widedeep").?.set);
     try std.testing.expectEqual(@as(?Variant, null), parseVariant("lightresumex"));
@@ -982,6 +1264,99 @@ test "quantized eval reproduces the float table it came from (#129)" {
     // one table only: the value is that table's entry, so the tolerance is a single quantization step
     try std.testing.expect(@abs(net.value(idx) - q.value(idx)) < 0.02);
     try std.testing.expect(@abs(net.eval(sample_board) - q.eval(sample_board)) < 0.02);
+}
+
+test "delayed TD(lambda) matches the naive bounded trace including the episode tail (#290)" {
+    const gpa = std.testing.allocator;
+    var reference = try TupleNet.initWith(gpa, .light);
+    defer reference.deinit(gpa);
+    var delayed = try TupleNet.initWith(gpa, .light);
+    defer delayed.deinit(gpa);
+
+    var second = sample_board;
+    second[0][0] = 0;
+    second[3][3] = 4;
+    var third = sample_board;
+    third[1][1] = 0;
+    third[2][2] = 16;
+    const states = [_]Indices{
+        indices(sample_board),
+        indices(second),
+        indices(third),
+        indices(sample_board),
+        indices(second),
+        indices(third),
+    };
+    const deltas = [_]f64{ 1.25, -0.5, 2.0, -3.0, 0.25, 4.0 };
+    const lr = 0.05;
+
+    trainTdLambdaReference(&reference, &states, &deltas, lr, delayed_td_lambda, delayed_td_horizon);
+    var learner = DelayedTDLambda.init(&delayed, lr);
+    for (states, deltas) |idx, delta| learner.observe(idx, delta);
+    learner.finish();
+
+    for (reference.storage, delayed.storage) |want, got| {
+        try std.testing.expectApproxEqAbs(want, got, 0.00001);
+    }
+}
+
+/// Straightforward per-error implementation used only as a test oracle for the delayed update.
+fn trainTdLambdaReference(net: *TupleNet, states: []const Indices, deltas: []const f64, lr: f64, lambda: f64, horizon: usize) void {
+    std.debug.assert(states.len == deltas.len);
+    for (deltas, 0..) |delta, t| {
+        const first = if (t > horizon) t - horizon else 0;
+        var k = t + 1;
+        while (k > first) {
+            k -= 1;
+            var decay: f64 = 1;
+            for (0..t - k) |_| decay *= lambda;
+            net.applyDelta(states[k], delta * decay, lr);
+        }
+    }
+}
+
+test "temporal coherence scales updates by accumulated signed versus absolute error (#288)" {
+    const gpa = std.testing.allocator;
+    var net = try TupleNet.initCount(gpa, 1);
+    defer net.deinit(gpa);
+    var tc = try TemporalCoherence.init(gpa, &net);
+    defer tc.deinit(gpa);
+
+    var first: Indices = @splat(0);
+    first[0] = 1;
+    var second: Indices = @splat(0);
+    second[0] = 2;
+
+    tc.beginEpisode();
+    tc.observe(first, 2.0, 1.0);
+    tc.observe(second, -1.0, 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), net.storage[1], 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), tc.errors[1], 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), tc.abs_errors[1], 0.00001);
+
+    tc.beginEpisode();
+    tc.observe(first, 3.0, 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.5), net.storage[1], 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), tc.errors[1], 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), tc.abs_errors[1], 0.00001);
+}
+
+test "temporal coherence trace stops propagating beyond the configured horizon (#288)" {
+    const gpa = std.testing.allocator;
+    var net = try TupleNet.initCount(gpa, 1);
+    defer net.deinit(gpa);
+    var tc = try TemporalCoherence.init(gpa, &net);
+    defer tc.deinit(gpa);
+
+    tc.beginEpisode();
+    for (1..6) |entry| {
+        var idx: Indices = @splat(0);
+        idx[0] = @intCast(entry);
+        tc.observe(idx, 1.0, 1.0);
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 1.875), net.storage[1], 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.875), net.storage[2], 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), net.storage[5], 0.00001);
 }
 
 test "trainGame keeps the on-policy target and max backup differs from it (#131)" {

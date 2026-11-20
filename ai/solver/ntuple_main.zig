@@ -10,16 +10,19 @@ const stats = @import("stats");
 const usage =
     \\usage: ntuple [train_games] [eval_games] [eval_seed] [learning_rate] [variant] [table_path] [train_seed]
     \\
-    \\  train_games   TD(0) self-play games; 0 loads table_path (default 2000)
+    \\  train_games   self-play training games; 0 loads table_path (default 2000)
     \\  eval_games    games per policy on the eval seed range (default 100)
     \\  eval_seed     first eval seed; game i uses eval_seed + i (default 1000)
-    \\  learning_rate TD step for n-tuple tables (default 0.01)
+    \\  learning_rate TD step size (or TC beta) for n-tuple training (default 0.01)
     \\  variant       base (greedy 1-ply) or chance (1 spawn lookahead); deep (2-ply) adds a
     \\                second own move. light / lightdeep use only the 5 base 4-tuples.
     \\                wide / widedeep add the second 2x3 6-tuple (both 2x3 orbits, #106).
+    \\                widedelay opts into delayed TD(lambda) on wide tables (lambda=0.5, horizon=3, #290).
+    \\                widetc / widedeep_tc opt into TC(lambda) on wide tables (lambda=0.5, horizon=3, #288).
     \\                maxb / maxbchance / maxbdeep are wide with the max-backup TD target (#131).
     \\                resume loads table_path first, then trains train_games more games.
     \\  table_path    file to load (train_games 0) or write (default ai/solver/ntuple_weights.bin);
+    \\                experimental learners require a separate path with a distinct filename
     \\                a path ending in .q16.bin reads/writes the int16 quantized format (#129)
     \\  train_seed    seed for self-play games (default 1)
     \\
@@ -28,6 +31,26 @@ const usage =
 ;
 
 const default_table_path = "ai/solver/ntuple_weights.bin";
+
+fn learnerTrainingPathAllowed(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    learner: ntuple.Learner,
+    train_games: u32,
+    table_path: []const u8,
+) !bool {
+    if (train_games == 0 or learner == .td_zero) return true;
+    const output_path = try std.fs.path.resolveAlloc(allocator, &.{ cwd, table_path });
+    defer allocator.free(output_path);
+    // Also block shipped basenames outside this worktree (e.g. an absolute path into the main checkout).
+    for ([_][]const u8{ default_table_path, "ai/solver/ntuple_wide_q16.bin" }) |shipped| {
+        if (std.ascii.eqlIgnoreCase(std.fs.path.basename(output_path), std.fs.path.basename(shipped))) return false;
+        const shipped_path = try std.fs.path.resolveAlloc(allocator, &.{ cwd, shipped });
+        defer allocator.free(shipped_path);
+        if (std.mem.eql(u8, output_path, shipped_path)) return false;
+    }
+    return true;
+}
 
 // Positional defaults, one named constant each (`usage` above is the compatibility surface).
 const default_train_games: u32 = 2000;
@@ -43,6 +66,8 @@ const Eval = struct {
     avg_moves: f64 = 0,
     best_tile: core.Tile = 0,
     total_score: u64 = 0,
+    game_stderr: f64 = 0,
+    reach_8192: u32 = 0,
     leaves: u64 = 0,
     elapsed_ns: i96 = 0,
 };
@@ -65,6 +90,14 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}", .{usage});
         return;
     }
+    if (train_games > 0 and variant.learner != .td_zero) {
+        const cwd = try std.process.currentPathAlloc(init.io, init.gpa);
+        defer init.gpa.free(cwd);
+        if (!try learnerTrainingPathAllowed(init.gpa, cwd, variant.learner, train_games, table_path)) {
+            std.debug.print("Experimental learner training needs a candidate table_path with a distinct filename\n{s}", .{usage});
+            return;
+        }
+    }
 
     var net = try ntuple.TupleNet.initWith(init.gpa, variant.set);
     defer net.deinit(init.gpa);
@@ -74,6 +107,23 @@ pub fn main(init: std.process.Init) !void {
         net.storage.len,
         @as(f64, @floatFromInt(net.storage.len * @sizeOf(f32))) / (1024 * 1024),
     });
+    if (train_games > 0 and variant.learner == .delayed_td_lambda) {
+        std.debug.print("delayed TD(lambda) extra memory: {d} bytes (fixed h+1 afterstate/error queue)\n", .{
+            ntuple.delayedTDLambdaExtraMemoryBytes(),
+        });
+    }
+
+    var tc_state: ?ntuple.TemporalCoherence = null;
+    defer {
+        if (tc_state) |*tc| tc.deinit(init.gpa);
+    }
+    if (train_games > 0 and variant.learner == .temporal_coherence) {
+        tc_state = try ntuple.TemporalCoherence.init(init.gpa, &net);
+        const tc = tc_state.?;
+        std.debug.print("temporal coherence extra memory: {d:.1} MiB (signed + absolute TD errors + episode trace)\n", .{
+            @as(f64, @floatFromInt(tc.extraMemoryBytes())) / (1024 * 1024),
+        });
+    }
 
     // A `.q16.bin` path writes (or, for an eval-only run, reads) the int16 quantized file.
     const quantized_path = std.mem.endsWith(u8, table_path, ".q16.bin");
@@ -92,7 +142,15 @@ pub fn main(init: std.process.Init) !void {
         for (0..train_games) |g| {
             // linear decay to 10% of the start rate, same schedule as nn_main
             const frac = @as(f64, @floatFromInt(g)) / @as(f64, @floatFromInt(train_games));
-            const game = ntuple.trainGameWith(&net, rng.random(), learning_rate * (1 - 0.9 * frac), mode, variant.target);
+            const lr = learning_rate * (1 - 0.9 * frac);
+            const game = switch (variant.learner) {
+                .td_zero => ntuple.trainGameWith(&net, rng.random(), lr, mode, variant.target),
+                .delayed_td_lambda => ntuple.trainGameDelayedTDLambda(&net, rng.random(), lr, mode),
+                .temporal_coherence => if (tc_state) |*tc|
+                    ntuple.trainGameTemporalCoherence(tc, rng.random(), lr, mode)
+                else
+                    unreachable,
+            };
             last_score = game.score;
             total_moves += game.moves;
             if ((g + 1) % 5000 == 0) {
@@ -100,10 +158,14 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         const elapsed = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
-        std.debug.print("trained {d} games, {d} moves in {d:.1} s (lr={d}, seed={d}, variant={s})\n", .{
+        // Report throughput for every learner: the A/B of compares TD(0) and widedelay on games/s.
+        const rate_seconds = @max(@as(f64, @floatFromInt(elapsed)) / 1e9, 1e-9);
+        std.debug.print("trained {d} games, {d} moves in {d:.1} s ({d:.2} games/s, {d:.1} moves/s; lr={d}, seed={d}, variant={s})\n", .{
             train_games,
             total_moves,
-            @as(f64, @floatFromInt(elapsed)) / 1e9,
+            rate_seconds,
+            @as(f64, @floatFromInt(train_games)) / rate_seconds,
+            @as(f64, @floatFromInt(total_moves)) / rate_seconds,
             learning_rate,
             train_seed,
             variant_name,
@@ -145,6 +207,11 @@ pub fn main(init: std.process.Init) !void {
         const start = std.Io.Clock.awake.now(init.io);
         parallel.map(ntuple.PlayResult, res_all, EvalCtx{ .net = &net, .policy = idx, .eval_seed = eval_seed }, playGame);
         stats.rangeTotals(ntuple.PlayResult, Eval, r, res_all, eval_games);
+        // `seed_ranges` is 1, so the between-range stderr above is always zero; a single-range row is
+        // only judgeable with the per-game standard error.
+        const game_scores = try init.arena.allocator().alloc(f64, games);
+        for (res_all, 0..) |res, i| game_scores[i] = @as(f64, @floatFromInt(res.score));
+        r.game_stderr = stats.meanStderr(game_scores).stderr;
         r.elapsed_ns = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
     }
     const last_seed = eval_seed + seed_ranges * eval_games - 1;
@@ -159,7 +226,13 @@ pub fn main(init: std.process.Init) !void {
             .best_tile = r.best_tile,
             .elapsed_ns = r.elapsed_ns,
         }, r.total_score, r.leaves);
-        std.debug.print("\n", .{});
+        std.debug.print("eval per-game score stderr={d:.1} (n={d}); reach8192={d}/{d} ({d:.1}%)\n\n", .{
+            r.game_stderr,
+            games,
+            r.reach_8192,
+            games,
+            100 * @as(f64, @floatFromInt(r.reach_8192)) / @as(f64, @floatFromInt(games)),
+        });
     }
 }
 
@@ -172,10 +245,39 @@ test "train seed argument (position 7) is optional and defaults to 1" {
     try std.testing.expectEqual(@as(u64, 3), try cli.argOr(u64, &with_seed, 7, default_train_seed));
 }
 
+test "experimental n-tuple learners cannot overwrite the shipped table" {
+    const gpa = std.testing.allocator;
+    const cwd = "/repo";
+    const experimental = [_]ntuple.Learner{ .delayed_td_lambda, .temporal_coherence };
+    const refused = [_][]const u8{
+        default_table_path,
+        "./ai/solver/ntuple_weights.bin",
+        "ai/solver/../solver/ntuple_weights.bin",
+        "/repo/ai/solver/ntuple_weights.bin",
+        "ai/solver/ntuple_wide_q16.bin",
+        "/other/repo/ai/solver/ntuple_weights.bin",
+        "/tmp/ntuple_wide_q16.bin",
+        "/tmp/NTUPLE_WEIGHTS.BIN",
+    };
+    for (experimental) |learner| {
+        for (refused) |path| {
+            try std.testing.expect(!(try learnerTrainingPathAllowed(gpa, cwd, learner, 1, path)));
+        }
+        // Loading never writes, and a distinct candidate filename is the intended output.
+        try std.testing.expect(try learnerTrainingPathAllowed(gpa, cwd, learner, 0, default_table_path));
+        try std.testing.expect(try learnerTrainingPathAllowed(gpa, cwd, learner, 1, "candidate.bin"));
+    }
+    try std.testing.expect(try learnerTrainingPathAllowed(gpa, cwd, .td_zero, 1, default_table_path));
+}
+
 test "usage text lists both variants" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "base (greedy") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "chance (1 spawn") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "lightdeep") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "widedeep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "widedelay") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "widetc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "widedeep_tc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "separate path with a distinct filename") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "resume") != null);
 }
