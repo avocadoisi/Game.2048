@@ -8,6 +8,15 @@ Zig で書いた 2048。ゲームロジックを `2048.core` として切り出�
 - `zig build test` で全ユニットテストが通ること
 - 乱数は注入式で、seed 固定なら同じゲーム・同じ solver の手順が再現する
 
+## 開発方針
+
+simple · short。作らないのが第一、作るのが最後の手段。作らなかった案は issue に残し、その変更が死なせたものは消す。
+
+- コメントは稀に。**挙動はテストが保証し、コメントは説明だけをする。** テストで確かめられることは、コメントではなくテストに書く
+- コメントに書くのはテストでは表せない制約だけ——なぜこの形でなければならないか、呼び出し側が守る前提、その数値の出所
+- 経緯（どの issue で何を試し、何を却下したか）はコメントに書かない。`docs/solver-history.md` に置く
+- 規約は、それを守らせるコードの隣に置く（同じ文言を `.pi/skills/tdd-2048/SKILL.md` の Local rules にも置いている）
+
 ## クイックスタート
 
 ```bash
@@ -32,9 +41,9 @@ zig build run -- help
 
 | 何 | 大きさ | 中身 |
 | --- | ---: | --- |
-| `game2048.wasm` | 685 KiB | gzip 264 KiB。ゲーム + 同梱 solver（`wasm.policies`、既定は `nn2` と `nn3`）+ NN 重み |
+| `game2048.wasm` | 561 KiB | gzip 421 KiB。ゲーム + 同梱 solver（`wasm.policies`、既定は `nn2` と `nn3`）+ NN 重み |
 | 初期メモリ | 2.44 MiB | `memory.grow` なし。スタック 1 MiB、静的データ 1.4 MiB（うち TT 640 KiB） |
-| NN 重み | 148 KB | `@embedFile`。実行時に外部ファイルを取らない |
+| NN 重み | 290 KB | `@embedFile`。実行時に外部ファイルを取らない |
 | 行テーブル | 512 KiB | `src/core.zig` の `row_table`（1 行のマージを引く 65,536 エントリ）。wasm の静的データの大半 |
 | n-tuple 表 | 64.6 MiB | wasm には入れない（native の API 専用） |
 

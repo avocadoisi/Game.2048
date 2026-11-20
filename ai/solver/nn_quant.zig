@@ -1,5 +1,5 @@
 //! Converts the value net from the f32 format to the int16 quantized one and reports what that costs
-//! in accuracy (#170). The quantized file is a shipping artefact (37,170 B instead of 148,504 B), so it
+//! in accuracy. The quantized file is a shipping artefact (37,170 B instead of 148,504 B), so it
 //! is written wherever the caller points and never committed.
 //! `zig build nn-quant -- ai/solver/nn_weights.bin /tmp/nn_weights_q.bin [games] [seed]`
 
@@ -114,7 +114,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("  weights only        mean |dV| {e:.3} max {e:.3}\n", .{ weights_only.mean(), weights_only.max });
     std.debug.print("  weights + int16 act mean |dV| {e:.3} max {e:.3}\n", .{ quantized.mean(), quantized.max });
 
-    // Player-level check of the opt-in path (#170): the same policy, `Value.quantized` instead of
+    // Player-level check of the opt-in path: the same policy, `Value.quantized` instead of
     // `Value.single`, through the normal play loop.
     const f32_play = playAll(.{ .single = &net }, rng, games);
     const q_play = playAll(.{ .quantized = &back }, rng, games);

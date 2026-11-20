@@ -284,7 +284,7 @@ fn maxArgs(spec: VariantSpec, row_spec: ?[]const u8, use_par: bool) usize {
     };
 }
 
-/// (#203) Fill `sel` from the `rows` argument: comma-separated indices, any bad token or an index
+/// Fill `sel` from the `rows` argument: comma-separated indices, any bad token or an index
 /// past the table is an error, so a typo never silently runs the full table.
 fn parseRows(sel: []bool, spec: []const u8) !void {
     @memset(sel, false);
@@ -296,7 +296,7 @@ fn parseRows(sel: []bool, spec: []const u8) !void {
     }
 }
 
-/// Default `par` step multiplier (#203): sqrt of the batch size. The linear rule (= the batch size)
+/// Default `par` step multiplier: sqrt of the batch size. The linear rule (= the batch size)
 /// matches serial over 20k games but oversteps on a 100k run at lr 0.003 (three seeds land 26k-68k
 /// behind the shipped net in the paired test), while sqrt stays at the shipped net's level.
 fn batchScaleFor(batch_size: usize) f64 {
@@ -308,20 +308,20 @@ fn defaultBatchScale() f64 {
 }
 
 /// Positional arg 10, appended after `train_seed`: the literal "par" runs the variant of arg 6 in
-/// parallel batches (issue #99). "-" is the explicit "no par" placeholder that opens the dump slots
-/// of #159; any other value is a typo.
+/// parallel batches. "-" is the explicit "no par" placeholder that opens the dump slots
+/// of ; any other value is a typo.
 ///
-/// (#137) Batch delta multiplier for `par` runs, arg 12 (after the `par` slot and its `-` dump slot):
-/// omitted = `defaultBatchScale()`, `-` = the historical 1.0 ("mean of the per-game deltas", which
-/// under-trains by 1/games), a number = that multiplier (`8` = the #208 linear rule).
+/// Batch delta multiplier for `par` runs, arg 12 (after the `par` slot and its `-` dump slot):
+/// omitted = `defaultBatchScale`, `-` = the historical 1.0 ("mean of the per-game deltas", which
+/// under-trains by 1/games), a number = that multiplier (`8` = the linear rule).
 fn parseBatchScale(args: []const []const u8) !f64 {
     if (args.len <= 12) return defaultBatchScale();
     if (std.mem.eql(u8, args[12], "-")) return 1.0;
     return std.fmt.parseFloat(f64, args[12]) catch error.InvalidBatchScale;
 }
 
-/// (#207) `tch` takes the teacher's search mode at arg 12: `deep3` (the default, #175/#206) or `h4`
-/// (`phase_h4`: 3-ply everywhere plus 4-ply in the endgame, #171), which prices the deep boards the
+/// `tch` takes the teacher's search mode at arg 12: `deep3` (the default) or `h4`
+/// (`phase_h4`: 3-ply everywhere plus 4-ply in the endgame), which prices the deep boards the
 /// dump actually holds with one more ply. Typo = error, so a label pass never silently uses the old mode.
 fn parseTeacherMode(args: []const []const u8) !nn.Mode {
     if (args.len <= 12) return .deep3;
@@ -332,8 +332,8 @@ fn parseTeacherMode(args: []const []const u8) !nn.Mode {
     return error.InvalidTeacherMode;
 }
 
-/// (#207) `ft2` takes the deep-half thinning after the dump path: arg 12 is `deep_every`, one deep
-/// update per that many self-play moves. `1` is the #159 50% mix, which diverges to NaN; 4..8 is the
+/// `ft2` takes the deep-half thinning after the dump path: arg 12 is `deep_every`, one deep
+/// update per that many self-play moves. `1` is the 50% mix, which diverges to NaN; 4..8 is the
 /// mix the stable offline twin (`dist`) uses.
 fn parseDeepEvery(args: []const []const u8) !u32 {
     if (args.len <= 12) return 1;
@@ -343,7 +343,7 @@ fn parseDeepEvery(args: []const []const u8) !u32 {
     return every;
 }
 
-/// (#206) `dist` / `dson` take the teacher mix after the dump path: arg 12 is `distill_every`
+/// `dist` / `dson` take the teacher mix after the dump path: arg 12 is `distill_every`
 /// (1 = every step) and arg 13 is the divisor applied to the TD rate for teacher updates (0 = same rate).
 const DistillMix = struct { every: u32 = 1, div: f64 = 0 };
 
@@ -362,9 +362,9 @@ fn parseDistillMix(args: []const []const u8) !DistillMix {
 /// Absolute teacher step: the TD rate divided by the arg-13 divisor, or 0 for "same as TD".
 ///
 /// `nn.Options.distill_lr` is an absolute rate (see its tests in `nn.zig`), so the divisor has to be
-/// applied here, where the TD rate is known. The #206 code wrote `1 / div` into the field instead, and
+/// applied here, where the TD rate is known. The code wrote `1 / div` into the field instead, and
 /// `dist` with the documented divisor of 10 therefore took steps 300x the TD rate at lr 3e-4: the net
-/// blew up to NaN within a few thousand games (#207).
+/// blew up to NaN within a few thousand games.
 fn distillRate(learning_rate: f64, div: f64) f64 {
     return if (div > 0) learning_rate / div else 0;
 }
@@ -376,7 +376,7 @@ fn parseParFlag(args: []const []const u8) !bool {
     return true;
 }
 
-/// (#231) Adam's own step size for variant `adam`, at the row-spec slot (dist owns that slot for its
+/// Adam's own step size for variant `adam`, at the row-spec slot (dist owns that slot for its
 /// teacher divisor, so the two variants never collide).
 fn parseAdamLr(args: []const []const u8) !f64 {
     if (args.len <= 13) return 0.01;
@@ -386,7 +386,7 @@ fn parseAdamLr(args: []const []const u8) !f64 {
     return lr;
 }
 
-/// (#234) Ceiling on the TD target for variant `clamp`, at the same row-spec slot as Adam's step size and
+/// Ceiling on the TD target for variant `clamp`, at the same row-spec slot as Adam's step size and
 /// `tailw`'s alpha. 0 or `-` leaves the target alone (i.e. a plain `base` run), so a value is required.
 fn parseClamp(args: []const []const u8) !f64 {
     if (args.len <= 13) return 200;
@@ -396,8 +396,8 @@ fn parseClamp(args: []const []const u8) !f64 {
     return cap;
 }
 
-/// (#300) `sweep_lambda` of the `rlam` variant, at the row-spec slot (index 13). Default 0.7; `0`
-/// restores the plain TD(0) replay sweep, which is the control of the #300 comparison, so 0 is allowed
+/// `sweep_lambda` of the `rlam` variant, at the row-spec slot (index 13). Default 0.7; `0`
+/// restores the plain TD(0) replay sweep, which is the control of the comparison, so 0 is allowed
 /// (unlike `tailw`, where 0 would silently make the variant a plain `base`) but negatives are refused.
 fn parseSweepLambda(args: []const []const u8) !f64 {
     if (args.len <= 13) return default_sweep_lambda;
@@ -407,7 +407,7 @@ fn parseSweepLambda(args: []const []const u8) !f64 {
     return lambda;
 }
 
-/// (#232) `tail_alpha` for variant `tailw`, at the same row-spec slot as Adam's step size: the step of a
+/// `tail_alpha` for variant `tailw`, at the same row-spec slot as Adam's step size: the step of a
 /// per-move sample is `lr * (1 + alpha * (15 - empties) / 15)`, i.e. up to `1 + alpha` times `lr` on a
 /// board with no empty cell. 0 would make the variant a plain `base` run, so it is refused.
 fn parseTailAlpha(args: []const []const u8) !f64 {
@@ -418,7 +418,7 @@ fn parseTailAlpha(args: []const []const u8) !f64 {
     return alpha;
 }
 
-/// (#277) `shape_c` for variant `shape`, at the same row-spec slot as Adam's step size, `tailw`'s
+/// `shape_c` for variant `shape`, at the same row-spec slot as Adam's step size, `tailw`'s
 /// alpha, `clamp`'s target bound and `clip`'s cap. The default and `-` are 1; 0 would make the variant
 /// a plain `base` run, so it is refused. Negative coefficients are valid potential shaping.
 fn parseShapeC(args: []const []const u8) !f64 {
@@ -429,15 +429,15 @@ fn parseShapeC(args: []const []const u8) !f64 {
     return shape_c;
 }
 
-/// (#246) Which ceiling the `clip` variant applies: the L2 norm of one merged `par` batch delta
+/// Which ceiling the `clip` variant applies: the L2 norm of one merged `par` batch delta
 /// (`norm`, the `sym_batch_clip` style) or every element of one step's `|dw|` (`step`).
 const ClipMode = enum { norm, step };
 
-/// (#246) `clip`'s default ceiling: the unit L2 norm `sym_batch_clip` already uses for an averaged
+/// `clip`'s default ceiling: the unit L2 norm `sym_batch_clip` already uses for an averaged
 /// symmetry gradient, so `clip` without a value bounds a batch step to a single sample's scale.
 const default_clip_cap: f64 = nn.sym_batch_clip;
 
-/// (#246) `clip`'s ceiling, at the same row-spec slot as Adam's step size, `tailw`'s alpha and
+/// `clip`'s ceiling, at the same row-spec slot as Adam's step size, `tailw`'s alpha and
 /// `clamp`'s target bound. 0 or `-` would be a plain `base` run, so it is refused.
 fn parseStepCap(args: []const []const u8) !f64 {
     if (args.len <= 13) return default_clip_cap;
@@ -447,7 +447,7 @@ fn parseStepCap(args: []const []const u8) !f64 {
     return cap;
 }
 
-/// (#246) `clip`'s mode at arg 14: `norm` (default) bounds the merged batch delta's L2 norm, `step`
+/// `clip`'s mode at arg 14: `norm` (default) bounds the merged batch delta's L2 norm, `step`
 /// bounds every element of a step. A stray token is an error, never a silent fallback to `norm`.
 fn parseClipMode(args: []const []const u8) !ClipMode {
     if (args.len <= 14) return .norm;
@@ -457,15 +457,15 @@ fn parseClipMode(args: []const []const u8) !ClipMode {
 }
 
 /// `par` forks whole games onto threads, so it cannot carry the cross-game priority buffer (shared by
-/// pointer), the staged net (no batch path, one net is ~1 MB), or the #167 teacher cells (their search
+/// pointer), the staged net (no batch path, one net is ~1 MB), or the teacher cells (their search
 /// is the whole cost of the run; batching would only multiply it by the thread count).
-/// The #158 aligned variants t2/p2/tp2 use the plain per-move path, so they batch like base; the
-/// value cache is threadlocal and cleared per move (#228), so the games do not share stale leaves.
+/// The aligned variants t2/p2/tp2 use the plain per-move path, so they batch like base; the
+/// value cache is threadlocal and cleared per move, so the games do not share stale leaves.
 fn parSupported(opts: nn.Options, is_mstd: bool) bool {
     // `distill` stays out: it is read-only and race-free, but a 20,000-game `dist` net trained under `par`
-    // is 30,000 points behind the same serial run at every batch_scale tried (#207), so the batched path
+    // is 30,000 points behind the same serial run at every batch_scale tried, so the batched path
     // is refused rather than silently offered.
-    // `-Dfeat` builds stay out too (#226): a feature net trained under `par` lands far below the same
+    // `-Dfeat` builds stay out too: a feature net trained under `par` lands far below the same
     // serial run (feat 1, 100k games, sqrt rule: 27,433 under `par` vs 81,959 serial), so the batched
     // path would silently produce a broken net.
     return opts.priority == null and !is_mstd and opts.teacher == null and opts.distill == null and
@@ -474,13 +474,13 @@ fn parSupported(opts: nn.Options, is_mstd: bool) bool {
         (opts.selfplay == .greedy1 or opts.selfplay == .deep2);
 }
 
-/// Foreign rerank score of the #189 eval row: the snake heuristic of `solver.evaluate` (the #117
-/// `baseline` weights), divided by `nn.reward_scale` so it is on the NN value scale.
+/// Foreign rerank score of the eval row: the snake heuristic of `solver.evaluate` on the `baseline`
+/// weights, divided by `nn.reward_scale` so it is on the NN value scale.
 fn snakeScore(board: core.Board) f64 {
     return solver.evaluate(board) / nn.reward_scale;
 }
 
-/// Loads the #175 teacher file (`tch` output) for `dist`. A missing, foreign or empty file is a
+/// Loads the teacher file (`tch` output) for `dist`. A missing, foreign or empty file is a
 /// command-line error (usage + exit 1), never a silent fallback to plain self-play.
 fn loadTeachers(buffer: *nn.Teachers, io: std.Io, gpa: std.mem.Allocator, path: []const u8) void {
     buffer.load(io, gpa, path) catch |err| {
@@ -523,7 +523,7 @@ fn startStaged(staged: *nn.Staged, io: std.Io, gpa: std.mem.Allocator, train_gam
 const NnEvalRow = struct {
     mode: nn.Mode,
     opts: nn.Options = .{},
-    /// (#260) The eval-only `leaf` variant reads `omit_leaf_reward` from the run options. Only
+    /// The eval-only `leaf` variant reads `omit_leaf_reward` from the run options. Only
     /// the rows whose leaves it changes set this; the row's other options stay in `opts`.
     leaf_override: bool = false,
 };
@@ -553,41 +553,41 @@ const all_rows = [_]EvalRow{
     .{ .name = "nn phase h2 (#157)", .spec = .{ .nn = .{ .mode = .phase_h2 } } },
     .{ .name = "nn phase h3 (#157)", .spec = .{ .nn = .{ .mode = .phase_h3 } } },
     .{ .name = "nn phase h4 (#171)", .spec = .{ .nn = .{ .mode = .phase_h4 } } },
-    // #182: the same 2-ply tree as `nn 2-ply (deep)`, minus each chance node's lowest-probability
+    // : the same 2-ply tree as `nn 2-ply (deep)`, minus each chance node's lowest-probability
     // spawn branches up to 5% of its mass.
     .{ .name = "nn 2-ply + mass cutoff (#182)", .spec = .{ .nn = .{ .mode = .deep_mass } } },
-    // #178: the .deep row with every search leaf averaged over the 8 dihedral transforms.
+    // : the .deep row with every search leaf averaged over the 8 dihedral transforms.
     .{ .name = "nn 2-ply + sym leaf (#178)", .spec = .{ .nn = .{ .mode = .deep, .opts = .{ .sym_leaf = true } } } },
-    // #183: iterative deepening from the .deep row, stopping at a leaf-evaluation budget instead of
+    // : iterative deepening from the .deep row, stopping at a leaf-evaluation budget instead of
     // a fixed ply, so a position it can afford searches deeper than 2 and still costs the same.
     .{ .name = "nn iterative deepening (#183)", .spec = .{ .nn = .{ .mode = .deep, .opts = .{ .id_budget = 200_000 } } } },
-    // #189: the .deep row, reranked between the top two moves by the snake heuristic when the
+    // : the .deep row, reranked between the top two moves by the snake heuristic when the
     // net's own gap is within 0.05 (NN values are score deltas / reward_scale, so 50 points of
     // one-move score); the snake score enters at half its `reward_scale` units.
     .{ .name = "nn 2-ply + rerank (#189)", .spec = .{ .nn = .{ .mode = .deep, .opts = .{ .rerank = .{ .margin = 0.05, .weight = 0.5, .score = &snakeScore } } } } },
-    // #187: the .deep row with every chance node scored 30% by its CVaR below the lower 25%
+    // : the .deep row with every chance node scored 30% by its CVaR below the lower 25%
     // quantile, so a move that is usually good but sometimes losing ranks below a stable one.
     .{ .name = "nn 2-ply + downside risk (#187)", .spec = .{ .nn = .{ .mode = .deep, .opts = .{ .risk_weight = 0.3 } } } },
-    // #188: the #183 budget, but a root move that already beats its runner-up by more than 0.05
+    // : the budget, but a root move that already beats its runner-up by more than 0.05
     // ends the deepening after the first iteration, so only near-tie positions pay for a deeper tree.
     .{ .name = "nn deepening on near ties (#188)", .spec = .{ .nn = .{ .mode = .deep, .opts = .{ .id_budget = 200_000, .id_margin = 0.05 } } } },
-    // #263: the .deep3 row with completed interior nodes reused inside one search. #266 made this
+    // : the .deep3 row with completed interior nodes reused inside one search. made this
     // the default for 3-ply, so the row passes no options and measures the shipped path; row 4 is
     // the explicit-off baseline the two are compared on.
     .{ .name = "nn 3-ply + node TT default (#266)", .spec = .{ .nn = .{ .mode = .deep3 } } },
-    // #263: the same table at a 1e-3 spawn cut: the time the table saved, spent on a wider tree.
+    // : the same table at a 1e-3 spawn cut: the time the table saved, spent on a wider tree.
     .{ .name = "nn 3-ply 1e-3 + node TT (#263)", .spec = .{ .nn = .{ .mode = .deep3, .opts = .{ .cutoff = 1e-3 } } } },
-    // #267: `deep4`, one more own move and spawn layer than row 15 at the same 1e-2 cut, with the
+    // : `deep4`, one more own move and spawn layer than row 15 at the same 1e-2 cut, with the
     // node table on. A/B against row 15 answers whether the saved time buys a deeper tree.
     .{ .name = "nn 4-ply + node TT (#267)", .spec = .{ .nn = .{ .mode = .deep4, .opts = .{ .node_tt = true } } } },
-    // #281: row 15 with a higher spawn cut, so the 4 branches at empty cells >= 6 (0.02) or >= 3
+    // : row 15 with a higher spawn cut, so the 4 branches at empty cells >= 6 (0.02) or >= 3
     // (0.05) are dropped. A/B against row 15 measures whether the saved leaves buy a better score.
     .{ .name = "nn 3-ply cutoff 0.02 + node TT (#281)", .spec = .{ .nn = .{ .mode = .deep3, .opts = .{ .cutoff = 0.02, .node_tt = true } } } },
     .{ .name = "nn 3-ply cutoff 0.05 + node TT (#281)", .spec = .{ .nn = .{ .mode = .deep3, .opts = .{ .cutoff = 0.05, .node_tt = true } } } },
-    // #261: the `deep3` tree, but a spawn branch under the fixed cut is evaluated on its real
+    // : the `deep3` tree, but a spawn branch under the fixed cut is evaluated on its real
     // child board one own-move/reward layer shallower instead of being dropped and renormalized.
     .{ .name = "nn 3-ply cut branches recovered 1 ply shallow (#261)", .spec = .{ .nn = .{ .mode = .deep3_recover } } },
-    // #320: `deep4`'s extra ply, paid for by keeping only a finite weighted sample of each chance
+    // : `deep4`'s extra ply, paid for by keeping only a finite weighted sample of each chance
     // node's spawns (0.9/0.1 kept, deterministic seed). A/B against row 15 answers whether the deeper
     // tree beats the full-width 3-ply at a comparable leaf budget.
     .{ .name = "nn 4-ply spawn sample 2 + node TT (#320)", .spec = .{ .nn = .{ .mode = .deep4, .opts = .{ .sample = 2 } } } },
@@ -607,12 +607,12 @@ const Eval = struct {
     best_tile: core.Tile = 0,
     total_score: u64 = 0,
     leaves: u64 = 0,
-    /// #263 interior-node probes and hits over the whole run (0 when the row has no node table).
+    /// interior-node probes and hits over the whole run (0 when the row has no node table).
     node_probes: u64 = 0,
     node_hits: u64 = 0,
     elapsed_ns: i96 = 0,
     /// Games whose final `max_tile` is at or above the tile (counts, not rates); the avg score is a
-    /// central measure, so how often a run actually gets there has to be counted separately (#156).
+    /// central measure, so how often a run actually gets there has to be counted separately.
     reach_4096: u32 = 0,
     reach_8192: u32 = 0,
     reach_16384: u32 = 0,
@@ -643,7 +643,7 @@ fn printDiag(diag: *const nn.Diag) void {
     printTileDiag(diag);
 }
 
-/// Max-tile half of the diagnostic (#159): how many of the trained afterstates ever reach the deep tail.
+/// Max-tile half of the diagnostic: how many of the trained afterstates ever reach the deep tail.
 fn printTileDiag(diag: *const nn.Diag) void {
     const tile_names = [_][]const u8{ "<=256", "512", "1024", "2048", "4096", "8192+" };
     var total: u64 = 0;
@@ -661,7 +661,7 @@ fn printTileDiag(diag: *const nn.Diag) void {
     }
 }
 
-/// Loads the #159 deep-position file for the variants that train from it. A missing, foreign or empty
+/// Loads the deep-position file for the variants that train from it. A missing, foreign or empty
 /// dump is a command-line error (usage + exit 1), never a silent no-op.
 fn loadDump(dump: *nn.Dump, io: std.Io, gpa: std.mem.Allocator, path: []const u8) void {
     dump.load(io, gpa, path) catch |err| {
@@ -682,13 +682,13 @@ fn parsePairLeafMode(arg: ?[]const u8) ?nn.Mode {
     return null;
 }
 
-/// `pairrow` row index (#267): a 0-based index into `all_rows`, so `15` is the shipped 3-ply row.
+/// `pairrow` row index: a 0-based index into `all_rows`, so `15` is the shipped 3-ply row.
 fn parsePairRow(arg: ?[]const u8) ?usize {
     const text = arg orelse return null;
     return std.fmt.parseInt(usize, std.mem.trim(u8, text, " "), 10) catch null;
 }
 
-/// (#262) Frozen bootstrap net for `tnet`: a copy of the live net, refreshed only between merged
+/// Frozen bootstrap net for `tnet`: a copy of the live net, refreshed only between merged
 /// `par` batches. Every game inside a batch therefore prices its next afterstate from the same
 /// snapshot; the target cannot chase the weights it is training, and no batch sees a mid-batch copy.
 const TargetSync = struct {
@@ -707,11 +707,11 @@ const TargetSync = struct {
     }
 };
 
-/// (#262) `tnet` sync interval: merged `par` batches between target snapshots, at the row-spec slot.
+/// `tnet` sync interval: merged `par` batches between target snapshots, at the row-spec slot.
 /// 0 would freeze the initial random net forever, so it is refused instead of silently meaning off.
 const default_target_every: usize = 100;
 
-/// (#300) TD(lambda) of the `rlam` replay sweep when index 13 is omitted or `-`.
+/// TD(lambda) of the `rlam` replay sweep when index 13 is omitted or `-`.
 const default_sweep_lambda: f64 = 0.7;
 
 fn parseTargetEvery(args: []const []const u8) !usize {
@@ -725,7 +725,7 @@ fn parseTargetEvery(args: []const []const u8) !usize {
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     // `zig build nn` without `--` used to run the defaults (2000 games, write weights_path = the shipped
-    // file). It silently retrained the shipped net twice (#207), so no arguments now means "show me how".
+    // file). It silently retrained the shipped net twice, so no arguments now means "show me how".
     if (args.len <= 1) {
         std.debug.print("{s}", .{usage});
         return;
@@ -770,14 +770,14 @@ pub fn main(init: std.process.Init) !void {
     const is_oi = spec.variant == .oi;
     const is_oi16 = spec.variant == .oi16;
     // `dumpp2` records the same buffer as `dump`, but from 2-ply self-play boards: the distribution the
-    // 2-ply eval actually visits, which is what the teacher regression is supposed to fix (#175).
+    // 2-ply eval actually visits, which is what the teacher regression is supposed to fix.
     const is_dumpp2 = spec.variant == .dumpp2;
     const is_dump = spec.variant == .dump or is_dumpp2;
     const is_ft2 = spec.variant == .ft2;
     const is_restart = spec.variant == .restart;
-    // Paired comparison (#168): two policies play the same spawn tape.
+    // Paired comparison: two policies play the same spawn tape.
     const is_pair = spec.variant == .pair;
-    // Paired comparison of two weight files (#210): A = weights_path, B = the file at index 12, both with
+    // Paired comparison of two weight files: A = weights_path, B = the file at index 12, both with
     // the same policy, so a candidate net is judged against the shipped one on identical spawns.
     const is_pairw = spec.variant == .pairw;
     const is_pairleaf = spec.variant == .pairleaf;
@@ -791,27 +791,27 @@ pub fn main(init: std.process.Init) !void {
     const is_tchadd = spec.variant == .tchadd;
     const is_dist = spec.variant == .dist;
     const is_dson = spec.variant == .dson;
-    // (#228) the 2-ply-aligned variants: the search per move is priced from `weights_path` too.
+    // the 2-ply-aligned variants: the search per move is priced from `weights_path` too.
     const is_t2 = spec.variant == .t2;
     const is_p2 = spec.variant == .p2;
     const is_tp2 = spec.variant == .tp2;
-    // (#231) `par` only: Adam steps on the merged batch gradient.
+    // `par` only: Adam steps on the merged batch gradient.
     const is_adam = spec.variant == .adam;
-    // (#232) `par`-compatible: the weight is a per-sample `lr` multiplier, so every game stays independent.
+    // `par`-compatible: the weight is a per-sample `lr` multiplier, so every game stays independent.
     const is_tailw = spec.variant == .tailw;
-    // (#234) `par`-compatible: a bounded TD target, so a diverging value cannot bootstrap itself.
+    // `par`-compatible: a bounded TD target, so a diverging value cannot bootstrap itself.
     const is_clamp = spec.variant == .clamp;
-    // (#277) `par`-compatible: potential-based shaping with the empty-cell potential.
+    // `par`-compatible: potential-based shaping with the empty-cell potential.
     const is_shape = spec.variant == .shape;
-    // (#262) replay with a frozen bootstrap net: a `par` variable, see `TargetSync`.
+    // replay with a frozen bootstrap net: a `par` variable, see `TargetSync`.
     const is_tnet = spec.variant == .tnet;
     const target_every: usize = if (is_tnet) try parseTargetEvery(args) else 0;
-    // (#246) the step ceiling: `norm` bounds the merged `par` delta, `step` every element of a step.
+    // the step ceiling: `norm` bounds the merged `par` delta, `step` every element of a step.
     const is_clip = spec.variant == .clip;
     const clip_mode: ClipMode = if (is_clip) try parseClipMode(args) else .norm;
-    // (#206) the teacher mix: `distill_every` (arg 12) and the rate divisor (arg 13).
+    // the teacher mix: `distill_every` (arg 12) and the rate divisor (arg 13).
     const dist_mix: DistillMix = if (is_dist or is_dson) try parseDistillMix(args) else .{};
-    // #159 variants train from the net in weights_path (the deep positions come from that net), like `resume`
+    // variants train from the net in weights_path (the deep positions come from that net), like `resume`
     const is_lam = spec.variant == .lam;
     const is_rlam = spec.variant == .rlam;
     const use_resume = spec.load_weights;
@@ -820,21 +820,21 @@ pub fn main(init: std.process.Init) !void {
     const replay_k: usize = try cli.argOr(usize, args, 7, default_replay_k);
     const weights_path: []const u8 = try cli.argOr([]const u8, args, 8, default_weights_path);
     const train_seed: u64 = try cli.argOr(u64, args, 9, default_train_seed);
-    // Deep-position buffer (#159). Index 10 must say "par" or "-" (see `parseParFlag`); index 11 is the
+    // Deep-position buffer. Index 10 must say "par" or "-" (see `parseParFlag`); index 11 is the
     // dump path.
     const dump_path: ?[]const u8 = if (args.len > 11) args[11] else null;
     var dump: nn.Dump = .{};
     var priority: nn.Priority = .{};
     var adam: nn.Adam = .{};
-    // (#262) Declared before `opts`, which points at its `net`; initialised from the live net after
+    // Declared before `opts`, which points at its `net`; initialised from the live net after
     // `startNet` and refreshed between batches only.
     var target_sync: TargetSync = undefined;
-    // `nn.Teachers` is ~40 MB (32 dumps worth, #207), so it is heap allocated, unlike the small buffers.
+    // `nn.Teachers` is ~40 MB (32 dumps worth), so it is heap allocated, unlike the small buffers.
     const teachers = try init.gpa.create(nn.Teachers);
     defer init.gpa.destroy(teachers);
     teachers.len = 0;
     teachers.draws = 0;
-    // (#137) `par` merges whole-game deltas into one step; arg 12 scales that step (1 = historical mean).
+    // `par` merges whole-game deltas into one step; arg 12 scales that step (1 = historical mean).
     const batch_scale: f64 = if (use_par) try parseBatchScale(args) else 1.0;
     // `use_resume` only decides whether `weights_path` is loaded; the variant still has to reach `opts`
     // (before, `dump`/`ft2`/`restart`/`dist` fell into this first branch and their options were dropped).
@@ -847,10 +847,10 @@ pub fn main(init: std.process.Init) !void {
     else if (is_replay)
         .{ .replay_k = replay_k }
     else if (is_rlam)
-        // (#300) resume + the replay sweep as TD(lambda); index 13 `0` is the TD(0) control.
+        // resume + the replay sweep as TD(lambda); index 13 `0` is the TD(0) control.
         .{ .replay_k = replay_k, .sweep_lambda = try parseSweepLambda(args) }
     else if (is_lam)
-        // (#300) the same sweep from scratch: a resumed net blew up (self-play bootstrap + replay), see
+        // the same sweep from scratch: a resumed net blew up (self-play bootstrap + replay), see
         // the issue, so the score comparison starts from the seed net instead.
         .{ .replay_k = replay_k, .sweep_lambda = try parseSweepLambda(args) }
     else if (is_tnet)
@@ -924,10 +924,10 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}", .{usage});
         return;
     };
-    // (#137) the merge multiplier applies to every variant that reached a batched path; the branch above
+    // the merge multiplier applies to every variant that reached a batched path; the branch above
     // only set it for the plain ones, so `dist`/`sym`/`replay` silently ran with the struct default 1.0.
     opts.batch_scale = batch_scale;
-    // (#277) Refuse a shaped run mixed with a variant that retrains afterstates later or replaces the
+    // Refuse a shaped run mixed with a variant that retrains afterstates later or replaces the
     // TD target: those paths do not implement the shaped reward, and silently training on the raw
     // reward would hide the mistake.
     nn.validateOptions(opts) catch {
@@ -935,8 +935,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
     // `dump` is the shared layout plus one slot: index 11 carries the dump path.
-    // `par` runs may carry the #137 batch_scale at index 12, after the `-` dump slot.
-    // (#203) index 13 narrows the eval table to the rows a measurement needs (`0,2`). The variants that
+    // `par` runs may carry the batch_scale at index 12, after the `-` dump slot.
+    // index 13 narrows the eval table to the rows a measurement needs (`0,2`). The variants that
     // own 13 for another parameter are marked `rows = false` in `variant_specs` (including `lam`/`rlam`,
     // whose current double-read is deliberately preserved).
     const row_spec: ?[]const u8 = if (spec.rows and args.len > 13) args[13] else null;
@@ -951,17 +951,17 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}", .{usage});
         return;
     }
-    // (#231) Adam steps on the merged batch gradient only, so the variant needs `par` at arg 10.
+    // Adam steps on the merged batch gradient only, so the variant needs `par` at arg 10.
     if (is_adam and !use_par) {
         std.debug.print("{s}", .{usage});
         return;
     }
-    // (#246) the norm ceiling is on the delta one merged batch builds, which only `par` has.
+    // the norm ceiling is on the delta one merged batch builds, which only `par` has.
     if (is_clip and clip_mode == .norm and !use_par) {
         std.debug.print("{s}", .{usage});
         return;
     }
-    // (#262) the frozen snapshot is per merged batch, so the serial loop has no equivalent interval.
+    // the frozen snapshot is per merged batch, so the serial loop has no equivalent interval.
     if (is_tnet and !use_par) {
         std.debug.print("{s}", .{usage});
         return;
@@ -977,7 +977,7 @@ pub fn main(init: std.process.Init) !void {
     if (is_dist or is_dson) loadTeachers(teachers, init.io, init.gpa, dump_path.?);
 
     var net: nn.Net = undefined;
-    // `nn.Staged` is 7 nets (~2 MB at the 128/32 default), too much for the stack (#233).
+    // `nn.Staged` is 7 nets (~2 MB at the 128/32 default), too much for the stack.
     const staged = try init.gpa.create(nn.Staged);
     defer init.gpa.destroy(staged);
     const loaded = if (is_mstd)
@@ -985,13 +985,13 @@ pub fn main(init: std.process.Init) !void {
     else
         try startNet(&net, init.io, init.gpa, train_games, use_resume, train_seed, weights_path);
     if (loaded) std.debug.print("loaded {s}\n", .{weights_path});
-    // (#262) The initial snapshot is the starting net; the first batch trains against it.
+    // The initial snapshot is the starting net; the first batch trains against it.
     if (is_tnet) target_sync = TargetSync.init(&net, target_every);
-    // Optimistic initialization (#107) only rescales the random init, so it stays out of `nn.Options`.
+    // Optimistic initialization only rescales the random init, so it stays out of `nn.Options`.
     if (is_oi) nn.scaleInit(&net, 4) else if (is_oi16) nn.scaleInit(&net, 16);
     if (is_tch) {
-        // #175 teacher pass: price every stored deep afterstate once, write `<dump_path>.tch`, train nothing.
-        // #207 `tchadd` appends to that file instead of replacing it, so N dumps give one N x 65,536 teacher.
+        // teacher pass: price every stored deep afterstate once, write `<dump_path>.tch`, train nothing.
+        // `tchadd` appends to that file instead of replacing it, so N dumps give one N x 65,536 teacher.
         const path = try std.fmt.allocPrint(init.arena.allocator(), "{s}.tch", .{dump_path.?});
         if (is_tchadd) loadTeachers(teachers, init.io, init.gpa, path);
         var rng = std.Random.DefaultPrng.init(train_seed);
@@ -1041,11 +1041,11 @@ pub fn main(init: std.process.Init) !void {
                 const batch = try nn.trainBatchOpts(&net, train_seed, g, games, learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null, opts);
                 last_score = batch.score;
                 total_moves += batch.moves;
-                // (#242) One pathological game stalls the whole batch (seed 3 spent 53 min in one at 60k),
+                // One pathological game stalls the whole batch (seed 3 spent 53 min in one at 60k),
                 // so stop on the first capped game instead of waiting for the other seven.
                 if (batch.capped_game) |i| return moveCap(g + i + 1, train_games, batch.capped_moves, opts.move_cap, weights_path);
                 if (!nn.weightsFinite(&net)) return diverged(g + games, train_games, weights_path);
-                // (#262) Refresh only after the merged batch is complete: every game in it saw the
+                // Refresh only after the merged batch is complete: every game in it saw the
                 // same target, and no thread observed a half-written copy.
                 if (is_tnet) target_sync.afterBatch(&net);
                 if ((g + games) % 5000 == 0) {
@@ -1070,7 +1070,7 @@ pub fn main(init: std.process.Init) !void {
         }
         const elapsed = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
         const variant_label = label: {
-            // (#246) `clip` has two ceilings, so the log names the one that ran.
+            // `clip` has two ceilings, so the log names the one that ran.
             const base_label = if (is_clip) try std.fmt.allocPrint(init.arena.allocator(), "{s}:{s}", .{ variant, @tagName(clip_mode) }) else if (is_tnet) try std.fmt.allocPrint(init.arena.allocator(), "tnet:{d}", .{target_every}) else variant;
             break :label if (par_tail) try std.fmt.allocPrint(init.arena.allocator(), "{s}+par", .{base_label}) else base_label;
         };
@@ -1096,7 +1096,7 @@ pub fn main(init: std.process.Init) !void {
     // `deep3`/iterative-deepening row can cost minutes, so a short training run must be able to skip it.
     if (eval_games == 0) return;
 
-    // Rows are all on by default; `rows` (arg 13, #203) keeps the two a measurement needs
+    // Rows are all on by default; `rows` (arg 13) keeps the two a measurement needs
     // (0 = 1-ply, 2 = 2-ply) instead of paying for the 3-ply rows twice over. A stray token is a
     // command-line error, never a silent fallback to the full table.
     var row_selection: [all_rows.len]bool = @splat(true);
@@ -1116,13 +1116,13 @@ pub fn main(init: std.process.Init) !void {
     }
     const results = results_buf[0..result_count];
     const games = eval_games * seed_ranges;
-    // `mstd` evaluates through the staged value, everything else through the single net (#107)
+    // `mstd` evaluates through the staged value, everything else through the single net
     const eval_value: nn.Value = if (is_mstd) .{ .staged = staged } else .{ .single = &net };
 
-    // Paired comparison (#168): play one game with A (`deep`), then replay the same spawns with B
+    // Paired comparison: play one game with A (`deep`), then replay the same spawns with B
     // (`deep3`), so both see identical tiles. The per-game difference has much less noise than two
     // independent runs. Opt-in with variant `pair` (train_games 0, eval as usual).
-    // (#210) A second net, so `pairw` can put a candidate file against the reference on the same spawns.
+    // A second net, so `pairw` can put a candidate file against the reference on the same spawns.
     var net_b: nn.Net = undefined;
     const pair_b_value: nn.Value = if (is_pairw) blk: {
         // The second path sits in the dump slot (index 11): `pairw` has no dump to read.
@@ -1254,7 +1254,7 @@ pub fn main(init: std.process.Init) !void {
                 },
                 .nn => |row| blk: {
                     var row_opts = row.opts;
-                    // (#260) `leaf` is eval-only: rows 2 and 4 take its omit-leaf option, and row 4
+                    // `leaf` is eval-only: rows 2 and 4 take its omit-leaf option, and row 4
                     // keeps its TT-off baseline from the table.
                     if (row.leaf_override) row_opts.omit_leaf_reward = c.opts.omit_leaf_reward;
                     break :blk nn.playValueOpts(c.vfn, prng.random(), row.mode, row_opts);
@@ -1275,7 +1275,7 @@ pub fn main(init: std.process.Init) !void {
     for (results) |r| {
         const st = stats.meanStderr(r.range_scores);
         // `avg score` is the mean over seed ranges (not the pooled average), which is exactly what
-        // `avg_score` of the shared row holds. The reach counts are this runner's own tail (#141).
+        // `avg_score` of the shared row holds. The reach counts are this runner's own tail.
         bench.printEvalRow(r.name, st.stderr, seed_ranges, .{
             .games = games,
             .avg_score = st.mean,
@@ -1370,7 +1370,7 @@ test "train seed argument (position 9) is optional and defaults to 1" {
     try std.testing.expectError(error.InvalidCharacter, cli.argOr(u64, &[_][]const u8{ "nn", "0", "20", "2000", "0.003", "-", "base", "30", "x.bin", "x" }, 9, default_train_seed));
 }
 
-/// `mstd` keeps seven nets, so the divergence check has to look at every stage (#234).
+/// `mstd` keeps seven nets, so the divergence check has to look at every stage.
 fn stagedFinite(staged: *const nn.Staged) bool {
     for (0..nn.stage_count) |k| {
         if (!nn.weightsFinite(&staged.nets[k])) return false;
@@ -1378,13 +1378,13 @@ fn stagedFinite(staged: *const nn.Staged) bool {
     return true;
 }
 
-/// Stop before the checkpoint write: a diverged run must leave the last good weights file in place (#234).
+/// Stop before the checkpoint write: a diverged run must leave the last good weights file in place.
 fn diverged(done: usize, total: usize, weights_path: []const u8) error{Diverged} {
     std.debug.print("diverged at {d}/{d} games (non-finite or |w| > 1e6), not saving {s}\n", .{ done, total, weights_path });
     return error.Diverged;
 }
 
-/// (#242) Same policy for a game that hit the move cap: report which game and how many moves, then
+/// Same policy for a game that hit the move cap: report which game and how many moves, then
 /// stop without overwriting the last good checkpoint. The game is pathological, not a result to keep.
 fn moveCap(done: usize, total: usize, moves: u32, cap: u32, weights_path: []const u8) error{MoveCap} {
     std.debug.print("game {d}/{d} hit the {d}-move cap at {d} moves, stopping the run and not saving {s}\n", .{ done, total, cap, moves, weights_path });
@@ -1405,7 +1405,7 @@ test "omitted train seed trains seed 1 and matches the recorded checksum" {
     const net_default = trainSeedWeights(try cli.argOr(u64, &no_args, 9, default_train_seed), 5);
     const net_seed1 = trainSeedWeights(1, 5);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&net_seed1), std.mem.asBytes(&net_default));
-    // re-recorded at #233: the shipped width changed (64/32 -> 128/32), so the same 5 games land elsewhere
+    // re-recorded at : the shipped width changed (64/32 -> 128/32), so the same 5 games land elsewhere
     try std.testing.expectEqual(@as(u32, 3379822721), std.hash.Crc32.hash(std.mem.asBytes(&net_default)));
 }
 
@@ -1467,7 +1467,7 @@ test "par flag is off without arg 10 and on with the literal par" {
     try std.testing.expect(try parseParFlag(&eleven_args));
     const typo = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "sym", "30", "x.bin", "3", "pa" };
     try std.testing.expectError(error.InvalidParFlag, parseParFlag(&typo));
-    // "-" is the explicit "no par" placeholder that #159 uses to reach the dump path
+    // "-" is the explicit "no par" placeholder that uses to reach the dump path
     const dash = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "dump", "30", "x.bin", "3", "-", "x.dmp" };
     try std.testing.expect(!try parseParFlag(&dash));
 }
@@ -1475,7 +1475,7 @@ test "par flag is off without arg 10 and on with the literal par" {
 test "omitted batch_scale is the sqrt rule, '-' is the old mean (#203)" {
     const omitted = [_][]const u8{ "nn", "2000", "20", "2000", "0.003", "-", "base", "30", "x.bin", "3", "par", "-" };
     try std.testing.expectEqual(defaultBatchScale(), try parseBatchScale(&omitted));
-    // The rule itself is checked at a fixed batch size; trainBatchSize() is host-dependent, so the
+    // The rule itself is checked at a fixed batch size; trainBatchSize is host-dependent, so the
     // default is then checked against whatever this machine reports.
     try std.testing.expectApproxEqAbs(@as(f64, 2.8284271247461903), batchScaleFor(8), 1e-12);
     try std.testing.expectEqual(batchScaleFor(nn.trainBatchSize()), defaultBatchScale());
@@ -1632,21 +1632,21 @@ test "par is refused for the priority buffer, the staged net and the teacher var
     defer std.testing.allocator.destroy(teachers);
     try std.testing.expect(parSupported(.{}, false));
     try std.testing.expect(parSupported(.{ .symmetry = true, .replay_k = 30 }, false));
-    // #271: rsym is one per-move update with a random input orientation, stateless like base
+    // : rsym is one per-move update with a random input orientation, stateless like base
     try std.testing.expect(parSupported(.{ .rsym = true }, false));
-    // #273: rtgt is still one per-move update, with the same random orientation on both sides
+    // : rtgt is still one per-move update, with the same random orientation on both sides
     try std.testing.expect(parSupported(.{ .rtgt = true }, false));
     try std.testing.expect(!parSupported(.{}, true));
     try std.testing.expect(!parSupported(.{ .priority = &pr }, false));
-    // #228: t2/p2/tp2 are plain per-move runs (the value cache is thread-local and cleared per move),
+    // : t2/p2/tp2 are plain per-move runs (the value cache is thread-local and cleared per move),
     // so they batch like base
     try std.testing.expect(parSupported(.{ .target = .search2 }, false));
     try std.testing.expect(parSupported(.{ .selfplay = .deep2 }, false));
     try std.testing.expect(parSupported(.{ .target = .search2, .selfplay = .deep2 }, false));
-    // #167: the teacher search is the whole cost, so a batch would only multiply it
+    // : the teacher search is the whole cost, so a batch would only multiply it
     try std.testing.expect(!parSupported(.{ .teacher = .deep }, false));
     try std.testing.expect(!parSupported(.{ .teacher = .deep3 }, false));
-    // `dist` is read-only, but batched it loses ~30,000 points over 20,000 games (#207).
+    // `dist` is read-only, but batched it loses ~30,000 points over 20,000 games.
     try std.testing.expect(!parSupported(.{ .distill = teachers, .distill_every = 8 }, false));
 }
 
@@ -1682,7 +1682,7 @@ test "teacher mix parses the divisor and the teacher rate divides the TD rate (#
     const mix = try parseDistillMix(&.{ "nn", "0", "0", "9000", "0.0003", "1", "dist", "30", "w", "1", "-", "t.tch", "4", "3" });
     try std.testing.expectEqual(@as(u32, 4), mix.every);
     try std.testing.expectApproxEqAbs(@as(f64, 3), mix.div, 1e-12);
-    // the teacher step is `learning_rate / div`, never `1 / div` (the #206 code passed 0.1 to `train`)
+    // the teacher step is `learning_rate / div`, never `1 / div` (the code passed 0.1 to `train`)
     try std.testing.expectApproxEqRel(@as(f64, 1e-4), distillRate(3e-4, 3), 1e-12);
     try std.testing.expectApproxEqRel(@as(f64, 3e-5), distillRate(3e-4, 10), 1e-12);
     // divisor 0 / "-" keeps the teacher step at the TD rate (0 = "same as TD" in nn.Options)

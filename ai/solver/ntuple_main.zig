@@ -75,7 +75,7 @@ pub fn main(init: std.process.Init) !void {
         @as(f64, @floatFromInt(net.storage.len * @sizeOf(f32))) / (1024 * 1024),
     });
 
-    // A `.q16.bin` path writes (or, for an eval-only run, reads) the int16 quantized file (#129).
+    // A `.q16.bin` path writes (or, for an eval-only run, reads) the int16 quantized file.
     const quantized_path = std.mem.endsWith(u8, table_path, ".q16.bin");
     if (train_games == 0 or variant.resume_from_file) {
         if (quantized_path) {
@@ -151,7 +151,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("eval: games={d}/range ranges={d} seeds={d}..{d}\n", .{ eval_games, seed_ranges, eval_seed, last_seed });
     for (results) |r| {
         const st = stats.meanStderr(r.range_scores);
-        // Same row as `zig build nn`: `avg_score` holds the mean over seed ranges (#141).
+        // Same row as `zig build nn`: `avg_score` holds the mean over seed ranges.
         bench.printEvalRow(r.name, st.stderr, seed_ranges, .{
             .games = games,
             .avg_score = st.mean,

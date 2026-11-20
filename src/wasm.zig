@@ -11,9 +11,9 @@
 //!                             `algo` indexes the module's policy list, in the order
 //!                             `wasm.policies` names them (see `algo_name`); `depth` 0 means
 //!                             "the policy's own horizon" (`policy_info`)
-//! - `board_ptr() -> *const u32` 16 row-major tile values (0 = empty)
-//! - `score() -> u32`, `best_tile() -> u32`
-//! - `algo_count() -> u32`, `algo_name(i) -> *const u8` (NUL-terminated),
+//! - `board_ptr -> *const u32` 16 row-major tile values (0 = empty)
+//! - `score -> u32`, `best_tile -> u32`
+//! - `algo_count -> u32`, `algo_name(i) -> *const u8` (NUL-terminated),
 //!   `algo_name_len(i) -> u32`, and the same pair for the one-line description the page shows:
 //!   `algo_score(i)`, `algo_score_len(i)`: the policy's measured average score, for the page
 //!   `algo_speed(i)`, `algo_speed_len(i)`: its cost per move in the browser ("" when unmeasured)
@@ -26,7 +26,7 @@ const options = @import("options");
 var state: core.GameState = .{};
 var prng: std.Random.DefaultPrng = undefined;
 
-/// Policies this module ships, in `wasm.policies` order (#154). Only these kernels are linked in —
+/// Policies this module ships, in `wasm.policies` order. Only these kernels are linked in —
 /// `chooseAt` specialises per policy, so everything else is dead code — and the page builds its
 /// dropdown from `algo_count`/`algo_name`, so the module and the UI cannot disagree.
 const policies: []const solver.Policy = blk: {
@@ -85,7 +85,7 @@ const speeds: []const []const u8 = blk: {
 /// Default horizon per shipped policy: `solve`'s `depth == 0` means "the policy's own horizon",
 /// the same convention `expectimax_id` uses for its time budget. Without it a depth-dependent
 /// policy added to `wasm.policies` (`expectimax`, `ga`) would be searched at depth 0, which wraps
-/// to 255 plies and freezes the tab (#154 review).
+/// to 255 plies and freezes the tab.
 const depths: []const u8 = blk: {
     var out: [policies.len]u8 = undefined;
     for (policies, 0..) |policy, i| out[i] = solver.policyInfo(policy).depth;
@@ -169,7 +169,7 @@ export fn algo_count() u32 {
     return @intCast(policies.len);
 }
 
-/// NUL-terminated, static lifetime; index is `0..algo_count()`.
+/// NUL-terminated, static lifetime; index is `0..algo_count`.
 export fn algo_name(algo: u32) [*]const u8 {
     if (algo >= policies.len) return "";
     return @tagName(policies[algo]).ptr;

@@ -10,12 +10,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Width of the value MLP (#205): the hidden layers are compile-time sized, so a capacity sweep is a
+    // Width of the value MLP: the hidden layers are compile-time sized, so a capacity sweep is a
     // build option instead of three edited copies (`zig build nn -Dh1=32 -Dh2=16`).
     const width_opts = b.addOptions();
     width_opts.addOption(u32, "h1", b.option(u32, "h1", "hidden layer 1 width (default 128, #233)") orelse 128);
     width_opts.addOption(u32, "h2", b.option(u32, "h2", "hidden layer 2 width (default 32, #233)") orelse 32);
-    // Hand-engineered global features on top of the one-hot board (#226): 0 (default) keeps today's
+    // Hand-engineered global features on top of the one-hot board: 0 (default) keeps today's
     // 256-input net and file format, 1..6 adds that many of `nn.featureNames` to the input layer.
     width_opts.addOption(u32, "feat", b.option(u32, "feat", "global board features 0..6 (default 0)") orelse 0);
     width_opts.addOption(bool, "simd", b.option(bool, "nn-simd", "experiment with SIMD first-layer accumulation (#317)") orelse false);
@@ -26,7 +26,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Shared eval aggregation (#304). A named module, not a relative import: `nn` is a module and
+    // Shared eval aggregation. A named module, not a relative import: `nn` is a module and
     // the CLIs are separate roots, and Zig refuses to put one file in both modules.
     const stats_mod = b.addModule("stats", .{
         .root_source_file = b.path("ai/solver/stats.zig"),
@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Cursor over little-endian bytes, shared by the file formats (#302/#303).
+    // Cursor over little-endian bytes, shared by the file formats.
     const blob_mod = b.addModule("blob", .{
         .root_source_file = b.path("ai/solver/blob.zig"),
         .target = target,
@@ -107,7 +107,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
-    // Run steps depend on their own executable only. Depending on `b.getInstallStep()` made
+    // Run steps depend on their own executable only. Depending on `b.getInstallStep` made
     // `zig build nn -- 2000 ...` recompile every other artifact first (game-2048, solve, ranking,
     // ...) because the install step pulls all of them; a one-minute training run paid a full
     // ReleaseFast rebuild of the whole set. `zig build` (the default step) still installs everything.
@@ -285,7 +285,7 @@ pub fn build(b: *std.Build) void {
     });
     b.step("bench-forward", "Measure shipped NN forward inference").dependOn(&b.addRunArtifact(forward_bench).step);
 
-    // The int16 file is a shipping artefact: write it where you like, do not commit it (#170).
+    // The int16 file is a shipping artefact: write it where you like, do not commit it.
     const nn_quant_exe = b.addExecutable(.{
         .name = "nn-quant",
         .root_module = b.createModule(.{
@@ -432,7 +432,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     // Which policies the browser module ships is deploy config, not code: the list lives in
-    // `wasm.policies` next to this file and `src/wasm.zig` parses it at compile time (#154).
+    // `wasm.policies` next to this file and `src/wasm.zig` parses it at compile time.
     // `@embedFile` makes editing that file rebuild the module, and the parse (with its
     // "unknown policy" / "needs the n-tuple table" errors) stays in one place.
     const wasm_options = b.addOptions();

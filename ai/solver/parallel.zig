@@ -1,6 +1,6 @@
 const std = @import("std");
 
-/// Upper bound on worker threads (issue #40: min(cpu count, 8)).
+/// Upper bound on worker threads (40: min(cpu count, 8)).
 pub const max_threads = 8;
 
 /// Fills `out[i] = play(ctx, i)` for every i, split into contiguous chunks over threads.

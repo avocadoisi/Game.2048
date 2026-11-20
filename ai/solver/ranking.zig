@@ -28,7 +28,7 @@ const Entry = struct {
 const PolicySpec = struct { policy: solver.Policy, depth: u8 };
 
 /// Policies `zig build ranking` runs without a filter, in `Policy` order: exactly the entries
-/// `solver.policy_info` marks `ranked`, so the list and the depths come from one table (#139).
+/// `solver.policy_info` marks `ranked`, so the list and the depths come from one table.
 const policies = blk: {
     var list: []const PolicySpec = &.{};
     for (solver.policy_info) |info| {
@@ -69,7 +69,7 @@ fn runEntries(io: std.Io, gpa: std.mem.Allocator, selected: []const PolicySpec, 
 }
 
 /// One-line summary of each policy, shown next to its ranking row. The text lives in
-/// `solver.policy_info`, so the ranking and the HTTP UI cannot disagree (#139).
+/// `solver.policy_info`, so the ranking and the HTTP UI cannot disagree.
 fn describe(policy: solver.Policy) []const u8 {
     return solver.policyInfo(policy).description;
 }
@@ -132,7 +132,7 @@ test "runEntries executes only the filtered policies" {
 
 test {
     // `zig build test` only runs tests of files it reaches from a target's root, so the shared CLI
-    // helper's tests ride along with the ranking target instead of adding a 16th one (#139).
+    // helper's tests ride along with the ranking target instead of adding a 16th one.
     std.testing.refAllDecls(cli);
 }
 

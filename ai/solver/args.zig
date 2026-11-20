@@ -1,4 +1,4 @@
-//! Positional-argument parsing shared by the CLI runners in this directory (#139).
+//! Positional-argument parsing shared by the CLI runners in this directory.
 //!
 //! Every runner reads its positional arguments the same way: `args[i]` when it was given, else a
 //! named default. The order of those arguments is a compatibility surface (each runner documents it

@@ -20,7 +20,7 @@ pub fn meanStderr(xs: []const f64) MeanErr {
 /// `node_probes` / `node_hits` are read only when both it and `Acc` have them. `Acc` is the runner's
 /// row, whose `range_scores` slice the caller allocates with one slot per seed range. The reach
 /// counters are filled only when `Acc` has those fields, so the nn and n-tuple runners can share
-/// this loop without either printing a column it does not have (#304).
+/// this loop without either printing a column it does not have.
 ///
 /// `avg_score` stays the mean of the seed-range averages, never the pooled average; `avg_moves`
 /// divides by every game (`eval_games * ranges`) exactly as the two hand-written loops did.

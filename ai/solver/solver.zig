@@ -14,8 +14,8 @@ const lost_score: f64 = -1e9;
 const beam_width = 32;
 const beam_horizon = 3;
 
-/// Path shapes for the order penalty, compared by `zig build evalab` (issue #112).
-/// `flex` / `flex_reverse` are the user-supplied "flex" layout (#112 comment): only 7 ranked cells
+/// Path shapes for the order penalty, compared by `zig build evalab`.
+/// `flex` / `flex_reverse` are the user-supplied "flex" layout: only 7 ranked cells
 /// are ordered, the other 9 stay free.
 pub const Layout = enum { snake, column_snake, spiral, block2, flex, flex_reverse };
 
@@ -23,34 +23,34 @@ pub const Layout = enum { snake, column_snake, spiral, block2, flex, flex_revers
 pub const Weights = struct {
     empty: f64 = 10,
     order_penalty: f64 = 30,
-    /// order penalty once the board's largest tile reaches 4096 (endgame phase, issue #92).
+    /// order penalty once the board's largest tile reaches 4096 (endgame phase, 92).
     /// Default equals `order_penalty`, so shipped weights behave the same in both phases.
     order_penalty_late: f64 = 30,
     merge: f64 = 10,
     /// extra penalty when only `down` is legal (the top-left anchor breaks)
     forced_down: f64 = 100,
-    /// path shape of the order penalty (issue #112). The default is the shipped row snake.
+    /// path shape of the order penalty. The default is the shipped row snake.
     layout: Layout = .snake,
     /// anchor of that path: rotation (anchor >> 1, 90° clockwise each) plus a column mirror
-    /// (anchor & 1) (issue #113). 0 keeps the shipped top-left anchor.
+    /// (anchor & 1). 0 keeps the shipped top-left anchor.
     anchor: u8 = 0,
-    /// number of leading path cells that must stay ordered; the rest are free cells (issue #112,
+    /// number of leading path cells that must stay ordered; the rest are free cells (112,
     /// "flex" layouts). 16 keeps the whole path constrained, which is the shipped behaviour.
     ordered: u8 = 16,
-    /// penalty for |log2| steps between adjacent tiles (issue #114). 0 keeps the shipped evaluation.
+    /// penalty for |log2| steps between adjacent tiles. 0 keeps the shipped evaluation.
     smoothness: f64 = 0,
-    /// penalty for the monotonicity violation of each row and column (issue #114).
+    /// penalty for the monotonicity violation of each row and column.
     monotonic: f64 = 0,
-    /// bonus for the sum of log2 tile values on the board (issue #114).
+    /// bonus for the sum of log2 tile values on the board.
     tile_sum: f64 = 0,
-    /// fragility penalty weight (issue #101): boards the death net expects to
+    /// fragility penalty weight: boards the death net expects to
     /// die sooner score lower by `fragility * (0 - v)`. 0 keeps evaluateW as-is.
     fragility: f64 = 0,
     /// death-variant net whose value is ≈ -(moves to game over)/reward_scale.
     /// Without it the fragility term is skipped.
     death_net: ?*const nn.Net = null,
 };
-/// Shipped weights. `monotonic = 32` was adopted in #117 (see docs/evalab.md).
+/// Shipped weights. `monotonic = 32` was adopted in (see docs/evalab.md).
 pub const baseline: Weights = .{ .order_penalty = 43.174, .order_penalty_late = 25, .monotonic = 32 };
 
 pub const Algorithm = enum { expectimax, greedy };
@@ -95,24 +95,24 @@ pub fn bestMoveW(state: GameState, depth: u8, w: Weights) ?Direction {
 
 /// Move-choosing policies compared in the ranking (`zig build ranking`).
 /// The order is the ranking's display order. The browser build picks its policies by name from
-/// `wasm.policies` (#154), so reordering this enum no longer changes the WASM ABI.
+/// `wasm.policies`, so reordering this enum no longer changes the WASM ABI.
 pub const Policy = enum { random, greedy, expectimax, mcts, beam, expectimax_tt, ga, nn, nn2, nnmcts, nnbeam, expectimax_id, nn3, ntuple };
 
 /// What every layer needs to know about one `Policy`; the name itself is `@tagName`. Keeping it in
-/// one table is the point of #139: the ranking, the HTTP UI and the WASM build used to carry three
-/// hand-written copies that drifted apart (a new variant broke `ranking.describe` in #138).
+/// one table is the point of : the ranking, the HTTP UI and the WASM build used to carry three
+/// hand-written copies that drifted apart (a new variant broke `ranking.describe` in ).
 pub const PolicyInfo = struct {
     policy: Policy,
     /// Depth `zig build ranking` passes; 0 = the policy's own default (see `choose`).
     depth: u8,
     /// One line shown next to the ranking row and in the HTTP UI. Japanese, like the UI.
     description: []const u8,
-    /// Average score of a `zig build ranking` run (5 run x 20 games, seed 1000, #136) — the number
+    /// Average score of a `zig build ranking` run (5 run x 20 games, seed 1000) — the number
     /// the browser page shows under the policy picker, so a player sees the strength without the
     /// implementation notes. `nn3`, `expectimax_id` and `ntuple` are not in the default ranking, so
-    /// their numbers come from the sections that measured them (#152, #104, #98).
+    /// their numbers come from the sections that measured them.
     score: []const u8,
-    /// Cost per move measured in the browser (V8 on wasm, #143/#152), e.g. "4〜400 ms". Empty when
+    /// Cost per move measured in the browser (V8 on wasm), e.g. "4〜400 ms". Empty when
     /// nobody measured that policy in the browser, since the native ms/move from `zig build ranking`
     /// is not the same number (wasm is ~3-8x slower) and mixing the two would mislead.
     speed: []const u8 = "",
@@ -167,7 +167,7 @@ pub const ga_weights: Weights = .{ .empty = 7.028, .order_penalty = 43.174, .ord
 /// Trained value net (`zig build nn`), embedded at build time.
 const nn_weight_bytes = @embedFile("nn_weights.bin");
 
-/// The embedded net parsed once per thread (issue #87). Every move passes this `*const Net` by
+/// The embedded net parsed once per thread. Every move passes this `*const Net` by
 /// reference instead of re-parsing the ~148 KB weight block, so parallel ranking / HTTP / WASM each
 /// keep their own copy with no shared mutable state.
 threadlocal var cached_net: ?nn.Net = null;
@@ -189,7 +189,7 @@ pub fn scoreRootMove(policy: Policy, state: GameState, dir: Direction) ?f64 {
 }
 
 /// Quantized n-tuple table used by `algo=ntuple`; 64.6 MiB, so it is loaded once per thread and
-/// only when that policy is actually chosen (#129). Missing file -> the policy has no move.
+/// only when that policy is actually chosen. Missing file -> the policy has no move.
 const ntuple_weight_bytes = "ai/solver/ntuple_wide_q16.bin";
 threadlocal var cached_ntuple: ?ntuple.Quantized = null;
 
@@ -230,7 +230,7 @@ pub fn choose(policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Dir
 }
 
 /// `choose` for one compile-time-known policy. Instantiating this per policy is what lets the
-/// browser build link only the policies it ships (`wasm.policies`, #154): a runtime switch over
+/// browser build link only the policies it ships (`wasm.policies`): a runtime switch over
 /// every variant (which is what `choose` is) drags all of them into the module.
 pub fn chooseOne(comptime policy: Policy, state: GameState, rng: std.Random, depth: u8) ?Direction {
     switch (policy) {
@@ -259,16 +259,16 @@ pub fn chooseOne(comptime policy: Policy, state: GameState, rng: std.Random, dep
         // the way `depth` is per-policy elsewhere: bench/ranking/solve pass it through.
         .expectimax_id => return bestMoveID(state, if (depth == 0) id_budget_ms else depth),
         .ga => return bestMoveW(state, depth, ga_weights),
-        // 1-ply greedy from the quantized n-tuple table (#129)
+        // 1-ply greedy from the quantized n-tuple table
         .ntuple => return if (ntupleTable()) |q| ntuple.bestMoveQuantized(q, state) else null,
-        // The net is parsed once per thread and reused by reference (issue #87), never copied per move.
+        // The net is parsed once per thread and reused by reference, never copied per move.
         .nn, .nn2, .nn3, .nnmcts, .nnbeam => {
             const net = nnNet();
             return switch (policy) {
                 .nn => nn.bestMove(net, state, .chance),
                 // the 2-ply search itself dominates the cost.
                 .nn2 => nn.bestMove(net, state, .deep),
-                // 3-ply with the spawn cut (issue #108): a few times nn2's cost, so ranking leaves it out.
+                // 3-ply with the spawn cut: a few times nn2's cost, so ranking leaves it out.
                 .nn3 => nn.bestMove(net, state, .deep3),
                 .nnmcts => nnmctsMove(net, state, rng),
                 // the sampled beam stays below nn2's leaf count.
@@ -477,7 +477,7 @@ fn insertBeam(items: *[beam_width]BeamNode, len: *usize, candidate: BeamNode) vo
     if (len.* < beam_width) len.* += 1;
 }
 
-/// shortcut: fixed small beam so the sampled spawns stay cheap (issue #83); tune only if nnbeam beats nn2.
+/// shortcut: fixed small beam so the sampled spawns stay cheap; tune only if nnbeam beats nn2.
 const nnbeam_width = 8;
 const nnbeam_horizon = 3;
 const nnbeam_spawn_samples = 2;
@@ -593,7 +593,7 @@ fn insertNnBeam(items: *[nnbeam_width]NnBeamNode, len: *usize, candidate: NnBeam
 const tt_entry_count = 8192;
 
 /// `*_pruned` keep the probability-pruned values apart from the full-width ones: once branches are
-/// cut the same board and depth is worth a different number, so the keys must not mix (issue #104).
+/// cut the same board and depth is worth a different number, so the keys must not mix.
 const TTKind = enum { max, chance, max_pruned, chance_pruned };
 
 const TTEntry = struct {
@@ -606,7 +606,7 @@ const TTEntry = struct {
 
 /// Leaf evaluator of the one expectimax search, chosen at comptime. Only `plain` may use the TT:
 /// a slot keyed by board + depth cannot tell two `Weights` apart, so a weighted value would poison
-/// the plain search (issue #312).
+/// the plain search.
 const Leaf = enum { plain, weighted };
 
 fn usesTT(comptime leaf: Leaf) bool {
@@ -621,9 +621,9 @@ fn leafValue(comptime leaf: Leaf, state: GameState, w: Weights) f64 {
 }
 
 /// One expectimax search, specialized at comptime: `cut = false` is the full-width tree and
-/// `cut = true` drops chance branches below `cutoff`, renormalizing the kept mass (issue #298).
+/// `cut = true` drops chance branches below `cutoff`, renormalizing the kept mass.
 /// `cutoff` is only read when `cut` is true; the two specializations keep the hot loop branch-free.
-/// `leaf` picks the leaf values and whether the TT is touched at all (issue #312): `table` is null
+/// `leaf` picks the leaf values and whether the TT is touched at all: `table` is null
 /// exactly when `leaf` is `.weighted`, so its search compiles without any TT access.
 fn bestMoveSearch(comptime cut: bool, comptime leaf: Leaf, state: GameState, depth: u8, cutoff: f64, table: ?*[tt_entry_count]TTEntry, w: Weights) ?Direction {
     var best: ?Direction = null;
@@ -644,7 +644,7 @@ fn bestMoveTT(comptime cut: bool, state: GameState, depth: u8, cutoff: f64, tabl
     return bestMoveSearch(cut, .plain, state, depth, cutoff, table, baseline);
 }
 
-/// Per-thread table reused across moves and games (issue #88). An entry is only returned on a
+/// Per-thread table reused across moves and games. An entry is only returned on a
 /// full board + depth + kind match, so stale entries are misses at worst, never wrong values;
 /// no shared mutable state because each thread keeps its own table.
 threadlocal var tt_workspace: [tt_entry_count]TTEntry = undefined;
@@ -766,7 +766,7 @@ const prob_cutoff: f64 = 1e-4;
 
 /// Iterative deepening never searches shallower than this, so a zero budget still gets the depth-2 move.
 const id_min_depth: u8 = 2;
-/// shortcut: cap for one move's overrun, since the budget is only checked between depths (issue #104).
+/// shortcut: cap for one move's overrun, since the budget is only checked between depths.
 const id_max_depth: u8 = 8;
 /// Time budget per move of `expectimax_id`.
 /// shortcut: measured, not derived; a larger budget plays stronger and must still fit the 6 s/game limit.
@@ -797,7 +797,7 @@ pub fn bestMoveID(state: GameState, budget_ms: u32) ?Direction {
 /// Whether iterative deepening may search one more depth. `clock_available` is false where
 /// `clockNow` is the freestanding stub (it returns a fixed timestamp), and a timed loop there could
 /// never expire: with `elapsed_ms` pinned at 0 the search ran to `id_max_depth` and took minutes per
-/// move in the browser (issue #145). Such a target keeps the depth it already has.
+/// move in the browser. Such a target keeps the depth it already has.
 pub fn shouldDeepen(depth: u8, budget_ms: u32, clock_available_: bool, elapsed_ms: i96) bool {
     return depth < id_max_depth and clock_available_ and elapsed_ms < @as(i96, budget_ms);
 }
@@ -861,7 +861,7 @@ pub fn evaluateW(board: Board, w: Weights) f64 {
         }
         max_level = @max(max_level, level);
     }
-    // endgame phase once the largest tile reaches 4096 = 2^12 (issue #92)
+    // endgame phase once the largest tile reaches 4096 = 2^12
     const order_penalty = if (max_level >= 12) w.order_penalty_late else w.order_penalty;
     var base = empties * w.empty - penalty * order_penalty + mergePairs(board) * w.merge;
     if (w.smoothness != 0) base -= rough(board) * w.smoothness;
@@ -1343,7 +1343,7 @@ test "expectimax full and pruned searches pin their fixed-board moves and values
         .{ .{ 4, 4, 4, 4 }, .{ 4, 4, 4, 4 }, .{ 4, 4, 4, 4 }, .{ 4, 4, 4, 0 } },
         .{ .{ 2, 4, 2, 4 }, .{ 4, 2, 4, 2 }, .{ 2, 4, 2, 4 }, .{ 4, 2, 4, 0 } },
     };
-    // Recorded from the two-search implementation before #298 folded it into one comptime
+    // Recorded from the two-search implementation before folded it into one comptime
     // specialization: rows are board 0 depth 2, board 0 depth 3, board 1 depth 2, ...
     const expected = [_]struct {
         full_move: ?Direction,
@@ -1572,7 +1572,7 @@ test "iterative deepening with a zero budget returns the depth 2 move" {
 }
 
 // The freestanding clock is a fixed timestamp, so `elapsed_ms` never advances there: a timed loop
-// would run to `id_max_depth` and take minutes per move in the browser (issue #145). The loop
+// would run to `id_max_depth` and take minutes per move in the browser. The loop
 // condition is a pure function so this target can pin the frozen-clock case directly.
 test "iterative deepening never deepens without an advancing clock" {
     try std.testing.expect(!shouldDeepen(id_min_depth, 1, false, 0)); // frozen clock (WASM)
@@ -1583,8 +1583,8 @@ test "iterative deepening never deepens without an advancing clock" {
 }
 
 // The order is the ranking table's order and the `algo=` values of the HTTP API, so it is pinned
-// here — a rename or a reorder silently changes both (#139). The browser build no longer depends on
-// it: it names its policies in `wasm.policies` (#154).
+// here — a rename or a reorder silently changes both. The browser build no longer depends on
+// it: it names its policies in `wasm.policies`.
 test "Policy order is the ranking order" {
     const abi = [_][]const u8{
         "random",        "greedy",        "expectimax", "mcts",   "beam",
@@ -1649,7 +1649,7 @@ test "rank lists legal moves best first" {
     try std.testing.expectEqual(@as(usize, 2), r.len);
     try std.testing.expect(r.items[0].value >= r.items[1].value);
     try std.testing.expect(r.items[0].dir == .left or r.items[0].dir == .right);
-    // since monotonic (#117) greedy and expectimax disagree here; compare like with like
+    // since monotonic greedy and expectimax disagree here; compare like with like
     try std.testing.expectEqual(bestMove(state, 2), rank(state, .expectimax, 2).items[0].dir);
 }
 
@@ -1940,8 +1940,8 @@ test "baseline weights follow the adopted phase weights (#92)" {
         .{ 0, 0, 0, 0 },
         .{ 0, 0, 0, 0 },
     };
-    // adopted values (see docs/solver-history.md, issue #92): 43.174 before 4096, 25 from 4096;
-    // the monotonic term adds 10 / 11 violation steps x32 since #117
+    // adopted values (see docs/solver-history.md, 92): 43.174 before 4096, 25 from 4096;
+    // the monotonic term adds 10 / 11 violation steps x32 since
     try std.testing.expectApproxEqAbs(@as(f64, 140 - 10 * 43.174 - 10 * 32), evaluateW(mid, baseline), 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 140 - 11 * 25 - 11 * 32), evaluateW(late, baseline), 1e-9);
     // ga weights stay phase-invariant at their evolved 43.174
@@ -2006,7 +2006,7 @@ test "playGame finishes a game and reports its result" {
     try std.testing.expect(result.max_tile >= 2);
 }
 
-/// Golden fingerprint of a full game's move sequence and outcome (issue #87 regression guard).
+/// Golden fingerprint of a full game's move sequence and outcome.
 const Golden = struct { score: u32, max_tile: core.Tile, moves: u32, checksum: u64 };
 
 /// Play one full game with `policy` on `seed`, returning its outcome plus an FNV-1a checksum of
@@ -2027,7 +2027,7 @@ fn goldenPlay(policy: Policy, seed: u64, depth: u8) Golden {
 
 test "nn policy reproduces the same move sequence and score on a fixed seed" {
     const g = goldenPlay(.nn, 20240601, 0);
-    // re-recorded at #233 with the 128/32 shipped net (was 32,380 / 2048 / 1,669 moves)
+    // re-recorded at with the 128/32 shipped net (was 32,380 / 2048 / 1,669 moves)
     try std.testing.expectEqual(@as(u32, 81104), g.score);
     try std.testing.expectEqual(@as(core.Tile, 4096), g.max_tile);
     try std.testing.expectEqual(@as(u32, 3744), g.moves);
@@ -2036,7 +2036,7 @@ test "nn policy reproduces the same move sequence and score on a fixed seed" {
 
 test "nn2 policy reproduces the same move sequence and score on a fixed seed" {
     const g = goldenPlay(.nn2, 20240601, 0);
-    // re-recorded at #233 with the 128/32 shipped net (was 77,164 / 4096 / 3,542 moves)
+    // re-recorded at with the 128/32 shipped net (was 77,164 / 4096 / 3,542 moves)
     try std.testing.expectEqual(@as(u32, 132164), g.score);
     try std.testing.expectEqual(@as(core.Tile, 8192), g.max_tile);
     try std.testing.expectEqual(@as(u32, 5520), g.moves);

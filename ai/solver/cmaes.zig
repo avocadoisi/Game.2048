@@ -1,4 +1,4 @@
-//! Small CMA-ES for tuning real-valued weights (issue #105).
+//! Small CMA-ES for tuning real-valued weights.
 //!
 //! shortcut: CSA step size + rank-one covariance update only (no rank-mu), and samples are clipped
 //! into `bounds` instead of penalised; good enough for the 4-dim weight search. Upgrade to the full

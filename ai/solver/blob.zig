@@ -1,4 +1,4 @@
-//! Cursor-style little-endian I/O for the weight and table files (#302).
+//! Cursor-style little-endian I/O for the weight and table files.
 //!
 //! Every format used to carry its own offset arithmetic and bounds checks; this is the one place
 //! that turns bytes into values and back. Formats keep their own layout, magic and error names —
