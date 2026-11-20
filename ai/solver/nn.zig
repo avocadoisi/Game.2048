@@ -351,7 +351,8 @@ pub const PopArtState = struct {
     pub fn load(self: *PopArtState, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(popart_state_file_len + 1));
         defer gpa.free(bytes);
-        self.* = try parse(bytes);
+        // Qualified: `nn.parse` (the Net file) is also in scope here, so a bare `parse` is ambiguous.
+        self.* = try PopArtState.parse(bytes);
     }
 };
 
