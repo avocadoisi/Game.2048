@@ -60,6 +60,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core", .module = core_mod },
+            .{ .name = "blob", .module = blob_mod },
         },
     });
 
@@ -419,6 +420,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core", .module = wasm_core_mod },
+            .{ .name = "blob", .module = wasm_blob_mod },
         },
     });
     const wasm_solver_mod = b.addModule("solver-wasm", .{

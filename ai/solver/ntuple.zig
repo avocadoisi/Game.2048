@@ -1,5 +1,6 @@
 const std = @import("std");
 const core = @import("core");
+const blob = @import("blob");
 
 const Board = core.Board;
 
@@ -418,49 +419,33 @@ pub fn quantizedFileLen(n: usize) usize {
 /// scales (f64 LE), then the i16 LE payload.
 pub fn encodeQuantized(gpa: std.mem.Allocator, q: *const Quantized) ![]u8 {
     const bytes = try gpa.alloc(u8, quantizedFileLen(q.count));
-    @memcpy(bytes[0..8], quantized_magic);
-    std.mem.writeInt(u32, bytes[8..12], file_version, .little);
-    std.mem.writeInt(u32, bytes[12..16], endian_marker, .little);
-    std.mem.writeInt(u32, bytes[16..20], @intCast(q.count), .little);
-    var pos = header_len;
-    for (0..q.count) |p| {
-        std.mem.writeInt(u32, bytes[pos..][0..4], @intCast(tableLen(p)), .little);
-        pos += 4;
-    }
-    for (0..q.count) |p| {
-        std.mem.writeInt(u64, bytes[pos..][0..8], @bitCast(q.scales[p]), .little);
-        pos += 8;
-    }
-    for (q.storage) |w| {
-        std.mem.writeInt(i16, bytes[pos..][0..2], w, .little);
-        pos += 2;
-    }
+    var w = blob.Writer.init(bytes);
+    blob.writeHeader(&w, quantized_magic, file_version);
+    w.writeU32(@intCast(q.count));
+    for (0..q.count) |p| w.writeU32(@intCast(tableLen(p)));
+    for (0..q.count) |p| w.writeF64(q.scales[p]);
+    for (q.storage) |value| w.writeI16(value);
     return bytes;
 }
 
 pub fn parseQuantized(gpa: std.mem.Allocator, bytes: []const u8) !Quantized {
     if (bytes.len < header_len) return error.WrongTableFileSize;
-    if (!std.mem.eql(u8, bytes[0..8], quantized_magic)) return error.BadTableMagic;
-    if (std.mem.readInt(u32, bytes[8..12], .little) != file_version) return error.UnsupportedTableVersion;
-    if (std.mem.readInt(u32, bytes[12..16], .little) != endian_marker) return error.WrongTableEndianness;
-    const n: usize = std.mem.readInt(u32, bytes[16..20], .little);
+    var r = blob.Reader.init(bytes);
+    try blob.readHeader(&r, quantized_magic, file_version, .{
+        .magic = error.BadTableMagic,
+        .version = error.UnsupportedTableVersion,
+        .endian = error.WrongTableEndianness,
+    });
+    const n: usize = try r.readU32();
     if (n == 0 or n > pattern_count) return error.WrongPatternCount;
     if (bytes.len != quantizedFileLen(n)) return error.WrongTableFileSize;
-    var pos = header_len;
     for (0..n) |p| {
-        if (std.mem.readInt(u32, bytes[pos..][0..4], .little) != tableLen(p)) return error.WrongTableLength;
-        pos += 4;
+        if (try r.readU32() != tableLen(p)) return error.WrongTableLength;
     }
     var q = try Quantized.initCount(gpa, n);
     errdefer q.deinit(gpa);
-    for (0..n) |p| {
-        q.scales[p] = @bitCast(std.mem.readInt(u64, bytes[pos..][0..8], .little));
-        pos += 8;
-    }
-    for (q.storage) |*w| {
-        w.* = std.mem.readInt(i16, bytes[pos..][0..2], .little);
-        pos += 2;
-    }
+    for (0..n) |p| q.scales[p] = try r.readF64();
+    for (q.storage) |*value| value.* = try r.readI16();
     return q;
 }
 
@@ -478,7 +463,6 @@ pub fn loadQuantized(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !Quan
 
 pub const file_magic = "2048-NT\x00";
 pub const file_version: u32 = 1;
-const endian_marker: u32 = 0x01020304;
 const header_len: usize = 8 + 4 + 4 + 4;
 /// File length for `n` tables; `.wide` is `fileLen(pattern_count)`.
 pub fn fileLen(n: usize) usize {
@@ -488,41 +472,31 @@ pub fn fileLen(n: usize) usize {
 /// File: magic, version, endianness marker, pattern count, per-table lengths (u32 LE), then f32 LE payload.
 pub fn encode(gpa: std.mem.Allocator, net: *const TupleNet) ![]u8 {
     const bytes = try gpa.alloc(u8, fileLen(net.count));
-    @memcpy(bytes[0..8], file_magic);
-    std.mem.writeInt(u32, bytes[8..12], file_version, .little);
-    std.mem.writeInt(u32, bytes[12..16], endian_marker, .little);
-    std.mem.writeInt(u32, bytes[16..20], @intCast(net.count), .little);
-    var pos = header_len;
-    for (0..net.count) |p| {
-        std.mem.writeInt(u32, bytes[pos..][0..4], @intCast(tableLen(p)), .little);
-        pos += 4;
-    }
-    for (net.storage) |w| {
-        std.mem.writeInt(u32, bytes[pos..][0..4], @bitCast(w), .little);
-        pos += 4;
-    }
+    var w = blob.Writer.init(bytes);
+    blob.writeHeader(&w, file_magic, file_version);
+    w.writeU32(@intCast(net.count));
+    for (0..net.count) |p| w.writeU32(@intCast(tableLen(p)));
+    for (net.storage) |value| w.writeF32(value);
     return bytes;
 }
 
 pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !TupleNet {
     if (bytes.len < header_len) return error.WrongTableFileSize;
-    if (!std.mem.eql(u8, bytes[0..8], file_magic)) return error.BadTableMagic;
-    if (std.mem.readInt(u32, bytes[8..12], .little) != file_version) return error.UnsupportedTableVersion;
-    if (std.mem.readInt(u32, bytes[12..16], .little) != endian_marker) return error.WrongTableEndianness;
-    const n: usize = std.mem.readInt(u32, bytes[16..20], .little);
+    var r = blob.Reader.init(bytes);
+    try blob.readHeader(&r, file_magic, file_version, .{
+        .magic = error.BadTableMagic,
+        .version = error.UnsupportedTableVersion,
+        .endian = error.WrongTableEndianness,
+    });
+    const n: usize = try r.readU32();
     if (n == 0 or n > pattern_count) return error.WrongPatternCount;
     if (bytes.len != fileLen(n)) return error.WrongTableFileSize;
-    var pos = header_len;
     for (0..n) |p| {
-        if (std.mem.readInt(u32, bytes[pos..][0..4], .little) != tableLen(p)) return error.WrongTableLength;
-        pos += 4;
+        if (try r.readU32() != tableLen(p)) return error.WrongTableLength;
     }
     var net = try TupleNet.initCount(gpa, n);
     errdefer net.deinit(gpa);
-    for (net.storage) |*w| {
-        w.* = @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little));
-        pos += 4;
-    }
+    for (net.storage) |*value| value.* = try r.readF32();
     return net;
 }
 
@@ -1060,6 +1034,116 @@ test "light table file round-trips with its own pattern count" {
     defer back.deinit(std.testing.allocator);
     try std.testing.expectEqual(light_count, back.count);
     try std.testing.expectEqualSlices(f32, light.storage, back.storage);
+}
+
+test "encode writes the f32 table layout byte for byte (#302)" {
+    const gpa = std.testing.allocator;
+    var net = try TupleNet.initCount(gpa, 1);
+    defer net.deinit(gpa);
+    for (net.storage, 0..) |*value, i| value.* = @floatFromInt(@as(i32, @intCast(i % 11)) - 5);
+
+    const bytes = try encode(gpa, &net);
+    defer gpa.free(bytes);
+    // magic, version, endianness marker, pattern count, then the length of the one 4-tuple table
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        '2', '0', '4', '8', '-', 'N', 'T', 0,
+        1,   0,   0,   0,   4,   3,   2,   1,
+        1,   0,   0,   0,   0,   0,   1,   0,
+    }, bytes[0 .. header_len + 4]);
+    // the payload starts with -5.0, then -4.0, as f32 little endian
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x00, 0xa0, 0xc0, 0x00, 0x00, 0x80, 0xc0 }, bytes[header_len + 4 ..][0..8]);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    try std.testing.expectEqualStrings("378f24e3dca98db88df93c86e20b4fb6727b0990140658edccc15eee93eb7819", &hex);
+}
+
+test "encodeQuantized writes the int16 table layout byte for byte (#302)" {
+    const gpa = std.testing.allocator;
+    var q = try Quantized.initCount(gpa, 1);
+    defer q.deinit(gpa);
+    q.scales[0] = 1.0;
+    for (q.storage, 0..) |*value, i| value.* = @intCast(@as(i32, @intCast(i % 3001)) - 1500);
+
+    const bytes = try encodeQuantized(gpa, &q);
+    defer gpa.free(bytes);
+    // ... and the 8-byte scale (1.0) follows the table length, which starts right after the header
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        '2', '0', '4', '8', '-', 'N', 'Q',  0,
+        1,   0,   0,   0,   4,   3,   2,    1,
+        1,   0,   0,   0,   0,   0,   1,    0,
+        0,   0,   0,   0,   0,   0,   0xf0, 0x3f,
+    }, bytes[0 .. header_len + 12]);
+    // the payload starts with -1500, then -1499, as i16 little endian
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x24, 0xfa, 0x25, 0xfa, 0x26, 0xfa, 0x27, 0xfa }, bytes[header_len + 12 ..][0..8]);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    try std.testing.expectEqualStrings("bdc28ee4d1918a0ccdc3a231c148208b76ccdd2734c1c7e2b06c9b90ded0f936", &hex);
+}
+
+test "parse rejects a foreign magic, another version, a wrong length and a wrong size (#302)" {
+    const gpa = std.testing.allocator;
+    var net = try TupleNet.initCount(gpa, 1);
+    defer net.deinit(gpa);
+    const full = try encode(gpa, &net);
+    defer gpa.free(full);
+
+    try std.testing.expectError(error.WrongTableFileSize, parse(gpa, full[0 .. header_len - 1]));
+    try std.testing.expectError(error.WrongTableFileSize, parse(gpa, full[0 .. full.len - 1]));
+    const oversized = try gpa.alloc(u8, full.len + 1);
+    defer gpa.free(oversized);
+    @memcpy(oversized[0..full.len], full);
+    oversized[full.len] = 0;
+    try std.testing.expectError(error.WrongTableFileSize, parse(gpa, oversized));
+
+    const bytes = try gpa.dupe(u8, full);
+    defer gpa.free(bytes);
+    bytes[0] ^= 0xff;
+    try std.testing.expectError(error.BadTableMagic, parse(gpa, bytes));
+    bytes[0] ^= 0xff;
+    std.mem.writeInt(u32, bytes[8..12], file_version + 1, .little);
+    try std.testing.expectError(error.UnsupportedTableVersion, parse(gpa, bytes));
+    std.mem.writeInt(u32, bytes[8..12], file_version, .little);
+    std.mem.writeInt(u32, bytes[12..16], 0x04030201, .little);
+    try std.testing.expectError(error.WrongTableEndianness, parse(gpa, bytes));
+    std.mem.writeInt(u32, bytes[12..16], blob.endian_marker, .little);
+    std.mem.writeInt(u32, bytes[16..20], 0, .little);
+    try std.testing.expectError(error.WrongPatternCount, parse(gpa, bytes));
+    std.mem.writeInt(u32, bytes[16..20], @intCast(pattern_count + 1), .little);
+    try std.testing.expectError(error.WrongPatternCount, parse(gpa, bytes));
+    std.mem.writeInt(u32, bytes[16..20], 1, .little);
+    std.mem.writeInt(u32, bytes[20..24], @intCast(tableLen(0) + 1), .little);
+    try std.testing.expectError(error.WrongTableLength, parse(gpa, bytes));
+}
+
+test "parseQuantized rejects the same broken headers as parse (#302)" {
+    const gpa = std.testing.allocator;
+    var q = try Quantized.initCount(gpa, 1);
+    defer q.deinit(gpa);
+    q.scales[0] = 1.0;
+    const full = try encodeQuantized(gpa, &q);
+    defer gpa.free(full);
+
+    try std.testing.expectError(error.WrongTableFileSize, parseQuantized(gpa, full[0 .. header_len - 1]));
+    try std.testing.expectError(error.WrongTableFileSize, parseQuantized(gpa, full[0 .. full.len - 1]));
+
+    const bytes = try gpa.dupe(u8, full);
+    defer gpa.free(bytes);
+    bytes[0] ^= 0xff;
+    try std.testing.expectError(error.BadTableMagic, parseQuantized(gpa, bytes));
+    bytes[0] ^= 0xff;
+    std.mem.writeInt(u32, bytes[8..12], file_version + 1, .little);
+    try std.testing.expectError(error.UnsupportedTableVersion, parseQuantized(gpa, bytes));
+    std.mem.writeInt(u32, bytes[8..12], file_version, .little);
+    std.mem.writeInt(u32, bytes[12..16], 0x04030201, .little);
+    try std.testing.expectError(error.WrongTableEndianness, parseQuantized(gpa, bytes));
+    std.mem.writeInt(u32, bytes[12..16], blob.endian_marker, .little);
+    std.mem.writeInt(u32, bytes[16..20], 0, .little);
+    try std.testing.expectError(error.WrongPatternCount, parseQuantized(gpa, bytes));
+    std.mem.writeInt(u32, bytes[16..20], 1, .little);
+    std.mem.writeInt(u32, bytes[20..24], @intCast(tableLen(0) + 1), .little);
+    try std.testing.expectError(error.WrongTableLength, parseQuantized(gpa, bytes));
 }
 
 test "resume keeps learned values instead of reinitialising the table" {
