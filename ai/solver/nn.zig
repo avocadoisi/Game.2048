@@ -242,8 +242,120 @@ pub fn trainCapped(net: *Net, cache: *const Cache, target: f64, lr: f64, step_cl
     }
 }
 
-/// Adam moment estimates, one per weight. The optimizer state lives outside the weight file, so the format,
-/// the shipped net and every other variant stay untouched.
+/// PopArt uses exponential target moments in the existing reward_scale units; the weight file still
+/// stores the ordinary raw-value network, while the optimizer sidecar stores these statistics.
+pub const popart_beta: f64 = 1e-3;
+const popart_min_variance: f64 = 1e-6;
+const popart_state_magic = "2048-PA\x00";
+const popart_state_version: u32 = 1;
+const popart_state_file_len = 72;
+
+pub const PopArtState = struct {
+    mu: f64 = 0,
+    nu: f64 = 1,
+    updates: u64 = 0,
+    value_mu: f64 = 0,
+    value_nu: f64 = 1,
+    value_updates: u64 = 0,
+    beta: f64 = popart_beta,
+
+    pub fn variance(self: *const PopArtState) f64 {
+        return @max(self.nu - self.mu * self.mu, popart_min_variance);
+    }
+
+    pub fn sigma(self: *const PopArtState) f64 {
+        return @sqrt(self.variance());
+    }
+
+    /// EMA variance of raw predictions, for diagnostics only (not the normalization target).
+    pub fn valueVariance(self: *const PopArtState) f64 {
+        return @max(self.value_nu - self.value_mu * self.value_mu, popart_min_variance);
+    }
+
+    pub fn valueSigma(self: *const PopArtState) f64 {
+        return @sqrt(self.valueVariance());
+    }
+
+    pub fn denormalize(self: *const PopArtState, normalized: f64) f64 {
+        return self.sigma() * normalized + self.mu;
+    }
+
+    /// Update target moments and temporarily convert the raw-value output layer to the new normalized
+    /// coordinates. `cache` was computed before the conversion; its hidden activations remain valid.
+    pub fn startTrainingUpdate(self: *PopArtState, net: *Net, cache: *Cache, raw_target: f64) f64 {
+        const raw_value = cache.out;
+        self.value_mu = (1 - self.beta) * self.value_mu + self.beta * raw_value;
+        self.value_nu = @max((1 - self.beta) * self.value_nu + self.beta * raw_value * raw_value, self.value_mu * self.value_mu + popart_min_variance);
+        self.value_updates += 1;
+        self.mu = (1 - self.beta) * self.mu + self.beta * raw_target;
+        self.nu = @max((1 - self.beta) * self.nu + self.beta * raw_target * raw_target, self.mu * self.mu + popart_min_variance);
+        self.updates += 1;
+        const sigma_now = self.sigma();
+        for (&net.w3) |*weight| weight.* /= sigma_now;
+        net.b3 = (net.b3 - self.mu) / sigma_now;
+        cache.out = (cache.out - self.mu) / sigma_now;
+        return (raw_target - self.mu) / sigma_now;
+    }
+
+    /// Restore the raw-value parameterization after the normalized SGD step, preserving the existing
+    /// Net/weight-file contract for play, evaluation, and non-PopArt variants.
+    pub fn finishTrainingUpdate(self: *const PopArtState, net: *Net) void {
+        const sigma_now = self.sigma();
+        for (&net.w3) |*weight| weight.* *= sigma_now;
+        net.b3 = sigma_now * net.b3 + self.mu;
+    }
+
+    pub fn encode(self: *const PopArtState) [popart_state_file_len]u8 {
+        var bytes: [popart_state_file_len]u8 = undefined;
+        @memcpy(bytes[0..8], popart_state_magic);
+        std.mem.writeInt(u32, bytes[8..12], popart_state_version, .little);
+        std.mem.writeInt(u32, bytes[12..16], endian_marker, .little);
+        std.mem.writeInt(u64, bytes[16..24], self.updates, .little);
+        std.mem.writeInt(u64, bytes[24..32], @bitCast(self.mu), .little);
+        std.mem.writeInt(u64, bytes[32..40], @bitCast(self.nu), .little);
+        std.mem.writeInt(u64, bytes[40..48], @bitCast(self.beta), .little);
+        std.mem.writeInt(u64, bytes[48..56], self.value_updates, .little);
+        std.mem.writeInt(u64, bytes[56..64], @bitCast(self.value_mu), .little);
+        std.mem.writeInt(u64, bytes[64..72], @bitCast(self.value_nu), .little);
+        return bytes;
+    }
+
+    pub fn parse(bytes: []const u8) !PopArtState {
+        if (bytes.len != popart_state_file_len) return error.InvalidPopArtStateSize;
+        if (!std.mem.eql(u8, bytes[0..8], popart_state_magic)) return error.BadPopArtMagic;
+        if (std.mem.readInt(u32, bytes[8..12], .little) != popart_state_version) return error.UnsupportedPopArtVersion;
+        if (std.mem.readInt(u32, bytes[12..16], .little) != endian_marker) return error.WrongPopArtEndianness;
+        const state = PopArtState{
+            .updates = std.mem.readInt(u64, bytes[16..24], .little),
+            .mu = @bitCast(std.mem.readInt(u64, bytes[24..32], .little)),
+            .nu = @bitCast(std.mem.readInt(u64, bytes[32..40], .little)),
+            .beta = @bitCast(std.mem.readInt(u64, bytes[40..48], .little)),
+            .value_updates = std.mem.readInt(u64, bytes[48..56], .little),
+            .value_mu = @bitCast(std.mem.readInt(u64, bytes[56..64], .little)),
+            .value_nu = @bitCast(std.mem.readInt(u64, bytes[64..72], .little)),
+        };
+        if (!std.math.isFinite(state.mu) or !std.math.isFinite(state.nu) or
+            !std.math.isFinite(state.value_mu) or !std.math.isFinite(state.value_nu) or
+            !(state.nu >= state.mu * state.mu) or !(state.value_nu >= state.value_mu * state.value_mu) or
+            state.updates != state.value_updates or state.beta != popart_beta) return error.InvalidPopArtState;
+        return state;
+    }
+
+    pub fn save(self: *const PopArtState, io: std.Io, path: []const u8) !void {
+        const bytes = self.encode();
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = &bytes });
+    }
+
+    pub fn load(self: *PopArtState, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(popart_state_file_len + 1));
+        defer gpa.free(bytes);
+        // Qualified: `nn.parse` (the Net file) is also in scope here, so a bare `parse` is ambiguous.
+        self.* = try PopArtState.parse(bytes);
+    }
+};
+
+/// Adam moment estimates, one per weight. The optimizer state lives outside the weight file, so the
+/// format, the shipped net and every existing variant stay untouched.
 pub const Adam = struct {
     m: Net = std.mem.zeroes(Net),
     v: Net = std.mem.zeroes(Net),
@@ -1951,7 +2063,9 @@ pub const Options = struct {
     /// `GameResult.capped = true` and trains nothing more, and the CLI stops the run before the
     /// checkpoint write. Without it one pathological game can hang a batch for the whole run.
     move_cap: u32 = default_move_cap,
-    /// No per-move update during the game; afterwards train every stored afterstate from last to first.
+    /// Candidate : adaptive target normalization for the plain TD(0) path only.
+    popart: ?*PopArtState = null,
+    /// Candidate A: no per-move update during the game; afterwards train every stored afterstate from last to first.
     backward: bool = false,
     /// After the game, re-train the last `replay_k` afterstates once more (0 = off), oldest first.
     replay_k: usize = 0,
@@ -2134,9 +2248,19 @@ pub const Options = struct {
 /// below re-train afterstates after the game, use another target, or own a different update path, so
 /// they would silently ignore the shaped reward. Refuse them explicitly instead of falling back to
 /// the raw reward. `shape_c == 0` is always allowed and takes the untouched historical path.
-pub const OptionsError = error{ShapeRequiresPlainTd1};
+/// PopArt is also restricted to the plain serial TD(0) path: its EMA lives at `trainStep`, so
+/// any other field would change the update, the target or the game against statistics that no longer
+/// describe what is being trained.
+pub const OptionsError = error{ ShapeRequiresPlainTd1, PopArtRequiresPlainTd1 };
+
+/// Everything but the PopArt pointer itself must stay at its default; `move_cap` is a safety
+/// bound on one game, not an update, so it is carried over.
+fn popartIsPlainTd1(opts: Options) bool {
+    return std.meta.eql(opts, Options{ .popart = opts.popart, .move_cap = opts.move_cap });
+}
 
 pub fn validateOptions(opts: Options) OptionsError!void {
+    if (opts.popart != null and !popartIsPlainTd1(opts)) return error.PopArtRequiresPlainTd1;
     if (opts.shape_c == 0) return;
     if (opts.nstep > 0 or opts.backward or opts.replay_k != 0 or opts.priority != null or
         opts.target_net != null or opts.death or opts.teacher != null or
@@ -2736,7 +2860,15 @@ fn trainStep(net: *Net, cache: *Cache, after: Board, target: f64, lr: f64, opts:
     const transforms: usize = if (opts.symmetry) symmetry_count else 1;
     for (0..transforms) |k| {
         _ = forward(net, if (opts.symmetry) transformBoard(k, after) else after, cache);
-        if (opts.lambda > 0) trainTrace(net, cache, target, lr, trace, opts.lambda) else trainCapped(net, cache, target, lr, opts.step_clip);
+        if (opts.popart) |popart| {
+            const normalized_target = popart.startTrainingUpdate(net, cache, target);
+            trainCapped(net, cache, normalized_target, lr, opts.step_clip);
+            popart.finishTrainingUpdate(net);
+        } else if (opts.lambda > 0) {
+            trainTrace(net, cache, target, lr, trace, opts.lambda);
+        } else {
+            trainCapped(net, cache, target, lr, opts.step_clip);
+        }
     }
 }
 
@@ -3050,11 +3182,17 @@ pub fn trainBatch(net: *Net, seed: u64, first_game: usize, games: usize, lr: f64
     return trainBatchOpts(net, seed, first_game, games, lr, diag, .{}) catch unreachable;
 }
 
+fn validateBatchOptions(opts: Options) OptionsError!void {
+    try validateOptions(opts);
+    if (opts.popart != null) return error.PopArtRequiresPlainTd1;
+}
+
 /// `trainBatch` with options: every game trains with `trainGameOpts(.., opts)`, so any stateless
 /// variant (`backward`, `replay`, `sym`, `symlam`, `nstep`) batches the same way `base` does.
-/// Refuses a shaped run that the per-move path cannot implement, like `trainGameOpts`.
+/// Refuses a shaped run that the per-move path cannot implement. Refuses PopArt because
+/// its EMA state is serial-only.
 pub fn trainBatchOpts(net: *Net, seed: u64, first_game: usize, games: usize, lr: f64, diag: ?*Diag, opts: Options) OptionsError!BatchOutcome {
-    try validateOptions(opts);
+    try validateBatchOptions(opts);
     std.debug.assert(games >= 1 and games <= parallel.max_threads);
     // the priority buffer is cross-game state shared by pointer: batching it would be a data race
     std.debug.assert(opts.priority == null);
@@ -3537,6 +3675,89 @@ test "forward gives one finite scalar and is deterministic" {
     // empty board differs from the sample: the input encoding reaches the output
     var empty: Cache = .{};
     try std.testing.expect(forward(&net, std.mem.zeroes(Board), &empty) != first);
+}
+
+test "PopArt target-stat update preserves the raw network output (#289)" {
+    var rng = std.Random.DefaultPrng.init(289);
+    var net = Net.init(rng.random());
+    var state: PopArtState = .{};
+    var cache: Cache = .{};
+    const before = forward(&net, sample_board, &cache);
+    const raw_target = 7.5;
+    const normalized_target = state.startTrainingUpdate(&net, &cache, raw_target);
+    const new_sigma = state.sigma();
+    try std.testing.expectApproxEqAbs((before - state.mu) / new_sigma, cache.out, 1e-12);
+    try std.testing.expectApproxEqAbs((raw_target - state.mu) / new_sigma, normalized_target, 1e-12);
+    try std.testing.expectEqual(@as(u64, 1), state.value_updates);
+    try std.testing.expectApproxEqAbs(popart_beta * raw_target, state.mu, 1e-12);
+    try std.testing.expectApproxEqAbs(@max((1 - popart_beta) + popart_beta * raw_target * raw_target, state.mu * state.mu + popart_min_variance), state.nu, 1e-12);
+    try std.testing.expectApproxEqAbs(popart_beta * before, state.value_mu, 1e-12);
+    try std.testing.expectApproxEqAbs(@max((1 - popart_beta) + popart_beta * before * before, state.value_mu * state.value_mu + popart_min_variance), state.value_nu, 1e-12);
+    try std.testing.expectApproxEqAbs(@max(state.value_nu - state.value_mu * state.value_mu, popart_min_variance), state.valueVariance(), 1e-12);
+
+    var normalized_cache: Cache = .{};
+    const normalized_output = forward(&net, sample_board, &normalized_cache);
+    try std.testing.expectApproxEqAbs(before, state.denormalize(normalized_output), 1e-12);
+    state.finishTrainingUpdate(&net);
+    var restored_cache: Cache = .{};
+    try std.testing.expectApproxEqAbs(before, forward(&net, sample_board, &restored_cache), 1e-12);
+}
+
+test "PopArt trainStep applies one normalized update and restores raw-value weights (#289)" {
+    var rng = std.Random.DefaultPrng.init(290);
+    var net = Net.init(rng.random());
+    const initial = net;
+    var expected = net;
+    var state: PopArtState = .{};
+    var expected_state: PopArtState = .{};
+    var cache: Cache = .{};
+    var expected_cache: Cache = .{};
+    _ = forward(&expected, sample_board, &expected_cache);
+    const normalized_target = expected_state.startTrainingUpdate(&expected, &expected_cache, 7.5);
+    trainCapped(&expected, &expected_cache, normalized_target, 0.001, 0);
+    expected_state.finishTrainingUpdate(&expected);
+
+    trainStep(&net, &cache, sample_board, 7.5, 0.001, .{ .popart = &state }, &net);
+    try std.testing.expectEqualSlices(f64, flatConst(&expected), flatConst(&net));
+    try std.testing.expect(!std.mem.eql(f64, flatConst(&initial), flatConst(&net)));
+    try std.testing.expectEqual(expected_state.mu, state.mu);
+    try std.testing.expectEqual(expected_state.nu, state.nu);
+    try std.testing.expectEqual(expected_state.value_mu, state.value_mu);
+    try std.testing.expectEqual(expected_state.value_nu, state.value_nu);
+    try std.testing.expectEqual(@as(u64, 1), state.updates);
+    try std.testing.expectEqual(@as(u64, 1), state.value_updates);
+    try std.testing.expect(weightsFinite(&net));
+    var verify_cache: Cache = .{};
+    try std.testing.expect(std.math.isFinite(forward(&net, sample_board, &verify_cache)));
+}
+
+test "PopArt stats sidecar round-trips its versioned state (#289)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/popart.bin", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+
+    const saved = PopArtState{
+        .mu = 12.5,
+        .nu = 200,
+        .updates = 4321,
+        .value_mu = 3.25,
+        .value_nu = 20,
+        .value_updates = 4321,
+    };
+    try saved.save(io, path);
+    var loaded: PopArtState = .{};
+    try loaded.load(io, std.testing.allocator, path);
+    try std.testing.expectEqual(saved.mu, loaded.mu);
+    try std.testing.expectEqual(saved.nu, loaded.nu);
+    try std.testing.expectEqual(saved.updates, loaded.updates);
+    try std.testing.expectEqual(saved.value_mu, loaded.value_mu);
+    try std.testing.expectEqual(saved.value_nu, loaded.value_nu);
+    try std.testing.expectEqual(saved.value_updates, loaded.value_updates);
+    try std.testing.expectEqual(saved.beta, loaded.beta);
 }
 
 test "levelOf maps tiles to log2 levels and clamps large tiles" {
@@ -7500,6 +7721,23 @@ test "explicit shape_c zero trains exactly like base, serial and par (#277)" {
     _ = trainBatch(&plain_par, 277, 0, 3, 0.001, null);
     _ = try trainBatchOpts(&zero_par, 277, 0, 3, 0.001, null, .{ .shape_c = 0 });
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&plain_par), std.mem.asBytes(&zero_par));
+}
+
+test "PopArt refuses mixed training variants and stays opt-in (#289)" {
+    var state: PopArtState = .{};
+    const adam = try std.testing.allocator.create(Adam);
+    defer std.testing.allocator.destroy(adam);
+    adam.* = .{};
+    try validateOptions(.{});
+    try validateOptions(.{ .popart = &state });
+    try std.testing.expectError(error.PopArtRequiresPlainTd1, validateOptions(.{ .popart = &state, .lambda = 0.7 }));
+    try std.testing.expectError(error.PopArtRequiresPlainTd1, validateOptions(.{ .popart = &state, .step_clip = 1 }));
+    try std.testing.expectError(error.PopArtRequiresPlainTd1, validateOptions(.{ .popart = &state, .adam = adam }));
+    // a search-only field (the spawn sampler) is inert on this path, so it is refused, not ignored
+    try std.testing.expectError(error.PopArtRequiresPlainTd1, validateOptions(.{ .popart = &state, .sample = 2 }));
+    // the per-game safety bound is not an update and stays allowed
+    try validateOptions(.{ .popart = &state, .move_cap = 500 });
+    try std.testing.expectError(error.PopArtRequiresPlainTd1, validateBatchOptions(.{ .popart = &state }));
 }
 
 test "shape refuses variants that would drop the shaped reward (#277)" {
