@@ -10,6 +10,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const game_limit_mod = b.addModule("game_limit", .{
+        .root_source_file = b.path("ai/solver/game_limit.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core_mod }},
+    });
+
     // Width of the value MLP: the hidden layers are compile-time sized, so a capacity sweep is a
     // build option instead of three edited copies (`zig build nn -Dh1=32 -Dh2=16`).
     const width_opts = b.addOptions();
@@ -47,6 +54,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core", .module = core_mod },
+            .{ .name = "game_limit", .module = game_limit_mod },
             .{ .name = "parallel", .module = parallel_mod },
             .{ .name = "stats", .module = stats_mod },
             .{ .name = "blob", .module = blob_mod },
@@ -61,6 +69,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core", .module = core_mod },
             .{ .name = "blob", .module = blob_mod },
+            .{ .name = "game_limit", .module = game_limit_mod },
         },
     });
 
@@ -88,6 +97,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core", .module = core_mod },
+            .{ .name = "game_limit", .module = game_limit_mod },
             .{ .name = "nn", .module = nn_mod },
             .{ .name = "ntuple", .module = ntuple_mod },
         },
@@ -258,6 +268,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "core", .module = core_mod },
                 .{ .name = "solver", .module = solver_mod },
                 .{ .name = "nn", .module = nn_mod },
+                .{ .name = "game_limit", .module = game_limit_mod },
                 .{ .name = "parallel", .module = parallel_mod },
                 .{ .name = "stats", .module = stats_mod },
             },
@@ -317,6 +328,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "core", .module = core_mod },
                 .{ .name = "solver", .module = solver_mod },
                 .{ .name = "ntuple", .module = ntuple_mod },
+                .{ .name = "game_limit", .module = game_limit_mod },
                 .{ .name = "parallel", .module = parallel_mod },
                 .{ .name = "stats", .module = stats_mod },
             },
@@ -393,6 +405,12 @@ pub fn build(b: *std.Build) void {
         .target = wasm_target,
         .optimize = optimize,
     });
+    const wasm_game_limit_mod = b.addModule("game_limit-wasm", .{
+        .root_source_file = b.path("ai/solver/game_limit.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = wasm_core_mod }},
+    });
     const wasm_parallel_mod = b.addModule("parallel-wasm", .{
         .root_source_file = b.path("ai/solver/parallel.zig"),
         .target = wasm_target,
@@ -409,6 +427,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core", .module = wasm_core_mod },
+            .{ .name = "game_limit", .module = wasm_game_limit_mod },
             .{ .name = "parallel", .module = wasm_parallel_mod },
             .{ .name = "blob", .module = wasm_blob_mod },
             .{ .name = "nn_width", .module = width_opts.createModule() },
@@ -421,6 +440,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core", .module = wasm_core_mod },
             .{ .name = "blob", .module = wasm_blob_mod },
+            .{ .name = "game_limit", .module = wasm_game_limit_mod },
         },
     });
     const wasm_solver_mod = b.addModule("solver-wasm", .{
@@ -429,6 +449,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core", .module = wasm_core_mod },
+            .{ .name = "game_limit", .module = wasm_game_limit_mod },
             .{ .name = "nn", .module = wasm_nn_mod },
             .{ .name = "ntuple", .module = wasm_ntuple_mod },
         },

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const core = @import("core");
+const game_limit = @import("game_limit");
 const parallel = @import("parallel");
 const eval_stats = @import("stats");
 const blob = @import("blob");
@@ -1739,6 +1740,8 @@ pub const PlayResult = struct {
     /// The board the game ended on (the tape replay test compares it). Zero for callers that
     /// build a `PlayResult` without playing (the expectimax row of `nn_main`).
     board: Board = std.mem.zeroes(Board),
+    /// (#336) Stopped at the caller's time budget. Partial score/tile/moves are diagnostics only.
+    timed_out: bool = false,
 };
 
 /// Play one game to game over with the network policy.
@@ -1768,11 +1771,17 @@ pub fn playWithStatsValue(vfn: Value, rng: std.Random, mode: Mode, stats: *Stats
 
 /// `playWithStatsValue` with the search options.
 pub fn playWithOptsValue(vfn: Value, rng: std.Random, mode: Mode, stats: *Stats, opts: Options) PlayResult {
+    const start = gameStartTime(opts.game_time_limit_ns);
     var state = GameState.gameStart(rng);
     var moves: u32 = 0;
+    var timed_out = false;
     var move_stats: Stats = .{};
     var cache: ValueCache = .{}; // one workspace for the whole game (issue #88)
     while (true) {
+        if (gameTimeLimitReached(start, opts.game_time_limit_ns)) {
+            timed_out = true;
+            break;
+        }
         move_stats = .{};
         const dir = bestMoveWithCacheValueOpts(vfn, state, mode, &move_stats, &cache, opts) orelse break;
         stats.leaves += move_stats.leaves;
@@ -1782,7 +1791,7 @@ pub fn playWithOptsValue(vfn: Value, rng: std.Random, mode: Mode, stats: *Stats,
         _ = state.move(dir, rng);
         moves += 1;
     }
-    return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves, .leaves = stats.leaves, .node_probes = stats.node_probes, .node_hits = stats.node_hits, .board = state.board };
+    return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves, .leaves = stats.leaves, .node_probes = stats.node_probes, .node_hits = stats.node_hits, .board = state.board, .timed_out = timed_out };
 }
 
 /// One spawn of a game: a board-independent random pick and which of the two values the tile had.
@@ -1925,13 +1934,19 @@ pub fn playTapedWithStatsValue(vfn: Value, rng: std.Random, mode: Mode, tape: *T
 /// `playTapedWithStatsValue` with the search options, so a tape recorded by one policy can be
 /// replayed with a search option on exactly the same spawns.
 pub fn playTapedWithStatsValueOpts(vfn: Value, rng: std.Random, mode: Mode, tape: *Tape, stats: *Stats, opts: Options) PlayResult {
+    const start = gameStartTime(opts.game_time_limit_ns);
     var state = GameState.initEmpty();
     _ = tape.spawn(&state, rng);
     _ = tape.spawn(&state, rng);
     var moves: u32 = 0;
+    var timed_out = false;
     var move_stats: Stats = .{};
     var cache: ValueCache = .{};
     while (true) {
+        if (gameTimeLimitReached(start, opts.game_time_limit_ns)) {
+            timed_out = true;
+            break;
+        }
         move_stats = .{};
         const dir = bestMoveWithCacheValueOpts(vfn, state, mode, &move_stats, &cache, opts) orelse break;
         stats.leaves += move_stats.leaves;
@@ -1942,7 +1957,7 @@ pub fn playTapedWithStatsValueOpts(vfn: Value, rng: std.Random, mode: Mode, tape
         if (result.changed) _ = tape.spawn(&state, rng);
         moves += 1;
     }
-    return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves, .leaves = stats.leaves, .node_probes = stats.node_probes, .node_hits = stats.node_hits, .board = state.board };
+    return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves, .leaves = stats.leaves, .node_probes = stats.node_probes, .node_hits = stats.node_hits, .board = state.board, .timed_out = timed_out };
 }
 
 /// Paired comparison of two policies on the same spawn tape: `diffs[i]` is `score_b - score_a`
@@ -2056,6 +2071,13 @@ pub const SelfPlay = enum { greedy1, deep2 };
 /// thousand moves, so this is far past anything normal; a game that reaches it is pathological.
 pub const default_move_cap: u32 = 100_000;
 
+const clockNow = game_limit.clockNow;
+const gameStartTime = game_limit.start;
+
+fn gameTimeLimitReached(start: std.Io.Timestamp, limit_ns: ?u64) bool {
+    return game_limit.reached(start, limit_ns);
+}
+
 /// Opt-in training variants. The default `.{}` is the plain per-move TD(0) of `trainGame`; every
 /// option whose default is 0/false/null leaves that path bit-identical.
 pub const Options = struct {
@@ -2065,6 +2087,8 @@ pub const Options = struct {
     move_cap: u32 = default_move_cap,
     /// Candidate : adaptive target normalization for the plain TD(0) path only.
     popart: ?*PopArtState = null,
+    /// (#336) One game's wall-clock budget; null leaves library calls unlimited. The CLI sets it.
+    game_time_limit_ns: ?u64 = null,
     /// Candidate A: no per-move update during the game; afterwards train every stored afterstate from last to first.
     backward: bool = false,
     /// After the game, re-train the last `replay_k` afterstates once more (0 = off), oldest first.
@@ -2256,7 +2280,7 @@ pub const OptionsError = error{ ShapeRequiresPlainTd1, PopArtRequiresPlainTd1 };
 /// Everything but the PopArt pointer itself must stay at its default; `move_cap` is a safety
 /// bound on one game, not an update, so it is carried over.
 fn popartIsPlainTd1(opts: Options) bool {
-    return std.meta.eql(opts, Options{ .popart = opts.popart, .move_cap = opts.move_cap });
+    return std.meta.eql(opts, Options{ .popart = opts.popart, .move_cap = opts.move_cap, .game_time_limit_ns = opts.game_time_limit_ns });
 }
 
 pub fn validateOptions(opts: Options) OptionsError!void {
@@ -2700,7 +2724,14 @@ pub fn trainGame(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag) u32 {
     return trainGameOptsUnchecked(net, rng, lr, diag, .{}).score;
 }
 
-pub const GameResult = struct { score: u32, moves: u32, capped: bool = false };
+pub const GameResult = struct {
+    score: u32,
+    moves: u32,
+    capped: bool = false,
+    timed_out: bool = false,
+    /// Diagnostic partial result on a timeout; never a completed-game reach count.
+    max_tile: core.Tile = 0,
+};
 
 /// `trainGame` with options. `diag` is only recorded on the default path (`opts` all off).
 /// Returns `error.ShapeRequiresPlainTd1` rather than silently dropping a shaped reward on a
@@ -2711,9 +2742,10 @@ pub fn trainGameOpts(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Op
 }
 
 fn trainGameOptsUnchecked(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
-    if (opts.nstep > 0) return trainGameNStep(net, rng, lr, opts.nstep, opts.move_cap);
+    if (opts.nstep > 0) return trainGameNStep(net, rng, lr, opts.nstep, opts.move_cap, opts.game_time_limit_ns);
     if (opts.priority != null and !opts.death) return trainGamePerMove(net, rng, lr, diag, opts);
     if (!opts.backward and opts.replay_k == 0 and !opts.death) return trainGamePerMove(net, rng, lr, diag, opts);
+    const start = gameStartTime(opts.game_time_limit_ns);
     var steps: [step_cap]Step = undefined;
     var n: usize = 0;
     var state = GameState.gameStart(rng);
@@ -2723,6 +2755,7 @@ fn trainGameOptsUnchecked(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opt
         // Stop before the pick: a capped game is pathological, and its unfinished tail must not
         // enter any target. The check reads no rng, so every normal game is unchanged.
         if (opts.move_cap > 0 and n >= @as(usize, opts.move_cap)) return .{ .score = state.score, .moves = @intCast(n), .capped = true };
+        if (gameTimeLimitReached(start, opts.game_time_limit_ns)) return .{ .score = state.score, .moves = @intCast(n), .capped = true, .timed_out = true, .max_tile = core.maxTile(state.board) };
         const pick = pickMove(net, state, opts.death) orelse break;
         // With replay_k > 0 this path, not `tdBootstrap`, is the online TD update. Keep the
         // live `pick.value` unless a frozen target was asked for, so the default stays bit-identical.
@@ -2933,6 +2966,7 @@ fn tdTerminalUpdate(net: *Net, cache: *Cache, p: Pick, spawned: GameState, lr: f
 }
 
 fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
+    const start = gameStartTime(opts.game_time_limit_ns);
     const pr = opts.priority;
     const vfn: Value = .{ .single = net };
     var state = if (opts.restart) restartState(rng, opts.dump.?) else GameState.gameStart(rng);
@@ -2946,6 +2980,10 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
         if (opts.move_cap > 0 and moves >= opts.move_cap) {
             if (diag) |d| d.finish();
             return .{ .score = state.score, .moves = moves, .capped = true };
+        }
+        if (gameTimeLimitReached(start, opts.game_time_limit_ns)) {
+            if (diag) |d| d.finish();
+            return .{ .score = state.score, .moves = moves, .capped = true, .timed_out = true, .max_tile = core.maxTile(state.board) };
         }
         var pick = selfplayPick(vfn, state, opts.death, opts.selfplay, opts.teacher, opts.sym_leaf) orelse break;
         //: with probability `explore` play a uniformly random legal move, so the self-play walks
@@ -3079,7 +3117,8 @@ fn tdBootstrap(net: *const Net, next: Pick, spawned: GameState, opts: Options, n
 /// Online n-step TD on the same 1-ply self-play policy as `trainGamePerMove`: each step enters
 /// the window with V of its afterstate, and the step leaving the window is trained on its n rewards plus
 /// that value. The last min(n, game length) steps are flushed at game over with the rewards alone.
-fn trainGameNStep(net: *Net, rng: std.Random, lr: f64, n: usize, move_cap: u32) GameResult {
+fn trainGameNStep(net: *Net, rng: std.Random, lr: f64, n: usize, move_cap: u32, time_limit_ns: ?u64) GameResult {
+    const start = gameStartTime(time_limit_ns);
     var window = NStepWindow.init(n);
     var state = GameState.gameStart(rng);
     var cache: Cache = .{};
@@ -3087,6 +3126,7 @@ fn trainGameNStep(net: *Net, rng: std.Random, lr: f64, n: usize, move_cap: u32) 
     while (true) {
         // A capped game is not terminal, so its window is not flushed as one either.
         if (move_cap > 0 and moves >= move_cap) return .{ .score = state.score, .moves = moves, .capped = true };
+        if (gameTimeLimitReached(start, time_limit_ns)) return .{ .score = state.score, .moves = moves, .capped = true, .timed_out = true, .max_tile = core.maxTile(state.board) };
         const pick = pickMove(net, state, false) orelse break;
         moves += 1;
         if (window.push(.{ .after = pick.after, .reward = pick.reward }, pick.value)) |done|
@@ -3100,6 +3140,11 @@ fn trainGameNStep(net: *Net, rng: std.Random, lr: f64, n: usize, move_cap: u32) 
 /// MS-TD self-play game over the staged value: the same 1-ply policy as `trainGamePerMove`,
 /// one TD(0) step per move (gamma = 1), and each step trains only the net of the afterstate it reached.
 pub fn trainGameStaged(staged: *Staged, rng: std.Random, lr: f64) GameResult {
+    return trainGameStagedOpts(staged, rng, lr, .{});
+}
+
+pub fn trainGameStagedOpts(staged: *Staged, rng: std.Random, lr: f64, opts: Options) GameResult {
+    const start = gameStartTime(opts.game_time_limit_ns);
     const value: Value = .{ .staged = staged };
     var state = GameState.gameStart(rng);
     var pending: ?Pick = null;
@@ -3107,6 +3152,7 @@ pub fn trainGameStaged(staged: *Staged, rng: std.Random, lr: f64) GameResult {
     while (true) {
         // Same cap on the MS-TD path; the staged weights are also finite-safe.
         if (moves >= default_move_cap) return .{ .score = state.score, .moves = moves, .capped = true };
+        if (gameTimeLimitReached(start, opts.game_time_limit_ns)) return .{ .score = state.score, .moves = moves, .capped = true, .timed_out = true, .max_tile = core.maxTile(state.board) };
         const pick = pickMoveValue(value, state, false) orelse break;
         moves += 1;
         if (pending) |p| _ = staged.train(p.after, pick.after, p.reward, lr);
@@ -3135,6 +3181,8 @@ const BatchGame = struct {
     score: u32,
     moves: u32,
     capped: bool = false,
+    timed_out: bool = false,
+    max_tile: core.Tile = 0,
     diag: Diag = .{},
 };
 
@@ -3146,6 +3194,8 @@ fn runBatchGame(ctx: BatchGameCtx, i: usize) BatchGame {
     result.score = trained.score;
     result.moves = trained.moves;
     result.capped = trained.capped;
+    result.timed_out = trained.timed_out;
+    result.max_tile = trained.max_tile;
     return result;
 }
 
@@ -3161,6 +3211,12 @@ pub const BatchOutcome = struct {
     /// must stop on this instead of waiting for the other games.
     capped_game: ?usize = null,
     capped_moves: u32 = 0,
+    /// (#336) The first unfinished timed-out game and its diagnostic partial result. Its whole batch
+    /// is rejected before the merge, so no gradient from that batch reaches the caller's net.
+    timed_out_game: ?usize = null,
+    timed_out_score: u32 = 0,
+    timed_out_moves: u32 = 0,
+    timed_out_max_tile: core.Tile = 0,
 };
 
 fn mergeDiag(dst: *Diag, src: *const Diag) void {
@@ -3212,6 +3268,38 @@ pub fn trainBatchOpts(net: *Net, seed: u64, first_game: usize, games: usize, lr:
         .opts = thread_opts,
     }, runBatchGame);
 
+    var moves: u64 = 0;
+    var capped_game: ?usize = null;
+    var capped_moves: u32 = 0;
+    var timed_out_game: ?usize = null;
+    var timed_out_score: u32 = 0;
+    var timed_out_moves: u32 = 0;
+    var timed_out_max_tile: core.Tile = 0;
+    for (units[0..games], 0..) |u, i| {
+        moves += u.moves;
+        if (u.timed_out and timed_out_game == null) {
+            timed_out_game = i;
+            timed_out_score = u.score;
+            timed_out_moves = u.moves;
+            timed_out_max_tile = u.max_tile;
+        }
+        if (u.capped and !u.timed_out and capped_game == null) {
+            capped_game = i;
+            capped_moves = u.moves;
+        }
+    }
+    const outcome: BatchOutcome = .{
+        .score = units[games - 1].score,
+        .moves = moves,
+        .capped_game = capped_game,
+        .capped_moves = capped_moves,
+        .timed_out_game = timed_out_game,
+        .timed_out_score = timed_out_score,
+        .timed_out_moves = timed_out_moves,
+        .timed_out_max_tile = timed_out_max_tile,
+    };
+    if (timed_out_game != null) return outcome;
+
     const start = net.*;
     const start_w = std.mem.bytesAsSlice(f64, std.mem.asBytes(&start));
     const out_w = std.mem.bytesAsSlice(f64, std.mem.asBytes(net));
@@ -3235,17 +3323,7 @@ pub fn trainBatchOpts(net: *Net, seed: u64, first_game: usize, games: usize, lr:
         clipMergedDelta(out_w, start_w, opts);
     }
     if (diag) |d| for (units[0..games]) |u| mergeDiag(d, &u.diag);
-    var moves: u64 = 0;
-    var capped_game: ?usize = null;
-    var capped_moves: u32 = 0;
-    for (units[0..games], 0..) |u, i| {
-        moves += u.moves;
-        if (u.capped and capped_game == null) {
-            capped_game = i;
-            capped_moves = u.moves;
-        }
-    }
-    return .{ .score = units[games - 1].score, .moves = moves, .capped_game = capped_game, .capped_moves = capped_moves };
+    return outcome;
 }
 
 /// Bound the single step `trainBatchOpts` applies: `grad_clip` scales the whole delta down to
@@ -6372,6 +6450,72 @@ test "the parallel batch reports and aggregates the capped game (#242)" {
     try std.testing.expectEqual(cap, out.capped_moves);
 }
 
+test "game time limits are deterministic at their boundaries (#336)" {
+    const start = clockNow();
+    try std.testing.expect(!gameTimeLimitReached(start, null));
+    try std.testing.expect(gameTimeLimitReached(start, 0));
+    try std.testing.expect(!gameTimeLimitReached(start, std.math.maxInt(u64)));
+}
+
+test "a zero time limit rejects an unfinished game on every training path (#336)" {
+    var init_rng = std.Random.DefaultPrng.init(336);
+    const start = Net.init(init_rng.random());
+    inline for (.{ @as(Options, .{}), @as(Options, .{ .backward = true }), @as(Options, .{ .replay_k = 3 }), @as(Options, .{ .nstep = 4 }) }) |variant| {
+        var net = start;
+        var opts: Options = variant;
+        opts.game_time_limit_ns = 0;
+        var rng = std.Random.DefaultPrng.init(337);
+        const game = try trainGameOpts(&net, rng.random(), 0.003, null, opts);
+        try std.testing.expect(game.capped);
+        try std.testing.expect(game.timed_out);
+        try std.testing.expectEqual(@as(u32, 0), game.moves);
+        try std.testing.expectEqual(@as(u32, 0), game.score);
+        try std.testing.expectEqualSlices(u8, std.mem.asBytes(&start), std.mem.asBytes(&net));
+    }
+}
+
+test "a zero time limit rejects unfinished evaluation games (#336)" {
+    var init_rng = std.Random.DefaultPrng.init(336);
+    const net = Net.init(init_rng.random());
+    const opts: Options = .{ .game_time_limit_ns = 0 };
+    var rng = std.Random.DefaultPrng.init(337);
+    const plain = playValueOpts(.{ .single = &net }, rng.random(), .greedy, opts);
+    try std.testing.expect(plain.timed_out);
+    try std.testing.expectEqual(@as(u32, 0), plain.moves);
+    try std.testing.expect(plain.max_tile <= 4);
+
+    var spawns: [100]Spawn = undefined;
+    var tape = Tape.initRecord(&spawns);
+    const taped = playTapedValueOpts(.{ .single = &net }, rng.random(), .greedy, &tape, opts);
+    try std.testing.expect(taped.timed_out);
+    try std.testing.expectEqual(@as(u32, 0), taped.moves);
+    try std.testing.expect(taped.max_tile <= 4);
+}
+
+test "a timed-out parallel batch does not merge unfinished games (#336)" {
+    var init_rng = std.Random.DefaultPrng.init(336);
+    const start = Net.init(init_rng.random());
+    var net = start;
+    const out = try trainBatchOpts(&net, 337, 0, 4, 0.003, null, .{ .game_time_limit_ns = 0 });
+    try std.testing.expectEqual(@as(?usize, 0), out.timed_out_game);
+    try std.testing.expectEqual(@as(?usize, null), out.capped_game);
+    try std.testing.expectEqual(@as(u32, 0), out.timed_out_score);
+    try std.testing.expectEqual(@as(u32, 0), out.timed_out_moves);
+    try std.testing.expectEqual(@as(u64, 0), out.moves);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&start), std.mem.asBytes(&net));
+}
+
+test "a zero time limit also applies to staged training (#336)" {
+    var rng = std.Random.DefaultPrng.init(336);
+    var staged = Staged.init(rng.random());
+    const before = staged;
+    const game = trainGameStagedOpts(&staged, rng.random(), 0.003, .{ .game_time_limit_ns = 0 });
+    try std.testing.expect(game.capped);
+    try std.testing.expect(game.timed_out);
+    try std.testing.expectEqual(@as(u32, 0), game.moves);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&before), std.mem.asBytes(&staged));
+}
+
 test "the 8 dihedral transforms are distinct for a non-symmetric board and compose back to identity" {
     const board: Board = .{
         .{ 2, 4, 8, 16 },
@@ -7735,8 +7879,8 @@ test "PopArt refuses mixed training variants and stays opt-in (#289)" {
     try std.testing.expectError(error.PopArtRequiresPlainTd1, validateOptions(.{ .popart = &state, .adam = adam }));
     // a search-only field (the spawn sampler) is inert on this path, so it is refused, not ignored
     try std.testing.expectError(error.PopArtRequiresPlainTd1, validateOptions(.{ .popart = &state, .sample = 2 }));
-    // the per-game safety bound is not an update and stays allowed
-    try validateOptions(.{ .popart = &state, .move_cap = 500 });
+    // Per-game safety bounds do not alter an update, and stay allowed with PopArt.
+    try validateOptions(.{ .popart = &state, .move_cap = 500, .game_time_limit_ns = 0 });
     try std.testing.expectError(error.PopArtRequiresPlainTd1, validateBatchOptions(.{ .popart = &state }));
 }
 

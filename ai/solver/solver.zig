@@ -1,5 +1,6 @@
 const std = @import("std");
 const core = @import("core");
+const game_limit = @import("game_limit");
 
 const Board = core.Board;
 const Direction = core.Direction;
@@ -407,9 +408,18 @@ fn randomMove(state: *GameState, rng: std.Random) ?u32 {
 }
 
 pub fn playPolicy(rng: std.Random, policy: Policy, depth: u8) GameResult {
+    return playPolicyOpts(rng, policy, depth, .{});
+}
+
+/// Time is checked between moves, just as for NN and n-tuple. The shipped/replay path uses the
+/// unlimited wrapper, so its move/spawn order is unchanged.
+pub fn playPolicyOpts(rng: std.Random, policy: Policy, depth: u8, opts: ntuple.GameOptions) GameResult {
+    const start = ntuple.gameStartTime(opts.game_time_limit_ns);
     var state = GameState.gameStart(rng);
     var moves: u32 = 0;
-    while (choose(policy, state, rng, depth)) |d| {
+    while (true) {
+        if (game_limit.reached(start, opts.game_time_limit_ns)) return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves, .timed_out = true };
+        const d = choose(policy, state, rng, depth) orelse break;
         _ = state.move(d, rng);
         moves += 1;
     }
@@ -1002,6 +1012,7 @@ pub const GameResult = struct {
     score: u32,
     max_tile: core.Tile,
     moves: u32,
+    timed_out: bool = false,
 };
 
 /// Play one full game with the solver until no move changes the board.
@@ -2032,6 +2043,14 @@ test "nn policy reproduces the same move sequence and score on a fixed seed" {
     try std.testing.expectEqual(@as(core.Tile, 4096), g.max_tile);
     try std.testing.expectEqual(@as(u32, 3744), g.moves);
     try std.testing.expectEqual(@as(u64, 6496592461525624355), g.checksum);
+}
+
+test "expectimax evaluation can reject an unfinished game (#336)" {
+    var rng = std.Random.DefaultPrng.init(336);
+    const played = playPolicyOpts(rng.random(), .expectimax, 2, .{ .game_time_limit_ns = 0 });
+    try std.testing.expect(played.timed_out);
+    try std.testing.expectEqual(@as(u32, 0), played.moves);
+    try std.testing.expect(played.max_tile <= 4);
 }
 
 test "nn2 policy reproduces the same move sequence and score on a fixed seed" {

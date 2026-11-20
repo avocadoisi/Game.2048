@@ -6,6 +6,7 @@ const parallel = @import("parallel");
 const cli = @import("args.zig");
 const bench = @import("bench.zig");
 const stats = @import("stats");
+const game_limit = @import("game_limit");
 
 const usage =
     \\usage: nn [train_games] [eval_games] [eval_seed] [learning_rate] [seed_ranges|diag] [variant|par] [replay_k] [weights_path] [train_seed] [par|-] [dump_path]
@@ -121,6 +122,9 @@ const usage =
     \\                tnet's sync interval in merged batches (default 100) and clip's cap (default 1, the
     \\                sym_batch_clip scale). Arg 14 then picks clip's mode, `norm` (default) or `step`.
     \\
+    \\  variant+xtime (#336) one explicit extension after a promising first timeout: training 60 -> 300
+    \\                seconds per game, NN evaluation 30 -> 120 minutes per game. Otherwise no extension.
+    \\                A timed-out game is never aggregated or saved; a second timeout closes inconclusive.
     \\Weights are written to `weights_path` only when train_games > 0;
     \\train_games = 0 (eval only) never writes.
     \\
@@ -162,8 +166,25 @@ const default_seed_ranges: u32 = 1;
 /// Appended after `weights_path` so existing command lines keep their meaning.
 const default_train_seed: u64 = 1;
 
-/// Every accepted `variant` string, one tag per variant. The table below owns the facts and the options
-/// builder that used to be repeated at the hand-written dispatch sites in `main`.
+const RunPhase = game_limit.RunPhase;
+
+/// A spent normal budget permits `variant+xtime` exactly once. A second timeout closes the trial
+/// as inconclusive, never as an adopted or completed game.
+fn gameTimeLimitNs(phase: RunPhase, extended: bool) u64 {
+    return game_limit.limitNs(phase, extended);
+}
+
+fn promisingTimeout(score: u32, max_tile: core.Tile, extended: bool) bool {
+    return game_limit.promising(score, max_tile, extended);
+}
+
+fn evaluationOptions(base: nn.Options, extended: bool) nn.Options {
+    var out = base;
+    out.game_time_limit_ns = gameTimeLimitNs(.evaluate, extended);
+    return out;
+}
+
+/// Every accepted `variant` string, one tag per variant. The table owns the facts and options builders.
 const Variant = enum {
     base,
     backward,
@@ -540,6 +561,16 @@ fn findVariant(name: []const u8) ?VariantSpec {
         if (std.mem.eql(u8, name, @tagName(spec.variant))) return spec;
     }
     return null;
+}
+
+const ParsedVariant = struct { spec: VariantSpec, extended_time: bool };
+
+fn parseVariantName(name: []const u8) ?ParsedVariant {
+    const suffix = "+xtime";
+    const extended = std.mem.endsWith(u8, name, suffix);
+    const base_name = if (extended) name[0 .. name.len - suffix.len] else name;
+    const spec = findVariant(base_name) orelse return null;
+    return .{ .spec = spec, .extended_time = extended };
 }
 
 /// Reproduce the old `max_args` if-chain from the table facts and the two runtime slots that feed it.
@@ -1013,7 +1044,9 @@ pub fn main(init: std.process.Init) !void {
     const variant_name = if (args.len > 6) args[6] else "base";
     // arg 6 `par` means base + parallel (unchanged); arg 10 `par` batches the variant of arg 6
     const par_tail = try parseParFlag(args);
-    const spec = findVariant(variant_name) orelse VariantSpec{ .variant = .unknown };
+    const parsed_variant = parseVariantName(variant_name);
+    const spec = if (parsed_variant) |parsed| parsed.spec else VariantSpec{ .variant = .unknown };
+    const extended_time = if (parsed_variant) |parsed| parsed.extended_time else false;
     const variant = @tagName(spec.variant);
     const use_par = spec.variant == .par or par_tail;
     const is_mstd = spec.variant == .mstd;
@@ -1111,6 +1144,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("PopArt is serial-only\n{s}", .{usage});
         return;
     }
+    opts.game_time_limit_ns = gameTimeLimitNs(.train, extended_time);
     // Refuse a shaped run mixed with a variant that retrains afterstates later or replaces the
     // TD target: those paths do not implement the shaped reward, and silently training on the raw
     // reward would hide the mistake.
@@ -1231,9 +1265,10 @@ pub fn main(init: std.process.Init) !void {
         if (is_mstd) {
             for (0..train_games) |g| {
                 const frac = @as(f64, @floatFromInt(g)) / @as(f64, @floatFromInt(train_games));
-                const game = nn.trainGameStaged(staged, rng.random(), learning_rate * (1 - 0.9 * frac));
+                const game = nn.trainGameStagedOpts(staged, rng.random(), learning_rate * (1 - 0.9 * frac), opts);
                 last_score = game.score;
                 total_moves += game.moves;
+                if (game.timed_out) return gameTimeLimit(g + 1, train_games, game, opts.game_time_limit_ns.?, extended_time, weights_path);
                 if (game.capped) return moveCap(g + 1, train_games, game.moves, nn.default_move_cap, weights_path);
                 if (!stagedFinite(staged)) return diverged(g + 1, train_games, weights_path);
                 if ((g + 1) % 5000 == 0) {
@@ -1250,6 +1285,12 @@ pub fn main(init: std.process.Init) !void {
                 const batch = try nn.trainBatchOpts(&net, train_seed, g, games, learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null, opts);
                 last_score = batch.score;
                 total_moves += batch.moves;
+
+                if (batch.timed_out_game) |i| return gameTimeLimit(g + i + 1, train_games, .{
+                    .score = batch.timed_out_score,
+                    .moves = batch.timed_out_moves,
+                    .max_tile = batch.timed_out_max_tile,
+                }, opts.game_time_limit_ns.?, extended_time, weights_path);
                 // One pathological game stalls the whole batch (seed 3 spent 53 min in one at 60k),
                 // so stop on the first capped game instead of waiting for the other seven.
                 if (batch.capped_game) |i| return moveCap(g + i + 1, train_games, batch.capped_moves, opts.move_cap, weights_path);
@@ -1269,6 +1310,7 @@ pub fn main(init: std.process.Init) !void {
                 const game = try nn.trainGameOpts(&net, rng.random(), learning_rate * (1 - 0.9 * frac), if (want_diag) &diag else null, opts);
                 last_score = game.score;
                 total_moves += game.moves;
+                if (game.timed_out) return gameTimeLimit(g + 1, train_games, game, opts.game_time_limit_ns.?, extended_time, weights_path);
                 if (game.capped) return moveCap(g + 1, train_games, game.moves, opts.move_cap, weights_path);
                 if (!nn.weightsFinite(&net)) return diverged(g + 1, train_games, weights_path);
                 if ((g + 1) % 5000 == 0) {
@@ -1320,6 +1362,7 @@ pub fn main(init: std.process.Init) !void {
     // `eval_games = 0` is "train only": the table below plays every row on every eval game, and one
     // `deep3`/iterative-deepening row can cost minutes, so a short training run must be able to skip it.
     if (eval_games == 0) return;
+    opts = evaluationOptions(opts, extended_time);
 
     // Rows are all on by default; `rows` (arg 13) keeps the two a measurement needs
     // (0 = 1-ply, 2 = 2-ply) instead of paying for the 3-ply rows twice over. A stray token is a
@@ -1418,22 +1461,26 @@ pub fn main(init: std.process.Init) !void {
             var tape = nn.Tape.initRecord(spawns);
             const pair_mode = if (is_pairleaf) leaf_mode else .deep;
             const a_start = std.Io.Clock.awake.now(init.io);
+            const pair_opts_a = if (is_pairrow) evaluationOptions(pair_spec_a.?.opts, extended_time) else opts;
+            const pair_opts_b = if (is_pairrow) evaluationOptions(pair_spec_b.?.opts, extended_time) else if (is_pairleaf) evaluationOptions(.{ .omit_leaf_reward = true }, extended_time) else opts;
             const a = if (is_pairrow)
-                nn.playTapedValueOpts(eval_value, pair_rng.random(), pair_spec_a.?.mode, &tape, pair_spec_a.?.opts)
+                nn.playTapedValueOpts(eval_value, pair_rng.random(), pair_spec_a.?.mode, &tape, pair_opts_a)
             else
-                nn.playTapedValue(eval_value, pair_rng.random(), pair_mode, &tape);
+                nn.playTapedValueOpts(eval_value, pair_rng.random(), pair_mode, &tape, pair_opts_a);
             const a_ns_i: u64 = @intCast(a_start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds());
+            if (a.timed_out) return evalTimeLimit(if (is_pairrow) pair_name_a else "A", i, a, extended_time);
             var replay = nn.Tape.initReplay(spawns[0..tape.len]);
             const b_start = std.Io.Clock.awake.now(init.io);
             const b = if (is_pairrow)
-                nn.playTapedValueOpts(eval_value, pair_rng.random(), pair_spec_b.?.mode, &replay, pair_spec_b.?.opts)
+                nn.playTapedValueOpts(eval_value, pair_rng.random(), pair_spec_b.?.mode, &replay, pair_opts_b)
             else if (is_pairw)
-                nn.playTapedValue(pair_b_value, pair_rng.random(), .deep, &replay)
+                nn.playTapedValueOpts(pair_b_value, pair_rng.random(), .deep, &replay, pair_opts_b)
             else if (is_pairleaf)
-                nn.playTapedValueOpts(eval_value, pair_rng.random(), leaf_mode, &replay, .{ .omit_leaf_reward = true })
+                nn.playTapedValueOpts(eval_value, pair_rng.random(), leaf_mode, &replay, pair_opts_b)
             else
-                nn.playTapedValue(eval_value, pair_rng.random(), .deep3, &replay);
+                nn.playTapedValueOpts(eval_value, pair_rng.random(), .deep3, &replay, pair_opts_b);
             const b_ns_i: u64 = @intCast(b_start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds());
+            if (b.timed_out) return evalTimeLimit(if (is_pairrow) pair_name_b else "B", i, b, extended_time);
             diffs[i] = @as(f64, @floatFromInt(b.score)) - @as(f64, @floatFromInt(a.score));
             a_ns += a_ns_i;
             b_ns += b_ns_i;
@@ -1474,11 +1521,12 @@ pub fn main(init: std.process.Init) !void {
             var prng = std.Random.DefaultPrng.init(c.eval_seed + i);
             return switch (c.spec) {
                 .expectimax => |depth| blk: {
-                    const b = solver.playPolicy(prng.random(), .expectimax, depth);
-                    break :blk nn.PlayResult{ .score = b.score, .max_tile = b.max_tile, .moves = b.moves };
+                    const b = solver.playPolicyOpts(prng.random(), .expectimax, depth, .{ .game_time_limit_ns = c.opts.game_time_limit_ns });
+                    break :blk nn.PlayResult{ .score = b.score, .max_tile = b.max_tile, .moves = b.moves, .timed_out = b.timed_out };
                 },
                 .nn => |row| blk: {
-                    var row_opts = row.opts;
+                    var row_opts = evaluationOptions(row.opts, false);
+                    row_opts.game_time_limit_ns = c.opts.game_time_limit_ns;
                     // `leaf` is eval-only: rows 2 and 4 take its omit-leaf option, and row 4
                     // keeps its TT-off baseline from the table.
                     if (row.leaf_override) row_opts.omit_leaf_reward = c.opts.omit_leaf_reward;
@@ -1492,6 +1540,14 @@ pub fn main(init: std.process.Init) !void {
         const res_all = try init.arena.allocator().alloc(nn.PlayResult, games);
         const start = std.Io.Clock.awake.now(init.io);
         parallel.map(nn.PlayResult, res_all, EvalCtx{ .vfn = eval_value, .spec = r.spec, .eval_seed = eval_seed, .opts = opts }, playGame);
+        var allow_extension = !extended_time;
+        var has_timeout = false;
+        for (res_all) |result| {
+            if (!result.timed_out) continue;
+            has_timeout = true;
+            allow_extension = allow_extension and promisingTimeout(result.score, result.max_tile, extended_time);
+        }
+        if (has_timeout) return evalTimeLimitResults(r.name, res_all, opts.game_time_limit_ns.?, allow_extension, extended_time);
         stats.rangeTotals(nn.PlayResult, Eval, r, res_all, eval_games);
         r.elapsed_ns = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
     }
@@ -1607,6 +1663,42 @@ fn stagedFinite(staged: *const nn.Staged) bool {
 fn diverged(done: usize, total: usize, weights_path: []const u8) error{Diverged} {
     std.debug.print("diverged at {d}/{d} games (non-finite or |w| > 1e6), not saving {s}\n", .{ done, total, weights_path });
     return error.Diverged;
+}
+
+fn evalTimeLimit(row: []const u8, game: usize, result: nn.PlayResult, extended: bool) error{EvalGameTimeLimit} {
+    printEvalTimeout(row, game, result, extended, promisingTimeout(result.score, result.max_tile, extended));
+    return error.EvalGameTimeLimit;
+}
+
+fn evalTimeLimitResults(row: []const u8, results: []const nn.PlayResult, limit_ns: u64, allow_extension: bool, extended: bool) error{EvalGameTimeLimit} {
+    for (results, 0..) |result, game| {
+        if (result.timed_out) {
+            std.debug.print("eval {s} game {d}: partial score={d} moves={d} max_tile={d}\n", .{ row, game, result.score, result.moves, result.max_tile });
+        }
+    }
+    const disposition = if (extended) "inconclusive-close" else if (allow_extension) "extend-once" else "no-go-close";
+    std.debug.print("eval {s}: {d:.1}min time cap, {s}, discarding this evaluation run\n", .{
+        row, @as(f64, @floatFromInt(limit_ns)) / std.time.ns_per_min, disposition,
+    });
+    return error.EvalGameTimeLimit;
+}
+
+fn printEvalTimeout(row: []const u8, game: usize, result: nn.PlayResult, extended: bool, allow_extension: bool) void {
+    const disposition = if (extended) "inconclusive-close" else if (allow_extension) "extend-once" else "no-go-close";
+    std.debug.print("eval {s} game {d}: {d:.1}min cap, partial score={d} moves={d} max_tile={d}, {s}, discarding this evaluation run\n", .{
+        row, game, @as(f64, @floatFromInt(gameTimeLimitNs(.evaluate, extended))) / std.time.ns_per_min, result.score, result.moves, result.max_tile, disposition,
+    });
+}
+
+/// (#336) Do not save a non-terminal game, even when its partial score is high. The one explicit
+/// extension is a second attempt, not evidence that the interrupted attempt completed.
+fn gameTimeLimit(done: usize, total: usize, result: anytype, limit_ns: u64, extended: bool, weights_path: []const u8) error{GameTimeLimit} {
+    const extend = promisingTimeout(result.score, result.max_tile, extended);
+    const disposition = if (extended) "inconclusive-close" else if (extend) "extend-once" else "no-go-close";
+    std.debug.print("game {d}/{d} hit the {d:.1}s time cap at {d} moves (partial score={d}, max_tile={d}), {s}, not saving {s}\n", .{
+        done, total, @as(f64, @floatFromInt(limit_ns)) / std.time.ns_per_s, result.moves, result.score, result.max_tile, disposition, weights_path,
+    });
+    return error.GameTimeLimit;
 }
 
 /// Same policy for a game that hit the move cap: report which game and how many moves, then
@@ -1979,6 +2071,26 @@ test "shape variant reads its coefficient from the row-spec slot (#277)" {
 test "usage text lists the shape variant and its coefficient slot (#277)" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "shape   (#277") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "empty-cell potential") != null);
+}
+
+test "one extended deadline is explicit and bounded (#336)" {
+    try std.testing.expectEqual(@as(u64, 60 * std.time.ns_per_s), gameTimeLimitNs(.train, false));
+    try std.testing.expectEqual(@as(u64, 300 * std.time.ns_per_s), gameTimeLimitNs(.train, true));
+    try std.testing.expectEqual(@as(u64, 30 * std.time.ns_per_min), gameTimeLimitNs(.evaluate, false));
+    try std.testing.expectEqual(@as(u64, 120 * std.time.ns_per_min), gameTimeLimitNs(.evaluate, true));
+
+    const base = parseVariantName("base+xtime").?;
+    try std.testing.expectEqual(Variant.base, base.spec.variant);
+    try std.testing.expect(base.extended_time);
+    try std.testing.expect(parseVariantName("base+xtime+xtime") == null);
+    try std.testing.expect(parseVariantName("xtime") == null);
+}
+
+test "only a promising first timeout may use the extension (#336)" {
+    try std.testing.expect(promisingTimeout(100_000, 128, false));
+    try std.testing.expect(promisingTimeout(99_999, 8192, false));
+    try std.testing.expect(!promisingTimeout(99_999, 4096, false));
+    try std.testing.expect(!promisingTimeout(1_000_000, 16384, true));
 }
 
 test "variant table lists every accepted variant name once (#314)" {

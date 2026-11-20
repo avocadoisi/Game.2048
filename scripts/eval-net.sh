@@ -9,6 +9,7 @@
 # What it prints
 #   1. pairw: A = shipped, B = candidate, identical spawn tape per game. `mean diff` is B - A, and
 #      `stderr` is the standard error over the games, so the acceptance rule is mean diff - 2*stderr > 0.
+#      A timed-out game fails the run instead of reaching VERDICT; --xtime is the one 120 minute retry.
 #   2. the non-paired table row (2-ply / `deep`) for both nets on `--seed` and `--seed + 100`:
 #      avg_score, 8192 reach and ms/move. A candidate must not lose ground here either.
 #   3. a VERDICT line with the numbers that decided it. ADOPT needs all three, not just the pair:
@@ -26,6 +27,7 @@ seed=9000
 shipped="ai/solver/nn_weights.bin"
 h1=128
 h2=32
+suffix=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --games)
@@ -48,6 +50,14 @@ while [ $# -gt 0 ]; do
       h2="$2"
       shift 2
       ;;
+    --xtime)
+      if [ "$suffix" = "+xtime" ]; then
+        echo "error: --xtime is the single extended retry; do not repeat it (#336)" >&2
+        exit 2
+      fi
+      suffix="+xtime"
+      shift
+      ;;
     -h | --help)
       sed -n '2,20p' "$0"
       exit 0
@@ -69,13 +79,14 @@ if [ ! -f "$shipped" ]; then
 fi
 
 seed_b=$((seed + 100))
-run() { zig build nn -Doptimize=ReleaseFast -Dh1="$h1" -Dh2="$h2" -- "$@" 2>&1; }
-
 table=$(mktemp)
 trap 'rm -f "$table"' EXIT
 
 echo "== pairw (A = $shipped, B = $cand, $games games, seed $seed) =="
-pair=$(run 0 "$games" "$seed" 0.003 1 pairw 30 "$shipped" 1 - "$cand")
+pair=$(zig build nn -Doptimize=ReleaseFast -Dh1="$h1" -Dh2="$h2" -- 0 "$games" "$seed" 0.003 1 pairw"$suffix" 30 "$shipped" 1 - "$cand" 2>&1) || {
+  printf '%s\n' "$pair" >&2
+  exit 1
+}
 echo "$pair" | grep -E "^pair " | tail -1
 mean=$(echo "$pair" | sed -nE 's/.*mean diff=(-?[0-9.]+).*/\1/p')
 err=$(echo "$pair" | sed -nE 's/.*± ([0-9.]+).*/\1/p')
@@ -89,7 +100,14 @@ for spec in "shipped:$shipped" "cand:$cand"; do
   name=${spec%%:*}
   path=${spec#*:}
   for s in "$seed" "$seed_b"; do
-    row=$(run 0 "$games" "$s" 0.003 1 resume 30 "$path" 1 - - - 0,2 | grep -E "^nn 2-ply")
+    output=$(zig build nn -Doptimize=ReleaseFast -Dh1="$h1" -Dh2="$h2" -- 0 "$games" "$s" 0.003 1 resume"$suffix" 30 "$path" 1 - - - 0,2 2>&1) || {
+      printf '%s\n' "$output" >&2
+      exit 1
+    }
+    row=$(printf '%s\n' "$output" | grep -E "^nn 2-ply") || {
+      echo "error: completed 2-ply row missing" >&2
+      exit 1
+    }
     score=$(echo "$row" | sed -nE 's/.*avg score=([0-9.]+).*/\1/p')
     reach=$(echo "$row" | sed -nE 's/.*reach8192=([0-9]+)\/[0-9]+.*/\1/p')
     mspm=$(echo "$row" | sed -nE 's/.*ms\/move=([0-9.]+).*/\1/p')
