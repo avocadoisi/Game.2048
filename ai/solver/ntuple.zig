@@ -257,6 +257,80 @@ pub fn delayedTDLambdaExtraMemoryBytes() usize {
     return @sizeOf(DelayedTDLambda);
 }
 
+/// TC(λ) horizon and trace decay from the paper's informal parameter search; β uses the existing learning-rate schedule (#288).
+pub const tc_horizon: usize = 3;
+pub const tc_lambda: f64 = 0.5;
+
+/// Per-weight signed/absolute TD-error accumulators plus the current episode's h-step trace.
+pub const TemporalCoherence = struct {
+    net: *TupleNet,
+    errors: []f32,
+    abs_errors: []f32,
+    trace: [tc_horizon + 1]Indices = undefined,
+    trace_len: usize = 0,
+
+    pub fn init(gpa: std.mem.Allocator, net: *TupleNet) !TemporalCoherence {
+        const errors = try gpa.alloc(f32, net.storage.len);
+        errdefer gpa.free(errors);
+        const abs_errors = try gpa.alloc(f32, net.storage.len);
+        errdefer gpa.free(abs_errors);
+        @memset(errors, 0);
+        @memset(abs_errors, 0);
+        return .{ .net = net, .errors = errors, .abs_errors = abs_errors };
+    }
+
+    pub fn deinit(self: *TemporalCoherence, gpa: std.mem.Allocator) void {
+        gpa.free(self.errors);
+        gpa.free(self.abs_errors);
+    }
+
+    pub fn extraMemoryBytes(self: *const TemporalCoherence) usize {
+        return (self.errors.len + self.abs_errors.len) * @sizeOf(f32) + @sizeOf(TemporalCoherence);
+    }
+
+    /// Reset episode-local trace only; per-weight coherence statistics persist through training.
+    pub fn beginEpisode(self: *TemporalCoherence) void {
+        self.trace_len = 0;
+    }
+
+    /// Apply one TD error to the current afterstate and up to `tc_horizon` preceding afterstates (Algorithm 2).
+    pub fn observe(self: *TemporalCoherence, idx: Indices, delta: f64, beta: f64) void {
+        // Drop before appending so `trace_len` never exceeds `tc_horizon` when it indexes `trace`.
+        if (self.trace_len > tc_horizon) self.dropOldest();
+        self.trace[self.trace_len] = idx;
+        self.trace_len += 1;
+
+        var decay: f64 = 1;
+        for (0..self.trace_len) |age| {
+            const trace_idx = self.trace[self.trace_len - 1 - age];
+            self.updateState(trace_idx, delta * decay, delta, beta);
+            decay *= tc_lambda;
+        }
+    }
+
+    fn updateState(self: *TemporalCoherence, idx: Indices, weighted_delta: f64, delta: f64, beta: f64) void {
+        const tuple_count: f64 = @floatFromInt(self.net.count);
+        for (0..self.net.count) |p| {
+            const entry = offsets[p] + idx[p];
+            const accumulated = self.errors[entry];
+            const accumulated_abs = self.abs_errors[entry];
+            const alpha = if (accumulated_abs != 0)
+                @as(f64, @floatCast(@abs(accumulated))) / @as(f64, @floatCast(accumulated_abs))
+            else
+                1;
+            const step: f32 = @floatCast(beta * alpha * weighted_delta / tuple_count);
+            self.net.storage[entry] += step;
+            self.errors[entry] += @floatCast(delta);
+            self.abs_errors[entry] += @floatCast(@abs(delta));
+        }
+    }
+
+    fn dropOldest(self: *TemporalCoherence) void {
+        for (1..self.trace_len) |i| self.trace[i - 1] = self.trace[i];
+        self.trace_len -= 1;
+    }
+};
+
 /// int16 view of a table: one scale per pattern, so the 4-tuples can use a coarser step than the
 /// 6-tuples. `q * scale` reproduces the f32 value to within half a step (129 MiB -> 64.6 MiB, #129).
 pub const Quantized = struct {
@@ -481,8 +555,8 @@ pub const Mode = enum {
 /// afterstate on the post-spawn board (`r + max_a V(after(s', a))`, the two-stage #131 target).
 pub const Target = enum { on_policy, max_backup };
 
-/// Training algorithm selected by the runner; TD(0) stays the default (#290).
-pub const Learner = enum { td_zero, delayed_td_lambda };
+/// Learning algorithm selected by the runner; TD(0) stays the default (#290, #288).
+pub const Learner = enum { td_zero, delayed_td_lambda, temporal_coherence };
 
 /// Runner variant: policy mode, table set, learner, TD target, and whether to load `table_path` first.
 pub const Variant = struct {
@@ -503,6 +577,8 @@ pub fn parseVariant(name: []const u8) ?Variant {
     if (std.mem.eql(u8, name, "lightresume")) return .{ .resume_from_file = true, .set = .light };
     if (std.mem.eql(u8, name, "wide")) return .{ .set = .wide };
     if (std.mem.eql(u8, name, "widedelay")) return .{ .set = .wide, .learner = .delayed_td_lambda };
+    if (std.mem.eql(u8, name, "widetc")) return .{ .set = .wide, .learner = .temporal_coherence };
+    if (std.mem.eql(u8, name, "widedeep_tc")) return .{ .mode = .deep, .set = .wide, .learner = .temporal_coherence };
     if (std.mem.eql(u8, name, "maxb")) return .{ .set = .wide, .target = .max_backup };
     if (std.mem.eql(u8, name, "maxbchance")) return .{ .set = .wide, .mode = .chance, .target = .max_backup };
     if (std.mem.eql(u8, name, "maxbdeep")) return .{ .set = .wide, .mode = .deep, .target = .max_backup };
@@ -765,6 +841,28 @@ pub fn trainGameDelayedTDLambda(net: *TupleNet, rng: std.Random, lr: f64, mode: 
     return .{ .score = state.score, .moves = moves };
 }
 
+/// Opt-in on-policy TD(λ) with per-weight Temporal Coherence (#288); the TD(0) path is unchanged.
+pub fn trainGameTemporalCoherence(tc: *TemporalCoherence, rng: std.Random, beta: f64, mode: Mode) GameResult {
+    const net = tc.net;
+    tc.beginEpisode();
+    var state = core.GameState.gameStart(rng);
+    var pending: ?Pick = null;
+    var moves: u32 = 0;
+    var stats: Stats = .{};
+    while (chooseMove(net, state, mode, &stats)) |pick| {
+        moves += 1;
+        if (pending) |p| {
+            // Re-evaluate the pending afterstate because its weights may have changed through the trace.
+            const delta = p.reward + pick.value - net.value(p.idx);
+            tc.observe(p.idx, delta, beta);
+        }
+        pending = pick;
+        _ = state.move(pick.dir, rng);
+    }
+    if (pending) |p| tc.observe(p.idx, p.reward - net.value(p.idx), beta);
+    return .{ .score = state.score, .moves = moves };
+}
+
 // ---------------------------------------------------------------------------
 
 fn testNet() !TupleNet {
@@ -1013,6 +1111,11 @@ test "variant names select the mode, the table set and resume" {
     try std.testing.expectEqual(Set.wide, widedelay.set);
     try std.testing.expectEqual(Learner.delayed_td_lambda, widedelay.learner);
     try std.testing.expectEqual(Target.on_policy, widedelay.target);
+    const widetc = parseVariant("widetc").?;
+    try std.testing.expectEqual(Learner.temporal_coherence, widetc.learner);
+    const widedeep_tc = parseVariant("widedeep_tc").?;
+    try std.testing.expectEqual(Mode.deep, widedeep_tc.mode);
+    try std.testing.expectEqual(Learner.temporal_coherence, widedeep_tc.learner);
     try std.testing.expectEqual(Mode.deep, parseVariant("widedeep").?.mode);
     try std.testing.expectEqual(Set.wide, parseVariant("widedeep").?.set);
     try std.testing.expectEqual(@as(?Variant, null), parseVariant("lightresumex"));
@@ -1126,6 +1229,50 @@ fn trainTdLambdaReference(net: *TupleNet, states: []const Indices, deltas: []con
             net.applyDelta(states[k], delta * decay, lr);
         }
     }
+}
+
+test "temporal coherence scales updates by accumulated signed versus absolute error (#288)" {
+    const gpa = std.testing.allocator;
+    var net = try TupleNet.initCount(gpa, 1);
+    defer net.deinit(gpa);
+    var tc = try TemporalCoherence.init(gpa, &net);
+    defer tc.deinit(gpa);
+
+    var first: Indices = @splat(0);
+    first[0] = 1;
+    var second: Indices = @splat(0);
+    second[0] = 2;
+
+    tc.beginEpisode();
+    tc.observe(first, 2.0, 1.0);
+    tc.observe(second, -1.0, 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), net.storage[1], 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), tc.errors[1], 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), tc.abs_errors[1], 0.00001);
+
+    tc.beginEpisode();
+    tc.observe(first, 3.0, 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.5), net.storage[1], 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), tc.errors[1], 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), tc.abs_errors[1], 0.00001);
+}
+
+test "temporal coherence trace stops propagating beyond the configured horizon (#288)" {
+    const gpa = std.testing.allocator;
+    var net = try TupleNet.initCount(gpa, 1);
+    defer net.deinit(gpa);
+    var tc = try TemporalCoherence.init(gpa, &net);
+    defer tc.deinit(gpa);
+
+    tc.beginEpisode();
+    for (1..6) |entry| {
+        var idx: Indices = @splat(0);
+        idx[0] = @intCast(entry);
+        tc.observe(idx, 1.0, 1.0);
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 1.875), net.storage[1], 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.875), net.storage[2], 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), net.storage[5], 0.00001);
 }
 
 test "trainGame keeps the on-policy target and max backup differs from it (#131)" {
