@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
-# Everything before a push. CI repeats it on the PR, so --no-verify is safe for WIP.
+# Everything before a push: format, lint and the fast test tier (slow full-game/training
+# regression tests are skipped). CI repeats the FULL suite on the PR, so --no-verify is safe for WIP.
 set -euo pipefail
-exec scripts/gate.sh all
+exec scripts/gate.sh push

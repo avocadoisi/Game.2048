@@ -19,6 +19,11 @@ pub fn build(b: *std.Build) void {
     // 256-input net and file format, 1..6 adds that many of `nn.featureNames` to the input layer.
     width_opts.addOption(u32, "feat", b.option(u32, "feat", "global board features 0..6 (default 0)") orelse 0);
     width_opts.addOption(bool, "simd", b.option(bool, "nn-simd", "experiment with SIMD first-layer accumulation (#317)") orelse false);
+    // The full-game / training regression tests are the slow part of `zig build test`. The
+    // pre-push gate passes -Dslow-tests=false to skip them; CI keeps the default (true) and runs
+    // everything. A skipped test returns error.SkipZigTest, so the fast tier still compiles the
+    // same binary and runs every cheap unit test.
+    width_opts.addOption(bool, "slow_tests", b.option(bool, "slow-tests", "run the slow full-game/training regression tests (default true; pre-push passes false)") orelse true);
 
     const parallel_mod = b.addModule("parallel", .{
         .root_source_file = b.path("ai/solver/parallel.zig"),

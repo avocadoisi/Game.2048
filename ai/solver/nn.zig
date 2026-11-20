@@ -17,6 +17,10 @@ pub const levels = 16;
 pub const input_count = core.BoardCellCount * levels;
 pub const h1_size: u32 = width.h1;
 pub const h2_size: u32 = width.h2;
+/// Gate tier: false under `zig build test -Dslow-tests=false` (pre-push). A slow full-game /
+/// training / deep-search regression test starts with `if (!slow_tests) return error.SkipZigTest;`
+/// so it runs only in CI (`gate.sh all`). Re-exported by `solver` for the targets that import it.
+pub const slow_tests = width.slow_tests;
 /// Hand-engineered global board features: 0 (the default build) keeps the 256 one-hot inputs and the current
 /// weights file; `zig build nn -Dfeat=6` adds the first `feature_count` of `feature_all` as extra input rows
 /// (`Net.wf`), so the net need not learn empty-count/monotonicity from scratch.
@@ -2837,6 +2841,7 @@ fn shapedTerminalReward(p: Pick, opts: Options) f64 {
 }
 
 test "tail weight scales only the nearly full boards (#232)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var open: Board = std.mem.zeroes(Board);
     open[0][0] = 1;
     try std.testing.expectEqual(@as(f64, 0.003), tailWeight(.{}, open, 0.003));
@@ -3593,6 +3598,7 @@ const sample_board: Board = .{
 };
 
 test "parallel nn games match the serial loop over 8 seeds" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(5);
     var net = Net.init(prng.random());
     const playSeed = struct {
@@ -3897,6 +3903,7 @@ const late_board: GameState = .{ .board = .{
 } };
 
 test "deep3 returns only legal moves on random boards" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(108);
     const net = Net.init(prng.random());
     var rng = std.Random.DefaultPrng.init(3);
@@ -4014,6 +4021,7 @@ test "node cache keeps the direct-leaf flag (#263/#260)" {
 }
 
 test "node table is cleared at the start of every top-level search (#263)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     const weights = try parse(@embedFile("nn_weights.bin"));
     const vfn: Value = .{ .single = &weights };
     var cache: ValueCache = .{};
@@ -4105,6 +4113,7 @@ test "node cache values match a fresh search at the same cprob (#263)" {
 }
 
 test "node cache keeps the chosen move along a game (#263/#266)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     const weights = try parse(@embedFile("nn_weights.bin"));
     const vfn: Value = .{ .single = &weights };
     var prng = std.Random.DefaultPrng.init(263);
@@ -4406,6 +4415,7 @@ test "risk weight picks the lower-variance move at equal expectation (#187)" {
 }
 
 test "phase modes return only legal moves on random boards (#157)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(157);
     const net = Net.init(prng.random());
     const dead: GameState = .{ .board = .{
@@ -4476,6 +4486,7 @@ test "phase_h2 and phase_h3 equal deep3 on a board with 4 empty cells (#157)" {
 }
 
 test "phase h4 depth 4 only in the last two empty cells (#171)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     // 4-ply from 2 empty cells down; everything above that is the `deep3` baseline
     for (0..17) |empties| {
         const depth = phaseDepth(.phase_h4, boardWithEmpties(empties));
@@ -4495,6 +4506,7 @@ test "phase h4 depth 4 only in the last two empty cells (#171)" {
 }
 
 test "deep4 searches one row at 4-ply and the deep3 cutoff (#267)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     // every empty-cell count uses the same row: the extra ply is the only difference from `deep3`
     for (0..17) |empties| {
         try std.testing.expectEqual(
@@ -4591,6 +4603,7 @@ test "sample_min_depth 2 keeps the last spawn layer exact (#320)" {
 }
 
 test "sampled 4-ply is deterministic and cheaper (#320)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     const weights = try parse(@embedFile("nn_weights.bin"));
     const vfn: Value = .{ .single = &weights };
     var a: Stats = .{};
@@ -4645,6 +4658,7 @@ test "phase_h4 leaves the earlier schedules alone (#171)" {
 }
 
 test "phase modes are deterministic for a fixed board (#157)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(157);
     const net = Net.init(prng.random());
     for (phase_modes) |mode| {
@@ -4681,6 +4695,7 @@ test "value cache keeps one entry per board and search depth (#157)" {
 }
 
 test "a cache warmed at another depth still gives the fresh move (#157)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(157);
     const net = Net.init(prng.random());
     // mid_board has 6 empty cells, so phase_h1 searches 3-ply here while the warm-up searched 2-ply
@@ -4900,6 +4915,7 @@ test "search2 target and deep2 pick price with the current weights, not the shar
 }
 
 test "teacher target equals the mode's search value (#167)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     // `teacherValue` clears the thread-local cache at entry, so a leaf another test left in it
     // cannot answer for this test's net; the reset below is belt and braces.
     sharedValueCache().* = .{};
@@ -4961,6 +4977,7 @@ fn frozenGame(net: *const Net, seed: u64, opts: Options) GameResult {
 }
 
 test "teacher self-play matches the deep2 spawn sequence (#167)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(167);
     const net = Net.init(prng.random());
     // `.deep` is `pickSearch2Value`'s own tree (`pickTeacherValue(.., .deep)`), so the teacher policy
@@ -4999,6 +5016,7 @@ test "value cache returns the forward value and counts leaf evaluations" {
 }
 
 test "reused value cache returns the same moves as a fresh cache (#88)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(6);
     const net = Net.init(prng.random());
     var warm: ValueCache = .{};
@@ -5068,6 +5086,7 @@ test "value cache slot collision drops the entry, never returns a wrong value (#
 }
 
 test "trainGame is deterministic for a fixed seed" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     var a = Net.init(init_rng.random());
     var b = a;
@@ -5089,6 +5108,7 @@ test "death reward is the scaled -1 per move instead of the score delta (#101)" 
 }
 
 test "death training drives values toward minus moves to game over (#101)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     var net = Net.init(init_rng.random());
     var train_rng = std.Random.DefaultPrng.init(12);
@@ -5500,6 +5520,7 @@ test "Dump parse rejects a wrong magic and a truncated file" {
 }
 
 test "dump_record leaves the weights and the rng consumption unchanged" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     var a = Net.init(init_rng.random());
     var b = a;
@@ -5522,6 +5543,7 @@ test "dump_record leaves the weights and the rng consumption unchanged" {
 }
 
 test "explore plays random legal moves and explore 0 keeps the greedy game (#224)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(21);
     const start = Net.init(init_rng.random());
     var plain_net = start;
@@ -5552,6 +5574,7 @@ test "explore plays random legal moves and explore 0 keeps the greedy game (#224
 }
 
 test "warm_open skips training for the random opening and still trains the rest (#224)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(31);
     const start = Net.init(init_rng.random());
     var plain_net = start;
@@ -5573,6 +5596,7 @@ test "warm_open skips training for the random opening and still trains the rest 
 }
 
 test "ft2 mixes one deep draw per self-play step and is deterministic" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     var a = Net.init(init_rng.random());
     var b = a;
@@ -5627,6 +5651,7 @@ test "restart starts on a stored deep board with one fresh spawn, deterministica
 }
 
 test "restart games are deterministic and start from a deep position" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     var a = Net.init(init_rng.random());
     var b = a;
@@ -5653,6 +5678,7 @@ test "restart games are deterministic and start from a deep position" {
 }
 
 test "trainGame with diagnostic gives the same weights and records steps" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     var a = Net.init(init_rng.random());
     var b = a;
@@ -5670,6 +5696,7 @@ test "trainGame with diagnostic gives the same weights and records steps" {
 }
 
 test "default trainGame weights match the recorded checksum (5 games, seeds 11/12)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     var net = Net.init(init_rng.random());
     var rng = std.Random.DefaultPrng.init(12);
@@ -5678,6 +5705,7 @@ test "default trainGame weights match the recorded checksum (5 games, seeds 11/1
 }
 
 test "trainGameOpts with default options equals trainGame" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     var a = Net.init(init_rng.random());
     var b = a;
@@ -5689,6 +5717,7 @@ test "trainGameOpts with default options equals trainGame" {
 }
 
 test "td1 + greedy1 is the default self-play path, bit for bit (#158)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     var base = Net.init(init_rng.random());
     var default_opts = base;
@@ -5706,6 +5735,7 @@ test "td1 + greedy1 is the default self-play path, bit for bit (#158)" {
 }
 
 test "search2, deep2 and tp2 train one game without NaN (#158)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     const init = Net.init(init_rng.random());
     const variants = [_]Options{
@@ -5759,6 +5789,7 @@ test "n-step window finish flushes the pending steps with truncated returns" {
 }
 
 test "nstep = 1 reproduces TD(0) byte for byte" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     var base = Net.init(init_rng.random());
     var one = base;
@@ -5771,6 +5802,7 @@ test "nstep = 1 reproduces TD(0) byte for byte" {
 }
 
 test "nstep = 4 changes the weights, stays finite and is deterministic" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     const base = Net.init(init_rng.random());
     var plain = base;
@@ -5788,6 +5820,7 @@ test "nstep = 4 changes the weights, stays finite and is deterministic" {
 }
 
 test "nstep = 0 equals the default path" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     var base = Net.init(init_rng.random());
     var off = base;
@@ -5799,6 +5832,7 @@ test "nstep = 0 equals the default path" {
 }
 
 test "sweep_lambda = 0 keeps the replay sweep's TD(0) step byte for byte (#300)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     const base = Net.init(init_rng.random());
     var plain = base;
@@ -5828,6 +5862,7 @@ test "a fresh sweep trace applies the plain TD(0) step whatever lambda is (#300)
 }
 
 test "sweep_lambda with replay_k = 1 matches the plain replay sweep (#300)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     const base = Net.init(init_rng.random());
     var td0 = base;
@@ -5840,6 +5875,7 @@ test "sweep_lambda with replay_k = 1 matches the plain replay sweep (#300)" {
 }
 
 test "sweep_lambda = 0.7 changes the weights, stays finite and is deterministic (#300)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     const base = Net.init(init_rng.random());
     var td0 = base;
@@ -5857,6 +5893,7 @@ test "sweep_lambda = 0.7 changes the weights, stays finite and is deterministic 
 }
 
 test "sweep_lambda = 0 leaves a non-replay run unchanged (#300)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     var base = Net.init(init_rng.random());
     var off = base;
@@ -5868,6 +5905,7 @@ test "sweep_lambda = 0 leaves a non-replay run unchanged (#300)" {
 }
 
 test "backward sweep changes the weights" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     var base = Net.init(init_rng.random());
     var back = base;
@@ -5879,6 +5917,7 @@ test "backward sweep changes the weights" {
 }
 
 test "replay tail changes the weights and K=0 is off" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     var base = Net.init(init_rng.random());
     var replay = base;
@@ -5914,6 +5953,7 @@ test "bootstrapValue reads the frozen target net while the live net is the defau
 // target for move selection would change the game; keeping score and moves equal proves the policy
 // and the spawn tape still come from the live net.
 test "frozen target leaves the live policy and spawn tape unchanged" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     const base = Net.init(init_rng.random());
     var target = base;
@@ -5935,6 +5975,7 @@ test "frozen target leaves the live policy and spawn tape unchanged" {
 // the online updates at a nonzero rate) and the replay path itself all have to see the target. The
 // same test asserts the target snapshot is never written during a game.
 test "frozen target changes the online and replay updates without being mutated" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     const base = Net.init(init_rng.random());
     var target = base;
@@ -5988,6 +6029,7 @@ test "priority sampling gives the uniform share plus the |err|^alpha share" {
 }
 
 test "priority pass changes the weights" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     var base = Net.init(init_rng.random());
     var prio = base;
@@ -6085,6 +6127,7 @@ test "midmix sampling falls back to the whole buffer when no 4..7 entry exists" 
 }
 
 test "parallel training batch matches a serial run of the same game seeds" {
+    if (!width.slow_tests) return error.SkipZigTest;
     const games = 4;
     var init_rng = std.Random.DefaultPrng.init(77);
     var base = Net.init(init_rng.random());
@@ -6120,6 +6163,7 @@ test "parallel training batch matches a serial run of the same game seeds" {
 }
 
 test "batch_scale multiplies the merged delta so a batch does the work of its games (#137)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     const games = 4;
     var init_rng = std.Random.DefaultPrng.init(77);
     var base = Net.init(init_rng.random());
@@ -6163,6 +6207,7 @@ test "clamp bounds the TD target (#234)" {
 }
 
 test "a zero step ceiling leaves serial and batch training bit-identical (#246)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(246);
     const base = Net.init(init_rng.random());
     var cache: Cache = .{};
@@ -6209,6 +6254,7 @@ test "step clip cuts every element of one SGD step (#246)" {
 }
 
 test "grad clip bounds the L2 norm of one merged batch step (#246)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     const games = 4;
     var init_rng = std.Random.DefaultPrng.init(246);
     const base = Net.init(init_rng.random());
@@ -6266,6 +6312,7 @@ test "Adam normalises a unit gradient to one lr-sized step per weight (#231)" {
 }
 
 test "par + Adam takes one bounded step per batch (#231)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     const games = 2;
     var init_rng = std.Random.DefaultPrng.init(77);
     var base = Net.init(init_rng.random());
@@ -6279,6 +6326,7 @@ test "par + Adam takes one bounded step per batch (#231)" {
 }
 
 test "parallel training batch with variant opts matches a serial run of the same game seeds" {
+    if (!width.slow_tests) return error.SkipZigTest;
     const games = 4;
     // symmetric per-move updates and the post-game replay pass take different branches of trainGameOpts
     const variants = [_]Options{ .{ .symmetry = true }, .{ .replay_k = 4 } };
@@ -6309,6 +6357,7 @@ test "parallel training batch with variant opts matches a serial run of the same
 }
 
 test "move cap leaves a normal game bit-identical and stops a long one (#242)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(242);
     const start = Net.init(init_rng.random());
 
@@ -6343,6 +6392,7 @@ test "move cap leaves a normal game bit-identical and stops a long one (#242)" {
 }
 
 test "the parallel batch reports and aggregates the capped game (#242)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     const games = 4;
     const cap: u32 = 20;
     var init_rng = std.Random.DefaultPrng.init(242);
@@ -6419,6 +6469,7 @@ test "forward on a transformed board equals forward with transformed weights" {
 }
 
 test "symmetry=false and lambda=0 reproduce the recorded checksum (5 games, seeds 11/12)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     var net = Net.init(init_rng.random());
     var rng = std.Random.DefaultPrng.init(12);
@@ -6714,6 +6765,7 @@ test "id_budget adopts a monotonically deeper ply as the budget grows (#183)" {
 }
 
 test "id_margin stops the deepening when the start depth's move is not a near tie (#188)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(3191);
     const net = Net.init(prng.random());
     const vfn: Value = .{ .single = &net };
@@ -6731,6 +6783,7 @@ test "id_margin stops the deepening when the start depth's move is not a near ti
 }
 
 test "id_margin = null and a wide margin keep every iteration (#188)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(3193);
     const net = Net.init(prng.random());
     const vfn: Value = .{ .single = &net };
@@ -6824,6 +6877,7 @@ test "one symmetry step equals eight separate transformed TD(0) steps" {
 }
 
 test "symmetry and symlam change the weights (smoke)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(11);
     const base = Net.init(init_rng.random());
     var plain = base;
@@ -7024,6 +7078,7 @@ test "staged weights round trip and stay separate from the single-net file" {
 }
 
 test "staged self-play training is deterministic for a fixed seed" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_a = std.Random.DefaultPrng.init(19);
     var init_b = std.Random.DefaultPrng.init(19);
     const staged_a = try heapStaged(std.testing.allocator, init_a.random());
@@ -7376,6 +7431,7 @@ test "computeTeachers prices each stored afterstate with one spawn (#175)" {
 }
 
 test "dist takes one regression step per self-play step on average (#175)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(97);
     const rng = prng.random();
     const net = Net.init(rng);
@@ -7410,6 +7466,7 @@ test "dist takes one regression step per self-play step on average (#175)" {
 }
 
 test "distill_every thins the teacher mix and distill_lr does not change the TD half (#206)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(98);
     const rng = prng.random();
     const net = Net.init(rng);
@@ -7677,6 +7734,7 @@ test "shape_c zero keeps the raw reward bit-identical (#277)" {
 }
 
 test "par accepts shape and matches the serial games (#277)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     const games = 2;
     const opts = Options{ .shape_c = 0.5 };
     var init_rng = std.Random.DefaultPrng.init(277);
@@ -7703,6 +7761,7 @@ test "par accepts shape and matches the serial games (#277)" {
 }
 
 test "explicit shape_c zero trains exactly like base, serial and par (#277)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(277);
     const base = Net.init(init_rng.random());
 
@@ -7741,6 +7800,7 @@ test "PopArt refuses mixed training variants and stays opt-in (#289)" {
 }
 
 test "shape refuses variants that would drop the shaped reward (#277)" {
+    if (!width.slow_tests) return error.SkipZigTest;
     var init_rng = std.Random.DefaultPrng.init(277);
     try validateOptions(.{});
     try validateOptions(.{ .shape_c = 0, .replay_k = 30, .backward = true });
