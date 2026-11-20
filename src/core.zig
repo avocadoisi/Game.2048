@@ -184,7 +184,7 @@ pub fn spawn(state: *GameState, rng: anytype) bool {
 }
 
 /// Number of empty (0) cells. Board predicates live in core so the solver's spawn samplers,
-/// its diagnostics and the play loops do not each carry their own scan (#139).
+/// its diagnostics and the play loops do not each carry their own scan.
 pub fn countEmpty(board: Board) usize {
     var n: usize = 0;
     for (board) |row| for (row) |value| {

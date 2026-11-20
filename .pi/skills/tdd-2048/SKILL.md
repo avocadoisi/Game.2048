@@ -30,6 +30,9 @@ Cycle and test discipline: `dev-philosophy`. Order of a change: `dev-workflow`.
 
 ## Local rules
 
+- comments are rare: behaviour is guaranteed by a test, a comment only explains it. anything a test could check becomes that test
+- what a comment may carry is the constraint a test cannot express: why the code has to look like this, the assumption the caller must honour, where a number came from
+- history (which issue tried what and rejected it) never goes in a comment — it goes in `docs/solver-history.md`. same wording in README 開発方針
 - inject RNG; core never calls a global random source
 - core does not depend on CLI, IO, or allocator-heavy code
 - randomness in tests: `SequenceRng` (scripted) or a fixed-seed `DefaultPrng`

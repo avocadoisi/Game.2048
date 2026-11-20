@@ -19,7 +19,7 @@ const usage =
     \\
 ;
 
-/// Every probe board holds this multiset, so the scorers only see where the tiles sit (issue #115).
+/// Every probe board holds this multiset, so the scorers only see where the tiles sit.
 const tiles = [_]core.Tile{ 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4 };
 
 /// One probe board: `tiles` placed along `layout` / `anchor`, or a literal `board` when set.

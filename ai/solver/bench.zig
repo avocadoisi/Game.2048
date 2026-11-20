@@ -14,7 +14,7 @@ pub const Summary = struct {
     /// Deepest expectimax depth any move of the whole batch finished (`expectimax_id` only, else 0).
     max_depth: u8 = 0,
     /// Games whose final `max_tile` is at or above the tile (counts, not rates); the average score is a
-    /// central measure, so how often a batch actually gets there has to be counted separately (#156).
+    /// central measure, so how often a batch actually gets there has to be counted separately.
     reach_4096: u32 = 0,
     reach_8192: u32 = 0,
     reach_16384: u32 = 0,

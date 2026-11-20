@@ -1,195 +1,130 @@
 # Solver history: what worked
 
-Record of solver variants, their scores, and the decisions made. Numbers come from the
-runs in this log (depth 2 unless noted). Early numbers are from the first benchmarks;
-the later table comes from `zig build solve` with `runs=10 games/run=20 depth=2 seed=1`.
+記録は変種ごとに「何を試したか・決めた数字・判定」だけを残す。深さ 2 のスコアは
+`zig build solve` の `runs=10 games/run=20 depth=2 seed=1` か、明記した評価コマンドの値。
 
 ## Evaluation: the timeline
 
-1. **Corner bonus (expectimax, first version)**: score = empty cells x10 + corner bonus.
-   depth 1: avg 3,673 (seed 1). depth 2: avg 7,606 (seed 1), 7,866 (seed 2). depth 3: avg 11,876 on 20 games (about 23 s).
-2. **Row order + forced-down penalty**: order 1..16 row by row, largest tile at the bottom-right.
-   depth 2: avg 18,596 (seed 1), 19,812 (seed 2). The forced-down penalty (-100 when only down is legal) was added here.
-3. **Largest tile at top-left (row order)**: the direction flipped to match the top-left anchor.
-   depth 2: 19,198 (seed 1), 19,352 (seed 2). depth 1: 3,343.
-   - Bug found while flipping: the first non-empty cell was compared against 0, which penalized large first tiles.
-     Fixed by starting the comparison at the first non-empty cell (`?f64`).
-   - An earlier result (5,421 / 5,106 for the flipped direction) came from that bug. It was not a real weakness.
-4. **Order penalty weight tuned (row order, x30)**. Sweep at empty weight 10, depth 2, mean of seeds 1 and 2:
-   x3 about 10.5k, x10 19.3k, x30 22.5k (adopted), x50 20.3k, x100 21.1k.
-   Empty weight 5 gave 20.9k and 30 gave 20.0k, so 10 was kept.
-5. **Snake order (adopted)**: row 0 left to right, row 1 right to left, and so on.
-   Same weights (empty 10, order penalty 30). depth 2: 26,716 (seed 1), 24,935 (seed 2).
+1. **Corner bonus (expectimax)**: empty ×10 + corner bonus. depth 1 3,673; depth 2 7,606 (seed 1) / 7,866 (seed 2);
+   depth 3 11,876 (20 games, 23 s).
+2. **Row order + forced-down penalty**: order 1..16 row by row, largest tile bottom-right, −100 when only down is legal.
+   depth 2 18,596 / 19,812.
+3. **Largest tile at top-left**: 19,198 / 19,352, depth 1 3,343. The earlier 5,421 / 5,106 came from a bug
+   (the first non-empty cell was compared against 0); fixed by starting at the first non-empty cell (`?f64`).
+4. **Order penalty ×30** (empty 10, mean of seeds 1+2): ×3 10.5k, ×10 19.3k, ×30 **22.5k adopted**, ×50 20.3k, ×100 21.1k.
+   Empty 5 → 20.9k, empty 30 → 20.0k, so 10 was kept.
+5. **Snake order (adopted)**: row 0 L→R, row 1 R→L, …; weights empty 10 / order 30. depth 2 26,716 / 24,935.
+6. **Merge bonus ×10 (adopted)**: `+10 × (adjacent equal non-empty pairs)`. Holdout 200 games: seed 100 26,232 vs 24,627,
+   seed 300 25,078 vs 24,140. ×5 (25,428 / 23,983) inconsistent, ×15 24,753, ×30 18,954. Smoothness ×1/×3 25,015 / 24,866 (noise).
+   The bonus counts pairs that have not merged yet, so a move that only forms a pair scores; the unit test
+   `bestMove takes a merge over a move that does nothing` was rebuilt on a full board where only left/right are legal.
 
-## Tried and rejected (not merged)
-
-- **Gap penalty** (empty cells between two tiles on the snake path, x20) together with a **down-move cost** (x50, applied to every move).
-  bench seed 1: 20,199 avg, lower than the snake baseline (25,827).
-- **Down-move cost only** (x50, gap 0): 24,226 avg, still lower than the baseline.
-  - Lesson: the down cost is not useful at this weight. The forced-down penalty already covers the extreme case.
-  - The gap penalty was not re-tuned; at x20 it was the main drop. A smaller weight is untested.
-
-6. **Merge bonus x10 (adopted)**: `+10 × (count of adjacent equal non-empty pairs)`, added to the snake evaluation.
-   Holdout seeds (200 games each, depth 2): seed 100 26,232 vs 24,627 baseline; seed 300 25,078 vs 24,140.
-   - Tried: merge x5 (seed 100 25,428 / seed 300 23,983, not consistent), x15 (24,753), x30 (18,954, clearly worse).
-   - Smoothness (sum of |log2 diff| between neighbours, x1 and x3): seed 100 25,015 and 24,866. Within noise, not adopted.
-   - Caveat: the bonus counts pairs that have not merged yet, so a move that only forms a pair can score well.
-     The old unit test `bestMove takes a merge over a move that does nothing` failed because of this. Its board was changed
-     to a full board where only left/right are legal (the old comment wrongly said down did nothing).
+Rejected at this stage: **gap penalty** ×20 (empty cells between two tiles on the snake path) with **down cost** ×50 → 20,199;
+down cost alone ×50 → 24,226, both under the snake baseline 25,827. The forced-down penalty already covers the extreme case;
+the gap weight was never re-tuned (a smaller one is untested).
 
 ## Benchmark (`zig build solve`, runs=10, games/run=20, depth=2, seed=1, ReleaseFast)
 
-| Variant | avg score | avg moves | best tile | speed (games/s) | elapsed |
+| Variant | avg score | avg moves | best tile | games/s | elapsed |
 |---|---|---|---|---|---|
-| Row order, order x30 (main before snake) | 20,744 | 1,129 | 4096 | 6.72 | 29.8 s |
-| **Snake, order x30 (adopted)** | **25,827** | **1,366** | **4096** | **5.04-5.14** | **38.9-39.7 s** |
+| Row order, order ×30 | 20,744 | 1,129 | 4096 | 6.72 | 29.8 s |
+| **Snake, order ×30 (adopted)** | **25,827** | **1,366** | **4096** | **5.04-5.14** | **38.9-39.7 s** |
 | Snake + down cost 50 | 24,226 | 1,311 | 4096 | 5.12 | 39.1 s |
 | Snake + gap 20 + down cost 50 | 20,199 | 1,119 | 4096 | 6.42 | 31.2 s |
-| Snake + merge x10 (seed 100 holdout) | 26,232 | 1,398 | 4096 | 2.86 | — |
+| Snake + merge ×10 (holdout seed 100) | 26,232 | 1,398 | 4096 | 2.86 | — |
 
-Speed differs run to run (runs were sequential on one machine); treat it as a rough figure.
-
-## Caveats
-
-- Weights were tuned on seeds 1 and 2 (100 games each). The benchmark above uses seed 1 again,
-  so its numbers are optimistic. Use a new seed range for the next check.
-- depth 1 and depth 3 were not measured for the snake order.
-- The evaluation is hand-set (`ai/solver/solver.zig`). An n-tuple table is the planned replacement.
-
-## Next steps
-
-- Re-check the snake order at depth 1 and 3, and on new seeds (e.g. `zig build solve -- 10 20 2 100`).
-- Try merge x10 with a deeper search (depth 3) and a time budget.
-- Try a smaller gap penalty (e.g. x2 or x5) and a down cost below x50 with the same benchmark.
-- Record every new variant in this file with its benchmark line.
+Weights were tuned on seeds 1-2 (100 games each) and this benchmark reuses seed 1, so the numbers are optimistic;
+depth 1 / 3 were not measured for the snake order. The evaluation is hand-set in `ai/solver/solver.zig`; the n-tuple table replaced it.
 
 ## Policy ranking (`zig build ranking`)
-Served at `/api/ranking` from `src/web/ranking.json`. Regenerate with:
-`zig build ranking -Doptimize=ReleaseFast -- 5 20 1000 > src/web/ranking.json`
-(seed 1000 is not used for tuning.) Current result: expectimax (depth 2) 25,267 > greedy 3,424 > random 1,062 (avg score).
+Served at `/api/ranking` from `src/web/ranking.json`:
+`zig build ranking -Doptimize=ReleaseFast -- 5 20 1000 > src/web/ranking.json` (seed 1000 is not used for tuning).
+Result: expectimax (depth 2) 25,267 > greedy 3,424 > random 1,062.
 
-## Parallel candidates (ranking seed 1000, 5 runs x 20 games, avg score)
-- expectimax_tt (depth 3 + transposition table): 41,216. Same moves as depth 3, about 4x faster (3.4 vs 15.2 s/game on a loaded machine).
-- mcts (200 rollouts/move): 29,722 at about 2.0 s/game.
-- expectimax (depth 2): 25,267.
-- beam (width 32, 3 plies, spawn approximated as 2): 12,696 at about 0.07 s/game.
+## Parallel candidates (ranking seed 1000, 5 runs × 20 games)
+- `expectimax_tt` (depth 3 + transposition table): 41,216, about 4× faster than depth 3 (3.4 vs 15.2 s/game).
+- `mcts` (200 rollouts/move): 29,722 at 2.0 s/game.
+- `expectimax` depth 2: 25,267.
+- `beam` (width 32, 3 plies, spawn approximated as 2): 12,696 at 0.07 s/game.
 - greedy 3,424; random 1,062.
-Speed rule: no policy slower than depth 3 (about 6.8 to 15 s/game depending on machine load).
+Speed rule: no policy slower than depth 3 (6.8-15 s/game depending on load).
 
 ## Deep learning: small MLP value net (`zig build nn`)
 
-- Model: `ai/solver/nn.zig`, one hidden layer MLP over afterstates, trained by TD(0) in pure Zig (no dependencies).
-- Training: 20,000 self-play games, learning rate 0.003 (default in `nn_main.zig`). Weights go to `ai/solver/nn_weights.bin` (tracked in git and embedded by `solver.zig`; format: 16-byte header + little-endian f64, see `nn.encode`/`nn.parse`).
-- Eval on seeds 2000..2099 (100 games, `zig build nn -- 20000 100 2000 0.003`):
+- Model: `ai/solver/nn.zig`, one hidden layer MLP over afterstates, TD(0) in pure Zig (no dependencies).
+- Training: 20,000 self-play games, lr 0.003. Weights in `ai/solver/nn_weights.bin` (tracked, embedded by `solver.zig`;
+  16-byte header + little-endian f64, see `nn.encode` / `nn.parse`).
+- Eval seeds 2000..2099 (100 games, `zig build nn -- 20000 100 2000 0.003`):
 
 | Policy | avg score | avg moves | best tile | time (100 games) |
 |---|---|---|---|---|
 | NN 1-ply | 21,227 | 1,129 | 4096 | 0.6 s |
 | NN + 1 spawn lookahead | 38,734 | 1,919 | 4096 | 36.2 s |
-| expectimax depth 2 (baseline) | 25,004 | 1,328 | 4096 | 19.7 s |
+| expectimax depth 2 | 25,004 | 1,328 | 4096 | 19.7 s |
 
-- Learning-rate sweep, 20 games on seed 1000 (short run, noisy): 0.0003 gave 5,571 / 14,493; 0.001 gave 11,452 / 20,286; 0.003 gave 18,234 / 34,645.
-- Caveats: one training run and one seed range only. The lookahead is not a like-for-like depth comparison with expectimax. It costs about 2x the baseline time. Re-check on more seeds before adopting.
+- lr sweep, 20 games on seed 1000 (noisy): 0.0003 → 5,571 / 14,493; 0.001 → 11,452 / 20,286; 0.003 → 18,234 / 34,645.
+- One training run, one seed range; the lookahead is not a like-for-like depth comparison and costs about 2× the baseline.
 
 ## GA over evaluation weights (`zig build ga-rl`)
 
-- Evolves the 4 snake-evaluation weights (empty, order_penalty, merge, forced_down_penalty) with tournament selection, uniform crossover, and clamped log-normal mutation. Args: `16 15 8 2 1 500 100` (population 16, 15 generations, games/fitness 8, depth 2, seed 1, holdout 500, 100 games).
-- Holdout seeds 500..599 (100 games, depth 2): baseline 24,067, evolved 25,095 (+4%).
-- Evolved weights: empty 7.028, order_penalty 43.174, merge 0, forced_down 0.
-- Caveats: one GA run, one holdout range; merge and forced_down collapsed to 0, so the gain may be noise. Check on another seed range before adopting.
+- Evolves the 4 snake weights (empty, order_penalty, merge, forced_down) with tournament selection, uniform crossover,
+  clamped log-normal mutation: `16 15 8 2 1 500 100` (population 16, 15 generations, 8 games/fitness, depth 2, seed 1, holdout 500, 100 games).
+- Holdout 500..599: baseline 24,067 → evolved 25,095 (+4%). Evolved weights: empty 7.028, order 43.174, merge 0, forced_down 0.
+- merge and forced_down collapsing to 0 with one run and one holdout range means the +4% may be noise.
 
 ## Policies wired into the solver (`ga`, `nn`)
 
-- `ga`: `solver.ga_weights` (3-decimal values from `zig build ga-rl`) with depth 2. `nn`: embedded `ai/solver/nn_weights.bin` (148 KB, committed), chance-mode net.
-- Both are selectable in `/api/solve?algo=ga|nn` and in the UI dropdown (ranking.json regenerated with `zig build ranking -Doptimize=ReleaseFast -- 5 20 1000`).
-- Ranking, seed 1000 (5 runs x 20 games, avg score): expectimax_tt 41,216 / nn 36,885 / mcts 29,722 / expectimax 25,267 / ga 24,046 / beam 12,696 / greedy 3,424 / random 1,062.
-- The GA weights are lower than plain expectimax on seed 1000. The +4% above holds only on seeds 500–599. Not a clear win.
+- `ga`: `solver.ga_weights` (3 decimals from `zig build ga-rl`), depth 2. `nn`: embedded `ai/solver/nn_weights.bin` (148 KB), chance-mode net.
+- Selectable in `/api/solve?algo=ga|nn` and the UI dropdown; ranking.json regenerated with `zig build ranking -Doptimize=ReleaseFast -- 5 20 1000`.
+- Ranking seed 1000: expectimax_tt 41,216 / nn 36,885 / mcts 29,722 / expectimax 25,267 / ga 24,046 / beam 12,696 / greedy 3,424 / random 1,062.
+  The GA weights lose to plain expectimax here; the +4% held only on seeds 500-599.
 
 ## NN: longer training (200,000 games, lr 0.003 decaying to 10%)
 
-- `zig build nn -- 200000 100 3000 0.003`: 3,316 s training (same 64/32 MLP, 148 KB weights, checkpoint every 5,000 games). Linear lr decay added.
-- Eval seeds 3000..3099 (100 games): NN 1-ply 35,687 (best 4096); **NN + 1 spawn lookahead 66,600 (best 8192, 73.8 s)**; expectimax depth 2 24,839 (37.9 s). Before (20,000 games, seeds 2000..): 38,734.
-- Ranking seed 1000 (5x20): nn 64,113 (was 36,885), above expectimax_tt 41,216. Slower than expectimax depth 2 (~2x per game), so it breaks the "no policy slower than depth 3" rule only in time per game of about 0.7 s; still faster than depth 3.
-- Not measured: wider net (128/64, runs slower in training, see below), TD(lambda), n-tuple tables.
+- `zig build nn -- 200000 100 3000 0.003`: 3,316 s, same 64/32 MLP, 148 KB, checkpoint every 5,000 games, linear decay added.
+- Eval seeds 3000..3099: NN 1-ply 35,687 (4096); **NN + 1 spawn lookahead 66,600 (8192, 73.8 s)**; expectimax depth 2 24,839 (37.9 s). Previous: 38,734.
+- Ranking seed 1000 (5×20): nn 64,113 (was 36,885), above expectimax_tt 41,216, at about 2× expectimax depth 2 per game (0.7 s/game), still faster than depth 3.
+- Not measured: wider net 128/64 (slower to train), TD(λ), n-tuple tables.
 
 ## Speed work (no change in play)
 
-Goal: faster self-play for AI training. Every row below gives identical moves for the same seed
-(checked with `zig build solve -- 2 20 2 1`: avg score 22135.1, avg moves 1219.0).
+Every row gives identical moves for the same seed (`zig build solve -- 2 20 2 1`: 22135.1, 1219.0).
 
-| Change | speed (games/s, depth 2, 40 games) |
+| Change | games/s (depth 2, 40 games) |
 |---|---|
 | Baseline | 5.4 |
-| `evaluate`: `@log2(value)` -> `@ctz(value)` (tiles are powers of 2, so the result is the same) | 7.3 |
-| `core.mergeLine`: 65536-entry row table, fallback to the general path for non-powers-of-2 or >= 65536 | 8.3 |
+| `evaluate`: `@log2(value)` → `@ctz(value)` (tiles are powers of 2) | 7.3 |
+| `core.mergeLine`: 65536-entry row table, general path for non-powers-of-2 or ≥ 65536 | 8.3 |
 
-- Tried and dropped: precomputed slide index table (`slide_lines`) in `core.slide`. No measurable gain (about 27 ns per slide both ways).
-- Cost of the row table: about 512 KB in the binary, and about 15-20 s extra compile time in ReleaseFast.
-- Remaining cost is mostly the solver (`evaluateState` runs up to 4 slides per call). A bitboard core would be the next big step, but it changes `Board` everywhere.
+Dropped: a precomputed slide index table (`slide_lines`) in `core.slide` (about 27 ns/slide either way).
+The row table costs about 512 KB in the binary and 15-20 s of ReleaseFast compile time. The remaining cost is
+`evaluateState` (up to 4 slides per call); a bitboard core would be the next step but changes `Board` everywhere.
 
 ## Tried and not merged: packed nibble search (branch `exp/packed-search`)
 
-Idea: search on rows packed as 4 nibbles (log2 of each tile), so a slide is one table lookup per row.
-- Micro benchmark (slide only, random rows): about 3 ns per slide, against about 28 ns for `GameState.slide`.
-- Full version (`core.Packed`, expectimax on packed boards, bit-identical results): `zig build solve -- 2 20 2 1`
-  gives the same avg score 22135.1, but speed is about 5.5-5.9 games/s, the same as the merged version.
-- Profile after the change: the heuristic (`evaluateStateP`, nibble extraction in the order loop) and
-  `Packed.slide` dominate. The board-based heuristic was already cheap enough that the slide cost was not the limit.
-- A pack-and-unpack wrapper around `GameState.slide` (no packed state kept) was slower: about 40 ns per slide.
-- Conclusion: a real speedup needs `GameState` itself stored packed. That changes about 78 `.board` uses and
-  makes tiles of 65536 and above need a separate path. Not done.
+Rows packed as 4 nibbles (log2 per tile) make a slide one table lookup per row: about 3 ns vs about 28 ns for `GameState.slide`.
+`core.Packed` with expectimax on packed boards is bit-identical (`zig build solve -- 2 20 2 1` → 22135.1) but runs 5.5-5.9 games/s,
+the same as the merged version: the profile moved to `evaluateStateP` and `Packed.slide`. A pack/unpack wrapper around
+`GameState.slide` was slower (about 40 ns). A real speedup needs `GameState` stored packed, which touches about 78 `.board`
+uses and needs a separate path for tiles ≥ 65536. Not done.
 
 ## Training focus: near-loss states (proposal)
 
-Problem: `nn.trainGame` runs TD(0) over every move of every self-play game with the same weight.
-Most moves are in the safe early and middle game, so the net sees few examples of boards close to
-game over. Those boards decide the score, and their values are the least accurate.
+`nn.trainGame` runs TD(0) over every move of every game with the same weight, so boards close to game over — the ones that
+decide the score — are rare examples. Candidates, cheapest first:
+1. **Diagnose first**: log per-move `|target − V(s)|` by empty count (0..3, 4..7, 8+) and by distance to game over (last 10, 11..30, earlier).
+2. **Backward sweep per game**: keep the (afterstate, reward) pairs and train last → first so the terminal value propagates in one pass.
+3. **Replay the last K moves** of each lost game (K ≈ 30) in a second pass with a smaller lr.
+4. **Prioritized replay** by `|δ|^α` (α ≈ 0.5) with a uniform share (e.g. 50%) so the distribution does not drift.
+5. **Restarts from hard boards** with few empty cells (risky: they may be unreachable under the policy, so keep the share small).
 
-Current behaviour (`ai/solver/nn.zig`, `trainGame`): each step calls `train(net, cache, reward + next_value, lr)`
-in forward order, one update per move, no replay, no weighting by position.
-
-### Candidate ideas (cheapest first)
-
-1. **Diagnose before changing anything.** Log the per-move TD error `|target - V(s)|` grouped by
-   empty-cell count (0..3, 4..7, 8+) and by distance to game over (last 10, 11..30, earlier).
-   If the error and the value drop (`V(s_{t+1}) - V(s_t)`) are concentrated near game over, the
-   focus idea is worth doing. If not, skip it. This needs only logging, no change in training.
-2. **Backward sweep after each game.** Store the (afterstate, reward) pairs of the game and train
-   from the last move back to the first. The terminal value propagates to earlier states in one
-   pass, so the near-loss boards learn the real outcome sooner. Cost: a small buffer per game.
-   Risk: changes the update order, so results differ from the current run; compare on the same seeds.
-3. **Replay the last K moves of each lost game.** Keep the final K (e.g. 30) afterstates of each game
-   and train on them again, in a separate pass with a smaller learning rate. This oversamples
-   the states just before a loss without changing how games are played.
-4. **Prioritized replay by TD error.** Keep a buffer of recent (state, target) pairs; sample with
-   probability proportional to `|δ|^α` (α about 0.5), and always keep a fraction (e.g. 50%) uniform.
-   Large `|δ|` is a good proxy for "the value just dropped". The uniform part keeps the training
-   distribution from drifting too far from the one the policy visits.
-5. **Restarts from hard boards.** Begin some games from saved boards with few empty cells and
-   high tiles (taken from earlier games). Gives direct coverage of late-game states. Riskier:
-   those boards may be unreachable under the policy, so keep the share small.
-
-### Safety rules for any of the above
-
-- Focusing on losing states is off-policy. Always mix in uniform samples (ideas 2–4 keep the
-  normal per-move update as well).
-- Compare with the same total number of moves processed, not the same number of games,
-  because replay makes each game cost more time.
-- Evaluate with the existing protocol: `zig build nn -- 20000 100 2000 0.003` on seeds 2000..2099,
-  then a fresh seed range (e.g. 3000..3099) before deciding. Record every run in this file.
-- Keep the diagnostic (idea 1) as a flag so it can be re-run after the training changes.
-
-### Next steps
-
-- Add the diagnostic log (idea 1) to `nn_main.zig` or behind a flag in `nn.zig`.
-- If the error is concentrated near game over: implement idea 3 (cheapest) and measure.
-  Then try idea 2 and idea 4 on the same seeds.
-- Status (#28): all three are done and measured (#32 diagnostic, #33 replay/backward, #34 priority).
-  Conclusion below: the error is spread out, so focusing on near-loss states does not pay off.
+Safety rules for all of them: focusing on losing states is off-policy, so keep the uniform per-move update; compare at equal
+**moves processed**, not equal games; evaluate with `zig build nn -- 20000 100 2000 0.003`, then a fresh range (3000..3099);
+record every run here. All three cheap candidates were built and measured (#32, #33, #34) — conclusion below.
 
 ## Diagnostic run (#32)
 
-Command: `zig build nn -Doptimize=ReleaseFast -- 2000 1 2000 0.003 diag` (2000 training games, seed 1; weights restored afterwards).
+`zig build nn -Doptimize=ReleaseFast -- 2000 1 2000 0.003 diag` (2,000 games, seed 1; weights restored afterwards).
 
 | empty | moves | steps | mean \|err\| | mean drop | share err |
 |---|---|---|---|---|---|
@@ -201,189 +136,127 @@ Command: `zig build nn -Doptimize=ReleaseFast -- 2000 1 2000 0.003 diag` (2000 t
 | 4..7 | earlier | 355867 | 0.1002 | -0.0061 | 52.6% |
 | 8+ | earlier | 150594 | 0.0702 | -0.0136 | 15.6% |
 
-- Reading: the last 10 moves before game over have about 3-4x the mean TD error of the early game (0.30 vs 0.07-0.10), and the value drops by about -0.22 on average there.
-- But they are a small share of the total error (about 8%), because few steps are that close to game over. Most error sits in the 4..7 empty, earlier-move bucket (53%).
-- So the near-loss states are badly fit per step, but focusing only on them would cover little of the error. Mix them in (e.g. #33 K-move replay, #34 priority with a uniform share) instead of replacing the uniform training.
-- Caveat: one training run, one seed, 2000 games. Re-check with more games before deciding.
-
-## Bench run 2026-10-25 19:31:46 +0900
-
-- command: `zig build solve -- 1 2 2 1`
-- commit: 248c1a5
-- date: 2026-10-25 19:31:46 +0900
-- exit: 0
-
-```text
-runs=1 games/run=2 depth=2 seed=1 games=2
-avg score=20954.0 avg moves=1148.0 best tile=2048
-speed: 0.54 games/s, 621 moves/s, elapsed 3.7 s
-```
+The last 10 moves carry 3-4× the per-step error of the early game (0.2966 vs 0.0702-0.1002) and the value drops about −0.22 there,
+but they are only about 8% of total error; 53% sits in the 4..7 empty, earlier bucket. So near-loss states are badly fit per step
+but too few to drive the fit: mix them in instead of replacing the uniform update. One run, one seed, 2,000 games.
 
 ## Eval variance (#37)
 
-Command (eval only, loads committed weights, writes nothing):
+`zig build nn -- 0 20 1000 0.003 5` (eval only, committed weights, seeds 1000..1099 as 5 disjoint ranges of 20 games;
+mean ± stderr over the 5 range means, stderr = sd/√5).
 
-```
-zig build nn -- 0 20 1000 0.003 5
-```
-
-Seeds 1000..1099 as 5 disjoint ranges of 20 games. Every policy plays the same seeds.
-Each range gives one average; the table reports mean ± stderr over the 5 range averages
-(stderr = sample sd / sqrt(5)).
-
-| policy | avg score (mean ± stderr) | avg moves | best tile |
+| policy | avg score | avg moves | best tile |
 |---|---|---|---|
 | nn 1-ply | 18851 ± 503 | 1028.1 | 2048 |
 | nn + 1 spawn lookahead | 38572 ± 1608 | 1917.1 | 4096 |
 | expectimax depth 2 | 24776 ± 1267 | 1319.8 | 4096 |
 
-Reading the stderr:
-- nn 1-ply vs expectimax depth 2: difference 5925. Stderr of the difference is about
-  sqrt(503² + 1267²) ≈ 1363, so the gap is about 4.3 stderr (about 8 df). Significant at p < 0.01.
-  Treat the expectimax lead as real for these weights and this seed set.
-- nn + spawn lookahead vs expectimax: difference 13796, stderr about 2070 (≈ 6.7). Clearly significant.
-- These stderr values assume independent ranges. Policies share seeds, so the true paired
-  difference may be tighter; the independent estimate is conservative.
-- Only 100 games per policy in total. Stderr is from 5 range means, so it is itself noisy.
-  More ranges (e.g. 10+) or more games per range would tighten it.
-- Single-seed-range runs with 20 games (the previous protocol) can not show this: one range
-  alone gives no stderr. Use `seed_ranges` ≥ 5 for policy comparisons.
-- Wall time: nn + spawn lookahead dominates (394 s for 100 games); 1-ply took 5 s.
+nn 1-ply vs expectimax: +5,925 with stderr ≈ 1,363 (4.3σ, p < 0.01); lookahead vs expectimax: +13,796, stderr ≈ 2,070 (6.7σ).
+The independent-range stderr is conservative because policies share seeds. 100 games per policy total is still thin:
+a single 20-game range gives no stderr at all, so policy comparisons need `seed_ranges` ≥ 5. Wall time: lookahead 394 s, 1-ply 5 s per 100 games.
 
 ## Fair comparison (#38)
 
-Command: `zig build nn -Doptimize=ReleaseFast -- 0 20 1000 0.003 5` (eval only, committed weights, seeds 1000..1099 in 5 ranges of 20 games). Score per second = total score / CPU seconds for the 100 games.
+Same command as #37; score/s = total score / CPU seconds for 100 games.
 
-| policy | avg score (mean ± stderr) | avg moves | elapsed (100 games) | score/s |
+| policy | avg score | avg moves | elapsed | score/s |
 |---|---|---|---|---|
 | nn 1-ply | 18851 ± 503 | 1028 | 0.6 s | 2,957,818 |
 | nn + spawn lookahead | 38572 ± 1608 | 1917 | 42.2 s | 91,306 |
 | expectimax depth 2 | 24776 ± 1267 | 1320 | 18.2 s | 136,202 |
 
-- Per game, the lookahead is clearly stronger than expectimax depth 2 (about +13.8k).
-- Per CPU second, the lookahead is about 33% slower than expectimax (91k vs 136k score/s), so the gain does not hold at equal time.
-- nn 1-ply is far cheaper per second but much weaker per game. It is the cheapest option, not the strongest.
-- Caveat: one set of weights, one seed range, 100 games per policy. The timing is a single run on a loaded machine.
+The lookahead wins per game (+13.8k) but loses about 33% per CPU second (91k vs 136k), so the gain does not hold at equal time.
 
 ## Parallel eval (#40)
 
-Eval loops (`zig build nn` and `zig build ranking`) now run games on threads via `ai/solver/parallel.zig` (`std.Thread.spawn`, `min(cpu count, 8)` threads). Each game keeps its own PRNG seeded by its seed, so results do not depend on the thread count. `ranking` parallelizes per run (one PRNG per run, games in order inside a run, the same stream as before).
+`ai/solver/parallel.zig` runs eval games on `std.Thread.spawn` threads, `min(cpu count, 8)`; each game keeps its own PRNG seeded
+by its seed, so results do not depend on thread count. `ranking` parallelizes per run (one PRNG per run, games in order inside a run).
+Machine: 8 logical CPUs.
 
-- Machine: 8 logical CPUs (`hw.ncpu` 8), up to 8 threads (nn: 100 games in 8 chunks; ranking: 5 runs, so 5 threads).
-- Command: `zig build nn -Doptimize=ReleaseFast -- 0 20 1000 0.003 5` (eval only, committed weights).
-
-| policy | serial elapsed | parallel elapsed | speedup |
+| policy | serial | parallel | speedup |
 |---|---|---|---|
-| nn 1-ply | 0.6 s | 0.1 s | 6x (too short to measure well) |
-| nn + spawn lookahead | 44.2 s | 9.9 s | 4.5x |
-| expectimax depth 2 | 13.1 s | 2.7 s | 4.9x |
-| sum of the three | 57.9 s | 12.7 s | 4.6x |
+| nn 1-ply | 0.6 s | 0.1 s | 6× (too short to measure) |
+| nn + spawn lookahead | 44.2 s | 9.9 s | 4.5× |
+| expectimax depth 2 | 13.1 s | 2.7 s | 4.9× |
+| sum | 57.9 s | 12.7 s | 4.6× |
 
-- Whole command wall time (includes build): 58.1 s serial, 29.4 s parallel. `zig build ranking -Doptimize=ReleaseFast -- 5 20 1000`: 7m00s serial, 2m17s parallel.
-- Identical results: nn output lines (avg score ± stderr, avg moves, best tile) match the serial run exactly: 18851.1 ± 503.4 / 1028.1 / 2048; 38572.0 ± 1607.6 / 1917.1 / 4096; 24775.9 ± 1266.8 / 1319.8 / 4096. The ranking JSON is byte-identical (`cmp`) to the serial output for `5 20 1000`.
-- Tests: `parallel.map` equals a serial loop (`parallel.zig`), nn games match the serial loop over 8 seeds (`nn.zig`), and `bench.run` matches a serial loop over 8 games (`bench.zig`).
-- Caveat: `score/s` in `zig build nn` is now total score per **wall** second, not per CPU second as in the fair-comparison table above. Use the serial numbers for per-CPU-second comparisons.
+Whole command 58.1 s → 29.4 s (includes build); `zig build ranking -- 5 20 1000` 7m00s → 2m17s. Results are unchanged:
+18851.1 ± 503.4 / 1028.1 / 2048, 38572.0 ± 1607.6 / 1917.1 / 4096, 24775.9 ± 1266.8 / 1319.8 / 4096, and the ranking JSON is
+byte-identical (`cmp`). Tests: `parallel.map` vs a serial loop, nn games vs a serial loop over 8 seeds, `bench.run` vs a serial loop.
+Caveat: `score/s` in `zig build nn` is now per **wall** second, not per CPU second.
 
 ## Near-loss focus: conclusion (#28)
 
-Closed after #32 (diagnostic), #33 (replay / backward sweep, PR #48) and #34 (priority replay, PR #50).
+Closed after #32 (diagnostic), #33 (replay / backward sweep, PR #48), #34 (priority replay, PR #50).
 
-- Measured: the last 10 moves before game over carry 3-4x the per-step TD error of the early game
-  (0.2966 vs 0.0702-0.1002 mean |err|) and the value drops by about -0.22 there. But those steps are
-  only about 8% of the total error; 53% sits in the 4..7 empty, earlier-move bucket (#32).
-- Measured at equal training budget (20000 games, training seed 1; eval on seed range 2000 and fresh
-  ranges 3000..6000, 20 games each): base 18,677 ± 717, replay K=30 14,973 ± 838,
-  priority (m=32, alpha 0.5, 50% uniform) 19,488 ± 1,490, backward 2,116 ± 80 (#33, #34).
-- So no candidate beats the uniform per-move TD(0) update. Priority comes closest: +811 against a
-  combined stderr of about 1,650 (0.5 sigma), and it processed 14.02M training moves vs base's 13.97M
-  (+0.3%), so that comparison is effectively at equal moves. Replay is about 3.4 sigma worse, and the
-  backward sweep collapses. The 8% error share explains it: oversampling near-loss states mostly
-  takes fit away from the mid-game states where half the error lives.
-- Candidate 5 (restart games from hard boards) is not implemented. The same 8% argument applies, with
-  an added risk: boards saved from earlier games may be unreachable under the current policy, so the
-  net would train on a state distribution it never plays. With every cheaper candidate at or below
-  baseline, restarting from hard boards is not worth the cost.
-- Kept: the diagnostic flag (`diag`) stays in `nn_main.zig` so the error split can be re-checked after
-  any future training change. The replay/backward/priority options stay off by default, with the
-  default path pinned by the recorded-checksum test in `ai/solver/nn.zig` ("default trainGame weights
-  match the recorded checksum (5 games, seeds 11/12)").
-- Not done: no equal-moves sweep for replay (it reached 92% of base's moves), K/m/alpha not swept, and
-  one training seed only. A wider sweep would need several training seeds before it could overturn the
-  conclusion.
+- At equal training budget (20,000 games, training seed 1; eval on 2000 and fresh 3000..6000, 20 games each):
+  base **18,677 ± 717**, replay K=30 **14,973 ± 838**, priority (m=32, α 0.5, 50% uniform) **19,488 ± 1,490**, backward **2,116 ± 80**.
+- Nothing beats the uniform per-move TD(0) update. Priority is closest (+811 against a combined stderr ≈ 1,650, 0.5σ) at equal
+  moves (14.02M vs 13.97M, +0.3%); replay is 3.4σ worse; the backward sweep collapses. The 8% error share explains it:
+  oversampling near-loss states takes fit away from the mid-game states holding half the error.
+- Candidate 5 (restarts from hard boards) was never implemented: same 8% argument plus the risk of training on states the policy never reaches.
+- Kept: the `diag` flag in `nn_main.zig`; replay/backward/priority stay off by default with the default path pinned by the
+  recorded-checksum test ("default trainGame weights match the recorded checksum (5 games, seeds 11/12)").
+- Not done: replay at equal moves (it reached 92% of base's moves), K/m/α sweeps, a second training seed.
 ## Training parallelization (#35)
 
-Self-play training (`trainGame`) runs in parallel batches. With the opt-in `par` argument the CLI
-takes batches of `N = min(cpu count, 8)` games (clamped to the games left). Game `i` uses seed
-`train_seed + i` and trains its own copy of the batch-start net; the next net is
-`net_start + (1/N) * sum_i (net_after_i - net_start)`, summed in game index order. The sum order is
-fixed, so the weights do not depend on the thread count; the serial path (no `par`) is unchanged.
-`diag` works with `par` (per-game diagnostics are merged into one table). #99 extends batching to the
-stateless variants (`par` in arg 10): see `par for stateless variants (#99)` at the end of this file.
+`trainGame` in parallel batches (opt-in `par`): `N = min(cpu count, 8)` games per batch, game `i` seeded `train_seed + i`,
+each training its own copy of the batch-start net; the next net is `net_start + (1/N) * Σ_i (net_after_i - net_start)`
+summed in game index order, so weights do not depend on thread count. Serial path unchanged; `diag` merges per-game tables.
+(#99 extends batching to the stateless variants — see `par for stateless variants` at the end.)
 
-- Command: `zig build nn -Doptimize=ReleaseFast -- 2000 1 2000 0.003` (serial) vs
-  `zig build nn -Doptimize=ReleaseFast -- 2000 1 2000 0.003 1 par` (parallel), 8 logical CPUs,
-  batches of 8 games, 250 batches. Weights restored with `git checkout -- ai/solver/nn_weights.bin`.
-- Training time: 9.1 s serial, 1.6 s parallel (5.7x). The parallel run applies the lr of the batch
-  start to the whole batch, so it is a slightly different lr schedule from the serial loop.
-- Reproducibility: game `i` must match a serial run of the same games with the same seeds. The unit
-  test `parallel training batch matches a serial run of the same game seeds` (`ai/solver/nn.zig`)
-  runs a 4-game batch on threads and compares the resulting weights byte-for-byte with a serial
-  loop over seeds 77..80 that averages the same per-game nets. `zig build test` passes. Two
-  parallel CLI runs of the command above also write byte-identical weight files.
-- Caveat: the batch average is not the same update as applying the 8 games one after another to a
-  single net; it is the aggregation chosen for determinism. `par` is opt-in, so existing commands
-  and recorded results above keep the serial behaviour.
-
+- `zig build nn -Doptimize=ReleaseFast -- 2000 1 2000 0.003` vs the same plus `1 par`, 8 CPUs, batches of 8, 250 batches:
+  9.1 s → 1.6 s (5.7×). The parallel run applies the batch-start lr to the whole batch, so the schedule differs slightly.
+- Reproducibility: the test `parallel training batch matches a serial run of the same game seeds` compares a 4-game batched run
+  byte-for-byte with a serial loop over seeds 77..80; two parallel CLI runs write byte-identical files.
+- The batch average is not "apply 8 games one after another"; it is the aggregation chosen for determinism, and `par` is opt-in,
+  so every recorded result above keeps the serial behaviour.
 
 ## Replay and backward sweep (#33)
 
-Options in `ai/solver/nn.zig` (`trainGameOpts`, `Options`); default off, and the default path is pinned by the recorded-checksum test above.
-- `backward`: no per-move update during the game (weights frozen while playing); afterwards every stored afterstate is trained from last to first, target = reward + V(next) with V recomputed.
-- `replay`: normal per-move updates, then the last K=30 afterstates are re-trained once, oldest first, at 0.5 x lr with fresh targets.
-- CLI: `zig build nn -- <train> <eval> <seed> <lr> <-|diag> <base|backward|replay> <K> <weights_path>`. Variant runs write to a temp path, so `ai/solver/nn_weights.bin` is not touched.
+`ai/solver/nn.zig` (`trainGameOpts`, `Options`), default off, default path pinned by the recorded-checksum test.
+- `backward`: no per-move update while playing; afterwards every stored afterstate is trained last → first, target `reward + V(next)` recomputed.
+- `replay`: normal per-move updates, then the last K = 30 afterstates are re-trained once, oldest first, at 0.5 × lr with fresh targets.
+- CLI: `zig build nn -- <train> <eval> <seed> <lr> <-|diag> <base|backward|replay> <K> <weights_path>`; variant runs write to a temp path.
 
-Command per variant: `zig build nn -Doptimize=ReleaseFast -- 20000 20 2000 0.003 - <variant> 30 /tmp/nnb/<variant>.bin`, then eval-only runs (`-- 0 20 <seed> 0.003 - base 30 /tmp/nnb/<variant>.bin`) on seed ranges 2000, 3000, 4000, 5000, 6000 (20 games each, 100 games per variant).
-Mean ± stderr is over the 5 range averages (n=5). The built-in `seed_ranges` argument only covers contiguous ranges (`eval_seed + r*eval_games + g`), so the 1000-apart ranges were run individually and the stderr was computed by hand.
+20,000 games, training seed 1; eval on ranges 2000, 3000, 4000, 5000, 6000 (20 games each; 1,000-apart ranges run individually, stderr by hand):
 
-| variant | train games | train moves | nn 1-ply avg score (mean ± stderr) | nn + 1 spawn avg score (mean ± stderr) |
-|---|---|---|---|---|
-| base | 20000 | 13,969,906 | 18,677 ± 717 | 39,715 ± 1,103 |
-| backward | 20000 | 6,272,449 | 2,116 ± 80 | 2,116 ± 80 (same policy, no lookahead gain) |
-| replay K=30 | 20000 | 12,811,345 | 14,973 ± 838 | 33,241 ± 740 |
+| variant | train moves | nn 1-ply | nn + 1 spawn |
+|---|---|---|---|
+| base | 13,969,906 | 18,677 ± 717 | 39,715 ± 1,103 |
+| backward | 6,272,449 | 2,116 ± 80 | 2,116 ± 80 (no lookahead gain) |
+| replay K=30 | 12,811,345 | 14,973 ± 838 | 33,241 ± 740 |
 
-Per range, nn 1-ply avg score: base 19,110 / 16,668 / 19,592 / 17,423 / 20,589; backward 2,288 / 2,101 / 1,821 / 2,196 / 2,176; replay 16,664 / 13,497 / 12,655 / 16,871 / 15,177 (seeds 2000, 3000, 4000, 5000, 6000 x 20 games). Expectimax depth 2 on seeds 2000..2019 was 21,840 in every run (same policy, reference only).
+Per-range (1-ply): base 19,110 / 16,668 / 19,592 / 17,423 / 20,589; backward 2,288 / 2,101 / 1,821 / 2,196 / 2,176;
+replay 16,664 / 13,497 / 12,655 / 16,871 / 15,177. expectimax depth 2 on seeds 2000..2019: 21,840 in every run.
 
-- Reading: neither candidate beats the baseline. Replay is about 20% lower than base (difference 3,704 vs combined stderr 1,103, about 3.4 sigma on the 1-ply policy). Backward collapses to about 2,100 (policy dies after about 200 moves). The collapse is not tuned: only lr 0.003 was tried, with the sweep updates applied to frozen-policy games.
-- Moves: backward played far fewer training moves because its policy is weak; replay reached 92% of base's moves. The comparison is at equal games (20000), and the moves are listed above. Equal-moves comparison was not run.
-- Caveats: one training seed (1, fixed in the code), K=30 and replay lr 0.5x not swept, backward not swept over lr. The near-loss error share (#32) is 8% of the total, so replaying it at this weight may just shift the fit away from the mid-game states. Next: if replay is kept, try a smaller replay share (K=10, lr x0.25) before deciding.
+Neither candidate beats base. Replay is about −20% (3,704 against combined stderr 1,103, 3.4σ); backward collapses to ~2,100
+(the policy dies after ~200 moves). Un-tuned: only lr 0.003, only K = 30, no backward lr sweep; replay reached 92% of base's moves,
+so the comparison is at equal games, not equal moves.
 
 ## Priority replay (#34)
 
-Option `priority` in `ai/solver/nn.zig` (`Priority`, `Options.priority`; CLI variant `priority`). Default off; the default path is pinned by that recorded-checksum test.
-- Normal per-move TD(0) updates run for every move, as in base. Each update is also stored in a ring buffer (1024 entries: afterstate, reward, next afterstate, terminal flag, |TD error|). The buffer persists across games.
-- After each game, `m = 32` extra updates. Each draws an entry: uniform with probability 0.5, otherwise with probability proportional to `(|δ| + 1e-3)^0.5`. The target is recomputed with the current weights, and the drawn entry's |δ| is refreshed.
-- Tests: sampling share checked against the analytic mixture (fixed seed, tolerance 0.01); priority pass changes the weights.
+`Options.priority` (CLI variant `priority`), default off. Per-move TD(0) updates unchanged; every update is also stored in a
+1024-entry ring buffer (afterstate, reward, next afterstate, terminal flag, |TD error|) that persists across games. After each
+game, `m = 32` extra updates draw an entry uniform with p = 0.5, else with p ∝ `(|δ| + 1e-3)^0.5`, target recomputed, the drawn
+entry's |δ| refreshed. Tests: sampling share against the analytic mixture (tolerance 0.01), priority pass changes the weights.
 
-Command per variant: `zig build nn -Doptimize=ReleaseFast -- 20000 20 2000 0.003 - <variant> 30 /tmp/nnp/<variant>.bin`, then eval-only runs (`-- 0 20 <seed> 0.003 - base 30 /tmp/nnp/<variant>.bin`) on seed ranges 2000, 3000, 4000, 5000, 6000 (20 games each, 100 games per variant). Mean ± stderr over the 5 range averages (n=5), as in #33.
+Same protocol as #33:
 
-| variant | train games | train moves | nn 1-ply avg score (mean ± stderr) |
-|---|---|---|---|
-| base | 20000 | 13,969,906 | 18,677 ± 717 |
-| priority (m=32, α=0.5, 50% uniform) | 20000 | 14,016,958 | 19,488 ± 1,490 |
+| variant | train moves | nn 1-ply |
+|---|---|---|
+| base | 13,969,906 | 18,677 ± 717 |
+| priority (m=32, α=0.5, 50% uniform) | 14,016,958 | 19,488 ± 1,490 |
 
-Per range, nn 1-ply avg score: base 19,110 / 16,668 / 19,592 / 17,423 / 20,589; priority 18,278 / 14,513 / 23,450 / 20,639 / 20,559.
-
-- Reading: no measurable gain. The difference is +811 against a combined stderr of about 1,650 (about 0.5 sigma). The priority spread is wider (seed range 3000 is the lowest of all runs, 14,513; seed 4000 the highest, 23,450). The base number reproduces #33 exactly (same moves and per-range scores), so the session is comparable.
-- Moves: priority played about 0.3% more training moves than base at equal games (14.02M vs 13.97M), so the extra updates did not change how games were played much.
-- Caveats: one training seed (1, fixed in the code), m=32 and α=0.5 not swept, 100 eval games per variant. Differences this size would need more training seeds to call either way. The issue's safety rules are met: the uniform share is kept at 50%, and the normal per-move update is unchanged.
+Per-range: base as above; priority 18,278 / 14,513 / 23,450 / 20,639 / 20,559. +811 against a combined stderr ≈ 1,650 (0.5σ),
+with a much wider spread (13.7k range between ranges). +0.3% moves, so game play barely changed. One training seed, m and α unswept.
 
 ## Priority replay across training seeds (#56)
 
-#34 left the only open question: one training seed cannot separate a +811 difference from noise. The training seed is now a CLI argument (positional 9, after `weights_path`, default 1), so the comparison can be repeated per training seed.
+The training seed became CLI argument 9 (after `weights_path`, default 1), so #34's +811 could be re-run per seed.
 
-Protocol: train `base` and `priority` for each training seed 1..5 (`zig build nn -Doptimize=ReleaseFast -- 20000 20 2000 0.003 - <variant> 30 /tmp/nnseed/<variant>_s<s>.bin <s>`), then evaluate every weights file on the fixed eval seed ranges 2000, 3000, 4000, 5000, 6000 (20 games each). Score is the nn 1-ply average score. Both variants stay on the serial per-game path: `par` trains the plain per-move variant only.
-
-Per training seed (mean of the 5 eval ranges):
+`zig build nn -Doptimize=ReleaseFast -- 20000 20 2000 0.003 - <variant> 30 /tmp/nnseed/<variant>_s<s>.bin <s>` for seeds 1..5,
+each net evaluated on ranges 2000/3000/4000/5000/6000 (20 games each), nn 1-ply. Variants stay on the serial path (`par` trains only plain per-move).
 
 | training seed | base | priority | delta |
 |---|---|---|---|
@@ -394,18 +267,21 @@ Per training seed (mean of the 5 eval ranges):
 | 5 | 17,846 | 19,957 | +2,111 |
 | **mean ± stderr (n=5)** | **18,754 ± 534** | **19,279 ± 959** | **+525 ± 1,224** (t = 0.4) |
 
-- Reading: priority wins 2 of 5 training seeds and loses 3. The paired delta is +525 against a stderr of 1,224, so the earlier +811 was a single-seed artefact, not a gain. Verdict unchanged: `priority` stays opt-in and off by default.
-- The spread across training seeds (base 17.8k-20.4k, priority 17.1k-22.4k) is about 1.5x the difference between variants, which is why one seed could not decide it. Base seed 1 reproduces #34 (19,611 vs 18,677, both inside one stderr).
-- Cost: 10 training runs of 20,000 games, 300-410 s each on 8 cores (serial). `par` reaches 2,000 games in 1.5 s against 8.6 s serial, but it cannot run the variant path, so these runs are slow by construction. `par` now also accepts `weights_path`, so a parallel run no longer has to overwrite the committed `ai/solver/nn_weights.bin`.
-- Caveats: still 5 training seeds and 100 eval games per variant; m=32 and α=0.5 were not swept.
+Priority wins 2 of 5 seeds, so the earlier +811 was a single-seed artefact. Training-seed spread (base 17.8k-20.4k, priority 17.1k-22.4k)
+is about 1.5× the between-variant difference, which is why one seed could not decide. Base seed 1 reproduces #34 (19,611 vs 18,677).
+Cost: 10 runs × 20,000 games, 300-410 s each. `par` reaches 2,000 games in 1.5 s against 8.6 s serial but cannot run variant paths;
+it now accepts `weights_path`, so a parallel run need not overwrite the committed `ai/solver/nn_weights.bin`.
 
 ## Mid-game focus (#59)
 
-#32 put 52.6% of the total TD error in the "4..7 empty cells, earlier move" bucket and only 7.9% in the last 10 moves before game over, so the next candidate was to sample the extra post-game updates from that mid-game bucket instead of the near-loss one.
+#32 localised 52.6% of the TD error in the "4..7 empty cells, earlier move" bucket against 7.9% in the last 10 moves, so the extra
+post-game updates were drawn from that bucket instead of the near-loss one.
 
-Mechanism: `Options.midgame` (CLI variant `midgame`). Same shape as `priority` — the per-move TD(0) update is untouched, the ring buffer (1024 entries) is reused, and after each game `m = 32` extra updates are drawn **uniformly from the entries with 4..7 empty cells** (falling back to the whole buffer while that bucket is empty), with the target recomputed from the current weights. Default off; the default path is pinned by the recorded-checksum test (base weights byte-identical, `md5 0a8e6bf01e256adf2fc481317c5072c9` at 2000 games before and after).
+`Options.midgame` (CLI variant `midgame`): per-move TD(0) untouched, same 1024-entry ring buffer, `m = 32` extra updates drawn
+**uniformly from entries with 4..7 empty cells** (whole buffer while empty), target recomputed. Default off; default path pinned by
+the checksum test (`md5 0a8e6bf01e256adf2fc481317c5072c9` at 2000 games before and after).
 
-Protocol identical to #56: train each variant for 20000 games at 5 training seeds, evaluate on the fixed seed ranges 2000, 3000, 4000, 5000, 6000 (20 games each), nn 1-ply average score. Base column is the #56 measurement re-evaluated with the same binary.
+Protocol as #56 (5 training seeds, ranges 2000..6000 × 20 games, nn 1-ply; base re-evaluated with the same binary):
 
 | training seed | base | midgame | delta |
 |---|---|---|---|
@@ -416,14 +292,15 @@ Protocol identical to #56: train each variant for 20000 games at 5 training seed
 | 5 | 17,846 | 17,488 | -358 |
 | **mean ± stderr (n=5)** | **18,754 ± 534** | **17,128 ± 1,290** | **-1,625 ± 1,710** (t = -1.0) |
 
-- Reading: no gain, and the spread is much wider than base (13.3k-21.1k against 17.8k-20.4k). Two seeds lose 6.3k and 4.7k, which is the same failure mode as `replay` (#33): replacing the uniform sample with a narrow bucket takes fit away from the rest of the state distribution.
-- Verdict: `midgame` stays opt-in and off by default. The error-share argument (#32) says where the error is, not that concentrating updates there helps — the last three attempts (`replay`, `priority`, `midgame`) all point the same way.
-- Next candidates, in order of expected value: mix the mid-game bucket with a uniform share (the shape that came closest in #34), more training games at the same protocol, and an lr sweep.
-- Cost: 5 training runs, 145-358 s each (serial; `par` still cannot run variant paths).
+No gain and a much wider spread (13.3k-21.1k); two seeds lose 6.3k and 4.7k, the same failure as `replay`: replacing the uniform
+sample with a narrow bucket takes fit from the rest of the distribution. So #32 says where the error is, not that concentrating
+updates there helps — `replay`, `priority` and `midgame` all point the same way. Untried, in order of expected value: mid-game bucket
+mixed with a uniform share, more training games at the same protocol, an lr sweep. Cost: 5 runs, 145-358 s each.
 
 ## Training games: 20,000 vs 40,000 (#61)
 
-Same protocol as #56 (5 training seeds, eval on seed ranges 2000, 3000, 4000, 5000, 6000 x 20 games, nn 1-ply average score), no code change: only `train_games` moved from 20,000 to 40,000. The linear lr decay is a function of the fraction trained, so the 40k runs also stretch the schedule to twice as many games.
+Protocol as #56, no code change, only `train_games` 20,000 → 40,000 (linear lr decay is a function of the fraction trained, so the
+schedule also stretches):
 
 | training seed | 20k | 40k | delta |
 |---|---|---|---|
@@ -434,17 +311,19 @@ Same protocol as #56 (5 training seeds, eval on seed ranges 2000, 3000, 4000, 50
 | 5 | 17,846 | 25,906 | +8,060 |
 | **mean ± stderr (n=5)** | **18,754 ± 534** | **30,706 ± 1,352** | **+11,952 ± 1,195** (t = 10.0) |
 
-- Reading: doubling the games is worth about 12,000 points of nn 1-ply score at this stage of the curve, far above the seed noise. The curve has not flattened at 40,000 games.
-- **The committed weights were not replaced**: they were trained with 200,000 games (see "NN weights" above) and score 40,282 on these same five ranges (38,641 / 34,894 / 34,196 / 50,210 / 43,467), well above any 40k net. Comparing a 40k net against them is not a fair fight, which is the point of the table: the protocol in #33/#34/#56/#59 uses 20,000-game nets, so those variant comparisons are all made far down the curve.
-- Cost: 5 runs x 40,000 games, 514-559 s each (serial). Re-evaluating the 20k and committed weights with the same binary is free.
++12,000 for doubling the games, far above seed noise, and the curve has not flattened at 40,000. The committed weights were not
+replaced: they are 200,000 games and score 40,282 on these same ranges (38,641 / 34,894 / 34,196 / 50,210 / 43,467). The point:
+the #33/#34/#56/#59 protocol uses 20,000-game nets, so all those variant comparisons sit far down the curve. Cost: 5 × 40,000 games, 514-559 s each.
 
 ## Mid-game mixed replay (#63)
 
-#59 lost the uniform share entirely and dropped 1,625 points. #34's design ("50% uniform + 50% |TD error| weighted") came closest to base of all candidates so far, so the two were combined: keep the uniform share, and bias the other half towards the bucket that holds 52.6% of the error (4..7 empty cells, #32).
+#59 lost the uniform share; #34 (50% uniform + 50% |TD error| weighted) came closest to base — so the two were combined.
 
-Mechanism: `Options.midmix` (CLI variant `midmix`). Per-move TD(0) update untouched; after each game `m = 32` extra updates, each one either uniform over the whole ring buffer (probability 0.5) or `(|δ| + 1e-3)^0.5` weighted **among entries with 4..7 empty cells** (falling back to a uniform whole-buffer draw while that bucket is empty), target recomputed from the current weights. Default off; default path byte-identical (`md5 0a8e6bf01e256adf2fc481317c5072c9` at 2000 games).
+`Options.midmix` (CLI variant `midmix`): per-move TD(0) untouched; after each game `m = 32` extra updates, each either uniform over the
+whole buffer (p = 0.5) or `(|δ| + 1e-3)^0.5` weighted **among 4..7-empty entries**, target recomputed. Default off, default path
+byte-identical (`md5 0a8e6bf01e256adf2fc481317c5072c9` at 2000 games).
 
-Protocol identical to #56/#59: 20000 games, 5 training seeds, eval on seed ranges 2000, 3000, 4000, 5000, 6000 (20 games each), nn 1-ply average score; base column from #61.
+Protocol as #56/#59:
 
 | training seed | base | midmix | delta |
 |---|---|---|---|
@@ -455,15 +334,17 @@ Protocol identical to #56/#59: 20000 games, 5 training seeds, eval on seed range
 | 5 | 17,846 | 17,883 | +37 |
 | **mean ± stderr (n=5)** | **18,754 ± 534** | **19,362 ± 1,377** | **+608 ± 1,762** (t = 0.3) |
 
-- Reading: 4 of 5 seeds are positive and the mean is the best of all mid-game variants tried, but the spread (14.6k-21.9k against base's 17.8k-20.4k) is three times the effect, so this is not a gain either. It is however the first variant that is not worse on average, which fits the #32/#34 story: keep the uniform share and mix in the mid-game bucket rather than replacing it.
-- Verdict: stays opt-in and off by default; committed weights unchanged.
-- Cost: 5 runs x 20,000 games, 194-353 s each.
+4 of 5 seeds positive and the best mid-game variant so far, but the spread (14.6k-21.9k) is three times the effect. It is however the
+first variant not worse on average, which fits the #32/#34 story: keep the uniform share and mix the bucket in rather than replacing it.
+Stays opt-in, committed weights unchanged. Cost: 5 runs × 20,000 games, 194-353 s.
 
 ## Model update: fine-tuning the committed weights (#66)
 
-`train_games > 0` always started from a random init, so the only way to improve the committed net was 200,000 games from scratch (#62). New CLI variant literal `resume` (positional 6) loads `weights_path` first and then trains `train_games` more games on the plain per-move path: `zig build nn -Doptimize=ReleaseFast -- 20000 20 2000 0.001 - resume 30 /tmp/x.bin 1`. The default path is unchanged (recorded-checksum test, `md5 0a8e6bf01e256adf2fc481317c5072c9`).
+`train_games > 0` always started from random init, so the only way forward was 200,000 games from scratch (#62). CLI variant literal
+`resume` (positional 6) loads `weights_path` and trains `train_games` more on the plain per-move path:
+`zig build nn -Doptimize=ReleaseFast -- 20000 20 2000 0.001 - resume 30 /tmp/x.bin 1`. Default path unchanged (checksum test).
 
-Protocol: start from `ai/solver/nn_weights.bin` (200,000 games, training seed 1), fine-tune, evaluate on the #56 in-protocol ranges (2000..6000) and on held-out ranges (7000..10000) that are never used to choose a candidate. All scores are nn 1-ply average score, 20 games per range unless noted.
+In-protocol ranges 2000..6000 vs held-out 7000..10000 (never used to choose a candidate), nn 1-ply, 20 games per range:
 
 | candidate (from committed) | in-protocol | held-out | vs committed (held-out) |
 |---|---|---|---|
@@ -476,123 +357,143 @@ Protocol: start from `ai/solver/nn_weights.bin` (200,000 games, training seed 1)
 | +20k, lr 1e-3, training seed 2 | 33,847 | 38,663 | +1,430 |
 | +20k, lr 3e-4, training seed 2 | 41,157 | 37,576 | +343 |
 
-- Chosen: **+20k lr 1e-3 then +20k lr 3e-4** (40,000 extra games, 1,028 s + 628 s serial). It wins in-protocol and held-out, and the pattern "high lr first, low lr to settle" beats the same budget at a single lr.
-- Final check on fresh ranges **11000..15000 with 40 games each** (never used before): committed 38,402, candidate 42,609 (+4,207, about +11%), candidate ahead on 4 of 5 ranges and tied on the fifth.
-- Canonical bench `zig build ranking -Doptimize=ReleaseFast -- 5 20 1000`: nn 64,112.9 -> **65,409.9** (+1,297, best tile 4096 -> 8192); every other policy unchanged, so the delta is the weights alone. `src/web/ranking.json` regenerated.
-- New committed weights: `ai/solver/nn_weights.bin`, `md5 e501bae176f5cf2ff11a25c6f99e75a0` (old `6c9a164b5e05519ca2298c26e30431c4`).
-- Caveat: fine-tuning cannot pass the point the 200k run already reached, so the gain is bounded. The single-lr and longer schedules were only tried at training seed 1 (seed 2 fine-tunes were clearly worse), so a small seed effect cannot be excluded.
+Chosen: **+20k lr 1e-3 then +20k lr 3e-4** (40,000 extra games, 1,028 s + 628 s). It wins in-protocol and held-out, and "high lr
+first, low lr to settle" beats the same budget at one lr. Fresh ranges **11000..15000 at 40 games each**: committed 38,402 → 42,609
+(+4,207, +11%), ahead on 4 of 5 and tied on the fifth. Canonical bench: nn 64,112.9 → **65,409.9** (+1,297, best tile 4096 → 8192),
+all other policies unchanged. New weights `md5 e501bae176f5cf2ff11a25c6f99e75a0` (old `6c9a164b5e05519ca2298c26e30431c4`).
+Fine-tuning cannot pass what the 200k run already reached, so the gain is bounded; the longer schedules were only tried at training seed 1.
 
 ## Fine-tune extra rounds: overfit past the #66 peak (#97)
 
-The 20k to 40k learning curve was still climbing (#66), so the question was whether more `resume` rounds on top of the current committed weights (200k + the #66 40k) keep paying. Same protocol as #66: `resume` from `ai/solver/nn_weights.bin`, training seed 1, nn 1-ply, in-protocol ranges 2000..6000 and held-out ranges 7000..10000, 20 games per range.
+Whether more `resume` rounds on the current committed weights keep paying. Protocol as #66 (training seed 1, in-protocol 2000..6000,
+held-out 7000..10000, 20 games per range):
 
 | candidate (from committed) | in-protocol | held-out | vs committed (held-out) |
 |---|---|---|---|
-| committed (200k + 40k, seed 1) | 43,187 | 45,342 | — |
+| committed (200k + 40k) | 43,187 | 45,342 | — |
 | +20k, lr 3e-4 (a2) | 43,083 | 41,936 | -3,406 |
 | +20k lr 1e-3 then +20k lr 3e-4 (a1r2) | 42,974 | 41,290 | -4,052 |
 
-- The held-out column is the decider (the #66 adoption rule): both candidates are flat in-protocol (spread ~200 against per-range noise of several thousand) but lose 3.4k-4.1k on the ranges that never select a candidate. The exact recipe that won +8,109 when applied once loses -4,052 when applied again — fine-tuning has passed its peak and is now fitting the training distribution.
-- Verdict: not adopted, `ai/solver/nn_weights.bin` unchanged (md5 `e501bae176f5cf2ff11a25c6f99e75a0`). More rounds on this recipe are spent; further gains need new training signal (search-based self-play, or the batched-update line in #98/#99), not more of the same.
-- Cost: 3 x 20,000 games serial (`resume`), 460 s / 319 s + 345 s / 460 s, plus 3 nets x 9 ranges x 20 eval games.
+Held-out is the decider (#66's rule): both are flat in-protocol (~200 against per-range noise of several thousand) and lose 3.4k-4.1k
+on ranges that never select a candidate. The recipe that won +8,109 once loses -4,052 the second time. Not adopted, weights unchanged;
+more of the same is spent — further gains need new signal (search-based self-play, or the batched-update line in #98/#99).
+Cost: 3 × 20,000 games (460 s / 319 s + 345 s / 460 s) plus 3 nets × 9 ranges × 20 eval games.
 
 ## 200,000 games from scratch across seeds (#62)
 
-Same protocol, `train_games` 200,000, training seeds 1 and 2, compared against the committed net.
-
 | training seed | in-protocol (2000..6000) | vs committed (40,282) |
 |---|---|---|
-| 1 | 40,282 | 0 (byte-identical weights, `md5 6c9a164b...`) |
+| 1 | 40,282 | 0 (byte-identical, `md5 6c9a164b...`) |
 | 2 | 38,116 | -2,166 |
 
-- Seed 1 reproducing the committed file byte-for-byte confirms the committed weights are exactly `200000 games, lr 0.003, seed 1`, and that the pipeline is deterministic (this is the check #62 asked for).
-- Seed 2 lands below it, so retraining from scratch across seeds does not improve the model. The win came from fine-tuning (#66) instead, at 40,000 games (about 1/5 of the cost).
-- Cost: 2 x 200,000 games, 4,118-4,254 s each.
+Seed 1 reproducing the committed file byte-for-byte confirms the committed weights are exactly `200000 games, lr 0.003, seed 1` and
+that the pipeline is deterministic. Seed 2 lands below it: retraining from scratch does not improve the model, and the win came from
+fine-tuning (#66) at 40,000 games (about 1/5 of the cost). Cost: 2 × 200,000 games, 4,118-4,254 s each.
 
 ## Symmetry augmentation + TD(lambda): diverges (#72)
 
-Two ways to get more out of each self-play game: reuse every position in all 8 dihedral orientations (rotation/reflection of the 4x4 board), and propagate TD errors backwards along the whole game with eligibility traces instead of one step.
+Two ways to get more out of each self-play game: all 8 dihedral orientations per position, and TD(λ) traces backwards along the game.
 
-Mechanism (opt-in, `nn.Options`): `symmetry` applies each per-move TD(0) update to all 8 dihedral transforms of the afterstate with the same target (deterministic, no RNG); `lambda` switches the update to TD(λ) with accumulating traces (`trace = λ * trace + grad V`, `net -= lr * (out - target) * trace`, λ = 0 reduces to today's TD(0)). CLI variants `sym` and `symlam` (symmetry + λ = 0.7). `base` and every earlier variant stay byte-identical; the recorded-checksum test is untouched.
+Opt-in `nn.Options`: `symmetry` applies each per-move TD(0) update to all 8 dihedral transforms with the same target (no RNG);
+`lambda` switches to TD(λ) with accumulating traces (`trace = λ * trace + grad V`, `net -= lr * (out - target) * trace`, λ = 0 = TD(0)).
+CLI variants `sym` and `symlam` (symmetry + λ = 0.7). `base` and earlier variants stay byte-identical; checksum test untouched.
+Correctness: one `sym` step equals eight explicit `forward(transformBoard(k, board))` + `train` steps (1e-15), λ = 0 matches TD(0),
+the 8 transforms are distinct and closed under composition, and `forward` on a transformed board equals `forward` with transformed weights.
 
-Correctness: one `sym` step equals eight explicit `forward(transformBoard(k, board))` + `train` steps (tested to 1e-15), λ = 0 matches the plain TD(0) step, the 8 transforms are distinct and closed under composition, and `forward` on a transformed board equals `forward` with transformed weights. So the implementation does what it says; the outcome is what fails.
+20,000 games per seed, ranges 2000..6000 × 20 games, nn 1-ply:
 
-20,000 training games per seed, eval ranges 2000/3000/4000/5000/6000 x 20 games, committed `nn` 1-ply protocol:
-
-| variant | lr | per-seed mean score | mean ± stderr | weights |
+| variant | lr | per-seed mean | mean ± stderr | weights |
 |---|---|---|---|---|
 | base (reference, #56) | 0.003 | — | 18,754 ± 534 | fine |
-| `sym` | 0.003 | 2,116 / 3,472 / 2,116 / 2,772 / 3,035 | 2,702 ± 264 | 2 of 5 nets contain NaN/Inf |
-| `sym` | 0.000375 (lr/8) | 4,274 / 6,828 / 2,762 | 4,621 ± 1,187 | finite but collapsed (V ≈ -51 for every board) |
-| `symlam` | 0.000375 | 2,116 / 4,958 / 2,116 | 3,064 ± 947 | 2 of 3 nets are entirely NaN |
+| `sym` | 0.003 | 2,116 / 3,472 / 2,116 / 2,772 / 3,035 | 2,702 ± 264 | 2 of 5 nets NaN/Inf |
+| `sym` | 0.000375 (lr/8) | 4,274 / 6,828 / 2,762 | 4,621 ± 1,187 | finite, collapsed (V ≈ -51 everywhere) |
+| `symlam` | 0.000375 | 2,116 / 4,958 / 2,116 | 3,064 ± 947 | 2 of 3 nets all NaN |
 
-- Reading: eight updates per visited position is not eight times the data, it is eight correlated steps against a target computed from the pre-step net, and TD(0) with function approximation cannot absorb that — at the normal lr the weights blow up to NaN within 20,000 games, at lr/8 they collapse to a near-constant value function (dead ReLUs), and λ = 0.7 makes it worse because traces multiply the same over-update. Dividing the lr keeps the total step size but not the optimisation dynamics: the game schedule (lr decay per game, freshest games last) is compressed 8x.
-- Verdict: not adopted, both options stay off by default (no default-path change, checksum test unchanged). A version that could work would accumulate the 8 transformed gradients from one net snapshot and apply a single averaged step (true batch augmentation) instead of eight sequential steps, and clip the gradient norm; that is a different, larger change, not a knob.
-- Cost: 2 settings x 5 seeds and 1 setting x 3 seeds x 20,000 games, ~150-800 s per run.
+Eight updates per position is not eight times the data: it is eight correlated steps against a target from the pre-step net, which
+TD(0) with function approximation cannot absorb. At the normal lr the weights blow up to NaN within 20,000 games; at lr/8 they
+collapse to a near-constant V (dead ReLUs); λ = 0.7 multiplies the same over-update. Dividing the lr keeps the total step size but
+not the dynamics (the per-game lr decay schedule is compressed 8×). Not adopted; both stay off by default. A version that could work
+would average the 8 gradients from one snapshot into a single step (true batch augmentation) and clip the gradient norm — a larger
+change, not a knob. Cost: 2 settings × 5 seeds and 1 × 3 seeds, ~150-800 s per run.
 
 ## Batched symmetry update: symbatch (#98)
 
-Follow-up of #72: reuse each position in all 8 dihedral orientations without the eight correlated steps that made `sym` diverge.
+Follow-up of #72: reuse the 8 orientations without eight correlated steps.
 
-Mechanism (opt-in `nn.Options.sym_batch`, CLI variant `symbatch`): for one afterstate and its target `t` (computed exactly as the `sym` path does: its scaled reward plus V of the next afterstate, 0 after game over) it runs `forward` + `gradOf` on the 8 transformed boards **while `net` is untouched**, so all eight gradients describe the same pre-step net, averages them elementwise (`mean_k (V_k - t) * grad V_k`), clips the averaged gradient's global L2 norm to `nn.sym_batch_clip = 1.0`, and applies one SGD step `net -= lr * clip(mean_k ...)`. Deterministic, no RNG. `base` and every earlier variant stay byte-identical; the recorded-checksum tests are untouched.
+Opt-in `nn.Options.sym_batch` (CLI variant `symbatch`): for one afterstate and target `t` it runs `forward` + `gradOf` on the 8
+transformed boards **while `net` is untouched**, averages them elementwise (`mean_k (V_k - t) * grad V_k`), clips the averaged
+gradient's global L2 norm to `nn.sym_batch_clip = 1.0`, and applies one step `net -= lr * clip(mean_k ...)`. Deterministic.
+`base` and earlier variants stay byte-identical; checksum tests untouched.
 
-Why the clip value: measured averaged-gradient norms over one self-play game are 0.04..0.26 on a freshly initialised net but 4..300 late in training on the committed net (TD errors grow with the value scale, ~36..40 there). A unit-norm clip is therefore a no-op at the start (where lr is largest) and only binds late, where it caps one update's total weight displacement at `lr = 0.003` against a committed net mean |w| of 0.44 — the blow-up path of #72 (weights moving by their own magnitude per move, 8 times per position) is cut off instead of pre-empted by a smaller lr.
+Why 1.0: averaged-gradient norms over one self-play game are 0.04..0.26 on a fresh net but 4..300 late in training on the committed
+net (TD errors grow with the value scale, ~36..40 there). A unit clip is a no-op early (where lr is largest) and binds late, capping
+one update's displacement at `lr = 0.003` against a committed mean |w| of 0.44 — #72's blow-up path (weights moving by their own
+magnitude per move, 8× per position) is cut off instead of pre-empted by a smaller lr.
+Correctness: one `symbatch` step equals the averaged gradient applied once (1e-15), differs from eight sequential `sym` steps, and at
+t = 100 the applied norm is exactly `lr * sym_batch_clip` while the unclipped average is >10× the clip (the clip branch is exercised).
 
-Correctness: one `symbatch` step equals the averaged gradient applied once (tested to 1e-15), differs from the eight sequential `sym` steps, and on a large TD error (t = 100) the applied step's norm is exactly `lr * sym_batch_clip` while the unclipped averaged gradient is more than 10x the clip, so the clipping branch is exercised.
+20,000 games, training seed 1, ranges 2000..6000 × 20 games, nn 1-ply:
 
-Measurement (#72 protocol: 20,000 training games, training seed 1, eval ranges 2000/3000/4000/5000/6000 x 20 games, `nn` 1-ply):
-
-| variant | lr | mean over ranges | per-range scores | training moves (games) |
+| variant | lr | mean over ranges | per-range | train moves (games) |
 |---|---|---|---|---|
-| base (reference, #56) | 0.003 | 18,754 ± 534 (5 seeds) | — | — |
-| `sym` (reference, #72) | 0.003 | 2,702 ± 264 | — | — |
-| `sym` (reference, #72) | 0.000375 | 4,621 ± 1,187 | — | — |
+| base (#56) | 0.003 | 18,754 ± 534 (5 seeds) | — | — |
+| `sym` (#72) | 0.003 | 2,702 ± 264 | — | — |
+| `sym` (#72) | 0.000375 | 4,621 ± 1,187 | — | — |
 | `symbatch` | 0.003 | 1,314 | 1,292 / 1,337 / 1,404 / 1,309 / 1,227 | 2,568,519 (~128/game) |
-| `symbatch` | 0.000375 (lr/8) | 794 | 732 / 883 / 766 / 788 / 803 | 1,858,935 (~93/game) |
+| `symbatch` | 0.000375 | 794 | 732 / 883 / 766 / 788 / 803 | 1,858,935 (~93/game) |
 
-- Reading: the averaged-snapshot step does not diverge (no NaN/Inf, unlike `sym`), but it collapses anyway — both nets play 90-130-move games that die at tile 128-256, below even the collapsed `sym` rows and an order of magnitude below `base`. The likely mechanism is the clip: the measured averaged-gradient norms reach 4-300 late in training, so `sym_batch_clip = 1.0` caps those updates at 1/4-1/300 of their natural size exactly when the value function would mature, and lr/8 shrinks the early updates too — so the lr/8 row is worse, not better. The #72 failure mode (eight correlated over-updates) is gone, but TD(0) with a bootstrapped target gets no benefit from the extra transforms and the throttled step cannot recover.
-- Verdict: not adopted; `symbatch` stays an opt-in experiment variant, `sym_batch = false` is the default, no default-path change (recorded-checksum tests untouched).
-- Next candidates if this line is retried: a clip sweep (`sym_batch_clip` at 10 or 100, or no clip), and/or a target averaged over the same 8 transforms so the regression is self-consistent.
-- Cost: 2 x 20,000 games (435 s + 335 s training), plus 5 ranges x 20 eval games per net.
+No NaN (unlike `sym`), but it collapses: 90-130-move games dying at tile 128-256, below even the collapsed `sym` rows. Likely the
+clip: norms reach 4-300 late, so a 1.0 cap throttles updates to 1/4-1/300 of natural size exactly when V would mature, and lr/8
+shrinks the early updates too — hence the lr/8 row is worse. #72's failure mode is gone, but TD(0) with a bootstrapped target gains
+nothing from the extra transforms and the throttled step cannot recover. Not adopted; `sym_batch = false` stays default. If retried:
+a clip sweep (10, 100, none) and/or a target averaged over the same 8 transforms so the regression is self-consistent.
+Cost: 2 × 20,000 games (435 s + 335 s) plus 5 ranges × 20 eval games per net.
+
 ## n-tuple network runner (#70)
 
-The classic 2048 SOTA value function, as a standalone runner: `ai/solver/ntuple.zig` holds flat f32 pattern tables (`[16^k]f32`) indexed by the same `levelOf` cell encoding as the MLP, `ai/solver/ntuple_main.zig` trains them by TD(0) on afterstates and evaluates them.
+`ai/solver/ntuple.zig` holds flat f32 pattern tables (`[16^k]f32`) indexed by the same `levelOf` encoding as the MLP;
+`ai/solver/ntuple_main.zig` trains them by TD(0) on afterstates and evaluates them.
 
-- Patterns (one table each, shared across the 8 dihedral transforms of the board): row 0, row 1, 2x2 top-left, 2x2 middle column, main diagonal (4-tuples), 2x3 top-left (6-tuple). The table index is the minimum over the 8 transforms, so a rotated or mirrored board gets the same weights (TDD test).
-- Index cost: a compile-time `cell -> (table, shift)` slot table, so one 16-cell scan yields all 48 transform accumulators; no table rescan per board.
-- Update: `table[p] += lr * (r + V(next) - V(after)) / n_tuples`, reward = score delta / 1000 (same scale as `nn`).
+- Patterns, one table each, shared across the 8 dihedral transforms: row 0, row 1, 2x2 top-left, 2x2 middle column, main diagonal
+  (4-tuples), 2x3 top-left (6-tuple). The index is the minimum over the 8 transforms, so rotated/mirrored boards hit the same weights.
+- Index cost: a compile-time `cell -> (table, shift)` slot table, so one 16-cell scan yields all 48 transform accumulators.
+- Update: `table[p] += lr * (r + V(next) - V(after)) / n_tuples`, reward = score delta / 1000.
 - File: 8-byte magic + version + endianness + pattern count + per-table lengths + f32 LE payload.
-- CLI: `zig build ntuple -- <train_games> <eval_games> <eval_seed> <lr> <base|chance> <table_path> [train_seed]`; `train_games = 0` loads the table. Eval prints the same lines as `nn`, labelled `ntuple`. `chance` is spawn-lookahead self-play and is much slower than `base`.
-- Not wired into `solver.Policy` / `ranking` / `server` yet (adoption is a follow-up PR).
+- CLI: `zig build ntuple -- <train_games> <eval_games> <eval_seed> <lr> <base|chance> <table_path> [train_seed]`; `train_games = 0`
+  loads the table. Eval prints nn-shaped lines labelled `ntuple`. `chance` (spawn-lookahead self-play) is much slower than `base`.
+- Not wired into `solver.Policy` / `ranking` / `server` (adoption was a follow-up PR).
 
-Smoke (Zig 0.17, Debug, `zig build ntuple -- 200 20 2000 0.01 base /tmp/t.bin 1`): 200 games, 37,341 moves, 0.2 s training. Eval seeds 2000..2019: `ntuple 1-ply` 2,439, `ntuple + 1 spawn lookahead` 8,710, expectimax depth 2 21,840. 2,000 games (same command, 10 eval games) gives 3,118 / 10,213 on seeds 2000..2009, so the tables do learn.
+Smoke (`zig build ntuple -- 200 20 2000 0.01 base /tmp/t.bin 1`): 200 games, 37,341 moves, 0.2 s. Eval on seeds 2000..2019:
+1-ply 2,439, +1 spawn 8,710, expectimax depth 2 21,840. At 2,000 games (10 eval games) 3,118 / 10,213, so the tables do learn.
+Table file: 68,419,628 bytes raw, 106,259 bytes with `gzip -9` after 200 games (182,822 after 2,000).
 
-Table file: 68,419,628 bytes raw, 106,259 bytes with `gzip -9` after 200 games (182,822 bytes after 2,000). The dense 6-tuple table dominates the raw size; it is almost all zeros early, so the gzip target holds for the smoke file but grows as training fills it. If that breaks the < 1 MB static-hosting target later, drop the 6-tuple until a quantized or sparse payload is in place.
+### Scaling the n-tuple tables (#70)
 
-### Scaling the n-tuple tables (training run, #70)
+Serial, initial lr 0.01 (linear decay to 10%), training seed 1, 68.4 MB raw (5 four-tuples + one 2x3 six-tuple):
 
-Serial training runs with the initial lr 0.01 (linear decay to 10%), training seed 1, table size 68.4 MB raw (5 four-tuples + one 2x3 six-tuple):
-
-| train games | moves | time | 1-ply | + 1 spawn lookahead |
+| train games | moves | time | 1-ply | + 1 spawn |
 |---|---|---|---|---|
 | 200 | 37,341 | 0.2 s | 2,439 | 8,710 |
 | 20,000 | 6,218,061 | 3.7 s | 4,426 | 11,385 |
 | 200,000 | 86,039,320 | 51.0 s | 7,783 | 15,100 |
 | 1,000,000 | 492,306,926 | 288.0 s | 8,832 | 17,093 |
 
-- Reading: still climbing steeply at 1M games and about 60 games/s, but the level is far below the MLP (`nn` 72,205 with 2-ply). The classic n-tuple result needs tens of millions of games plus a much lower per-sample lr; at this scale the MLP is simply better per unit time.
-- Table size: 68.4 MB raw, 106 KB gzipped at 200 games and 183 KB at 2,000 games, so a sparse/gzip payload is fine for static hosting as long as the six-tuple stays (it dominates the raw size).
-- Verdict: not adopted as a policy yet. Follow-ups tracked in #73: 2-ply search on the n-tuple leaf, a `light` table set (5 four-tuples, 1/17 the raw size) and training resume so long sweeps are possible.
+Still climbing at 1M games (~60 games/s) but far below the MLP (`nn2` 72,205). The classic n-tuple result needs tens of millions of
+games and a much lower per-sample lr; at this scale the MLP is better per unit time. The six-tuple dominates the raw size while the
+gzip payload stays small early. Not adopted as a policy; follow-ups in #73.
 
 ## Deeper search: nn2 (2-ply) (#69)
 
-The `nn` policy is "1-ply + one spawn lookahead". Every extra ply is expensive (branching 4 moves x ~6 empty cells x 2 tile values), but the MLP's afterstate value is cheap enough to afford one more level, so the question was simply how much score one more ply buys.
+`nn` is 1-ply + one spawn lookahead. Every extra ply costs 4 moves × ~6 empty cells × 2 tile values, but the afterstate value is
+cheap enough for one more level, so the question was how much score it buys.
 
-Mechanism: `nn.Mode.deep` — my move -> exact spawn over all empty cells x {2, 4} (4 with p = 0.1) -> my move -> spawn -> leaf = afterstate value + score_delta / reward_scale. Deterministic (no RNG), with a bounded value cache, exposed as `solver.Policy.nn2` (ranking depth 2) and therefore selectable via `/api/solve?algo=nn2`. `nn` is unchanged and remains the default; the recorded-checksum test is untouched.
+`nn.Mode.deep`: my move → exact spawn over all empty cells × {2, 4} (p = 0.1 for 4) → my move → spawn → leaf = afterstate value
++ score_delta / reward_scale. Deterministic (no RNG), bounded value cache, exposed as `solver.Policy.nn2` (ranking depth 2) and
+`/api/solve?algo=nn2`. `nn` unchanged and still default; checksum test untouched.
 
-Comparison with the committed weights (200,000 + 40,000 games), eval ranges 2000, 3000, 4000, 5000, 6000 (20 games each), ReleaseFast:
+Committed weights, ranges 2000..6000 × 20 games, ReleaseFast:
 
-| range | nn (1-ply + spawn) | nn2 (2-ply) | ms/move nn | ms/move nn2 |
+| range | nn | nn2 | ms/move nn | ms/move nn2 |
 |---|---|---|---|---|
 | 2000 | 64,052 | 72,220 | 0.10 | 0.97 |
 | 3000 | 64,231 | 73,277 | 0.10 | 1.07 |
@@ -601,38 +502,43 @@ Comparison with the committed weights (200,000 + 40,000 games), eval ranges 2000
 | 6000 | 67,640 | 69,797 | 0.05 | 0.48 |
 | **mean** | **64,373** | **72,205** | **0.08** | **0.76** |
 
-- Reading: +7,832 (+12.2%) for about 10x the time per move. Absolute cost is still under 1 ms per move and ~1,200 leaves per move, so it is affordable in the browser; expectimax depth 2, for comparison, needs 0.04-0.08 ms/move and scores ~22-25k.
-- Verdict: adopted as an extra policy (`nn2`); `nn` stays the default for speed, `nn2` is the quality option. `ranking.json` is regenerated separately once all pending policy changes land.
-- Canonical bench `zig build ranking -Doptimize=ReleaseFast -- 5 20 1000` after the policy landed: nn2 **71,611.4** (best tile 4096) > nn 65,409.9 > expectimax_tt 41,216.4 > mcts 29,722.0 > expectimax 25,266.8 > ga 24,046.1 > beam 12,695.9 > greedy 3,423.8 > random 1,061.5; `src/web/ranking.json` regenerated with these numbers.
-- Cost: 5 x 20 games, 63 s per range for nn2.
++7,832 (+12.2%) for ~10× the time per move, still under 1 ms/move and ~1,200 leaves/move, so it is affordable in the browser
+(expectimax depth 2 needs 0.04-0.08 ms/move for ~22-25k). Adopted as an extra policy: `nn` stays the default for speed, `nn2` is the
+quality option. Canonical bench after it landed: nn2 **71,611.4** > nn 65,409.9 > expectimax_tt 41,216.4 > mcts 29,722.0 >
+expectimax 25,266.8 > ga 24,046.1 > beam 12,695.9 > greedy 3,423.8 > random 1,061.5; `src/web/ranking.json` regenerated.
 
 ## Row-LUT board representation: no gain (#71)
 
-Idea: pack the board into one `u64` (4 bits per cell, tile level 0..15, the same encoding `nn.zig` uses) and generate moves with 65,536-entry row tables for left/right plus a transpose for up/down, so a slide is four table lookups instead of a per-row scan. Implemented as `ai/solver/fastboard.zig` (`fromBoard`/`toBoard`, `slidePacked(board, dir) -> {board, score, changed}`, `emptyMask`, `setCell`) and wired into `solver.zig`'s expectimax (`maxValuePacked`/`chanceValuePacked`, with the old path kept as the test oracle).
+Board packed into one `u64` (4 bits per cell, the `nn.zig` encoding) with 65,536-entry row tables for left/right and a transpose
+for up/down — four lookups per slide instead of a per-row scan. `ai/solver/fastboard.zig` (`fromBoard`/`toBoard`,
+`slidePacked(board, dir) -> {board, score, changed}`, `emptyMask`, `setCell`), wired into `solver.zig`'s expectimax
+(`maxValuePacked`/`chanceValuePacked`, old path kept as the test oracle).
+Correctness: 1,000 pseudo-random boards × 4 directions reproduce `core.GameState.slide` exactly (board, score delta, `changed`),
+round-trip `toBoard(fromBoard(b)) == b`, and searched values/best moves match. The scores below are byte-identical, so the LUT is right.
 
-Correctness: 1,000 pseudo-random boards x 4 directions reproduce `core.GameState.slide` exactly (board, score delta, `changed`), round-trip `toBoard(fromBoard(b)) == b`, and the searched values/best moves match the core-slide search. The scores in the table below are byte-identical, so the LUT is right — it just is not faster.
-
-Measured with the committed weights/weights-independent expectimax, ReleaseFast, seed 2000:
+ReleaseFast, seed 2000:
 
 | mode | moves/s (branch) | moves/s (main) | avg score | avg moves |
 |---|---|---|---|---|
 | expectimax depth 2, 20 games | 10,845 | 12,707 | 26,153.6 | 1,373.8 |
 | expectimax depth 3, 10 games | 280 | 301 | 42,718.8 | 2,084.0 |
 
-- Reading: 15% slower at depth 2 and 7% slower at depth 3, same scores. A slide is 4 LUT lookups plus a transpose for half the directions, while `core.slide` is already a tight 4-row scan, and every recursive leaf pays a `toBoard` conversion because the evaluation function still takes a `core.Board`. The move generation was never the bottleneck: chance-node recursion (6-8 spawns per node) and the position evaluation dominate.
-- Verdict: not adopted, code dropped. It would only pay off with a packed-native evaluation function (no `toBoard` at leaves) and a packed chance-node spawn, i.e. rewriting the whole search around the representation — a separate, much larger change than a faster slider.
-- Cost: 2 x 20 + 2 x 10 games, ~3 min build + 80 s measuring.
+15% slower at depth 2 and 7% slower at depth 3 with the same scores: a slide is 4 lookups plus a transpose for half the directions
+while `core.slide` is already a tight 4-row scan, and every leaf pays a `toBoard` because the evaluation still takes a `core.Board`.
+Move generation was never the bottleneck — chance-node recursion (6-8 spawns per node) and evaluation dominate. Not adopted, code
+dropped: it would only pay off with a packed-native evaluation and packed spawn, i.e. rewriting the search around the representation.
 
 ## n-tuple: deep search, light tables, resume (#73)
 
-The n-tuple value function (`ai/solver/ntuple.zig`) stores one weight per (pattern, cell-state) pair and learns it with TD(0) self-play. Issue #70 left it at the runner stage with two limits: only 1-ply and 1-spawn lookahead, and a 68 MiB raw table that is dominated by one 2x3 6-tuple pattern.
+#70 left the runner at 1-ply / 1-spawn and 68 MiB raw dominated by one 6-tuple.
 
-Added:
-- `Mode.deep` — my move -> exact spawn over empty cells x {2, 4} -> my move -> spawn -> leaf = afterstate value + score_delta / 1000 (same leaf rule as `nn`'s 2-ply `nn2`). Deterministic, leaf counts reported in the eval line (`leaves`, `leaves/move`, `ms/move`).
-- `Set.light` — only the five 4-tuple patterns, 327,680 entries, **1.3 MiB raw** instead of 68 MiB, so the table could actually ship.
-- `resume` / `lightresume` — load the table, then train more games from it (the load validates the file length, so a full-set file cannot be loaded into a light-set table: `error.TableSizeMismatch`).
+- `Mode.deep` — my move → exact spawn → my move → spawn → leaf = afterstate value + score_delta / 1000 (same leaf rule as `nn2`).
+  Deterministic; the eval line reports `leaves`, `leaves/move`, `ms/move`.
+- `Set.light` — only the five 4-tuples, 327,680 entries, **1.3 MiB raw** instead of 68 MiB.
+- `resume` / `lightresume` — load the table and train more games; the load validates length, so a full-set file cannot be loaded into
+  a light table (`error.TableSizeMismatch`).
 
-Measured, 20 games per policy on eval seed 2000, ReleaseFast:
+20 games per policy on eval seed 2000, ReleaseFast:
 
 | training | 1-ply | + 1 spawn | depth 2 | ms/move (depth 2) |
 |---|---|---|---|---|
@@ -640,68 +546,88 @@ Measured, 20 games per policy on eval seed 2000, ReleaseFast:
 | light, 500,000 games | 7,134 | 17,987 | **25,760** | 0.24 |
 | expectimax depth 2 (no table) | — | — | 21,840 | 0.02 |
 
-- Reading: greedy self-play training is cheap (500k games in 124 s, 202M moves), but a 1-ply table stays weak (7,134). Almost all of the strength comes from search depth: the same table jumps to 17,987 with one spawn and to 25,760 with a second own move, i.e. depth-2 n-tuple already beats expectimax depth 2 while still running at 0.24 ms/move (~4.6k leaves/move). Search, not more table entries, is where the gain is.
-- Against the MLP on the same protocol (eval seed 2000, 20 games): `nn` 64,052, `nn2` 72,220, depth-2 n-tuple 25,760 — roughly 2.5x below `nn`, so the n-tuple table is not a replacement for the learned MLP value function; it stays an experiment/runner (and a possible cheap browser-side fallback if the 1.3 MiB table ever matters more than strength).
-- Verdict: adopted as the experiments' new best non-MLP option; `light` + `deep` is the default sweep configuration from here (1.3 MiB table, evaluable in seconds). Not wired into `algo` yet: `ranking.json` regeneration and a `Policy.nntuple` connection are separate follow-ups.
-- Cost: 500k-game training 124 s + depth-2 eval 6.5 s per 20 games.
+Self-play training is cheap (500k games in 124 s, 202M moves) but a 1-ply table stays weak (7,134). Almost all strength comes from
+depth: the same table jumps to 17,987 with one spawn and 25,760 at depth 2 (0.24 ms/move, ~4.6k leaves/move), beating expectimax
+depth 2. Against the MLP on the same protocol (seed 2000, 20 games): `nn` 64,052, `nn2` 72,220, depth-2 n-tuple 25,760 — about 2.5×
+below `nn`, so the table is not a replacement for the learned value, only an experiment/runner (and a possible cheap browser-side
+fallback if 1.3 MiB matters more than strength). Adopted as the best non-MLP option, so `light` + `deep` is the default sweep config.
+Not wired into `algo` (ranking regeneration and `Policy.nntuple` were follow-ups). Cost: 124 s training + 6.5 s per 20 depth-2 games.
 
 ## Static WASM build (#68)
 
-The web UI used to need the Zig server (`zig build run -- serve`): the board lived in server state and every policy call went through `/api/solve`. `zig build wasm -Doptimize=ReleaseFast` now produces a static site in `zig-out/web/` — `index.html` plus `game2048.wasm` — that plays and solves entirely in the browser, no backend, so it can be hosted on GitHub Pages or any static file server.
+`zig build wasm -Doptimize=ReleaseFast` produces a static site in `zig-out/web/` (`index.html` + `game2048.wasm`) that plays and
+solves entirely in the browser — no backend, so it can be hosted on GitHub Pages.
+`src/wasm.zig` exposes a C ABI (`init(seed_lo, seed_hi)`, `move(dir)`, `solve(algo, depth)`, `board_ptr()`, `score()`,
+`best_tile()`, `algo_count()`, `algo_name(i)`) over the same `core`/`solver`; the nn weights are `@embedFile`-ed, so all nine
+policies work offline. `src/web/index.static.html` is a separate static UI (it never talks to `/api/*`). `scripts/wasm-smoke.mjs`
+(node, no dependencies) builds a game, applies moves and calls every policy, exiting non-zero on a bad direction or unchanged board.
 
-Mechanism: `src/wasm.zig` exposes a small C ABI (`init(seed_lo, seed_hi)`, `move(dir)`, `solve(algo, depth)`, `board_ptr()`, `score()`, `best_tile()`, `algo_count()`, `algo_name(i)`) over the same `core`/`solver` code the server uses; the nn weights are `@embedFile`-ed, so all nine policies (random, greedy, expectimax, mcts, beam, expectimax_tt, ga, nn, nn2) work offline. `src/web/index.static.html` is a separate static UI because it never talks to `/api/*`. `scripts/wasm-smoke.mjs` (node, no dependencies) builds a game, applies moves, and calls every policy, failing non-zero on a bad direction or an unchanged board.
-
-Two fixes were needed to make the module run in a browser:
-- `nn.ValueCache.get` indexed with `key & (capacity - 1)` where `usize` is 32-bit on wasm32; the slot is now explicitly `usize`.
-- The 8,192-entry value cache (128 KiB) lives on the stack of `deepMove` and overflowed the wasm stack (`RuntimeError: memory access out of bounds` on the first `nn2` call). The capacity is now comptime-selected: 1,024 entries on wasm, 8,192 elsewhere, so native `nn2` performance is unchanged.
-
-Measured: wasm module 745,167 bytes, smoke test passes for all nine policies and ten applied moves.
+Two browser fixes: `nn.ValueCache.get` indexed with `key & (capacity - 1)` where `usize` is 32-bit on wasm32 (slot made explicitly
+`usize`); and the 8,192-entry value cache (128 KiB) lived on `deepMove`'s stack and overflowed the wasm stack
+(`RuntimeError: memory access out of bounds` on the first `nn2` call) — the capacity is now comptime-selected, 1,024 on wasm and
+8,192 elsewhere, so native `nn2` is unchanged.
+Measured: module 745,167 bytes; smoke test passes for all nine policies and ten applied moves.
 
 ## Truncated-rollout MCTS with the NN leaf: nnmcts (#82)
 
-`mcts` plays whole random games out to a terminal state and scores them with the raw game score, so it only knows what a random player accumulates. `nnmcts` keeps the same root UCT but stops each rollout after 8 random plies and scores the truncated board with the trained MLP: a simulation's reward is `score gained along the rollout / 1000 + net value of the final board`, where 1000 is the `reward_scale` the net was trained on, so a truncated leaf and a terminal position are comparable. A dead board adds 0 future value, which keeps terminal positions on that same scale.
+`mcts` rolls out whole random games and scores them by raw game score, so it only knows what a random player accumulates. `nnmcts`
+keeps the same root UCT but stops each rollout after 8 random plies and scores the truncated board with the trained MLP:
+reward = `score gained / 1000 + net value of the final board` (1000 = the `reward_scale` the net was trained on), and a dead board
+adds 0 future value.
 
-Mechanism (`ai/solver/solver.zig`): `nnmctsMove` builds the four root arms from slide legality (null on a dead board) and per simulation runs `selectArm` — the UCT rule extracted verbatim from `mctsMove` — then adds one reward from `nnmctsRollout`. The rollout takes uniformly random legal slides and spawns after each ply except the last, so the leaf board is a post-slide, pre-spawn afterstate: the input shape the net was trained on. The first version evaluated the post-spawn board instead and scored 8,745 (200 sims x 8 plies) against 17,023 for the same budget once the leaf matched the training shape — the leaf's board shape matters more than the rollout length.
+`nnmctsMove` builds the four root arms from slide legality and per simulation runs `selectArm` (UCT rule extracted verbatim from
+`mctsMove`) plus one `nnmctsRollout` reward. The rollout takes uniformly random legal slides and spawns after each ply except the
+last, so the leaf is a post-slide, pre-spawn afterstate — the shape the net was trained on. The first version evaluated the
+post-spawn board and scored 8,745 (200 sims × 8 plies) against 17,023 for the same budget once the leaf matched: the leaf's board
+shape matters more than the rollout length.
+Wiring: `Policy.nnmcts` after `nn2`, so `algo=nnmcts`, `algo_count`/`algo_name`, the static UI and the smoke test pick it up;
+`src/web/ranking.json` deliberately not regenerated, so the UI still lists the nine adopted policies.
 
-Wiring: `Policy.nnmcts` is appended after `nn2`, so `algo=nnmcts` over HTTP, `algo_count`/`algo_name` in the wasm ABI, the static wasm UI and `scripts/wasm-smoke.mjs` pick it up without further changes. `src/web/ranking.json` is deliberately not regenerated, so the server UI table still lists the nine adopted policies.
+ReleaseFast, committed weights, eval seed 1000, 10 games per row, serial:
 
-Measured (ReleaseFast, committed weights only, eval seed 1000, 10 games per row, serial play):
-
-| sims x plies | avg score | ms/move |
+| sims × plies | avg score | ms/move |
 |---|---|---|
-| 200 x 2 | 17,085 | 0.27 |
-| 200 x 8 | 17,023 | 0.91 |
-| 200 x 16 | 13,717 | 1.19 |
-| 500 x 16 | 20,054 | 2.82 |
-| 1,000 x 2 | 17,115 | 1.65 |
-| 1,000 x 4 | 23,646 | 3.16 |
-| 1,000 x 8 (shipped) | 20,137 | 5.41 |
-| 1,000 x 16 | 23,113 | 4.12 |
-| 2,000 x 8 | 27,346 | 9.61 |
-| 5,000 x 2 | 20,026 | 2.91 |
+| 200 × 2 | 17,085 | 0.27 |
+| 200 × 8 | 17,023 | 0.91 |
+| 200 × 16 | 13,717 | 1.19 |
+| 500 × 16 | 20,054 | 2.82 |
+| 1,000 × 2 | 17,115 | 1.65 |
+| 1,000 × 4 | 23,646 | 3.16 |
+| 1,000 × 8 (shipped) | 20,137 | 5.41 |
+| 1,000 × 16 | 23,113 | 4.12 |
+| 2,000 × 8 | 27,346 | 9.61 |
+| 5,000 × 2 | 20,026 | 2.91 |
 
-References on the same seed: `mcts` 29,722 (committed `ranking.json`, 5 x 20 games), `nn` 64,601 at 0.34 ms/move and its 1-ply greedy variant 38,616 at 0.008 ms/move (same seed, 10 games).
+References on the same seed: `mcts` 29,722 (committed ranking, 5 × 20 games); `nn` 64,601 at 0.34 ms/move and its 1-ply greedy
+variant 38,616 at 0.008 ms/move (10 games).
 
-- Truncation plus the net leaf does not beat plain `mcts`: 2,000 simulations reach 27,346, i.e. `mcts`'s 29,722 at roughly 7x the per-move cost, and the shipped 1,000 x 8 point lands at 20,137 for 5.4 ms/move (~6.9 s/game against `mcts`'s ~1.3 ms/move).
-- Random play drives the board off the distribution the net was trained on, so after 8 random plies the leaf value is noisy and the arm means collapse toward each other. The same leaf used the way it was trained — argmax over 1-ply afterstates plus one spawn sample — is worth 64,601 at 0.34 ms/move: 3x the score for 1/16 of the time per move. The net reads afterstates; random play before the leaf only destroys information.
-- More simulations or deeper rollouts did not produce a consistent improvement at the tested budgets; even the best point (2,000 x 8) stayed below plain `mcts` and `nn` while costing more.
-- Verdict: not adopted for `ranking.json` or as the default policy; kept as an experimental policy (`Policy.nnmcts`, `algo=nnmcts`, wasm) because it documents the limit of pairing random rollouts with this value net.
-- The canonical 5 x 20 same-seed `zig build ranking` run for `nnmcts` was started but skipped — it did not finish within the working timeout — so the decision rests on the 10-game table above, which carries a few thousand points of noise per row. Existing `mcts` and `nn`/`nn2` behaviour is unchanged: the UCT and best-arm rules were extracted verbatim with the same RNG call order, and both NN policies still call the same `nn.bestMove`.
-- Wasm: three separate 148 KB per-move net copies (one per NN arm) overflowed the wasm stack — `solve` failed with `RuntimeError: memory access out of bounds` even for `algo=0`, since the copies live in `choose`'s frame. The three NN arms now share one copy; the module grew from 745,167 to 753,911 bytes (286,245 gzipped) and the smoke test passes for all ten policies and ten applied moves.
+Truncation plus a net leaf does not beat plain `mcts`: 2,000 sims reach 27,346, i.e. `mcts`'s 29,722 at ~7× the per-move cost, and the
+shipped 1,000 × 8 point lands at 20,137 for 5.4 ms/move (~6.9 s/game against `mcts`'s ~1.3 ms/move). Random play drives the board off
+the training distribution, so after 8 random plies the leaf value is noisy and the arm means collapse toward each other; the same leaf
+used the way it was trained (argmax over 1-ply afterstates plus one spawn sample) is worth 64,601 at 0.34 ms/move — 3× the score for
+1/16 of the time per move. More sims or deeper rollouts produced no consistent improvement even at the best point.
+Not adopted for `ranking.json` or as a default; kept as an experimental policy to document the limit of pairing random rollouts with
+this value net. The canonical 5 × 20 `zig build ranking` run did not finish within the working timeout, so the decision rests on the
+10-game table above (a few thousand points of noise per row). `mcts`/`nn`/`nn2` behaviour unchanged: the UCT and best-arm rules were
+extracted verbatim with the same RNG call order. Wasm: three separate 148 KB per-move net copies (one per NN arm) overflowed the wasm
+stack (`solve` failed even for `algo=0`, since the copies live in `choose`'s frame); the three arms now share one copy, and the module
+grew 745,167 → 753,911 bytes (286,245 gzipped). Smoke test passes for all ten policies and ten applied moves.
 ## NN-value beam with sampled spawns (#83)
 
-Idea: `beam` uses the hand-written snake/merge evaluation and assumes a 2 on every empty cell; `nn`/`nn2` use the learned MLP but only walk one or two own moves. `nnbeam` puts the learned value under a small beam: fixed width 8, horizon 3 own moves, and 2 sampled spawns between plies instead of an exact spawn expectation.
+`beam` uses the hand-written snake/merge evaluation and assumes a 2 on every empty cell; `nn`/`nn2` walk only one or two own moves.
+`nnbeam` puts the learned value under a small beam: fixed width 8, horizon 3 own moves, 2 sampled spawns between plies.
 
-Mechanism (`ai/solver/solver.zig`):
-- `nnBeamSearch(net, state, rng, horizon)` keeps two `[8]NnBeamNode` arrays (`state`, `first_move`, `reward`, `value`) and reuses the existing `insertBeam`-style insertion. Rewards are `score_delta / nn.reward_scale`; leaves are `nn.forward` on the afterstate, i.e. the same leaf rule as `nn`. `nnBeamBest` is the `nnbeam_horizon` wrapper the policy calls.
-- Spawns are sampled only *between* plies: `sampleSpawn` picks a uniformly random empty cell and places 2 (90%) or 4 (10%). The last ply inserts the afterstate itself, without a spawn, matching `nn2`, which ends on `chance(..., 0)` — the net was trained on afterstates before spawn, so a post-spawn leaf asks it about a board it never saw. A full board keeps the afterstate as the leaf; no legal root move returns `null`, so the dead-board semantics match the other policies.
-- `first_move` is copied from the ply-0 direction, so the returned move is always legal on the root board (a test asserts `canSlide` and that the deeper direction never leaks out).
-- Randomness comes only from the caller's `std.Random`, so the same seed replays the same move; a test plays 12 random-move boards and compares two identically seeded calls.
-- `depth` is ignored (the horizon is fixed); `Policy.nnbeam` is registered in `choose`, in `ranking`'s policy list/description, and therefore in the server, the wasm `algo_count`/`algo_name` export, and the static UI dropdown.
+`nnBeamSearch(net, state, rng, horizon)` keeps two `[8]NnBeamNode` arrays (`state`, `first_move`, `reward`, `value`) with
+`insertBeam`-style insertion; rewards are `score_delta / nn.reward_scale`, leaves are `nn.forward` on the afterstate (same rule as `nn`).
+Spawns are sampled only *between* plies (uniform empty cell, 2 with p = 0.9 else 4); the last ply inserts the afterstate without a
+spawn, matching `nn2`, which ends on `chance(..., 0)` — a post-spawn leaf would ask the net about a board it never saw. A full board
+keeps the afterstate as leaf; no legal root move returns `null`. `first_move` is copied from the ply-0 direction (a test asserts
+`canSlide`), randomness comes only from the caller's `std.Random` (a test replays 12 random boards twice), `depth` is ignored, and
+`Policy.nnbeam` is registered so it reaches the server, the wasm `algo_count`/`algo_name` and the static UI. Wasm: routing `nnbeam`
+through its own `nn.parse` arm pushed `choose`'s frame over the wasm stack (even `random` failed, since a frame is allocated on entry);
+the three NN policies now share one `nn.parse` per call.
 
-WASM: routing `nnbeam` through its own `nn.parse` arm pushed `choose`'s stack frame over the wasm stack — `random` failed too, because a function's frame is allocated on entry. The three NN policies now share one `nn.parse` per call (behavior unchanged: same net, one policy executes), and all ten policies pass the smoke test.
-
-Measured, ReleaseFast, one run per policy, same seed and policy order (`zig build ranking -Doptimize=ReleaseFast -- 1 20 2000`, 3m47s):
+ReleaseFast, one run per policy, same seed and order (`zig build ranking -Doptimize=ReleaseFast -- 1 20 2000`, 3m47s):
 
 | seed 2000 / 20 games | avg score | avg moves | ms/move |
 |---|---|---|---|
@@ -714,69 +640,52 @@ Measured, ReleaseFast, one run per policy, same seed and policy order (`zig buil
 | ga | 22,189.8 | 1,205.3 | 0.078 |
 | beam | 12,584.6 | 760.1 | 0.067 |
 
-- Reading: `nnbeam` scores exactly 2.03x `beam` (25,480 vs 12,585) at 0.124 ms/move, i.e. still cheap, so the sampled beam plus the learned leaf does lift the shallow `beam` baseline. It stays slightly below `expectimax` depth 2 (26,154) and far below `nn` (63,486): three plies of width 8 with 2 spawns each evaluate ~64 leaves per move, but every leaf is an afterstate the beam reached through one sampled spawn per gap, so the search commits to one spawn outcome instead of averaging it. That is the structural reason a sampled beam trails the 1-ply-plus-expectation `nn`.
-- Verdict: kept as an experimental policy (`algo=nnbeam`), not a default; `nn` stays the fast option and `nn2` the strong one. Either widening the beam or averaging the spawns would recover strength, but at `nn2`-class cost, so it stays a bounded experiment.
-- Correction: the first version of this section reported seed-1000 10-game numbers (23,875 / 28,493 / 16,513) from an implementation whose *last* ply also inserted a post-spawn child, so it asked the net about spawn boards at the leaf. Those numbers describe a different leaf rule and were dropped rather than mixed with the table above; the code now ends the last ply on the afterstate, and the focused test (`nnbeam evaluates the afterstate before spawn at the final ply`) pins the rule at horizon 1: the returned leaf board must equal the afterstate of the returned move.
-- `src/web/ranking.json` is not regenerated here (the canonical 5 x 20 run costs ~5 min and the policy is experimental); the file still lists the nine earlier policies.
+`nnbeam` is exactly 2.03× `beam` (25,480 vs 12,585) at 0.124 ms/move, so the sampled beam plus a learned leaf does lift the shallow
+baseline, but it stays just below `expectimax` depth 2 and far below `nn`: three plies of width 8 with 2 spawns evaluate ~64 leaves
+per move, each reached through one sampled spawn per gap, so the search commits to one spawn outcome instead of averaging it —
+the structural reason a sampled beam trails 1-ply-plus-expectation. Kept as an experimental policy, not a default. Correction: the
+first version of this section reported seed-1000 10-game numbers (23,875 / 28,493 / 16,513) from an implementation whose last ply
+inserted a post-spawn child; those were dropped, and the test `nnbeam evaluates the afterstate before spawn at the final ply` pins the
+rule at horizon 1. `src/web/ranking.json` not regenerated (the canonical 5 × 20 run costs ~5 min).
+
 ## n-step TD: worse than TD(0) at n = 4 (#84)
 
-TD(0) trains each afterstate from the next afterstate's value, i.e. from a value estimate one move old. A finite n-step return (`reward_t + ... + reward_{t+n-1} + V(s_{t+n})`) propagates a terminal reward back n moves per update and is still fully online, unlike the failed backward sweep (#33) which re-swept the whole game after it ended.
+TD(0) trains each afterstate from the next afterstate's value, one move old. A finite n-step return
+(`reward_t + … + reward_{t+n-1} + V(s_{t+n})`) propagates a terminal reward back n moves per update and stays online, unlike the
+failed backward sweep (#33).
 
-Mechanism (opt-in, `nn.Options.nstep`): 0 = off, 1 = TD(0), n > 1 = n-step. `NStepWindow` holds the pending steps; each new step's `V` closes the target of the step leaving the window (`sum of its n rewards + V`), and at game over `nextFinish` flushes the last min(n, game length) steps with the rewards alone (`V(terminal) = 0`). The moves come from the same 1-ply policy and the rng is used only by `state.move`, so the trajectory matches TD(0) exactly while the updates are identical (`n = 1` is byte-identical to TD(0), tested). CLI variant `nstep` (n = 4), standalone: other options are ignored and the weight file format is unchanged. Default weights and every existing variant stay byte-identical (recorded-checksum tests untouched).
+Opt-in `nn.Options.nstep` (0 = off, 1 = TD(0), n > 1 = n-step): `NStepWindow` holds the pending steps; each new step's `V` closes
+the target of the step leaving the window (`sum of its n rewards + V`), and `nextFinish` at game over flushes the last
+min(n, game length) steps with rewards alone (`V(terminal) = 0`). The trajectory matches TD(0) exactly (`n = 1` is byte-identical,
+tested); other options are ignored; the weight format is unchanged. CLI variant `nstep` (n = 4).
 
-Correctness: the window closes a step with exactly its n rewards plus the closing value and flushes truncated returns in order (unit tests); `nstep = 1` reproduces TD(0) scores and weights byte-for-byte; `nstep = 4` is deterministic and finite; `nstep = 0` equals the default path. So the implementation does what it says; the outcome is what fails.
+20,000 games, training seed 1, ranges 2000..6000 × 20 games (same seeds for both nets), ReleaseFast:
 
-20,000 training games, training seed 1, eval ranges 2000/3000/4000/5000/6000 x 20 games (100 games, same seeds for both nets), ReleaseFast, committed `nn` eval protocol:
-
-| variant | lr | train moves | train time | 1-ply | + 1 spawn | 2-ply (deep) |
+| variant | lr | train moves | train time | 1-ply | + 1 spawn | 2-ply |
 |---|---|---|---|---|---|---|
 | base TD(0) | 0.003 | 13,346,693 | 145.0 s | 19,175 ± 895 | 30,918 ± 816 | 43,048 ± 1,549 |
 | `nstep` (n = 4) | 0.003 | 10,150,588 | 100.6 s | 13,055 ± 641 | 23,755 ± 296 | 29,886 ± 679 |
 | `nstep` (n = 4) | 0.00075 (lr/4) | 8,335,318 | 89.1 s | 9,019 ± 231 | 15,253 ± 415 | 20,351 ± 584 |
 
-(± is the stderr over the 5 eval ranges; expectimax depth 2 on the same seeds is 25,004 ± 1,108, same for every run.)
+(expectimax depth 2 on the same seeds: 25,004 ± 1,108.)
 
-- Reading: at the normal lr n = 4 loses 6,120 points on 1-ply (−32%) and 13,162 on 2-ply (−31%), far outside the stderr. It is not a step-size problem: lr/4 is worse again (−53% on 1-ply, −42% on 2-ply), so the n-step target itself is the problem, not the size of the update.
-- The same game budget also yields fewer training moves (10.15M vs 13.35M, −24%): the policy being learned plays shorter games, so n-step training compounds its own regression instead of seeing more data. The faster wall time is that, not a gain.
-- Why: the update for a state is applied n−1 moves after it was visited, against a net that has already moved on, so the bootstrapped part of the return is stale and the target's scale is n rewards instead of one. TD(0)'s one-move-old target is exactly what this net, lr schedule and `reward_scale` were tuned for. Same failure mode as the backward sweep (#33) and TD(λ) (#72): value-side tricks that lag behind, or multiply, the online update.
-- Verdict: not adopted. `nstep` stays an opt-in experiment variant, `nstep = 0` is the default, no default or committed weights change. A version that could work would accumulate the n-step targets over a batch and apply one averaged step against a frozen snapshot, and normalise the target scale — a different, larger change, not a knob.
-- Limits: one training seed and one budget (20,000 games) at n = 4 only; lr/4 was the only extra diagnostic. The drop is far larger than the eval stderr, so more seeds would only sharpen the size of the loss, not its sign.
-- Cost: 3 x 20,000 games (145 / 101 / 89 s training) + 4 policies x 5 ranges x 20 eval games per run (2m51s-4m52s wall each, dominated by the 2-ply eval).
-## Bench run 2026-10-27 00:09:04 +0900
-
-- command: `/usr/bin/time -p zig build ranking -Doptimize=ReleaseFast -- 1 2 1000`
-- commit: 83af5aa
-- date: 2026-10-27 00:09:04 +0900
-- exit: 0
-
-```text
-{"seed":1000,"runs":1,"games_per_run":2,"entries":[{"policy":"nn2","depth":2,"games":2,"avg_score":67424.0,"avg_moves":3091.0,"best_tile":4096,"latency_ms_per_move":1.911,"games_per_sec":0.17,"description":"TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）"},{"policy":"nn","depth":0,"games":2,"avg_score":66624.0,"avg_moves":2992.5,"best_tile":4096,"latency_ms_per_move":0.197,"games_per_sec":1.69,"description":"TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）"},{"policy":"expectimax","depth":2,"games":2,"avg_score":60220.0,"avg_moves":2804.0,"best_tile":4096,"latency_ms_per_move":0.080,"games_per_sec":4.46,"description":"2手先まで探索し、ランダムな出現（2か4）を平均して評価する。評価は蛇行順と合体ペアの手作り関数"},{"policy":"ga","depth":2,"games":2,"avg_score":46584.0,"avg_moves":2287.0,"best_tile":4096,"latency_ms_per_move":0.068,"games_per_sec":6.43,"description":"GAで評価の重みを進化させた期待値探索（depth 2）。GA内のholdout(seed 500〜)では+4%だが、ranking seed 1000では素の expectimax より低い"},{"policy":"expectimax_tt","depth":0,"games":2,"avg_score":37282.0,"avg_moves":1825.0,"best_tile":4096,"latency_ms_per_move":0.686,"games_per_sec":0.80,"description":"depth 3の期待値探索を置換表で高速化したもの（同じ手を選ぶ）"},{"policy":"mcts","depth":0,"games":2,"avg_score":29732.0,"avg_moves":1533.0,"best_tile":2048,"latency_ms_per_move":1.018,"games_per_sec":0.64,"description":"UCTで候補手を選び、ランダムな対局を繰り返して評価する"},{"policy":"beam","depth":0,"games":2,"avg_score":17038.0,"avg_moves":943.5,"best_tile":2048,"latency_ms_per_move":0.061,"games_per_sec":17.45,"description":"幅32で3手先まで探索し、各空きマスに2が出現すると仮定して評価する"},{"policy":"greedy","depth":0,"games":2,"avg_score":3020.0,"avg_moves":251.0,"best_tile":256,"latency_ms_per_move":0.000,"games_per_sec":9428.40,"description":"1手先だけ見る。滑らせた盤面の評価が最も高い手を選ぶ（出現や探索はしない）"},{"policy":"random","depth":0,"games":2,"avg_score":1368.0,"avg_moves":140.0,"best_tile":128,"latency_ms_per_move":0.000,"games_per_sec":30207.83,"description":"合法手からランダムに1手選ぶ（比較の基準）"}]}
-real 19.65
-user 19.54
-sys 0.16
-```
-
-## Bench run 2026-10-27 00:09:36 +0900
-
-- command: `/usr/bin/time -p zig build ranking -Doptimize=ReleaseFast -- 1 2 1000 nn2`
-- commit: 83af5aa
-- date: 2026-10-27 00:09:36 +0900
-- exit: 0
-
-```text
-{"seed":1000,"runs":1,"games_per_run":2,"entries":[{"policy":"nn2","depth":2,"games":2,"avg_score":67424.0,"avg_moves":3091.0,"best_tile":4096,"latency_ms_per_move":1.911,"games_per_sec":0.17,"description":"TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）"}]}
-real 11.97
-user 11.89
-sys 0.13
-```
+At the normal lr n = 4 loses 6,120 on 1-ply (−32%) and 13,162 on 2-ply (−31%), far outside stderr, and lr/4 is worse again
+(−53% / −42%) — so the n-step target is the problem, not the step size. The same game budget yields 24% fewer training moves: the
+policy plays shorter games, so n-step training compounds its own regression (the faster wall time is that, not a gain). A state's
+update lands n−1 moves after it was visited, against a net that has moved on, so the bootstrapped part is stale and the target scale
+is n rewards — the same failure as the backward sweep (#33) and TD(λ) (#72): value-side tricks that lag or multiply the online update.
+Not adopted; `nstep = 0` stays default. Un-tested: n = 2/3, other lr, a frozen-snapshot batch average of n-step targets with a
+normalised target scale. One seed, one budget. Cost: 3 × 20,000 games (145 / 101 / 89 s) plus 4 policies × 5 ranges × 20 eval games.
 
 ## NN weights parsed once per thread, not once per move (#87)
 
-`choose` re-parsed the embedded ~148 KB weight block into a `Net` value on every move of every NN policy (one shared copy per move since the wasm-stack fix). Now a `threadlocal` cache parses the weights once per thread and every move passes a `*const Net` by reference, so parallel ranking / HTTP / WASM each keep one copy per thread with no shared mutable state. The `parse_count` seam in `nn.zig` pins the behaviour in a test (a fixed-seed nn/nn2 game parses exactly once), and the golden tests pin the move sequences.
+`choose` re-parsed the embedded ~148 KB weight block into a `Net` on every move of every NN policy. Now a `threadlocal` cache parses
+once per thread and each move passes a `*const Net`, so parallel ranking / HTTP / WASM keep one copy per thread with no shared
+mutable state. The `parse_count` seam in `nn.zig` pins it (a fixed-seed nn/nn2 game parses exactly once); golden tests pin the moves.
+Correctness: seed 1000 / 5 games identical before and after (nn2 71,880.0 / 3,267.2, nn 69,640.8 / 3,151.2, nnbeam 21,096.8 / 1,143.8,
+nnmcts 12,864.8 / 763.4); `zig build test` and the wasm smoke (11 policies, 10 moves) pass on the rebased branch.
 
-Correctness: same seed 1000 / 5 games give identical scores and move counts before and after (nn2 71,880.0 / 3,267.2, nn 69,640.8 / 3,151.2, nnbeam 21,096.8 / 1,143.8, nnmcts 12,864.8 / 763.4); `zig build test` and the wasm smoke (11 policies, 10 applied moves) pass on the rebased branch.
-
-Timing (`ranking`, ReleaseFast, `latency_ms_per_move` from the #89 instrument):
+`latency_ms_per_move` from the #89 instrument:
 
 | policy | before (b389ba5) | after | delta |
 |---|---|---|---|
@@ -785,109 +694,44 @@ Timing (`ranking`, ReleaseFast, `latency_ms_per_move` from the #89 instrument):
 | nnbeam | 0.1233 | 0.1197 | -2.9% |
 | nnmcts | 2.5574 | 2.5930 | +1.4% (noise) |
 
-(seed 1000, 5 games.) A second pair at seed 2000 / 10 games reproduces the direction: nn 0.1961 -> 0.1947 (-0.7%), nnbeam 0.1210 -> 0.1190 (-1.7%). Same-code repeat runs span nn 0.1902-0.1947 and nnbeam 0.1175-0.1190, so every before run sits above every after run for nn and nnbeam: the 1-3% gain is small but outside the run-to-run noise band. nn2's -1.1% is inside the band and nnmcts is flat.
-
-- Reading: the removed work is one 148 KB `Net` copy per move; against nn/nnbeam's 0.1-0.2 ms/move that is the visible 1-3%. For nn2 the 2-ply search dominates and hides it. The copy also lived in `choose`'s frame, the last wasm-stack footprint of the NN arms (per-arm copies used to overflow the wasm stack).
-- Verdict: adopted. Behaviour is byte-identical, the gain is small but consistent for the fast policies, and the change is the enabling step for reusing the parsed net inside a search.
-- Limits: one machine; one A/B pair per seed plus the repeats above; `latency_ms_per_move` is the serial per-move cost from the #89 instrument. `src/web/ranking.json` untouched.
-
-## Bench run 2026-10-27 01:26:14 +0900
-
-- command: `zig build ranking -Doptimize=ReleaseFast -- 1 5 1000 nn,nn2,nnmcts,nnbeam`
-- commit: b389ba5
-- date: 2026-10-27 01:26:14 +0900
-- exit: 0
-
-```text
-{"seed":1000,"runs":1,"games_per_run":5,"entries":[{"policy":"nn2","depth":2,"games":5,"avg_score":71880.0,"avg_moves":3267.2,"best_tile":4096,"latency_ms_per_move":1.8864,"games_per_sec":0.16,"description":"TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）"},{"policy":"nn","depth":0,"games":5,"avg_score":69640.8,"avg_moves":3151.2,"best_tile":4096,"latency_ms_per_move":0.1995,"games_per_sec":1.59,"description":"TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）"},{"policy":"nnbeam","depth":0,"games":5,"avg_score":21096.8,"avg_moves":1143.8,"best_tile":2048,"latency_ms_per_move":0.1233,"games_per_sec":7.09,"description":"NNの盤面価値を葉にしたビーム探索。幅8・3手先で、ply間のspawnを2回サンプリングする（固定seedで再現）"},{"policy":"nnmcts","depth":0,"games":5,"avg_score":12864.8,"avg_moves":763.4,"best_tile":1024,"latency_ms_per_move":2.5574,"games_per_sec":0.51,"description":"UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）"}]}
-```
-
-## Bench run 2026-10-27 01:25:05 +0900
-
-- command: `zig build ranking -Doptimize=ReleaseFast -- 1 5 1000 nn,nn2,nnmcts,nnbeam`
-- commit: 1380349
-- date: 2026-10-27 01:25:05 +0900
-- exit: 0
-
-```text
-{"seed":1000,"runs":1,"games_per_run":5,"entries":[{"policy":"nn2","depth":2,"games":5,"avg_score":71880.0,"avg_moves":3267.2,"best_tile":4096,"latency_ms_per_move":1.8658,"games_per_sec":0.16,"description":"TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）"},{"policy":"nn","depth":0,"games":5,"avg_score":69640.8,"avg_moves":3151.2,"best_tile":4096,"latency_ms_per_move":0.1955,"games_per_sec":1.62,"description":"TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）"},{"policy":"nnbeam","depth":0,"games":5,"avg_score":21096.8,"avg_moves":1143.8,"best_tile":2048,"latency_ms_per_move":0.1197,"games_per_sec":7.31,"description":"NNの盤面価値を葉にしたビーム探索。幅8・3手先で、ply間のspawnを2回サンプリングする（固定seedで再現）"},{"policy":"nnmcts","depth":0,"games":5,"avg_score":12864.8,"avg_moves":763.4,"best_tile":1024,"latency_ms_per_move":2.5930,"games_per_sec":0.51,"description":"UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）"}]}
-```
-
-## Bench run 2026-10-27 01:28:19 +0900
-
-- command: `zig build ranking -Doptimize=ReleaseFast -- 1 10 2000 nn,nnbeam`
-- commit: b389ba5
-- date: 2026-10-27 01:28:19 +0900
-- exit: 0
-
-```text
-{"seed":2000,"runs":1,"games_per_run":10,"entries":[{"policy":"nn","depth":0,"games":10,"avg_score":66471.2,"avg_moves":3016.5,"best_tile":4096,"latency_ms_per_move":0.1961,"games_per_sec":1.69,"description":"TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）"},{"policy":"nnbeam","depth":0,"games":10,"avg_score":25959.2,"avg_moves":1337.3,"best_tile":4096,"latency_ms_per_move":0.1210,"games_per_sec":6.18,"description":"NNの盤面価値を葉にしたビーム探索。幅8・3手先で、ply間のspawnを2回サンプリングする（固定seedで再現）"}]}
-```
-
-## Bench run 2026-10-27 01:28:27 +0900
-
-- command: `zig build ranking -Doptimize=ReleaseFast -- 1 10 2000 nn,nnbeam`
-- commit: 1380349
-- date: 2026-10-27 01:28:27 +0900
-- exit: 0
-
-```text
-{"seed":2000,"runs":1,"games_per_run":10,"entries":[{"policy":"nn","depth":0,"games":10,"avg_score":66471.2,"avg_moves":3016.5,"best_tile":4096,"latency_ms_per_move":0.1947,"games_per_sec":1.70,"description":"TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）"},{"policy":"nnbeam","depth":0,"games":10,"avg_score":25959.2,"avg_moves":1337.3,"best_tile":4096,"latency_ms_per_move":0.1190,"games_per_sec":6.28,"description":"NNの盤面価値を葉にしたビーム探索。幅8・3手先で、ply間のspawnを2回サンプリングする（固定seedで再現）"}]}
-```
+Seed 2000 / 10 games reproduces the direction (nn 0.1961 → 0.1947, nnbeam 0.1210 → 0.1190); same-code repeats span nn
+0.1902-0.1947 and nnbeam 0.1175-0.1190, so every before run sits above every after run for those two, while nn2's -1.1% is inside the
+band. The removed work is one 148 KB copy per move — the visible 1-3% for the fast policies; nn2's search dominates and hides it.
+Adopted: byte-identical behaviour, and the enabling step for reusing a parsed net inside a search. `src/web/ranking.json` untouched.
 
 ## Search workspaces reused per thread and per game (#88)
 
-- What changed: `nn2`'s `ValueCache` (built fresh inside every `Search`, i.e. every move) and `expectimax_tt`'s 8192-entry TT (allocated and cleared on every `bestMoveTT` call) are now reused workspaces. `nn.sharedValueCache()` and `ttWorkspace()` hand out one threadlocal workspace each (lazy-cleared on first use), `nn.bestMoveWithCache` lets a caller own the cache, `nn.playWithStats` keeps one cache per game, and `nnmcts` reuses `sharedValueCache()` across rollouts and moves. Entries validate the full board plus depth and kind (`ValueCache` keys on the 64-bit board hash and drops on mismatch), so a warm workspace changes speed only and can never return another position's value.
-- Correctness: same seed 1000 / 5 games give identical scores and move counts before and after (nn2 71,880.0 / 3,267.2, expectimax_tt 51,376.0 / 2,426.2, nnmcts 12,864.8 / 763.4). Four new tests cover fresh-vs-warm move identity over 30 moves (nn) and 2x40 moves across two games (TT, also asserting one shared workspace), plus slot-collision behaviour for both caches (a colliding entry is dropped, never returned as a wrong value). `zig build test` and the wasm smoke (755,150 bytes wasm, 11 policies, 10 applied moves) pass.
-- Timing (`ranking`, ReleaseFast, `latency_ms_per_move`, seed 1000 / 5 games; before = 3 runs on 8986c30, after = 2 runs on 3ac831d):
+`nn2`'s `ValueCache` (built inside every `Search`, i.e. every move) and `expectimax_tt`'s 8192-entry TT (allocated and cleared per
+`bestMoveTT` call) are now reused workspaces: `nn.sharedValueCache()` and `ttWorkspace()` hand out one threadlocal workspace each
+(lazy-cleared on first use), `nn.bestMoveWithCache` lets a caller own the cache, `nn.playWithStats` keeps one cache per game, and
+`nnmcts` reuses `sharedValueCache()` across rollouts and moves. Entries validate the full board plus depth and kind (`ValueCache` keys
+on the 64-bit board hash and drops on mismatch), so a warm workspace changes speed only.
+Correctness: seed 1000 / 5 games identical before and after (nn2 71,880.0 / 3,267.2, expectimax_tt 51,376.0 / 2,426.2, nnmcts
+12,864.8 / 763.4). Four tests cover fresh-vs-warm identity over 30 moves (nn) and 2×40 moves across two games (TT, also asserting one
+shared workspace), plus slot-collision behaviour (a colliding entry is dropped, never returned). Wasm smoke passes (755,150 bytes,
+11 policies).
 
-| policy | before | after | delta |
+| policy | before (3 runs, 8986c30) | after (2 runs, 3ac831d) | delta |
 |---|---|---|---|
 | nn2 | 1.8399-1.8668 | 1.7395-1.7427 | -5.5% |
 | expectimax_tt | 0.6965-0.7058 | 0.6613-0.6620 | -5.0% |
 | nnmcts | 2.5701-2.5920 | 2.5348-2.5362 | -1.4% |
 
-Every after run sits below every before run: the bands do not overlap for any of the three policies.
-- Cache statistics (temporary counters, seed 1000, 200 moves per case): `nn2` with the shared cache hit 88.2% (2,418,915 hits / 2,743,720 lookups) and evaluated 1,624.0 leaves/move vs 1,745.6 with a fresh cache per move (-7.0% leaf evaluations: 324,805 vs 349,113). `expectimax_tt` with the shared TT made 1,261,389 probes (6,306.9/move) vs 1,313,235 with a fresh table per move (-3.9% node expansions); hit rate 55.7% vs 54.5%.
-- Memory: the same arrays moved from per-call stack to per-thread TLS — TT 8192 x 32 B = 256 KiB per thread, `nn2`'s `ValueCache` 2^13 x 16 B = 128 KiB per thread (2^10 x 16 B = 16 KiB on wasm). What disappeared is per-move init traffic: the 128 KiB `@splat` reset plus the 8,192-entry `valid = false` clear loop now run once per thread instead of once per move.
-- Reading: nnmcts only shares `ValueCache` (it has no TT) and gains the least; expectimax_tt gains from both the removed clear and cross-move hits (a new root is inside the previous search's tree); nn2's gain is mostly the removed per-move init since the leaf saving is only 7%.
-- Verdict: adopted. No behaviour change, all three policies improve, every after run below every before run.
-- Limits: one machine; hit-rate figures come from temporary counters, not a permanent instrument; `latency_ms_per_move` is the serial per-move cost from the #89 instrument. `src/web/ranking.json` untouched.
-
-## Bench run 2026-10-27 01:50:00 +0900
-
-- command: `zig build ranking -Doptimize=ReleaseFast -- 1 5 1000 nn2,nnmcts,expectimax_tt`
-- commit: 8986c30
-- date: 2026-10-27 01:50:00 +0900
-- exit: 0
-
-```text
-{"seed":1000,"runs":1,"games_per_run":5,"entries":[{"policy":"nn2","depth":2,"games":5,"avg_score":71880.0,"avg_moves":3267.2,"best_tile":4096,"latency_ms_per_move":1.8399,"games_per_sec":0.17,"description":"TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）"},{"policy":"expectimax_tt","depth":0,"games":5,"avg_score":51376.0,"avg_moves":2426.2,"best_tile":4096,"latency_ms_per_move":0.6965,"games_per_sec":0.59,"description":"depth 3の期待値探索を置換表で高速化したもの（同じ手を選ぶ）"},{"policy":"nnmcts","depth":0,"games":5,"avg_score":12864.8,"avg_moves":763.4,"best_tile":1024,"latency_ms_per_move":2.5701,"games_per_sec":0.51,"description":"UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）"}]}
-```
-
-## Bench run 2026-10-27 02:03:28 +0900
-
-- command: `zig build ranking -Doptimize=ReleaseFast -- 1 5 1000 nn2,nnmcts,expectimax_tt`
-- commit: 3ac831d
-- date: 2026-10-27 02:03:28 +0900
-- exit: 0
-
-```text
-{"seed":1000,"runs":1,"games_per_run":5,"entries":[{"policy":"nn2","depth":2,"games":5,"avg_score":71880.0,"avg_moves":3267.2,"best_tile":4096,"latency_ms_per_move":1.7395,"games_per_sec":0.18,"description":"TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）"},{"policy":"expectimax_tt","depth":0,"games":5,"avg_score":51376.0,"avg_moves":2426.2,"best_tile":4096,"latency_ms_per_move":0.6620,"games_per_sec":0.62,"description":"depth 3の期待値探索を置換表で高速化したもの（同じ手を選ぶ）"},{"policy":"nnmcts","depth":0,"games":5,"avg_score":12864.8,"avg_moves":763.4,"best_tile":1024,"latency_ms_per_move":2.5348,"games_per_sec":0.52,"description":"UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）"}]}
-```
+Bands do not overlap for any of the three. Temporary counters (seed 1000, 200 moves): `nn2` with the shared cache hits 88.2%
+(2,418,915 / 2,743,720) and evaluates 1,624.0 leaves/move vs 1,745.6 fresh (−7.0%, 324,805 vs 349,113 leaves); `expectimax_tt` probes
+1,261,389 (6,306.9/move) vs 1,313,235 fresh (−3.9% expansions), hit rate 55.7% vs 54.5%. Memory moved from per-call stack to TLS:
+TT 8192 × 32 B = 256 KiB/thread, `ValueCache` 2^13 × 16 B = 128 KiB/thread (16 KiB on wasm); the 128 KiB `@splat` reset and the
+8,192-entry `valid = false` loop now run once per thread instead of once per move. nnmcts shares only the cache and gains least;
+expectimax_tt gains from both the removed clear and cross-move hits. Adopted.
 
 ## Order penalty follows the game phase, looser after 4096 (#92)
 
-Issue #92 proposed tuning the snake-order penalty by game phase: keep the mid-game relaxed
-(empties and merge pairs first) and tighten from the 4096 tile on, so the endgame builds the
-merge chain that reaches 8192. The mechanism shipped: `Weights.order_penalty_late`, used by
-`evaluateW` once the board's largest tile reaches 4096 (level >= 12). Default equals
-`order_penalty`, so pre-#92 behavior is unchanged unless a weight sets it; `ga_weights` keeps
-one gene for both phases.
+#92 proposed tightening the snake-order penalty late, so the endgame builds the merge chain that reaches 8192. What shipped is the
+mechanism, and the measurement inverted the hypothesis: `Weights.order_penalty_late` is used by `evaluateW` once the largest tile
+reaches 4096 (level ≥ 12), defaulting to `order_penalty`, so pre-#92 behaviour is unchanged unless a weight sets it; `ga_weights`
+keeps one gene for both phases.
 
-The measurement inverted the hypothesis. expectimax_tt depth 3, 50 games per cell, seeds
-1000-1049 (`TEMP measure order phase`, average score / reach 4096 / reach 8192 / dead below
-2048):
+expectimax_tt depth 3, 50 games per cell, seeds 1000-1049 (avg score / ≥4096 / ≥8192 / dead <2048):
 
 | config (mid / late) | avg score | >=4096 | >=8192 | dead <2048 |
 |---|---|---|---|---|
@@ -900,270 +744,55 @@ The measurement inverted the hypothesis. expectimax_tt depth 3, 50 games per cel
 | 43.174 / 10 | 39,996.6 | 14 | 0 | 8 |
 | 43.174 / 0 | 37,956.9 | 16 | 0 | 8 |
 
-Tightening after 4096 lost to the constant in every variant; loosening won, best at 25.
-Second seed set (2000-2049, 50 games, same cells) confirms: 43.174/25 avg 38,383.7 (>=4096
-16) vs A 38,025.2 (>=4096 13). Across both sets 43.174/25 averages 40,307 vs A 38,005 (+6.1%)
-with 30 vs 22 runs reaching 4096. Same-seed determinism verified by repeating the cell
-(50-game sets reproduce exactly).
+Tightening lost to the constant in every variant; loosening won, best at 25. Seeds 2000-2049 confirm: 43.174/25 → 38,383.7 (≥4096 16)
+vs A 38,025.2 (≥4096 13). Across both sets 43.174/25 averages 40,307 vs A 38,005 (+6.1%) with 30 vs 22 runs reaching 4096; 50-game
+cells reproduce exactly. The 5-game `ranking` snapshot on seed 1000 moved the other way (expectimax 41,107 → 19,964, beam
+14,369 → 12,329) but that is small-sample noise: at 50 games expectimax depth 2 is 24,297.7 (C5) vs 24,403.5 (A) on 1000-1049 and
+25,385.7 vs 24,220.1 on 2000-2049, beam 12,346.7 vs 11,373.8, greedy 3,195.5 vs 3,109.8, mcts 30,709.7 both (evaluation-independent).
+No weight-driven policy regresses at 50 games.
 
-The 5-game `ranking` snapshot on seed 1000 moved the other way for expectimax (41,107 -> 19,964)
-and beam (14,369 -> 12,329). Re-measured at 50 games per cell those are small-sample noise:
-expectimax depth 2 is 24,297.7 (C5) vs 24,403.5 (A) on seeds 1000-1049 and 25,385.7 vs
-24,220.1 on 2000-2049; beam 12,346.7 vs 11,373.8; greedy 3,195.5 vs 3,109.8; mcts is
-evaluation-independent (30,709.7 both). No evaluation-weight policy regresses at 50 games.
-
-Adopted as `baseline = .{ .order_penalty = 43.174, .order_penalty_late = 25 }` (commit follows).
-NN policies are unaffected (learned weights, not `Weights`).
-
-Reading: the mid-game wants the snake order enforced (43.174 > 30, same as the old GA weights),
-but after the 4096 anchor is secured the penalty should relax, not tighten — holding the chain
-rigidly costs the merges that grow 4096 into 8192. The 8192 tail (2 runs vs 1) is suggestive,
-not conclusive at 100 games.
-
-Verdict: adopted (expectimax_tt +6.1% avg, more 4096+ runs, no measured regression).
-
-Limits: one machine, 100 games per config; the 5-game ranking table in the run blocks below is
-too small to compare weight sets (expectimax flipped 41,107 -> 19,964 there and back at 50
-games); `ga_weights` keeps the single `order_penalty` gene for both phases, so GA evolution is
-unchanged; an intermediate sweep between 25 and 43.174 was not run.
-
+Adopted as `baseline = .{ .order_penalty = 43.174, .order_penalty_late = 25 }`. Reading: the mid-game wants the snake order enforced
+(43.174 > 30, as the old GA weights found), but once the 4096 anchor is secured the penalty should relax — holding the chain rigidly
+costs the merges that grow 4096 into 8192. The 8192 tail (2 runs vs 1) is suggestive, not conclusive at 100 games. Limits: one machine,
+100 games per config; the 5-game ranking snapshots below are too small to compare weight sets; GA evolution is unchanged (one gene);
+no sweep between 25 and 43.174.
 
 ## par for stateless variants (#99)
 
-`trainBatch` used to hard-code `trainGame`, so only the plain per-move variant could batch. It now
-delegates to `trainBatchOpts(.., opts)` (`ai/solver/nn.zig`), which runs each game with
-`trainGameOpts(.., opts)`: same `net_start + (1/N) * sum_i (net_after_i - net_start)` aggregation,
-now over variant-trained per-game nets. `trainBatch` stays as the default-options wrapper, so the
-plain path and its recorded checksum are unchanged.
+`trainBatch` hard-coded `trainGame`, so only the plain per-move variant could batch. It now delegates to `trainBatchOpts(.., opts)`,
+which runs each game with `trainGameOpts(.., opts)`: same `net_start + (1/N) * Σ_i (net_after_i - net_start)` aggregation over
+variant-trained per-game nets. `trainBatch` stays as the default-options wrapper, so the plain path and its checksum are unchanged.
 
-- CLI: arg 6 `par` keeps its meaning (base + parallel). The new positional arg 10 `par` batches the
-  variant named in arg 6: `zig build nn -Doptimize=ReleaseFast -- 20000 20 2000 0.003 - sym 30 /tmp/nnb/sym.bin 1 par`.
-  Arg 10 was an unused trailing slot (any 10th positional forced the usage error), so every existing
-  command line keeps its exact meaning. The training log prints the composed label (`variant=sym+par`).
-- Works: `base`, `backward`, `replay`, `sym`, `symlam`, `nstep`, and `resume` (the batch starts from
-  the net `startNet` loaded out of `weights_path`).
-- Not supported: `priority`, `midgame`, `midmix`. Their 1024-entry ring buffer is cross-game state
-  shared by pointer and the batch mean would change their semantics, so the CLI prints the usage text
-  and refuses; `trainBatchOpts` asserts the buffer is null.
-- Reproducibility: `parallel training batch with variant opts matches a serial run of the same game
-  seeds` (`ai/solver/nn.zig`) runs 4-game batches with `symmetry` and with `replay_k = 4` on threads
-  and compares the weights byte-for-byte with the serial reconstruction over seeds 77..80. Two CLI
-  runs each of `sym` + `par` and `replay` + `par` wrote identical weight files. `zig build test` passes.
-- Measured speedup (8 logical CPUs, batches of 8 games): `sym` 2,000 games 16.5 s serial -> 2.7 s
-  with `par` (**6.1x**), and the #66 `resume` fine-tune +20,000 games lr 3e-4 460 s serial -> 90.9 s
-  with `par` (**5.1x**). The speedup of #35's `base` (5.7x) carries over to the heavier variants.
-- Measured score (does batched aggregation change the outcome?): `resume` +20,000 games lr 3e-4,
-  training seed 1, the exact recipe of the #97 serial run `a2`, run as `resume` + `par`:
-  in-protocol (2000..6000, 20 games/range) 42,736 vs serial 43,083, held-out (7000..10000) 43,388
-  vs serial 41,936. The two update orders land within the eval noise of each other on both range
-  sets, so batching trades nothing measurable for the ~5x speedup. (Both stay below the committed
-  net's 45,342 held-out, which is the #97 overfit finding, not a batching effect.)
-
-
-## Bench run 2026-10-27 02:43:24 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 6d8ed10
-- date: 2026-10-27 02:43:24 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 1000-1049: avg_score=37985.2 reach4096=9 reach8192=1 dead_below2048=10 max_tile_seen=8192
-OK
-All 1 tests passed.
-```
-
-## Bench run 2026-10-27 02:44:46 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 6d8ed10
-- date: 2026-10-27 02:44:46 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 1000-1049: avg_score=39981.5 reach4096=14 reach8192=0 dead_below2048=8 max_tile_seen=4096
-OK
-All 1 tests passed.
-```
-
-## Bench run 2026-10-27 02:46:19 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 6d8ed10
-- date: 2026-10-27 02:46:19 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 1000-1049: avg_score=35069.0 reach4096=9 reach8192=0 dead_below2048=10 max_tile_seen=4096
-OK
-All 1 tests passed.
-```
-
-## Bench run 2026-10-27 02:47:30 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 6d8ed10
-- date: 2026-10-27 02:47:30 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 1000-1049: avg_score=39221.7 reach4096=14 reach8192=0 dead_below2048=8 max_tile_seen=4096
-OK
-All 1 tests passed.
-```
-
-## Bench run 2026-10-27 02:48:47 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 6d8ed10
-- date: 2026-10-27 02:48:47 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 1000-1049: avg_score=38056.3 reach4096=13 reach8192=1 dead_below2048=11 max_tile_seen=8192
-OK
-All 1 tests passed.
-```
-
-## Bench run 2026-10-27 02:51:29 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 6d8ed10
-- date: 2026-10-27 02:51:29 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 1000-1049: avg_score=40437.0 reach4096=14 reach8192=1 dead_below2048=8 max_tile_seen=8192
-OK
-All 1 tests passed.
-```
-
-## Bench run 2026-10-27 02:52:46 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 6d8ed10
-- date: 2026-10-27 02:52:46 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 1000-1049: avg_score=42230.7 reach4096=14 reach8192=2 dead_below2048=8 max_tile_seen=8192
-OK
-All 1 tests passed.
-```
-
-## Bench run 2026-10-27 02:54:26 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 6d8ed10
-- date: 2026-10-27 02:54:26 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 1000-1049: avg_score=39996.6 reach4096=14 reach8192=0 dead_below2048=8 max_tile_seen=4096
-OK
-All 1 tests passed.
-```
-
-## Bench run 2026-10-27 02:55:44 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 6d8ed10
-- date: 2026-10-27 02:55:44 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 1000-1049: avg_score=37956.9 reach4096=16 reach8192=0 dead_below2048=8 max_tile_seen=4096
-OK
-All 1 tests passed.
-```
-
-## Bench run 2026-10-27 02:57:01 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 6d8ed10
-- date: 2026-10-27 02:57:01 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 1000-1049: avg_score=39750.6 reach4096=16 reach8192=0 dead_below2048=8 max_tile_seen=4096
-OK
-All 1 tests passed.
-```
-
-## Bench run 2026-10-27 02:58:41 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 6d8ed10
-- date: 2026-10-27 02:58:41 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 2000-2049: avg_score=38972.6 reach4096=15 reach8192=0 dead_below2048=10 max_tile_seen=4096
-OK
-All 1 tests passed.
-```
-
-## Bench run 2026-10-27 02:59:57 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 6d8ed10
-- date: 2026-10-27 02:59:57 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 2000-2049: avg_score=37841.6 reach4096=15 reach8192=0 dead_below2048=10 max_tile_seen=4096
-OK
-All 1 tests passed.
-```
-
-## Bench run 2026-10-27 03:01:09 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 6d8ed10
-- date: 2026-10-27 03:01:09 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure order phase (#92)...[order-phase] 50 games seeds 2000-2049: avg_score=38025.2 reach4096=13 reach8192=1 dead_below2048=10 max_tile_seen=8192
-OK
-All 1 tests passed.
-```
-
-## Bench run 2026-10-27 03:13:41 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order phase v2 --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 255bef0
-- date: 2026-10-27 03:13:41 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure order phase v2 (#92)...[order-phase-v2] expectimax_tt d3 50 games seeds 1000-1049: avg_score=42230.7 avg_moves=2074.2 reach4096=14 dead_below2048=8
-[order-phase-v2] expectimax   d2 50 games seeds 1000-1049: avg_score=24297.7 avg_moves=1301.8 reach4096=5 dead_below2048=28
-OK
-All 1 tests passed.
-```
+- CLI: arg 6 `par` keeps its meaning; the new positional arg 10 `par` batches the variant named in arg 6:
+  `zig build nn -Doptimize=ReleaseFast -- 20000 20 2000 0.003 - sym 30 /tmp/nnb/sym.bin 1 par`. Arg 10 was an unused trailing slot
+  (any 10th positional forced the usage error), so every existing command line keeps its meaning. The log prints `variant=sym+par`.
+- Works: `base`, `backward`, `replay`, `sym`, `symlam`, `nstep`, `resume` (the batch starts from the net loaded out of `weights_path`).
+- Not supported: `priority`, `midgame`, `midmix` — their 1024-entry ring buffer is cross-game state shared by pointer and the batch mean
+  would change their semantics, so the CLI prints usage and refuses; `trainBatchOpts` asserts the buffer is null.
+- Reproducibility: `parallel training batch with variant opts matches a serial run of the same game seeds` runs 4-game batches with
+  `symmetry` and with `replay_k = 4` on threads and compares byte-for-byte with the serial reconstruction over seeds 77..80; two CLI runs
+  each of `sym` + `par` and `replay` + `par` wrote identical files. `zig build test` passes.
+- Speedup (8 CPUs, batches of 8): `sym` 2,000 games 16.5 s → 2.7 s (**6.1×**); the #66 `resume` fine-tune +20,000 games lr 3e-4
+  460 s → 90.9 s (**5.1×**), so #35's 5.7× carries over to the heavier variants.
+- Does batching change the outcome? `resume` +20,000 lr 3e-4, training seed 1, the #97 `a2` recipe as `resume` + `par`: in-protocol
+  (2000..6000) 42,736 vs serial 43,083, held-out (7000..10000) 43,388 vs 41,936 — within eval noise on both sets, so batching trades
+  nothing measurable for ~5×. (Both stay below the committed 45,342 held-out, which is #97's overfit finding, not a batching effect.)
 
 ## Death reward learns moves-to-death, but the fragility penalty does not pay (#101)
 
-Issue #101 asked whether a net trained to die fast can measure board fragility, and whether
-penalizing fragile boards in `evaluateW` raises the score or the survival rate. Two pieces
-shipped. `nn` gains an opt-in `death` variant: per-move reward is -1/reward_scale instead of
-the score delta, so the value learns V ≈ -(moves to game over)/1000. Training uses the
-backward full-return sweep, not one-step TD — with -1 per move the TD target is identical on
-every board and the net collapsed to a constant (observed, then fixed; the naive scale also
-blew up to NaN, hence the /reward_scale unit). `evaluateW` gains `Weights.fragility` +
-`Weights.death_net`, adding `fragility * (0 - V)`; both default to inert, so every existing
-policy is bit-identical unless a caller opts in. The CLI variant is `nn ... death`.
+Two pieces shipped. `nn` gains an opt-in `death` variant: per-move reward `-1/reward_scale` instead of the score delta, so
+V ≈ −(moves to game over)/1000. Training uses the backward full-return sweep, not one-step TD — with −1 per move the TD target is
+identical on every board and the net collapsed to a constant (observed, then fixed; the naive scale also blew up to NaN, hence the
+`/reward_scale` unit). `evaluateW` gains `Weights.fragility` + `Weights.death_net`, adding `fragility * (0 - V)`; both default inert,
+so every existing policy is bit-identical unless a caller opts in.
 
-Probe (TEMP harnesses, removed): 1k and 5k death games, then V vs true moves-left on
-expectimax_tt depth 3 games (seeds 3000+). In-distribution (the death policy's own games) the
-net works: pearson(V, ml) = -0.447 (1k) → -0.606 (5k). On real games it does not:
-pearson(V, ml) = 0.023 (1k) / -0.001 (5k) overall, and inside every empties bucket |r| <= 0.12
-with mixed signs. The ml <= 100 tail keeps the signal: n=2000, r = -0.230 overall, empties 1-6
-r = -0.137 / -0.030 / -0.216 / -0.056 / -0.197 / -0.496, terciles monotone. So V ranks
-near-death boards correctly and saturates OOD — exactly the training horizon.
+Probe (temporary harnesses, removed): 1k and 5k death games, then V vs true moves-left on expectimax_tt depth 3 games
+(seeds 3000+). In-distribution (the death policy's own games) it works: pearson(V, ml) = −0.447 (1k) → −0.606 (5k). On real games it
+does not: 0.023 (1k) / −0.001 (5k) overall, and inside every empties bucket |r| ≤ 0.12 with mixed signs. The ml ≤ 100 tail keeps the
+signal: n = 2000, r = −0.230 overall, empties 1-6 → −0.137 / −0.030 / −0.216 / −0.056 / −0.197 / −0.496, terciles monotone. So V ranks
+near-death boards and saturates OOD — exactly the training horizon.
 
-A/B of the penalty (50 games x 2 seed sets, expectimax depth 2, death net trained 5k games):
+A/B of the penalty (50 games × 2 seed sets, expectimax depth 2, death net trained 5k games):
 
 | fragility | avg (1000-1049) | avg (2000-2049) | dead <2048 (both sets) |
 |---|---|---|---|
@@ -1172,330 +801,64 @@ A/B of the penalty (50 games x 2 seed sets, expectimax depth 2, death net traine
 | 1000 | 26,354.1 | 25,614.8 | 50/100 |
 | 3000 | 26,345.5 | 24,204.2 | 49/100 |
 
-The λ=1000 bump did not replicate: a paired run (same seeds, off vs on) over 200 games on
-fresh sets 1000/2000/3000/4000 gives per-set diffs +2056.4 / +229.1 / -1306.3 / -1490.8,
-total -127.9 ± 1477.3, and deaths move the wrong way (93 → 104 of 200). That is noise with a
-hint of harm.
+The λ = 1000 bump did not replicate: a paired run (same seeds, off vs on) over 200 games on fresh sets 1000/2000/3000/4000 gives
++2056.4 / +229.1 / −1306.3 / −1490.8, total −127.9 ± 1477.3, and deaths move the wrong way (93 → 104 of 200). Noise with a hint of harm.
 
-Verdict: not adopted. `fragility` stays an opt-in field (tested, default 0 = current
-evaluation), nothing sets it, committed weights unchanged. The death variant itself works as
-advertised within its horizon and stays as `nn ... death`.
-
-Reading: the tail correlation (r ≈ -0.23..-0.50 at ml <= 100) is real but too thin to rank
-mid-game moves, and OOD saturation makes the term nearly constant across candidate boards —
-it cannot distinguish moves where it matters. A usable fragility signal would need training
-on the real policy's game lengths, not on self-play deaths.
-
-Limits: one machine; the sweep is 4 λ x 100 games plus a 200-game paired run; the probe's
-ml <= 100 cut is post-hoc; death nets were trained 1k/5k games only; the A/B plays expectimax
-depth 2 (the `Weights` consumer), not nn/nn2.
-
-## Bench run 2026-10-27 03:15:22 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order phase v2 --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 255bef0
-- date: 2026-10-27 03:15:22 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure order phase v2 (#92)...[order-phase-v2] expectimax_tt d3 50 games seeds 1000-1049: avg_score=37985.2 avg_moves=1904.5 reach4096=9 dead_below2048=10
-[order-phase-v2] expectimax   d2 50 games seeds 1000-1049: avg_score=24403.5 avg_moves=1304.8 reach4096=5 dead_below2048=26
-OK
-All 1 tests passed.
-```
-
-## Bench run 2026-10-27 03:17:36 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order phase v3 --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 255bef0
-- date: 2026-10-27 03:17:36 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure order phase v3 (#92)...[order-phase-v3] expectimax_tt d3 50 games seeds 2000-2049: avg_score=38025.2 reach4096=13 dead_below2048=10
-[order-phase-v3] expectimax d2 50 games seeds 2000-2049: avg_score=24220.1 reach4096=4 dead_below2048=25
-[order-phase-v3] beam 50 games seeds 2000-2049: avg_score=11373.8 reach4096=0 dead_below2048=47
-[order-phase-v3] greedy 50 games seeds 2000-2049: avg_score=3109.8 reach4096=0 dead_below2048=50
-[order-phase-v3] mcts 50 games seeds 2000-2049: avg_score=30709.7 reach4096=5 dead_below2048=13
-OK
-All 1 tests passed.
-```
-
-## Bench run 2026-10-27 03:20:18 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order phase v3 --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 255bef0
-- date: 2026-10-27 03:20:18 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure order phase v3 (#92)...[order-phase-v3] expectimax_tt d3 50 games seeds 2000-2049: avg_score=38383.7 reach4096=16 dead_below2048=10
-[order-phase-v3] expectimax d2 50 games seeds 2000-2049: avg_score=25385.7 reach4096=3 dead_below2048=24
-[order-phase-v3] beam 50 games seeds 2000-2049: avg_score=12346.7 reach4096=0 dead_below2048=44
-[order-phase-v3] greedy 50 games seeds 2000-2049: avg_score=3195.5 reach4096=0 dead_below2048=50
-[order-phase-v3] mcts 50 games seeds 2000-2049: avg_score=30709.7 reach4096=5 dead_below2048=13
-OK
-All 1 tests passed.
-```
-
-## Bench run 2026-10-27 03:34:23 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure order phase v3 --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 255bef0
-- date: 2026-10-27 03:34:23 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure order phase v3 (#92)...[order-phase-v3] expectimax_tt d3 50 games seeds 2000-2049: avg_score=38383.7 reach4096=16 dead_below2048=10
-[order-phase-v3] expectimax d2 50 games seeds 2000-2049: avg_score=25385.7 reach4096=3 dead_below2048=24
-[order-phase-v3] beam 50 games seeds 2000-2049: avg_score=12346.7 reach4096=0 dead_below2048=44
-[order-phase-v3] greedy 50 games seeds 2000-2049: avg_score=3195.5 reach4096=0 dead_below2048=50
-[order-phase-v3] mcts 50 games seeds 2000-2049: avg_score=30709.7 reach4096=5 dead_below2048=13
-OK
-All 1 tests passed.
-```
-
-
-## Bench run 2026-10-27 03:09:30 +0900
-
-- command: `zig build ranking -Doptimize=ReleaseFast -- 1 5 1000`
-- commit: 255bef0
-- date: 2026-10-27 03:09:30 +0900
-- exit: 0
-
-```text
-{"seed":1000,"runs":1,"games_per_run":5,"entries":[{"policy":"nn2","depth":2,"games":5,"avg_score":71880.0,"avg_moves":3267.2,"best_tile":4096,"latency_ms_per_move":1.7518,"games_per_sec":0.17,"description":"TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）"},{"policy":"nn","depth":0,"games":5,"avg_score":69640.8,"avg_moves":3151.2,"best_tile":4096,"latency_ms_per_move":0.1922,"games_per_sec":1.65,"description":"TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）"},{"policy":"expectimax_tt","depth":0,"games":5,"avg_score":50344.8,"avg_moves":2391.2,"best_tile":8192,"latency_ms_per_move":0.7048,"games_per_sec":0.59,"description":"depth 3の期待値探索を置換表で高速化したもの（同じ手を選ぶ）"},{"policy":"ga","depth":2,"games":5,"avg_score":27538.4,"avg_moves":1415.2,"best_tile":4096,"latency_ms_per_move":0.0822,"games_per_sec":8.59,"description":"GAで評価の重みを進化させた期待値探索（depth 2）。GA内のholdout(seed 500〜)では+4%だが、ranking seed 1000では素の expectimax より低い"},{"policy":"mcts","depth":0,"games":5,"avg_score":24463.2,"avg_moves":1301.2,"best_tile":2048,"latency_ms_per_move":1.0935,"games_per_sec":0.70,"description":"UCTで候補手を選び、ランダムな対局を繰り返して評価する"},{"policy":"nnbeam","depth":0,"games":5,"avg_score":21096.8,"avg_moves":1143.8,"best_tile":2048,"latency_ms_per_move":0.1200,"games_per_sec":7.28,"description":"NNの盤面価値を葉にしたビーム探索。幅8・3手先で、ply間のspawnを2回サンプリングする（固定seedで再現）"},{"policy":"expectimax","depth":2,"games":5,"avg_score":19964.0,"avg_moves":1093.0,"best_tile":2048,"latency_ms_per_move":0.0957,"games_per_sec":9.56,"description":"2手先まで探索し、ランダムな出現（2か4）を平均して評価する。評価は蛇行順と合体ペアの手作り関数"},{"policy":"nnmcts","depth":0,"games":5,"avg_score":12864.8,"avg_moves":763.4,"best_tile":1024,"latency_ms_per_move":2.5548,"games_per_sec":0.51,"description":"UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）"},{"policy":"beam","depth":0,"games":5,"avg_score":12328.8,"avg_moves":741.2,"best_tile":1024,"latency_ms_per_move":0.0703,"games_per_sec":19.19,"description":"幅32で3手先まで探索し、各空きマスに2が出現すると仮定して評価する"},{"policy":"greedy","depth":0,"games":5,"avg_score":3110.4,"avg_moves":258.4,"best_tile":256,"latency_ms_per_move":0.0014,"games_per_sec":2665.72,"description":"1手先だけ見る。滑らせた盤面の評価が最も高い手を選ぶ（出現や探索はしない）"},{"policy":"random","depth":0,"games":5,"avg_score":966.4,"avg_moves":110.2,"best_tile":128,"latency_ms_per_move":0.0017,"games_per_sec":5060.51,"description":"合法手からランダムに1手選ぶ（比較の基準）"}]}
-```
-
-## Bench run 2026-10-27 03:11:35 +0900
-
-- command: `zig build ranking -Doptimize=ReleaseFast -- 1 5 1000`
-- commit: 6d8ed10
-- date: 2026-10-27 03:11:35 +0900
-- exit: 0
-
-```text
-{"seed":1000,"runs":1,"games_per_run":5,"entries":[{"policy":"nn2","depth":2,"games":5,"avg_score":71880.0,"avg_moves":3267.2,"best_tile":4096,"latency_ms_per_move":1.7520,"games_per_sec":0.17,"description":"TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）"},{"policy":"nn","depth":0,"games":5,"avg_score":69640.8,"avg_moves":3151.2,"best_tile":4096,"latency_ms_per_move":0.1919,"games_per_sec":1.65,"description":"TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）"},{"policy":"expectimax_tt","depth":0,"games":5,"avg_score":51376.0,"avg_moves":2426.2,"best_tile":4096,"latency_ms_per_move":0.6913,"games_per_sec":0.60,"description":"depth 3の期待値探索を置換表で高速化したもの（同じ手を選ぶ）"},{"policy":"expectimax","depth":2,"games":5,"avg_score":41107.2,"avg_moves":2019.4,"best_tile":4096,"latency_ms_per_move":0.0854,"games_per_sec":5.80,"description":"2手先まで探索し、ランダムな出現（2か4）を平均して評価する。評価は蛇行順と合体ペアの手作り関数"},{"policy":"ga","depth":2,"games":5,"avg_score":27538.4,"avg_moves":1415.2,"best_tile":4096,"latency_ms_per_move":0.0823,"games_per_sec":8.59,"description":"GAで評価の重みを進化させた期待値探索（depth 2）。GA内のholdout(seed 500〜)では+4%だが、ranking seed 1000では素の expectimax より低い"},{"policy":"mcts","depth":0,"games":5,"avg_score":24463.2,"avg_moves":1301.2,"best_tile":2048,"latency_ms_per_move":1.0845,"games_per_sec":0.71,"description":"UCTで候補手を選び、ランダムな対局を繰り返して評価する"},{"policy":"nnbeam","depth":0,"games":5,"avg_score":21096.8,"avg_moves":1143.8,"best_tile":2048,"latency_ms_per_move":0.1211,"games_per_sec":7.22,"description":"NNの盤面価値を葉にしたビーム探索。幅8・3手先で、ply間のspawnを2回サンプリングする（固定seedで再現）"},{"policy":"beam","depth":0,"games":5,"avg_score":14368.8,"avg_moves":817.8,"best_tile":2048,"latency_ms_per_move":0.0674,"games_per_sec":18.14,"description":"幅32で3手先まで探索し、各空きマスに2が出現すると仮定して評価する"},{"policy":"nnmcts","depth":0,"games":5,"avg_score":12864.8,"avg_moves":763.4,"best_tile":1024,"latency_ms_per_move":2.5553,"games_per_sec":0.51,"description":"UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）"},{"policy":"greedy","depth":0,"games":5,"avg_score":3300.8,"avg_moves":272.2,"best_tile":256,"latency_ms_per_move":0.0004,"games_per_sec":8437.64,"description":"1手先だけ見る。滑らせた盤面の評価が最も高い手を選ぶ（出現や探索はしない）"},{"policy":"random","depth":0,"games":5,"avg_score":966.4,"avg_moves":110.2,"best_tile":128,"latency_ms_per_move":0.0005,"games_per_sec":18373.91,"description":"合法手からランダムに1手選ぶ（比較の基準）"}]}
-```
-
-
-## Bench run 2026-10-27 10:34:47 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure fragility --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 7ed57f9
-- date: 2026-10-27 10:34:47 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure fragility probe (#101)...#101 probe: 43057 afterstates, expectimax_tt d3 games (seeds 3000+), death net 1000 games
-#101 overall: pearson(empties, ml) = 0.278, pearson(V, ml) = 0.023
-#101 empties= 1 n=  1292 pearson(V, ml)=-0.007 tercile_ml=845.5/867.3/884.5
-#101 empties= 2 n=  2757 pearson(V, ml)=0.070 tercile_ml=808.4/931.3/957.3
-#101 empties= 3 n=  5063 pearson(V, ml)=0.089 tercile_ml=961.9/1011.3/1136.3
-#101 empties= 4 n=  7244 pearson(V, ml)=0.120 tercile_ml=1051.4/1129.0/1334.4
-#101 empties= 5 n=  7920 pearson(V, ml)=0.078 tercile_ml=1175.2/1276.7/1365.2
-#101 empties= 6 n=  7431 pearson(V, ml)=0.037 tercile_ml=1327.7/1406.8/1430.1
-#101 empties= 7 n=  5393 pearson(V, ml)=-0.016 tercile_ml=1578.4/1512.4/1584.1
-#101 empties= 8 n=  3245 pearson(V, ml)=-0.006 tercile_ml=1724.7/1644.4/1731.7
-#101 empties= 9 n=  1614 pearson(V, ml)=-0.033 tercile_ml=1917.8/1791.4/1900.1
-#101 empties=10 n=   657 pearson(V, ml)=-0.104 tercile_ml=2280.3/2049.6/1991.8
-#101 empties=11 n=   227 pearson(V, ml)=-0.044 tercile_ml=2088.6/2065.2/2075.5
-#101 empties=12 n=   119 pearson(V, ml)=0.011 tercile_ml=2242.3/2157.5/2486.9
-OK
-All 1 tests passed.
-```
-
-
-## Bench run 2026-10-27 10:38:38 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP death in-distribution --dep core --dep parallel -Mroot=ai/solver/nn.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mparallel=ai/solver/parallel.zig`
-- commit: 7ed57f9
-- date: 2026-10-27 10:38:38 +0900
-- exit: 0
-
-```text
-1/1 nn.test.TEMP death in-distribution (#101)...#101 in-dist: n=1706 pearson(V, ml)=-0.447
-OK
-All 1 tests passed.
-```
-
-
-## Bench run 2026-10-27 10:45:17 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure fragility probe robust --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 7ed57f9
-- date: 2026-10-27 10:45:17 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure fragility probe robust (#101)...#101 probe-5k: 43057 afterstates
-#101 overall-5k: pearson(empties, ml) = 0.278, pearson(V, ml) = -0.001
-#101 empties= 1 n=  1292 pearson(V, ml)=-0.059 tercile_ml=932.2/894.4/771.2
-#101 empties= 2 n=  2757 pearson(V, ml)=0.059 tercile_ml=825.1/928.9/942.9
-#101 empties= 3 n=  5063 pearson(V, ml)=0.076 tercile_ml=968.1/1030.1/1111.2
-#101 empties= 4 n=  7244 pearson(V, ml)=0.125 tercile_ml=1041.9/1133.1/1339.8
-#101 empties= 5 n=  7920 pearson(V, ml)=0.084 tercile_ml=1177.6/1281.7/1357.8
-#101 empties= 6 n=  7431 pearson(V, ml)=0.053 tercile_ml=1314.2/1395.1/1455.3
-#101 empties= 7 n=  5393 pearson(V, ml)=-0.012 tercile_ml=1540.1/1542.0/1592.7
-#101 empties= 8 n=  3245 pearson(V, ml)=0.004 tercile_ml=1696.2/1655.0/1749.6
-#101 empties= 9 n=  1614 pearson(V, ml)=-0.046 tercile_ml=1950.4/1761.7/1897.3
-#101 empties=10 n=   657 pearson(V, ml)=-0.112 tercile_ml=2267.5/2089.5/1964.7
-#101 empties=11 n=   227 pearson(V, ml)=-0.057 tercile_ml=2203.4/1954.8/2071.2
-#101 empties=12 n=   119 pearson(V, ml)=0.032 tercile_ml=2325.4/2250.3/2319.6
-OK
-All 1 tests passed.
-```
-
-
-## Bench run 2026-10-27 10:48:08 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP death in-dist robust --dep core --dep parallel -Mroot=ai/solver/nn.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mparallel=ai/solver/parallel.zig`
-- commit: 7ed57f9
-- date: 2026-10-27 10:48:08 +0900
-- exit: 0
-
-```text
-1/1 nn.test.TEMP death in-dist robust (#101)...#101 in-dist-5k: n=1385 pearson(V, ml)=-0.606
-OK
-All 1 tests passed.
-```
-
-
-## Bench run 2026-10-27 10:55:16 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure fragility probe tail --dep core --dep nn -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: 7ed57f9
-- date: 2026-10-27 10:55:16 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure fragility probe tail (#101)...#101 tail-5k: n=2000 pearson(V, ml)=-0.230
-#101 tail empties= 1 n=   336 pearson(V, ml)=-0.137 tercile_ml=36.2/32.6/29.3
-#101 tail empties= 2 n=   516 pearson(V, ml)=-0.030 tercile_ml=45.2/44.1/38.6
-#101 tail empties= 3 n=   514 pearson(V, ml)=-0.216 tercile_ml=56.8/54.4/43.9
-#101 tail empties= 4 n=   357 pearson(V, ml)=-0.056 tercile_ml=62.0/63.2/61.1
-#101 tail empties= 5 n=   191 pearson(V, ml)=-0.197 tercile_ml=70.7/70.3/67.1
-#101 tail empties= 6 n=    77 pearson(V, ml)=-0.496 tercile_ml=79.5/71.5/57.4
-OK
-All 1 tests passed.
-```
-
-
-## Bench run 2026-10-27 13:08:07 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure fragility A/B --dep core --dep nn --dep parallel -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: da3364c
-- date: 2026-10-27 13:08:07 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure fragility A/B (#101)...#101 fragility lam=0 seed=1000 avg=24297.7 moves=1301.8 reach4096=5 reach8192=0 dead=28
-#101 fragility lam=0 seed=2000 avg=25385.7 moves=1360.2 reach4096=3 reach8192=0 dead=24
-#101 fragility lam=300 seed=1000 avg=19420.6 moves=1082.9 reach4096=2 reach8192=0 dead=34
-#101 fragility lam=300 seed=2000 avg=24644.3 moves=1331.2 reach4096=2 reach8192=0 dead=24
-#101 fragility lam=1000 seed=1000 avg=26354.1 moves=1388.7 reach4096=5 reach8192=0 dead=23
-#101 fragility lam=1000 seed=2000 avg=25614.8 moves=1365.2 reach4096=5 reach8192=0 dead=27
-#101 fragility lam=3000 seed=1000 avg=26345.5 moves=1393.9 reach4096=5 reach8192=0 dead=22
-#101 fragility lam=3000 seed=2000 avg=24204.2 moves=1294.8 reach4096=4 reach8192=0 dead=27
-OK
-All 1 tests passed.
-```
-
-
-## Bench run 2026-10-27 13:29:16 +0900
-
-- command: `/nix/store/bg372xp0r29mh7qigkbx1gb3j50nnmcl-zig-0.17.0/bin/zig test -OReleaseFast --test-filter TEMP measure fragility A/B v2 --dep core --dep nn --dep parallel -Mroot=ai/solver/solver.zig -OReleaseFast -Mcore=src/core.zig -OReleaseFast --dep core --dep parallel -Mnn=ai/solver/nn.zig -OReleaseFast -Mparallel=ai/solver/parallel.zig`
-- commit: da3364c
-- date: 2026-10-27 13:29:16 +0900
-- exit: 0
-
-```text
-1/1 solver.test.TEMP measure fragility A/B v2 (#101)...#101 v2 set 1000: paired mean diff = 2056.4
-#101 v2 set 2000: paired mean diff = 229.1
-#101 v2 set 3000: paired mean diff = -1306.3
-#101 v2 set 4000: paired mean diff = -1490.8
-#101 v2 total n=200 avg0=25400.4 avg1000=25272.5 paired diff=-127.9 stderr=1477.3 dead0=93 dead1=104
-OK
-All 1 tests passed.
-```
+Not adopted: `fragility` stays an opt-in field (tested, default 0), nothing sets it, committed weights unchanged; the death variant
+works as advertised within its horizon and stays as `nn … death`. The tail correlation (r ≈ −0.23..−0.50 at ml ≤ 100) is real but too
+thin to rank mid-game moves, and OOD saturation makes the term nearly constant across candidate boards. A usable fragility signal
+needs training on the real policy's game lengths, not on self-play deaths. Limits: one machine; 4 λ × 100 games plus a 200-game paired
+run; the ml ≤ 100 cut is post-hoc; death nets trained only 1k/5k games; the A/B plays expectimax depth 2, not nn/nn2.
 
 ## 楽観的初期化 (OI) の検証 (#107, 2026-10-28)
 
-TD 学習の停滞を破る手法として、文献 (Guei et al. 2021) の楽観的初期化を `nn` の TD(0) afterstate
-学習に移植し、`base` と同条件で比べた。**結論: この MLP 構成では不採用**。
+Guei et al. 2021 の楽観的初期化を `nn` の TD(0) afterstate 学習に移植し、`base` と同条件で比べた。**この MLP 構成では不採用**。
 
-### 実装
+`nn.scaleInit(net, k)` で初期重み (w1/w2/w3) を k 倍してから学習する。variant `oi` (k=4) と `oi16` (k=16)。既定経路と committed
+weights は不変。出力バイアス `b3` を持ち上げる方式は採らなかった: 定数を足しても全 afterstate が同じだけずれるので argmax が
+変わらず、学習者に見えるデータも変化しない（no-op）。
 
-`nn.scaleInit(net, k)` で初期重み (w1 / w2 / w3) を k 倍してから学習する。`nn` の variant として
-`oi` (k=4) と `oi16` (k=16) を追加した（既定の学習経路・committed weights は不変）。
-出力バイアス `b3` を楽観的に持ち上げる方式は採らなかった: 定数を足しても全 afterstate が同じだけ
-ずれるので、手の argmax は変わらず、学習者に見えるデータが変化しない（no-op）。
-
-### プロトコル
-
-`zig build nn -Doptimize=ReleaseFast -- <games> 10 2000 0.003 2 <variant> 30 <tmp weights> <train_seed> par`
-
-- 訓練ゲーム数 4k / 20k / 100k / 400k、train_seed 1 と 2、lr 0.003（既存の線形減衰のまま）
-- 評価は train と無関係な seed 2000.. の 20 局 × 2 レンジ、`nn 2-ply (deep)` の avg score
-- 同じ row は同一 seed・同一ゲーム数で、初期重みのスケールだけが違う
-
-### 結果（avg score、nn 2-ply）
+`zig build nn -Doptimize=ReleaseFast -- <games> 10 2000 0.003 2 <variant> 30 <tmp weights> <train_seed> par`。
+訓練 4k / 20k / 100k / 400k、train_seed 1 と 2、lr 0.003（既存の線形減衰）。評価は seed 2000.. の 20 局 × 2 レンジ、
+`nn 2-ply (deep)`。
 
 | 訓練ゲーム数 | base seed1 | base seed2 | oi (×4) seed1 | oi (×4) seed2 | oi16 (×16) |
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 4,000 | 12,151 | 11,719 | 6,841 | 7,750 | 10,333 |
 | 20,000 | 21,279 | 15,212 | 8,813 | 13,069 | 10,333 |
 | 100,000 | 30,145 | 25,669 | 14,113 | 11,069 | 10,333 |
-| 400,000 | 76,977 | — | 26,952 | — | — |
+| 400,000 | 76,977 | — | 26,952 | — | 10,333 |
 
 expectimax depth 2 は同じ評価 seed で 36,410（base は 100k で追い抜く）。
 
-### わかったこと
+- **×16 は発散する。** 保存重みの最大絶対値 1e+291、NaN が 4,374/18,561。NaN で比較が常に偽になり手の選択が固定されるため、
+  訓練ゲーム数も train_seed も変えて同じスコア (10,333) になる。1-ply と 1-spawn lookahead も同値で、価値関数が定数に潰れた。
+- **×4 は発散しないが学習が大幅に遅い。** 100k で base の 1/2、400k でも 27.0k 対 77.0k。曲線は上昇中なので最終性能が
+  並ぶ可能性は残るが、「少ないゲームで同じスコア」という OI の主張は逆方向に出た。
+- OI の効果は「初期値の分散を上げて自己対戦を促す」ことに尽きるが、この MLP は既定のランダム初期化ですでに分散を持ち、
+  スケールを上げると TD(0) の更新が不安定になるだけだった。
 
-- **×16 は学習が発散する。** 保存された重みの最大絶対値が 1e+291、NaN が 4,374/18,561 個。
-  NaN になると比較がすべて偽になり手の選択が固定されるため、訓練ゲーム数も train_seed も
-  変えて同じスコア (10,333) になる。1-ply と 1-spawn lookahead も同値で、価値関数が定数に潰れた。
-- **×4 は発散しないが学習が大幅に遅い。** 100k で base の 1/2、400k でも 27.0k 対 77.0k。
-  曲線はまだ上昇中なので最終性能が同じになる可能性は残るが、少なくとも「少ないゲームで同じ
-  スコアに到達する」という OI の主張は逆方向に出た。
-- OI の効果は「初期値の分散を上げて自己対戦の探索を促す」ことに尽きるが、この MLP は既定の
-  ランダム初期化ですでに分散を持ち、スケールを上げると TD(0) の更新が不安定になるだけだった。
-
-### 残作業
-
-- **MS-TD (段階別評価) は未着手。** 空きマス数などの段階ごとにパラメータ集合を持つ必要があり、
-  重みファイル形式と `Cache`/`train` の変更を伴う。効果も「学習が遅くなる」という報告がある
-  (Matsuzaki 2017) ため、別 issue で設計から始める。
+残作業: **MS-TD（段階別評価）は未着手**（空きマス数などの段階ごとにパラメータ集合を持ち、重みファイル形式と `Cache`/`train` の
+変更を伴う。「学習が遅くなる」報告 (Matsuzaki 2017) があるため別 issue で設計から）。→ 下の節で実装・測定した。
 
 ## n-tuple の systematic パターン集合 (#106, 2026-10-29)
 
-### 背景
-
-n-tuple ネットワークは 6-tuple を 6 本使っていた（`{0,1,2,3,4,5}`, `{0,1,2,4,5,6}`,
-`{0,1,2,5,6,7}`, `{0,1,4,5,6,9}`, `{0,1,5,6,9,10}`, `{0,4,5,9,10,14}`）。これは Szubert & Jaśkowski の
-systematic な集合ではなく、文献の 1M ゲーム結果 (1-ply 100,178) には遠く及ばない。
-足りない要因はパターン集合か学習率かを切り分けるため、まず学習率だけを掃引した。
-
-### 学習率だけを動かす（既存 6 パターン、1M ゲーム、seed 1、20 局 × seed 2000）
+6-tuple を 6 本（`{0,1,2,3,4,5}`, `{0,1,2,4,5,6}`, `{0,1,2,5,6,7}`, `{0,1,4,5,6,9}`, `{0,1,5,6,9,10}`, `{0,4,5,9,10,14}`）使っていたが、
+Szubert & Jaśkowski の systematic な集合ではなく、文献の 1M ゲーム結果 (1-ply 100,178) には遠く及ばない。足りない要因が
+パターン集合か学習率かを切り分けるため、まず学習率だけを掃引した（既存 6 パターン、1M ゲーム、seed 1、20 局 × seed 2000）:
 
 | lr | 1-ply | +1 spawn | depth 2 |
 | ---: | ---: | ---: | ---: |
 | 0.01 | 8,831.8 | 17,093.4 | 30,750.4 |
 | 0.0025 | 6,953.4 | 16,435.0 | 25,763.4 |
 
-低い学習率の方が悪い。文献の α=0.0025 は 2 段階 (afterstate) TD とセットの値で、
-そのまま持ってきても効かない。**パターン集合が本質**と判断して次を実装した。
+低い学習率の方が悪い。文献の α=0.0025 は 2 段階 (afterstate) TD とセットの値で、そのまま持ってきても効かない。**パターン集合が
+本質**と判断して次を実装した。
 
-### 追加したパターン
-
-2x3 矩形の対称軌道を列挙すると、12 個の位置は 2 軌道に分かれる。
-
-- 8 位置の軌道（既存の `{0,1,2,4,5,6}` が代表）
-- 4 位置の軌道（中央寄り）→ `{4,5,6,8,9,10}`
-
-`indices` が 8 対称変換の最小を取る実装なので、同一軌道の別位置を足しても同じ表の重複になる。
-よって**追加は 1 本だけ**で、7 本（`.wide`）が実質的な上限。`Set = .light | .full | .wide` を追加し、
-既存の `ntuple_weights.bin`（6 本）は `.full` としてそのままロードできる。
+2x3 矩形の対称軌道を列挙すると 12 位置は 2 軌道に分かれる: 8 位置の軌道（既存 `{0,1,2,4,5,6}` が代表）と 4 位置の軌道
+（中央寄り）→ `{4,5,6,8,9,10}`。`indices` が 8 対称変換の最小を取る実装なので同一軌道の別位置は同じ表の重複になり、
+**追加は 1 本だけ**で 7 本（`.wide`）が実質的な上限。`Set = .light | .full | .wide` を追加し、既存の `ntuple_weights.bin`
+（6 本）は `.full` としてそのままロードできる。
 
 | set | パターン数 | entries | raw |
 | --- | ---: | ---: | ---: |
@@ -1503,10 +866,8 @@ systematic な集合ではなく、文献の 1M ゲーム結果 (1-ply 100,178) 
 | `.full` | 6 | 17,104,896 | 65.3 MiB |
 | `.wide` | 7 | 33,882,112 | 129.3 MiB |
 
-7 本目で entries が 2 倍になるのは、中央の 6-tuple が位置あたりの組み合わせ数が多いため。
-`gzip -9` で 2,963,242 B (2.9 MB) まで縮むが、static 配信で 1 MB 未満に収めるには量子化が要る。
-
-### 結果（wide、20 局 × seed 2000、評価は train と無関係な seed）
+7 本目で entries が 2 倍になるのは中央の 6-tuple の組み合わせ数が多いため。`gzip -9` で 2,963,242 B (2.9 MB) まで縮むが、
+static 配信で 1 MB 未満に収めるには量子化が要る。
 
 | 学習 | games | lr | train seed | 1-ply | +1 spawn | depth 2 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -1519,63 +880,42 @@ systematic な集合ではなく、文献の 1M ゲーム結果 (1-ply 100,178) 
 | wide | 5M | 0.01 | 3 | 17,347.0 | — | 46,434.4 |
 | wide | 10M | 0.01 | 1 | 20,013.8 | — | **51,950.6** |
 
-expectimax depth 2 は同じ評価 seed で 36,410（1-ply の wide はすでに 5 倍近い差で上回る）。
+（expectimax depth 2 は同じ評価 seed で 36,410。）
 
-### わかったこと
+- **パターン 1 本の追加で 1M ゲームの depth 2 が 30,750 → 39,344 (+28%)**、同じ計算量で expectimax depth 2 を超える。
+  学習率の掃引より効果が大きい。5M で 50,103 (+27%) とまだ頭打ちが見えない。
+- 学習率は 0.01〜0.02 が良く 0.0025 は明確に悪い (34,693)。文献の α はパターン集合とセットで意味を持つ値。
+- seed 差は 5M で 50,103 対 45,586 (±5%) あり、この規模の比較は複数 seed が要る。depth 2 の評価では 1 ゲーム 2,400 手超。
+  8192 到達はまだ出ていない。
+- 学習時間は 1M で 554 s、5M で 4,197 s（4 並列時の実測、単独なら ~2,000 s）。5M→10M では depth 2 が 47,374（3 seed 平均）→
+  51,951 で +10%、1-ply は 17,304 → 20,014 で +16% と鈍化し、depth 2 は 50k 前後で頭打ちが見え始めた（9,300 s で 8192 到達も無し）。
 
-- **パターン 1 本の追加で 1M ゲームの depth 2 が 30,750 → 39,344 (+28%)。** 同じ計算量で
-  expectimax depth 2 を超える。学習率の掃引より効果が大きい。
-- ゲーム数を 5M に増やすと 50,103（+27%）。まだ頭打ちが見えていない。
-- 学習率は 0.01〜0.02 が良く、0.0025 は明確に悪い（34,693）。文献の α はパターン集合と
-  セットで意味を持つ値で、単独では持ち込めない。
-- seed 差は 5M で 50,103 対 45,586（±5%）あり、この規模の比較は複数 seed が要る。
-- 1 ゲームあたりの手数が 2,400 を超える（depth 2 の評価）。8192 到達はまだ出ていない。
-
-### 残作業
-
-- `algo=ntuple` の API / WASM への接続はしていない。wide の表は 129 MiB で、WASM に同梱するには
-  量子化（f32 → int8 など）と 1-ply での運用が前提になる。`nn2` の 72,205 にはまだ届かないため、
-  接続は学習が頭打ちになってから判断する。
-- 学習時間は 1M で 554 s、5M で 4,197 s（4 並列時の実測、単独なら ~2,000 s）。パターンを増やすより
-  ゲーム数を増やす方がまだ効く。
-- ただし 5M→10M では depth 2 が 47,374（3 seed 平均）→ 51,951 で +10%、1-ply は 17,304 → 20,014 で
-  +16%。伸びは鈍化している。depth 2 は 50k 前後で頭打ちが見え始めた（9,300 s の学習で 8192 到達も無し）。
-  次に効かせるならパターンの追加（`.wide` が 7 本で上限）ではなく、量子化して 2-ply を安く回すか、
-  afterstate の 2 段階 TD に切り替えるかのどちらか。
+残作業: `algo=ntuple` の API / WASM 接続はしていない（wide は 129 MiB で、同梱には量子化と 1-ply 運用が前提。`nn2` の 72,205 に
+まだ届かないため、接続は頭打ちになってから判断する）。次に効かせるならパターン追加（`.wide` が 7 本で上限）ではなく、
+量子化して 2-ply を安く回すか、afterstate の 2 段階 TD に切り替えるか。
 
 ## expectimax_id の統計 (#104, 2026-10-30)
 
-`docs/evalab.md` の反復深化の節は 50 局（5 × 10）だったので、標本を増やして確かめた。
+`docs/evalab.md` の反復深化の節は 50 局（5 × 10）だったので標本を増やした（seed 9000）。
 
 | policy | 予算 | 局数 | avg score | avg moves | best | 到達深さ | games/s |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | expectimax（重み付き, depth 3） | — | 200 | 52,735.7 | 2,528.6 | 8192 | 3 | 0.18 |
 | expectimax_id | 2 ms | 100 | **75,202.3** | 3,429.3 | 8192 | 8（上限） | 0.07 |
 
-seed 9000。depth 3 は `zig build evalab -- "baseline" 4 50 3 9000`、id は
-`zig build solve -Doptimize=ReleaseFast -- 10 10 3 9000 expectimax_id`（予算は `solver.zig` の
-`id_budget_ms`）。**+43%** で、50 局のときの +34%（1 ms）と整合する。
-
-注意: `baseline` は `#117` で `.monotonic = 32` を採用済み（`ai/solver/solver.zig:52`）。
-したがって `monotonic=32` を明示しても `baseline` と同じ結果になる（no-op）。
-
+depth 3 は `zig build evalab -- "baseline" 4 50 3 9000`、id は `zig build solve -Doptimize=ReleaseFast -- 10 10 3 9000 expectimax_id`
+（予算は `solver.zig` の `id_budget_ms`）。**+43%** で、50 局のときの +34%（1 ms）と整合する。
+注意: `baseline` は `#117` で `.monotonic = 32` を採用済み（`ai/solver/solver.zig:52`）なので、`monotonic=32` を明示しても
+`baseline` と同じ結果になる（no-op）。
 ## MS-TD（段階別評価）の検証 (#107, 2026-10-30)
 
-### 実装
+段 = afterstate の空きマス数で 7 分割（`0..2`, `3..4`, `5..6`, `7..8`, `9..10`, `11..12`, `13..16`）。段ごとに独立した MLP を持ち、
+TD(0) の更新は遷移先 afterstate の段のネットだけに当てる。探索は `nn.Value = union(enum) { single: *const Net, staged: *const Staged }`
+を通して透過に使えるので、1-ply / 2-ply の探索コードは共有のまま staged 価値でも動く。重みファイルは専用 magic を持ち、
+既存の単一ネット形式はそのままロードできる。
 
-段 = afterstate の空きマス数で 7 分割（`0..2`, `3..4`, `5..6`, `7..8`, `9..10`, `11..12`, `13..16`）。
-段ごとに独立した MLP を持ち、TD(0) の更新は遷移先 afterstate の段のネットだけに当てる。
-探索からは `nn.Value = union(enum) { single: *const Net, staged: *const Staged }` を通して透過に使えるので、
-1-ply / 2-ply の探索コードは共有のまま staged 価値でも動く。重みファイルは専用の magic を持ち、
-既存の単一ネット形式（`nn_weights.bin`）はそのままロードできる。
-
-### プロトコル
-
-- 学習: `zig build nn -Doptimize=ReleaseFast -- <games> 10 2000 0.003 2 {base,mstd} 30 /tmp/w.bin 1`
-- 評価: 20 局（10 局 × 2 レンジ、seed 2000 から）で全 variant が同一 seed。`par` は使わない（下記）
-- 評価対象: 1-ply / 1 spawn lookahead / 2-ply (deep) / expectimax depth 2（参照）
-
-### 結果（avg score）
+学習 `zig build nn -Doptimize=ReleaseFast -- <games> 10 2000 0.003 2 {base,mstd} 30 /tmp/w.bin 1`、評価は 20 局
+（10 局 × 2 レンジ、seed 2000 から）で全 variant が同一 seed。`par` は使わない。
 
 | 訓練 | 1-ply | +1 spawn | 2-ply | 学習時間 |
 | --- | ---: | ---: | ---: | ---: |
@@ -1583,58 +923,43 @@ seed 9000。depth 3 は `zig build evalab -- "baseline" 4 50 3 9000`、id は
 | mstd 100k | 47,427 | 73,045 | 89,079 | 1,414 s |
 | mstd 400k | **2,288** | 2,288 | **10,333** | 1,447 s |
 
-expectimax depth 2 は同じ評価 seed で 36,410（100k の時点で both が追い抜く）。
+（expectimax depth 2 は同じ評価 seed で 36,410。）
 
-### わかったこと
+- **100k では base と同等**（89.1k 対 87.8k、stderr ±4.9k / ±1.1k）。段を分けた容量増はこの規模では誤差に埋もれる。
+- **400k では崩壊する。** 1-ply 2,288、2-ply 10,333。学習ログの総手数は 147.6M = 369 手/ゲーム（100k では 143.1M = 1,431 手/ゲーム）
+  なので、100k 以降に方策が短手数に落ち、以降の自己対戦が学習信号を失っている。段の境界をまたぐブートストラップ（γ=1、報酬は
+  終端のみ）は段ごとに独立した価値スケールを持つため、段間の整合が崩れると一気に発散しやすい。`lr * (1 - 0.9 * frac)` の減衰でも
+  抑えられなかった。
+- 対策案（未検証）: 段の境界をまたぐとき目標を切り離す（段内ブートストラップに限定）、段ごとに学習率・γ を分ける。ただし 100k で
+  利得が見えていないので、この MLP では追う価値が薄い。
 
-- **100k では base と同等**（89.1k 対 87.8k、stderr ±4.9k / ±1.1k）。段を分けた分の容量増は
-  この規模では誤差に埋もれる。
-- **400k では崩壊する。** 1-ply 2,288、2-ply 10,333。学習ログの総手数は 147.6M = 369 手/ゲーム
-  （100k では 143.1M = 1,431 手/ゲーム）なので、100k 以降に方策が短手数に落ち、以降の自己対戦が
-  学習信号を失っている。段の境界をまたぐブートストラップ（γ=1、報酬は終端のみ）は段ごとに
-  独立した価値スケールを持つため、段間の整合が崩れると一気に発散しやすい。
-  `lr * (1 - 0.9 * frac)` の減衰を入れても抑えられなかった。
-- 対策案（未検証）: 段の境界をまたぐときに目標を切り離す（段内ブートストラップに限定する）、
-  または段ごとの学習率・γ を分ける。ただし MS-TD の利得自体が 100k で見えていないので、
-  この MLP では追う価値が薄い。
-
-### 結論
-
-この MLP + TD(0) の構成では **MS-TD は採用しない**。100k では同等、400k では不安定化する。
-実装は variant `mstd` として残す（`zig build nn -- ... mstd ...`）。
+**結論: この MLP + TD(0) の構成では MS-TD は採用しない**（100k で同等、400k で不安定化）。実装は variant `mstd` として残す。
 
 ## 副作用として判明: `par` バッチ学習は 3 倍遅い (2026-10-30)
 
-MS-TD の比較用に `par` 無しの base を回したところ、同じ 100k ゲーム・lr 0.003・seed 1・同一評価 seed で
-大きな差が出た。
+MS-TD の比較用に `par` 無しの base を回したところ、同じ 100k ゲーム・lr 0.003・seed 1・同一評価 seed で大きな差が出た。
 
 | variant | 1-ply | +1 spawn | 2-ply | 学習時間 |
 | --- | ---: | ---: | ---: | ---: |
 | base + `par` | 8,832 | 17,093 | 30,145 | 187 s |
 | base（par なし） | 44,901 | 69,546 | 87,824 | 1,064 s |
 
-`par` は 8 ゲームぶんの勾配を平均し norm clip して 1 ステップにするので、1 ゲームあたりの
-実効学習率がおよそ 1/8 になる。**nn の学習は既定で `par` を使わない（または lr をバッチ数倍にする）**のが正しく、
-これまでの nn 系の計測（OI の A/B など）は par 前提だったため絶対値が控えめに出ている
-（同一条件どうしの相対比較はそのまま有効）。速度は 187 s 対 1,064 s（5.7 倍）なので、
+`par` は 8 ゲームぶんの勾配を平均し norm clip して 1 ステップにするので、1 ゲームあたりの実効学習率がおよそ 1/8 になる。
+**nn の学習は既定で `par` を使わない（または lr をバッチ数倍にする）**のが正しく、これまでの nn 系の計測（OI の A/B など）は
+par 前提だったため絶対値が控えめに出ている（同一条件どうしの相対比較はそのまま有効）。速度は 187 s 対 1,064 s（5.7 倍）なので、
 速度が要る場面では lr を上げた par を使う選択肢が残る（未検証）。
 
 ## n-tuple 表の量子化と `algo=ntuple` の接続 (#129, 2026-10-30)
 
-`.wide` の n-tuple 表は 33,882,112 entries × f32 = 129.3 MiB あり、そのままでは同梱できない。
-int16 に量子化して 64.6 MiB にし、`solver.Policy.ntuple` として API から使えるようにした。
+`.wide` は 33,882,112 entries × f32 = 129.3 MiB でそのままでは同梱できないので、int16 に量子化して 64.6 MiB にし、
+`solver.Policy.ntuple` として API から使えるようにした。
 
-### 形式
+- `ai/solver/ntuple.zig` の `Quantized`: int16 本体 + パターンごとのスケール（f64 × 7）。`q = round(w / scale)`、
+  `scale = max|w| / 32767`（表ごと）、復元 `w ≈ q * scale`。実際のステップはパターンあたり 1.7e-4（値域 ±6 程度なので丸め誤差は無視できる）。
+- ファイルは magic `2048-NQ\0` + version + endian + パターン数 + 表長 + スケール + i16 本体（f32 形式 `2048-NT\0` も読める）。
+- 変換は `zig build ntuple-quant -- <in.bin> <out.q16.bin>`。`zig build ntuple` も出力パスが `.q16.bin` で終われば量子化して保存する。
 
-- `ai/solver/ntuple.zig` の `Quantized`: int16 の本体 + パターンごとのスケール（f64 × 7）
-- 量子化は `q = round(w / scale)`、`scale = max|w| / 32767`（表ごと）。復元は `w ≈ q * scale`
-- ファイルは magic `2048-NQ\0` + version + endian + パターン数 + 表長 + スケール + i16 本体
-  （既存の f32 形式 `2048-NT\0` はそのまま読める）
-- 変換は `zig build ntuple-quant -- <in.bin> <out.q16.bin>`。`zig build ntuple` も出力パスが
-  `.q16.bin` で終われば量子化して保存する
-- 実際のステップはパターンあたり 1.7e-4（値の範囲が ±6 程度なので、丸め誤差は無視できる）
-
-### 精度（10M ゲーム wide 表、20 局 seed 2000、量子化表を f32 に戻して同じ評価コードで測定）
+精度（10M ゲーム wide 表、20 局 seed 2000、量子化表を f32 に戻して同じ評価コードで測定）:
 
 | 表 | 1-ply | +1 spawn | depth 2 |
 | --- | ---: | ---: | ---: |
@@ -1643,47 +968,34 @@ int16 に量子化して 64.6 MiB にし、`solver.Policy.ntuple` として API 
 
 差は 20 局のばらつき（±10%）に埋もれる。**量子化による劣化は観測できない。**
 
-### 接続
+接続: `Policy.ntuple` を enum の末尾に追加し、`solver.choose` は `ntuple.bestMoveQuantized`（1-ply）を呼ぶ。表は**遅延ロード**
+（初めて選ばれたとき、スレッドごとに 1 回だけ `ai/solver/ntuple_wide_q16.bin` を `std.heap.page_allocator` に読む）。
+`/api/solve?algo=ntuple` は表が無ければ 503 と理由を返す（`solver.ntupleAvailable()`）。WASM はファイルを読めないので
+`src/wasm.zig` の `algo_count()` が `-1` して一覧に出さない（enum の末尾に置いたのはこのため）。`ranking.zig` の既定リストには
+入れていない（64.6 MiB を CI/計測で読ませない）。
 
-- `Policy.ntuple` を enum の末尾に追加。`solver.choose` は `ntuple.bestMoveQuantized`（1-ply）を呼ぶ
-- 表は**遅延ロード**: そのポリシーが初めて選ばれたとき、スレッドごとに 1 回だけ
-  `ai/solver/ntuple_wide_q16.bin` を `std.heap.page_allocator` に読む（64.6 MiB）
-- `/api/solve?algo=ntuple` は表が無ければ 503 と理由を返す（`solver.ntupleAvailable()`）
-- WASM はファイルを読めないので `src/wasm.zig` の `algo_count()` が `-1` して一覧に出さない
-  （enum の末尾に置いたのはこのため）
-- `ranking.zig` の既定リストには入れていない（64.6 MiB の表を CI/計測で読ませない）
+限界: 1-ply のみ（`chance` / `deep` は solver 側から未接続）。1-ply で約 20,000 なので `nn2`（72,205）には遠く、`ranking.json` にも
+入れていない。64.6 MiB を git 管理している（既存 `ntuple_weights.bin` 68.4 MiB と合わせて約 133 MiB）。
 
 ### 副産物: WASM ビルドが main で壊れていた
 
-`#104` の `clockNow()` が `std.Io.Threaded.global_single_threaded.io()` を呼ぶため、
-wasm32-freestanding では `std.Io.Threaded` の `getrandom` / `IOV_MAX` 解決に失敗して
-`zig build wasm` が通らなくなっていた（`#104` の PR 以降、誰も wasm をビルドしていなかった）。
-`clockNow` を freestanding 用のスタブ（固定タイムスタンプを返す）に分岐させて修復した。
-当初ここには「その場合 `expectimax_id` は深さ 2 で止まる」と書いていたが、これは**間違いだった**。
-スタブは 0 を返すので `elapsedMs()` が常に 0 になり、`while (... elapsedMs(start) < budget_ms)` が
-常に真 → `id_max_depth = 8` まで深化して 1 手 80 s 以上かかっていた（#145）。いまは
-`shouldDeepen()` が「時計が進むターゲット」を条件に入れているので、wasm では `id_min_depth = 2` に固定される。
-
-### 限界
-
-- 1-ply のみ。`chance` / `deep`（n-tuple 版の 1 spawn / 2-ply）は `solver` 側からは未接続
-- 1-ply で約 20,000 なので `nn2`（72,205）には遠く、`ranking.json` には入れていない
-- 64.6 MiB を git 管理している（既存の `ntuple_weights.bin` 68.4 MiB と合わせて約 133 MiB）
+`#104` の `clockNow()` が `std.Io.Threaded.global_single_threaded.io()` を呼ぶため、wasm32-freestanding では `std.Io.Threaded` の
+`getrandom` / `IOV_MAX` 解決に失敗して `zig build wasm` が通らなくなっていた（#104 の PR 以降、誰も wasm をビルドしていなかった）。
+`clockNow` を freestanding 用のスタブ（固定タイムスタンプを返す）に分岐させて修復した。当初ここには「その場合 `expectimax_id` は
+深さ 2 で止まる」と書いていたが**間違いだった**: スタブは 0 を返すので `elapsedMs()` が常に 0 になり、
+`while (... elapsedMs(start) < budget_ms)` が常に真 → `id_max_depth = 8` まで深化して 1 手 80 s 以上かかっていた（#145）。
+いまは `shouldDeepen()` が「時計が進むターゲット」を条件に入れているので、wasm では `id_min_depth = 2` に固定される。
 
 ## n-tuple の TD 目標: afterstate + max backup (#131, 2026-10-31)
 
-現行の TD 目標は「実際に選んだ手の次の afterstate の価値」＝on-policy なサンプル目標。
-n-tuple の文献（Szubert ら）で使われる **max backup**、つまり出現後の盤面で
-`r + max_a V(afterstate(s', a))` を目標にする方式に変えて、同じ総ゲーム数で比較した。
+現行の目標は「実際に選んだ手の次の afterstate の価値」＝on-policy なサンプル目標。文献（Szubert ら）の **max backup**
+（出現後の盤面で `r + max_a V(afterstate(s', a))`）に変えて、同じ総ゲーム数で比較した。
 
-### 実装
+`ntuple.Target = enum { on_policy, max_backup }`、`trainGameWith(net, rng, lr, mode, target)`（`trainGame` は
+`trainGameWith(..., .on_policy)` のままで挙動不変。同じ seed で同じ表になることをテストで固定）。`.max_backup` の目標は
+`p.reward + bestAfterValue(net, state)`（`state` は出現後の盤面）。variant 名 `maxb` / `maxbchance` / `maxbdeep`（`.wide`）。
 
-- `ntuple.Target = enum { on_policy, max_backup }`、`trainGameWith(net, rng, lr, mode, target)`
-  （`trainGame` は `trainGameWith(..., .on_policy)` のままで挙動不変。同じ seed で同じ表になることをテストで固定）
-- `.max_backup` の目標は `p.reward + bestAfterValue(net, state)`（`state` は出現後の盤面）
-- variant 名 `maxb` / `maxbchance` / `maxbdeep`（いずれも `.wide` + 指定の target）
-
-### 結果（20 局、評価 seed 2000、lr 0.01、`.wide`）
+20 局、評価 seed 2000、lr 0.01、`.wide`:
 
 | 学習 | 1-ply | depth 2 | 学習時間 |
 | --- | ---: | ---: | ---: |
@@ -1694,98 +1006,69 @@ n-tuple の文献（Szubert ら）で使われる **max backup**、つまり出�
 | on-policy 5M, seed 1 | 15,777.6 | 50,103.2 | 4,197 s |
 | **maxb 5M, seed 1** | **17,567.6** | **52,953.4** | 6,436 s |
 
-- 1M の平均: 1-ply 13,946 → 16,477（+18%）、depth 2 40,367 → 40,476（±0%）
-- 5M の同一 seed 比較: 1-ply +11%、depth 2 +5.7%（seed 間のばらつき ±5% と同程度）
-- 学習は 1.2〜1.5 倍遅い（`bestAfterValue` が 1 手あたり 4 回の表引きを足す。ゲームも長くなる）
+1M の平均は 1-ply 13,946 → 16,477（+18%）、depth 2 40,367 → 40,476（±0%）。5M の同一 seed 比較は 1-ply +11%、depth 2 +5.7%
+（seed 間のばらつき ±5% と同程度）。学習は 1.2〜1.5 倍遅い（`bestAfterValue` が 1 手あたり 4 回の表引きを足し、ゲームも長くなる）。
 
-### 解釈
+- **1-ply の価値は明確に良くなる**: サンプルされた手ではなく最善手の価値で更新するので、表が「今の方策」より一歩先を評価する。
+- **2-ply 探索の利得は縮む**（maxb 5M は 52,953 / 17,568 = 3.0 倍、on-policy は 50,103 / 15,778 = 3.2 倍）。価値自体が先読みを
+  含むぶん、追加の探索で得られるものが減る。
+- 合計では depth 2 で +5.7% だが seed のばらつきに埋もれる。**既定の学習目標は変えない**（`maxb` 系は variant として残す）。
+  学習時間あたりでは on-policy が有利。
 
-- **1-ply の価値は明確に良くなる**。サンプルされた手ではなく最善手の価値で更新するので、
-  表が「今の自分の方策」より一歩先を評価するようになる。
-- **2-ply 探索の利得は縮む**（maxb 5M は 52,953 / 1-ply 17,568 = 3.0 倍、on-policy は 50,103 / 15,778 = 3.2 倍）。
-  価値自体が先読みを含むぶん、追加の探索で得られるものが減る。
-- 合計では depth 2 で +5.7% だが seed のばらつきに埋もれる。**既定の学習目標は変えない**
-  （`maxb` 系は variant として残す）。
-- 学習時間あたりでは on-policy が有利（6,436 s で +5.7% は割に合わない）。
-
-### 使い方
-
-```bash
-zig build ntuple -Doptimize=ReleaseFast -- 5000000 20 2000 0.01 maxb /tmp/table.bin 1
-```
+`zig build ntuple -Doptimize=ReleaseFast -- 5000000 20 2000 0.01 maxb /tmp/table.bin 1`
 
 ## 既定 nn 重みの学習レシピ修正 (#133, 2026-10-31)
 
-`#107` の MS-TD 検証中に、`par` バッチ学習が実効学習率を約 1/8 に薄めていることが分かった
-（同一 100k ゲーム・lr 0.003 で `par` あり 30,145 / なし 87,824）。それを受けて、
-**`par` なしで 100k ゲーム学習した `nn`** を `expectimax_id` と同じプロトコル
-（100 局 = 10 ゲーム × 10 seed レンジ, seed 9000–9009, 2-ply）で測り、既定重みと比べた。
+`#107` で `par` が実効学習率を約 1/8 に薄めると分かった（同一 100k・lr 0.003 で `par` あり 30,145 / なし 87,824）ので、
+**`par` なしで 100k 学習した `nn`** を `expectimax_id` と同じプロトコル（100 局 = 10 ゲーム × 10 seed レンジ、seed 9000–9009、2-ply）
+で測り、既定重みと比べた。
 
 | 重み | 1-ply | 2-ply | avg moves | 出典 |
 | --- | ---: | ---: | ---: | --- |
-| 既定 `nn_weights.bin`（200k ゲーム, 旧レシピ） | 41,611 ± 2,201 | **72,397 ± 832** | 3,282.6 | 再測 |
+| 既定 `nn_weights.bin`（200k, 旧レシピ） | 41,611 ± 2,201 | **72,397 ± 832** | 3,282.6 | 再測 |
 | 100k / par なし / train seed 1 | 36,562 ± 2,198 | **86,864 ± 2,503** | 3,865.8 | 本節 |
 | 100k / par なし / train seed 2 | 39,711 ± 1,895 | **93,852 ± 3,173** | 4,119.0 | 本節 |
-| `expectimax_id` 2 ms（`#104` の記録） | — | 75,202 | 3,429.3 | `#104` |
-| `expectimax` depth 2（同条件の手作り評価） | — | 34,000 ± 1,616 | 1,745.1 | 再測 |
+| `expectimax_id` 2 ms（#104） | — | 75,202 | 3,429.3 | #104 |
+| `expectimax` depth 2（手作り評価、同条件） | — | 34,000 ± 1,616 | 1,745.1 | 再測 |
 
-別の評価 seed（9100–9109）での追試: train seed 2 = 89,622 ± 1,674、train seed 1 = 81,540 ± 2,449。
-seed 2 が両方の評価で上なので採用した。2 seed 平均は **90,358**。
+別の評価 seed（9100–9109）での追試: train seed 2 = 89,622 ± 1,674、train seed 1 = 81,540 ± 2,449。seed 2 が両方の評価で上なので採用。
+2 seed 平均 **90,358**。
 
-### 解釈
+- **既定の `nn` / `nn2` は 2-ply で 90k 前後**になり `expectimax_id`（75,202）を上回り、しかも 0.57 games/s で 8 倍速い。
+- 既定重みが悪いのは `par` ではなく**学習ゲーム数**。100k がこの recipe のピークで、400k まで回すと 73,007 に劣化する
+  （自己対戦が短くなり学習信号が減る）。さらに延ばすなら lr 減衰か早期終了が要る。
+- 評価は 2-ply（`nn.deepMove`）で leaves/move ≈ 1,040、0.41 ms/手。1-ply は 36k〜42k で伸びない。
+- golden テストは 1 局だけなので `nn`（1-ply）の golden は 70,364 → 32,380 と下がったが、母集団の 1-ply は 41,611 → 39,711 でほぼ同等。
+  **1 局の golden で優劣を判断しない**（`nn2` の golden は 73,964 → 77,164 に上がっている）。
 
-- **既定の `nn` / `nn2` は 2-ply で 90k 前後**になり、`expectimax_id`（75,202）を上回る。
-  しかも 0.57 games/s で、`expectimax_id`（0.07 games/s）の 8 倍速い。
-- 既定重みが悪いのは `par` ではなく**学習ゲーム数**。100k がこの recipe のピークで、
-  400k まで回すと 73,007 に劣化する（lr 一定のまま延ばすと自己対戦が短くなり学習信号が減る）。
-  さらに延ばすなら lr 減衰か早期終了が要る。
-- 評価は 2-ply（`nn.deepMove`）で、leaves/move ≈ 1,040、0.41 ms/手。1-ply は 36k〜42k で伸びない。
-- golden テストは 1 局だけなので、`nn`（1-ply）の golden は 70,364 → 32,380 と下がった。
-  母集団の 1-ply は 41,611 → 39,711 でほぼ同等なので、**1 局の golden で優劣を判断しない**こと
-  （`nn2` の golden は 73,964 → 77,164 に上がっている）。
-
-### 再現
-
-```bash
-zig build nn -Doptimize=ReleaseFast -- 100000 10 9000 0.003 10 base 30 ai/solver/nn_weights.bin 2
-```
+再現: `zig build nn -Doptimize=ReleaseFast -- 100000 10 9000 0.003 10 base 30 ai/solver/nn_weights.bin 2`
 
 ## nn の学習を 100k より延ばせるか (#135, 2026-10-31)
 
-`#133` で 100k ゲーム / `par` なしが既定になったが、`ai/solver/nn_main.zig:220` を見ると
-**`par` なしの経路には既に線形減衰（`lr * (1 - 0.9 * frac)`、100% → 10%）が入っている**。
-したがって「減衰なしで延ばすと劣化する」ではなく「減衰させても延ばすと劣化する」が正しく、
-残るノブは減衰の形と fine tuning だった。
-
-train seed 3 で統一し、評価は 100 ゲーム（10 × 10 seed レンジ, seed 9000–9009, 2-ply）。
+`#133` で 100k / `par` なしが既定になったが、`ai/solver/nn_main.zig:220` を見ると**`par` なしの経路には既に線形減衰
+（`lr * (1 - 0.9 * frac)`、100% → 10%）が入っている**。したがって「減衰なしで延ばすと劣化する」ではなく「減衰させても延ばすと
+劣化する」が正しく、残るノブは減衰の形と fine tuning だった。train seed 3 で統一、評価は 100 ゲーム（10 × 10 レンジ、seed 9000–9009、2-ply）。
 
 | 学習 | 1-ply | 2-ply | 学習時間 |
 | --- | ---: | ---: | ---: |
-| 100k / lr 0.003（減衰 0.003 → 0.0003, 対照） | 36,743 ± 1,489 | **81,296 ± 1,986** | 1,229 s |
+| 100k / lr 0.003（減衰 0.003 → 0.0003、対照） | 36,743 ± 1,489 | **81,296 ± 1,986** | 1,229 s |
 | 200k / lr 0.003（減衰を 200k に引き伸ばす） | 39,633 ± 1,998 | **70,210 ± 1,213** | 2,677 s |
 | 100k から +100k / lr 0.001（0.001 → 0.0001 で fine tuning） | 45,662 ± 2,285 | **74,841 ± 476** | 1,800 s |
 
-### 解釈
-
 - **100k がこの recipe の最適点**。減衰を引き伸ばして 200k 回すと −14%、低 lr で追化学習すると −8%。
-- fine tuning は **1-ply を大きく上げる**（36,743 → 45,662, +24%）が **2-ply は下げる**。
-  低 lr で追い込むと価値が「今の方策の先読み」に寄り、探索の上乗せが効かなくなるため。
-  1-ply だけを見て採用判断すると罠になる。
-- 100k の train seed 間のばらつきは大きい: seed 1 = 86,864 / seed 2 = 93,852 / seed 3 = 81,296
-  （平均 87,337 ± 6,300）。`#133` で出荷した seed 2 の 93,852 は**上振れの側**なので、
-  「既定 nn は 90k」は 1 seed の値であって期待値ではない。母集団としては 85k 前後と見るのが妥当。
-- seed を選んで出荷している以上、この種の数値には選択バイアスが乗る。新しい候補を比べる時は
-  同一 train seed で並べること（本節はそれを守っている）。
+- fine tuning は **1-ply を大きく上げる**（36,743 → 45,662, +24%）が **2-ply は下げる**。低 lr で追い込むと価値が「今の方策の
+  先読み」に寄り、探索の上乗せが効かなくなる。1-ply だけを見て採用判断すると罠になる。
+- 100k の train seed 間のばらつきは大きい（seed 1 = 86,864 / seed 2 = 93,852 / seed 3 = 81,296、平均 87,337 ± 6,300）。
+  #133 で出荷した seed 2 の 93,852 は**上振れの側**なので、「既定 nn は 90k」は 1 seed の値であって期待値ではない。
+  母集団としては 85k 前後と見るのが妥当。
+- seed を選んで出荷している以上、この種の数値には選択バイアスが乗る。新しい候補を比べる時は同一 train seed で並べること。
 
 ## ranking 表の再生成と速度列（#136）
 
-`src/web/ranking.json`（`localhost:8080` のUIが読む比較表）は 2026-10-26 の生成物で、
-`latency_ms_per_move` / `games_per_sec` を出す前の形式だった。おかげでプレビューの表には
-速度が無く、スコアも #133 出荷前のまま古かった（nn2 が 72,397 と出ていた）。
-
-`zig build ranking -Doptimize=ReleaseFast -- 5 20 1000`（5 run × 20 ゲーム、seed 1000）で
-作り直し、UI の表に games/s と ms/move の列を足した。生成物を `src/web/ranking.json` に
-置いたら**ビルドし直す**必要がある（`src/server.zig` が `@embedFile` している）。
+`src/web/ranking.json` は 2026-10-26 の生成物で、`latency_ms_per_move` / `games_per_sec` を出す前の形式だった。プレビューの表に
+速度が無く、スコアも #133 出荷前（nn2 が 72,397）だった。`zig build ranking -Doptimize=ReleaseFast -- 5 20 1000`（5 run × 20 ゲーム、
+seed 1000）で作り直し、UI の表に games/s と ms/move の列を足した。生成物を `src/web/ranking.json` に置いたら**ビルドし直す**必要が
+ある（`src/server.zig` が `@embedFile` している）。
 
 | policy | depth | avg score | best tile | ms/move | games/s |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -1801,19 +1084,17 @@ train seed 3 で統一し、評価は 100 ゲーム（10 × 10 seed レンジ, s
 | greedy | 0 | 7,789 | 1024 | 0.0007 | 9,891 |
 | random | 0 | 1,062 | 512 | 0.0005 | 61,275 |
 
-計測中は nn3 のベンチマークが 2 コアを占有していたので、絶対速度は低めに出ている。表の中では
-同じ条件なので順序（nn2 ≪ nn ≪ expectimax_tt ≪ expectimax）は信用できる。nn2 は 1 手 3.2 ms
-（expectimax の 17 倍遅い）でスコアは 2.4 倍。速度で選ぶなら nn、強さで選ぶなら nn2。
+計測中は nn3 のベンチマークが 2 コアを占有していたので絶対速度は低め。表の中では同条件なので順序
+（nn2 ≪ nn ≪ expectimax_tt ≪ expectimax）は信用できる。nn2 は 1 手 3.2 ms（expectimax の 17 倍遅い）でスコアは 2.4 倍。
+速度なら nn、強さなら nn2。
 
 ## WASM 版はモデル選択をやめて nn2 固定（#143）
 
-（方針は #152 で `nn3` に、速度は「常に最大」から select に変えた。以下の実測値はその時点のもの）
+（方針は #152 で `nn3` に、速度は「常に最大」から select に変えた。以下の実測値はその時点のもの。）静的版は 13 方針と速度の
+ドロップダウンを出していたが、ブラウザで選ばせる意味が薄いので外した。実測（同マシン、V8 上の wasm、1 手あたり、終盤盤面、
+depth 2、単一スレッド）:
 
-静的版（`zig build wasm`）は 13 方針のドロップダウンと速度のドロップダウンを出していたが、
-ブラウザで選ばせる意味が薄いので外した。実測（同一マシン、V8 上の wasm、1 手あたり、
-終盤盤面、depth 2、単一スレッド）:
-
-| policy | ms/move | native の avg score |
+| policy | ms/move | native avg score |
 | --- | ---: | ---: |
 | `random` | 0.001 | 1,062 |
 | `greedy` | 0.003 | 7,789 |
@@ -1829,33 +1110,26 @@ train seed 3 で統一し、評価は 100 ゲーム（10 × 10 seed レンジ, s
 | `expectimax_id` | 深化が止まらず実質無限（下記） | 75,202 |
 | `ntuple` | 同梱不可（表 64.6 MiB） | 20,014 |
 
-- **`nn2` を固定**にした。1 手 1.3 ms で、最大速度の自動再生でも 1 フレーム 8 ms の予算に収まる。
-  速度優先なら `nn`（0.13 ms / 69,717）、強さ優先なら `nn3`（22.9 ms / 116,205）だが、
-  `nn3` はメインスレッドを掴むので既定にはしない。（#152 で `nn3` 既定に戻した。上の 22.9 ms は
-  終盤の盤面だけの値で、序盤は 0.3〜0.4 s かかる）
-- 方針は **index ではなく名前で解決**する（`algo_name` を走査して `"nn2"` を探し、無ければ
-  `expectimax`）。`Policy` の並びが変わったときに黙って別の方針になるのを防ぐ。
-- 自動再生は `requestAnimationFrame` ごとに 8 ms ぶんだけ解いて返す。以前の "max (no delay)" は
-  `while` で 1 ゲームを同期実行していたので、タブがその間固まっていた。
-- **`expectimax_id` はブラウザで壊れている**: freestanding の `clockNow` は常に 0 なので時間予算が
-  効かず、`0 < budget` が真のままで `id_max_depth = 8` まで深化する。`docs/solver-history.md` の
-  以前の記述（「深さ 2 で止まる」）は実装と食い違っていた。選択肢から外したので実害は無いが、
-  WASM で `expectimax_id` を出すなら時計かノード上限が要る。
-- WASM の制約（実測）: モジュール 763,545 B、初期メモリ 2.44 MiB（`memory.grow` 無し）、
-  スタック 1 MiB、TT 640 KiB + `cached_net` 148 KB が bss。スレッドは使わない。
+- **`nn2` 固定**（1 手 1.3 ms で、自動再生でも 1 フレーム 8 ms に収まる）。速度優先なら `nn`、強さ優先なら `nn3`（22.9 ms /
+  116,205）だが `nn3` はメインスレッドを掴むので既定にしない（#152 で既定に戻した。22.9 ms は終盤だけの値で序盤は 0.3〜0.4 s）。
+- 方針は **index ではなく名前で解決**する（`algo_name` を走査して `"nn2"` を探し、無ければ `expectimax`）。`Policy` の並びが
+  変わったときに黙って別の方針になるのを防ぐ。
+- 自動再生は `requestAnimationFrame` ごとに 8 ms ぶん解いて返す。以前の "max (no delay)" は `while` で 1 ゲームを同期実行して
+  いたのでタブが固まった。
+- **`expectimax_id` はブラウザで壊れている**: freestanding の `clockNow` が常に 0 なので時間予算が効かず、`id_max_depth = 8` まで
+  深化する。以前の記述（「深さ 2 で止まる」）は実装と食い違っていた。選択肢から外したので実害は無いが、WASM で出すなら時計か
+  ノード上限が要る。
+- WASM の制約（実測）: モジュール 763,545 B、初期メモリ 2.44 MiB（`memory.grow` 無し）、スタック 1 MiB、TT 640 KiB + `cached_net`
+  148 KB が bss。スレッドは使わない。
 
 ## 静的版を nn3 に戻し、再生速度を選べるようにした（#152）
 
-（#154 で方針 select が戻り、同梱する方針は `nn2` と `nn3` の 2 つになった。以下の
-「方針は固定」「smoke test は `SOLVER_NAME` を見る」は #152 時点の記録）
+（#154 で方針 select が戻り、同梱は `nn2` と `nn3` の 2 つになった。以下の「方針は固定」「smoke test は `SOLVER_NAME` を見る」は
+#152 時点の記録。）最大速度では 1 秒に何十手も進んで目で追えないので、既定を `nn3`（native 116,205、`nn2` は 82,772）にし、
+自動再生の速度を select で選べるようにした（当初 `max` / 250 ms / 500 ms / 1 s / 2 s、既定 `max`。1 秒以上は使わないので #154 で
+1 s / 2 s を外した）。
 
-#143 で `nn2` 固定・常に最大速度にしたが、最大速度では 1 秒に何十手も進んで何が起きているかを
-目で追えない。既定の方針を `nn3`（native avg score 116,205、`nn2` は 82,772）にし、自動再生の
-速度を select で選べるようにした（当初は `max` / 250 ms / 500 ms / 1 s / 2 s、既定は `max`。
-1 秒以上の待ちは使わないので #154 で 1 s / 2 s を外した）。
-
-wasm（ReleaseFast、V8、このマシン）での 1 手あたりの実測。`nn3` のコストは盤面に強く依存する。
-#143 の表の 22.9 ms は終盤の詰まった盤面だけを測った値で、序盤は 10 倍以上かかる:
+wasm（ReleaseFast、V8）での 1 手あたり。`nn3` のコストは盤面に強く依存し、#143 の 22.9 ms は終盤だけの値:
 
 | 局面 | 手数 | `nn2` | `nn3` |
 | --- | ---: | ---: | ---: |
@@ -1865,52 +1139,40 @@ wasm（ReleaseFast、V8、このマシン）での 1 手あたりの実測。`nn
 | 4096 タイル | 2,500 | — | 4 ms |
 | 4096 タイル（約 3,500 手） | 3,500 | — | 80 ms |
 
-序盤は空きマスが多く分岐が最大になるので 0.3〜0.4 s、盤面が詰まると 10 ms 前後まで落ちる。
-1 ゲーム 4,000 手前後なので、`nn3` の自動再生は数分〜十数分かかる。
+序盤は空きマスが多く分岐が最大なので 0.3〜0.4 s、詰まると 10 ms 前後。1 ゲーム 4,000 手前後なので `nn3` の自動再生は数分〜十数分。
 
-- 速度は「1 手あたりの待ち時間」。`max` は従来どおり 1 フレーム 8 ms の予算で回すが、`nn3` は
-  1 手でその予算を超えるので実質 1 フレーム 1 手になる。
-- 待ち時間は *solve が返ってから* 測り直す。solve 自体が 0.3 s かかる手に 250 ms を上乗せして
-  2 倍遅くしてしまうのを避けるため。
-- `nn3` の深さは `nn.bestMove(net, state, .deep3)` で固定なので、`solve` に渡す depth は
-  フォールバック（`expectimax`）のためのもの。
-- 自動再生のループは 1 本だけにする。`stopAuto` が保留中の `requestAnimationFrame` を
-  `cancelAnimationFrame` するので、停止→開始が 1 タスク内で起きても 2 本目が生まれない
-  （nn3 の solve が 0.3 s 固まる間に押されると起きていた）。
-- 速度の `<select>` にフォーカスがあるときは矢印キーを盤面に使わない。以前は select の
-  上下キーが `preventDefault` されて手になってしまっていた（サーバー版の `src/web/index.html` も同じ）。
-- `scripts/wasm-smoke.mjs` は「静的版の方針が wasm に載っている」ことを検査する。当時は
-  ページ側の定数名 `SOLVER_NAME` を見ていたが、#154 でページは方針名をモジュールから取るように
-  なり、この検査は同梱一覧と既定（`DEFAULT_POLICY`）の突き合わせに置き換わった。
+- 速度は「1 手あたりの待ち時間」。`max` は 1 フレーム 8 ms の予算で回すが、`nn3` は 1 手で予算を超えるので実質 1 フレーム 1 手。
+- 待ち時間は *solve が返ってから* 測り直す（solve 自体が 0.3 s の手に 250 ms を上乗せして 2 倍遅くしないため）。
+- `nn3` の深さは `nn.bestMove(net, state, .deep3)` で固定なので、`solve` の depth はフォールバック（`expectimax`）用。
+- 自動再生のループは 1 本だけ。`stopAuto` が保留中の `requestAnimationFrame` を `cancelAnimationFrame` するので、停止→開始が
+  1 タスク内で起きても 2 本目が生まれない（nn3 の solve が 0.3 s 固まる間に押されると起きていた）。
+- 速度の `<select>` にフォーカスがあるときは矢印キーを盤面に使わない（以前は select の上下キーが `preventDefault` されて手になった。
+  サーバー版の `src/web/index.html` も同じ）。
+- `scripts/wasm-smoke.mjs` は「静的版の方針が wasm に載っている」ことを検査する。当時はページ側の定数 `SOLVER_NAME` を見ていたが、
+  #154 でページは方針名をモジュールから取るようになり、検査は同梱一覧と既定（`DEFAULT_POLICY`）の突き合わせに置き換わった。
 
 ## 同梱する方針を設定ファイルで決め、nn2 / nn3 の 2 択にした（#154）
 
-#143 で 13 方針のドロップダウンを外したが、`#152` で `nn3` を既定にすると「速すぎて何が
-起きているか分からない」局面が出たので、方針の select を戻した。ただし 13 方針を全部載せる
-理由は無いので、**同梱する方針はコードではなく設定ファイル** `wasm.policies` に持たせた
+#143 で 13 方針のドロップダウンを外したが、#152 で `nn3` を既定にすると「速すぎて何が起きているか分からない」局面が出たので
+方針 select を戻した。13 方針を全部載せる理由は無いので、**同梱する方針はコードではなく設定ファイル** `wasm.policies` に持たせた
 （1 行 1 名、`#` 以降はコメント）。既定は `nn2` と `nn3`。
 
-- `build.zig` が `@embedFile("wasm.policies")` でそのまま `options` モジュールに渡し、
-  `src/wasm.zig` が comptime で解析する。未知の名前・重複・n-tuple 表が要る `ntuple` は
-  ビルドエラー。ファイルを編集すると wasm が再ビルドされる。
-- 同梱した方針だけをリンクするために、`solver.choose` を `chooseOne(comptime policy, ...)` に
-  分け、`solve` は `inline 0...policies.len - 1` でインデックスごとに定数方針を渡す。
-  実行時の `switch (policy)`（= 従来の `choose`）は全アームをリンクしてしまう。
-- ABI の `algo` は「モジュールに入れた順」の index になった。`Policy` の並びは ABI ではなく
-  なり、`wasm_policy_count`（"表が要る方針は最後" を強制する仕掛け）は消した。
-- ページの方針 select は `algo_count()` / `algo_name()` から組み立て、選んだ方針の**測った
-  平均スコアと 1 手の時間**を `algo_score()` / `algo_speed()`（`policy_info` の `score` と
-  `speed`）で select の下に出す。実装の説明（`description`）はページには長すぎるので出さない
-  （#155 の指摘）。`speed` はブラウザ実測（V8 on wasm）で、native の ms/move とは別物なので
-  測っていない方針は空にし、ページはスコアだけを出す。ページが自分で持つ方針名は
-  既定を指す `DEFAULT_POLICY = "nn3"` の 1 つだけで、同梱していない方針は選べないし、UI と
-  モジュールの一覧はずれない（既定が同梱に無いときだけ最後のエントリに落ちる）。
-- `scripts/wasm-smoke.mjs` は `wasm.policies` を読み、モジュールの一覧が名前も順序も一致する
-  こと、各エントリに説明があること、ビルド済み HTML が `algo_count()` で一覧を作っていること、
-  その `DEFAULT_POLICY` が同梱一覧に含まれることを検査する（後者が無いと、既定の方針を
-  `wasm.policies` から外したときにページが黙って別の方針になる）。`scripts/deploy-pages.sh` は
-  デプロイログに同梱方針を出す（インラインコメントは落とす。`--skip-smoke` のときは
-  「モジュールと設定ファイルの突き合わせをしていない」と警告する）。
+- `build.zig` が `@embedFile("wasm.policies")` でそのまま `options` モジュールに渡し、`src/wasm.zig` が comptime で解析する。
+  未知の名前・重複・n-tuple 表が要る `ntuple` はビルドエラー。ファイルを編集すると wasm が再ビルドされる。
+- 同梱した方針だけをリンクするため、`solver.choose` を `chooseOne(comptime policy, ...)` に分け、`solve` は
+  `inline 0...policies.len - 1` でインデックスごとに定数方針を渡す。実行時の `switch (policy)` は全アームをリンクしてしまう。
+- ABI の `algo` は「モジュールに入れた順」の index になった。`Policy` の並びは ABI ではなくなり、`wasm_policy_count`
+  （"表が要る方針は最後" を強制する仕掛け）は消した。
+- ページの方針 select は `algo_count()` / `algo_name()` から組み立て、選んだ方針の**測った平均スコアと 1 手の時間**を
+  `algo_score()` / `algo_speed()`（`policy_info` の `score` と `speed`）で select の下に出す。実装の説明（`description`）は
+  ページには長すぎるので出さない（#155 の指摘）。`speed` はブラウザ実測（V8 on wasm）で native の ms/move とは別物なので、
+  測っていない方針は空にしページはスコアだけを出す。ページが自分で持つ方針名は既定を指す `DEFAULT_POLICY = "nn3"` の 1 つだけで、
+  同梱していない方針は選べず、UI とモジュールの一覧はずれない（既定が同梱に無いときだけ最後のエントリに落ちる）。
+- `scripts/wasm-smoke.mjs` は `wasm.policies` を読み、モジュールの一覧が名前も順序も一致すること、各エントリに説明があること、
+  ビルド済み HTML が `algo_count()` で一覧を作っていること、その `DEFAULT_POLICY` が同梱一覧に含まれることを検査する
+  （最後は、既定を `wasm.policies` から外したときにページが黙って別の方針になるのを防ぐ）。`scripts/deploy-pages.sh` は
+  デプロイログに同梱方針を出す（インラインコメントは落とす。`--skip-smoke` のときは「モジュールと設定ファイルの突き合わせを
+  していない」と警告する）。
 
 サイズの実測（ReleaseFast、`zig build wasm`、`wc -c`）:
 
@@ -1923,1414 +1185,693 @@ wasm（ReleaseFast、V8、このマシン）での 1 手あたりの実測。`nn
 | NN 以外の 8 方針 | 591,768 |
 | `random` のみ（床） | 529,463 |
 
-- 13 → 2 で 63 KB（8%）しか減らない。`nn2` と `nn3` は同じ net と探索コードを共有していて、
-  2 つ目は 700 B しか増えないため。方針を削る効果はここで頭打ちになる。
+13 → 2 で 63 KB（8%）しか減らない。`nn2` と `nn3` は同じ net と探索コードを共有していて、2 つ目は 700 B しか増えないため。
+方針を削る効果はここで頭打ちになる。
+
 ### レビューで見つかって直したこと（#154）
 
-- `solve(algo, depth)` の `depth` を捨てていた。同梱が `nn2`/`nn3` の間は害が無い（両方とも
-  深さ固定）が、この機能の売り文句どおり `wasm.policies` に `expectimax` か `ga` を足すと
-  `depth = 0` が `chanceValueW` で `0 - 1` の u8 ラップで 255 手になり、タブも smoke テストも
-  戻ってこない。`depth` を通し、`0` は `policy_info` の既定深さ（`expectimax`/`ga` は 2）を
-  使う、という `expectimax_id` と同じ約束にした。`expectimax` を足したビルドで
-  `solve(0, 0)` が 1 手で返ることを確認済み。
-- パーサが `nn2#コメント` の名前を捨てていた（`#` の分岐が区切りの処理より先にあった）。
-  区切りとコメントの前で必ず名前を確定させ、先頭 BOM も読み飛ばし、`found[32]` の上限も
-  `@compileError` にした。
-- smoke テストの 2 s 上限は呼び出しが返ってからしか見ないので、ハングを検出できなかった
-  （#143/#145 の保護は実は「depth 引数」だった）。方針ごとに `--solve-one` の子プロセスで
-  回し、5 s で `spawnSync` が kill するようにした。
-- `src/wasm.zig` の `depth` ABI 説明と、`expectimax_id` の説明（「既定の40ms」→ 実際は
-  `id_budget_ms`）が実装とずれていたので直した。
+- `solve(algo, depth)` の `depth` を捨てていた。同梱が `nn2`/`nn3` の間は害が無い（両方とも深さ固定）が、`wasm.policies` に
+  `expectimax` か `ga` を足すと `depth = 0` が `chanceValueW` で `0 - 1` の u8 ラップで 255 手になり、タブも smoke テストも
+  戻ってこない。`depth` を通し、`0` は `policy_info` の既定深さ（`expectimax`/`ga` は 2）を使う、という `expectimax_id` と同じ
+  約束にした。`expectimax` を足したビルドで `solve(0, 0)` が 1 手で返ることを確認済み。
+- パーサが `nn2#コメント` の名前を捨てていた（`#` の分岐が区切りの処理より先にあった）。区切りとコメントの前で必ず名前を
+  確定させ、先頭 BOM も読み飛ばし、`found[32]` の上限も `@compileError` にした。
+- smoke テストの 2 s 上限は呼び出しが返ってからしか見ないのでハングを検出できなかった（#143/#145 の保護は実は「depth 引数」）。
+  方針ごとに `--solve-one` の子プロセスで回し、5 s で `spawnSync` が kill するようにした。
+- `src/wasm.zig` の `depth` ABI 説明と `expectimax_id` の説明（「既定の40ms」→ 実際は `id_budget_ms`）が実装とずれていた。
+- 内訳（既定ビルド）: code 11,787 B / data 689,801 B。data の大半は `src/core.zig` の `row_table`（`[65536]RowEntry` = 512 KiB）。
+  次にサイズを削るならここ（`RowEntry` は 8 B。score を半分にして u32 に詰めれば 256 KiB 減る）で、方針を削っても効かない。
+## 学習の両側を 2-ply に揃える（#158）
 
-- 内訳（既定ビルド）: code 11,787 B / data 689,801 B。data の大半は `src/core.zig` の
-  `row_table`（`[65536]RowEntry` = 512 KiB、1 行のマージを引く表）で、NN 重み 148 KB よりも
-  大きい。次にサイズを削るならここ（`RowEntry` は 8 B。score を半分にして u32 に詰めれば
-  256 KiB 減る）で、方針を削っても効かない。
+評価を 1-ply で学習し探索で 2-ply を使うと、学習目標（サンプルされた手の価値）と方策（最善手）がずれる。
+`Options.teacher`（`pickTeacher`）と `Options.target`（`tdBootstrap` の分岐）で両側を独立に切り替えられるようにした。
 
-## 2-ply の目標と自己対戦方策を評価側に揃える（#158）
-
-評価は 2-ply の探索値で手を選ぶのに、学習は 1-ply greedy の自己対戦と `reward + V(next afterstate)`
-で回っていた。価値関数が「今の方策の先読み」に寄るほど探索の上乗せが消える（#135 で fine tuning
-すると 1-ply は +24%、2-ply は −8%）ので、学習の両側を評価側に寄せる 4 セルを用意した。
-
-`zig build nn -Doptimize=ReleaseFast -- 100000 10 9000 0.003 10 {t,tp,p,tp2} 30 <tmp> 3`
-
-| セル | 目標 | 自己対戦 |
+| セル | 目標 | 手を選ぶ基準 |
 | --- | --- | --- |
-| `base`（対照） | `td1`: `reward + V(next afterstate)` | `greedy1`: 1-ply argmax |
-| `t` 目標のみ | `search2`: 2-ply 探索値 | `greedy1` |
-| `p` 方策のみ | `td1` | `deep2`: 評価の `.deep` で手を選ぶ |
-| `tp` 両方 | `search2` | `deep2` |
+| `base`（対照） | `reward + V(next afterstate)` | 1-ply argmax |
+| `t` | `search2`（2-ply 探索値） | 1-ply |
+| `p` | TD | `.deep` |
+| `tp` | `search2` | `.deep` |
 
-いずれのセルも spawn を列挙するので乱数の消費は `base` と同じで、ゲームの spawn 列が揃う。
+どのセルも spawn を列挙するので乱数の消費は `base` と同じ（ゲームの spawn 列が揃う）。
 
-### 目標の二重計上（レビューで見つけて直したこと）
+**目標の二重計上（レビューで修正）**: 最初の `search2` は `Search.value(spawned, 2, 1)` で、`value` の葉が
+「最後の報酬を足した後の afterstate」を評価するため `V` に次の報酬が二重に入っていた（決定的な鎖で
+固定点が真値の約 1.5 倍。`test "search2 target does not double count the last reward (#158)"` が差を 8/reward_scale
+として固定）。`Search.bootValue(state, rewards, cprob)`（同 `bootChance`）を足して葉を 1 手先へずらし、
+`search2Value` は `r_t + r_{t+1} + V(A_{t+2})` を返す。`Search.ply` を `search2_ply + 1` にして置換表のキーも
+葉の深さに合わせた（値自体は深さ非依存）。
 
-最初の `search2` は `Search.value(spawned, 2, 1)`、つまり「報酬 2 つ + 葉の `V`」だった。`value` の
-葉は**最後の報酬を足した後の afterstate** を評価するので、その `V` には次の報酬が既に入っている。
-決定的な鎖（各手の報酬が 1、割引なし）で確かめると固定点は 1, 2, 4, 5, 7, 10 と真値の約 1.5 倍に
-なっていた（`test "search2 target does not double count the last reward (#158)"` が差を 8/reward_scale
-として固定している）。
+## 深さを空き数で切り替えてもコストは下がらない（#157）
 
-`Search.bootValue(state, rewards, cprob)`（同 `bootChance`）を足し、葉を「最後の報酬より 1 手先の
-afterstate」にずらした。`bootValue(S, 0)` は 1 手先 afterstate の最大 `V`、`bootValue(S, r)` は
-`max_d (score_delta / reward_scale + bootChance(S', r - 1))` なので、`search2Value` は
-`r_t + r_{t+1} + V(A_{t+2})` を返す。`Search.ply` を `search2_ply + 1` にして置換表のキーも葉の
-深さに合わせた（値自体は深さ非依存）。
+`deep`（2-ply）/ `deep3`（3-ply, cutoff 1e-2）/ `phase_h1..h3`（空き数で深さを混ぜる）を、同梱 net
+（md5 `f584d99667f499184d7da2d5d0e9e0a1`）で 3 局（seed 9000-9002）測った。
 
-## 深さを空き数で切り替える（#157）の実測
+| 行 | avg score | ms/move | 4096 | 8192 |
+| --- | ---: | ---: | ---: | ---: |
+| 1-ply | 60,980 | 0.00 | 2/3 | 0/3 |
+| +1 spawn lookahead | 64,479 | 0.08 | 2/3 | 0/3 |
+| 2-ply (deep) | 69,272 | 0.72 | 3/3 | 0/3 |
+| expectimax depth 2 | 23,335 | 0.05 | 0/3 | 0/3 |
+| 3-ply (deep3) | 100,728 | 16.58 | 2/3 | 2/3 |
+| phase h1 / h2 / h3 | 93,912 / 110,843 / 108,901 | 21.4 / 26.4 / 29.6 | 3/3 | 1/3 / 1/3 / 2/3 |
 
-`deep`（1 通り 2-ply）、`deep3`（3-ply, cutoff 1e-2）、`phase_h1/h2/h3`（空き数で 2/3-ply を混ぜる）
-を同じ net・同じ 3 局（seed 9000-9002）で測った。native ReleaseFast、重みは同梱の
-`ai/solver/nn_weights.bin`（md5 `f584d99667f499184d7da2d5d0e9e0a1`）。この net は md5 を控えてから
-`/tmp` にコピーして使う（リポジトリのファイルを上書きしない・取り違えないため）。
+**空き数で深さを切り替えてもコストは下がらない**（h1-h3 は deep3 より高い）。1 局の手数の大半が空き 4-7 で
+消費され、そこを 3-ply にすると一律 3-ply と同じだけ読むため。序盤だけ 2-ply にした分は安いが、全体は深い
+局面の 3-ply が支配する。到達率は deep3 と h3 が 8192 に 2/3、deep は 0/3。n=3 なので avg score の差は
+判断材料にしない。
 
-`zig build nn -Doptimize=ReleaseFast -- 0 3 9000 0.003 1 base 30 /tmp/w.bin 1`
-
-| 行 | avg score | moves | best | ms/move | 4096 | 8192 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| nn 1-ply | 60,980 | 2,849 | 4096 | 0.00 | 2/3 | 0/3 |
-| nn + 1 spawn lookahead | 64,479 | 3,051 | 4096 | 0.08 | 2/3 | 0/3 |
-| nn 2-ply (deep) | 69,272 | 3,181 | 4096 | 0.72 | 3/3 | 0/3 |
-| expectimax depth 2 | 23,335 | 1,275 | 2048 | 0.05 | 0/3 | 0/3 |
-| nn 3-ply (deep3) | 100,728 | 4,354 | 8192 | 16.58 | 2/3 | **2/3** |
-| phase h1 | 93,912 | 4,143 | 8192 | 21.44 | 3/3 | 1/3 |
-| phase h2 | 110,843 | 4,862 | 8192 | 26.37 | 3/3 | 1/3 |
-| phase h3 | 108,901 | 4,663 | 8192 | 29.58 | 3/3 | 2/3 |
-
-**結論: 空き数で深さを切り替えてもコストは下がらない。** h1/h2/h3 は `deep3` より高い
-（21-30 ms/move 対 16.6 ms/move）。理由は 1 局の手数の大半が空き 4-7 で消費されることで、
-そこを 3-ply にすると 3-ply 一律と同じだけ読む。切り替えの副作用で序盤だけ 2-ply にした分は
-安く済むが、全体では深い局面の 3-ply が支配する。
-
-到達率では `deep3` と h3 が 8192 に 2/3 で届き、`deep` は 0/3、1-ply は 4096 に 2/3 止まり。
-**n=3 なので avg score の差（h2 110,843 対 deep3 100,728）は判断材料にしない**。差が出ているのは
-深さ（2-ply 対 3-ply）の方で、これは 8192 到達率としてはっきり出ている。
-
-### 計測まわりの事故（同じ轍を踏まないための記録）
-
-最初にこの表を取ったとき、作業ツリーの `ai/solver/nn_weights.bin` が #133 以前の 200k+40k net
-（md5 `0a8e6bf01e256adf2fc481317c5072c9`）に入れ替わっていて、全行が 4-14 倍低い値になった
-（`deep` 17,408、`deep3` 25,662、h3 22,773）。コードは壊れておらず、golden テスト
-（`ai/solver/solver.zig:1865-1879`、`nn` seed 20240601 = 32,380 / `nn2` = 77,164）は同梱 net で緑、
-古い net では赤になる。**評価を回す前に `md5` を控え、`/tmp` のコピーを渡す**こと。
+**計測事故（同じ轍を踏まないため）**: 最初の計測は作業ツリーの `ai/solver/nn_weights.bin` が #133 以前の
+200k+40k net（md5 `0a8e6bf01e256adf2fc481317c5072c9`）に入れ替わっていて全行 4-14 倍低く出た。コードは壊れて
+おらず golden（`ai/solver/solver.zig:1865-1879`、`nn` seed 20240601 = 32,380 / `nn2` = 77,164）は同梱 net で緑。
+**評価の前に md5 を控え、`/tmp` のコピーを渡す。**
 
 ## 終盤だけ 4-ply（#171）
 
-探索の深さを空きマス数で選ぶ表（`ai/solver/nn.zig` の `phase_schedules`）に `phase_h4` を足した。
-中盤は `deep3`（3-ply、cutoff 1e-2）のままで、**空きマスが 2 以下になってからだけ 4-ply** にする。
-#157 の `phase_h1/2/3` は深さを切り替えて**総コストを節約する**方向だったが、こちらは逆向きで、
-**終盤の数手にコストを積む**実験。
+`phase_schedules` に `phase_h4` を足した。中盤は `deep3` のままで、空きマスが 2 以下になってから 4-ply に
+する。終盤は分岐が潰れて 1 ply 増やすコストが小さく（終盤 1 手 4 ms 前後、遅くても ~80 ms）、4096 → 8192 の
+判断がその数手で決まるため。cutoff は `deep3` と同じ 1e-2（空き 2 では spawn の分岐が数個しかなく木が小さい）。
 
-理由は 2 つ。終盤は盤面が詰まって分岐が潰れるので、1 ply 増やす絶対コストが小さい（終盤の 1 手は
-4 ms 前後まで落ち、遅い局面でも ~80 ms。#152 の表）。そして 4096 → 8192 の判断はまさにその数手で
-決まる。**#157 が否定したのは「深さの切り替えで総コストを下げる」ことであって、「終盤だけ深く
-する」ことではない**ので、その結果とこの実験は矛盾しない。
+3 局（seed 9000-9002）: `deep3` 100,728 / 21.4 ms/move / 4096 2/3 → `phase_h4` **131,201** / 31.7 ms/move / 4096 3/3。
+**上乗せは約 +48%**、avg score +30%、手数 +28%、8192 は 2/3 のまま。n=3 なので avg score は参考値。
 
-| `min_empty` | ply | cutoff | 意味 |
-| ---: | ---: | ---: | --- |
-| 3 以上 | 3 | 1e-2 | `deep3` と同じ（控えめな基準線） |
-| 0〜2 | 4 | 1e-2 | 空きが 2 以下なら 1 ply 追加 |
-
-4-ply の行も cutoff は `deep3` と同じ 1e-2。空き 2 の盤面では spawn の分岐が数個しかなく、木は
-もともと小さいので、`phase_h2`/`phase_h3` の 1e-4 まで絞る必要がない。
-
-計測（3 局、seed 9000–9002）:
-
-    zig build nn -Doptimize=ReleaseFast -- 0 3 9000 0.003 1 base 30 <tmp_weights> 1
+10 局（seed 9000-9009、同梱 net）:
 
 | 方針 | avg score | moves | ms/move | 4096 | 8192 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `nn 3-ply (deep3, #108)`（基準線） | 100,728 | 4,354 | 21.42 | 2/3 | 2/3 |
-| `nn phase h4 (#171)` | **131,201** | 5,569 | 31.69 | 3/3 | 2/3 |
+| 1-ply | 50,496 | 2,384 | 0.00 | 6/10 | 0/10 |
+| 2-ply (deep) | 86,565 | 3,828 | 0.58 | **10/10** | 3/10 |
+| 3-ply (deep3) | 106,936 | 4,567 | 12.04 | 8/10 | **6/10** |
+| phase h4 (#171) | **117,566** | 5,016 | 22.88 | **10/10** | **6/10** |
 
-`deep3` は同じ net・同じ seed で 16.58-21.42 ms/move（マシンの空き具合で振れる）なので、
-**4-ply にした分の上乗せは約 +48%**。avg score は +30%、手数は +28%、4096 到達は 2/3 → 3/3。
-8192 到達率は 2/3 のまま（n=3 では差が出ない）。**n=3 なので avg score の差は参考値**だが、
-同じ 3 局で手数と 4096 到達が揃って上を向いているので、10 局に増やして判断する価値はある。
+- **4096 は 2-ply で 10/10**（1 手 0.58 ms）。3-ply の 8/10 は 2 局が 4096 直後で死んだノイズ。
+- **8192 は 2-ply 3/10、3-ply 6/10、phase_h4 も 6/10 で上がらない**。一方 avg score は +10%、手数 +10%、
+  コスト 1.9 倍。「終盤を深く読むと、8192 に届くかは変わらないが、届いたときの伸びが良くなる」。
+- **8192 到達率を動かすには探索の深さではなく評価関数そのもの**（3 段の差はすべて V の質）を良くする必要が
+  ある。#167 / #175 の蒸留が本命。
 
-## 深さ別の比較（10 局, seed 9000-9009, 同梱 net）
-
-`deep`（2-ply）/ `deep3`（3-ply）/ `phase_h4`（終盤 0-2 空きだけ 4-ply, `#171`）を 10 局で測った。
-native ReleaseFast、重みは同梱 `ai/solver/nn_weights.bin`（md5 `f584d99667f499184d7da2d5d0e9e0a1`）を
-`/tmp` にコピーして使う。
-
-`zig build nn -Doptimize=ReleaseFast -- 0 10 9000 0.003 1 base 30 /tmp/w.bin 1`
-
-| 方針 | avg score | moves | ms/move | 4096 | 8192 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| nn 1-ply | 50,496 | 2,384 | 0.00 | 6/10 | 0/10 |
-| nn 2-ply (deep) | 86,565 | 3,828 | 0.58 | **10/10** | 3/10 |
-| nn 3-ply (deep3) | 106,936 | 4,567 | 12.04 | 8/10 | **6/10** |
-| nn phase h4 (#171) | **117,566** | 5,016 | 22.88 | **10/10** | **6/10** |
-
-読み方:
-
-- **4096 は 2-ply で 10/10**。1 手 0.58 ms（native）で、ユーザの前提「nn2 で 4096 まではほぼ確実」は
-  10 局では確定。3-ply の 8/10 は 10 局ではノイズの範囲（2 局が 4096 直後で死んでいる）。
-- **8192 は 2-ply で 3/10、3-ply で 6/10**。`#171` の終盤 4-ply も 6/10 で、**8192 到達率は上がらない**。
-  一方で avg score は `deep3` より +10%（106,936 → 117,566）、手数 +10%、コスト 1.9 倍。
-  「終盤を深く読むと、8192 に届くかどうかは変わらないが、届いたときの伸びが良くなる」。
-- 8192 到達率を動かすには、**探索の深さではなく評価関数そのもの**を良くする必要がある（この表の
-  3 段の差はすべて V の質の差であって、探索の差ではない）。`#167`/`#175` の蒸留が本命。
 ## 深い探索を教師にする蒸留（#167）
 
-nn3 = 116,205 / nn2 = 82,772 / nn = 69,717 と、この差の大半は探索が稼いでいる。一方 #135 では、
-評価を自分の 1-ply 方策で fine tuning すると 2-ply の上乗せが消える（1-ply は +24%、2-ply は −8%）と
-分かった。#158 は学習の両側を 2-ply 評価に揃えたが、その延長として**評価そのものに深い探索の値を
-教える**（蒸留）。3-ply で自己対戦し、目標をその探索値にして、遊ぶときは 2-ply の評価 1 枚で済ませる。
+3-ply で自己対戦し、目標をその探索値にして、遊ぶときは 2-ply の評価 1 枚で済ませる。
 
-- **目標**: `tdBootstrap` が `teacherValue(vfn, spawned, mode)` = `Search.value(spawned, ply, 1)` を
-  返す（`spawned` は指した手の後の spawn 済み盤面、`ply` はモードの位相行の深さ）。`.deep3` は
-  `ply = 3` / `cutoff = 1e-2` なので、`Mode.deep` が手を並べるのに使う値（`reward + chance(A, 2)`、
-  つまり `value(S, 3)`）をそのまま学ぶ。`.deep` は #158 の `search2` と同じ木の `value(S, 2)`。
+- **目標**: `tdBootstrap` が `teacherValue(vfn, spawned, mode)` = `Search.value(spawned, ply, 1)` を返す
+  （`spawned` は指した手の後の spawn 済み盤面、`ply` はモードの位相行の深さ）。`.deep3` は `ply = 3` /
+  `cutoff = 1e-2`、`.deep` は #158 の `search2` と同じ木の `value(S, 2)`。
 - **方策**: `Options.teacher` を立てると自己対戦も同じモードの探索で指す（`pickTeacherValue`:
-  `reward + Search.chance(after, ply, 1)`）。方策と目標が別の木を見ると #135 の再現になるので、
-  両側を同じ木から取る。spawn は列挙するので乱数は消費せず、spawn 列は `base` と同一。
+  `reward + Search.chance(after, ply, 1)`）。方策と目標が別の木を見ると #135 の再現になるので両側を同じ木から取る。
+- セル: `d2`（教師 `.deep`、目標 `value(spawned, 2)`、自己対戦 `.deep` の手）/ `d3`（`.deep3`、`value(spawned, 3)`、
+  `.deep3` の手）。既定は不変（`teacher = null`）なので `base` / `t2` / `p2` / `tp2` の checksum はそのまま。
+- **コスト**: `d3` の 1 ゲームは `tp2` の 15 倍前後（3-ply は 15-23 ms/手、2-ply は 1.2 ms/手）。`par` は `d2` / `d3`
+  では弾く（教師探索が実行時間のほぼ全部）。比較は遊ぶ側を 2-ply で測る。**数値は未取得。**
 
-| セル | 教師 | 目標 | 自己対戦 |
-| --- | --- | --- | --- |
-| `d2` | `.deep` | `value(spawned, 2)` | `.deep` の手 |
-| `d3` | `.deep3` | `value(spawned, 3)`（`1e-2` 枝刈り） | `.deep3` の手 |
+## 追加学習では 8192 到達率が動かない（#159）
 
-既定は不変（`Options{}` は `teacher = null`）なので、`base` / `t2` / `p2` / `tp2` の学習と checksum は
-そのまま。
+学習は 1 ゲームずつ順に回すので 1 コア。`par`（第 10 引数）は `min(cpu 数, 8)` ゲームを同時に進め、この機械
+（8 論理 / 4 物理）で 2,000 ゲームが 31.8 s → 9.1 s（3.5 倍）。`par` は `mstd` / `dist` / `dson` / `dump` 系 /
+#158 の 2-ply 系を弾く。`replay_k` は無視しない。
 
-### コスト
+同梱 net から 5,000 ゲーム追加学習、評価 20 局（seed 9000-9019、2-ply）、基準 79,657 / 8192 4/20:
+`par` lr 3e-4 86,064（seed 1）/ 77,760（seed 5）、lr 5e-4 93,126 / 81,661 / 91,066 / 88,062（seed 1-4）、
+直列 + `replay_k=30` lr 3e-4 93,318 / 84,440 / 85,971、lr 5e-4 82,560。ゲーム数を 10k / 20k / 50k に増やすと
+81.8k / 90.1k / 87.2k。蒸留（#175）は同予算で score を壊す（58.4k-63.6k）か浅い局面の価値を崩す（`dson` は
+1-ply が 5k まで落ちる）。**自己対戦の追加学習では 8192 は動かない**（+8% は seed ばらつき ±5k と同程度）。
 
-3-ply を毎手使うのは native で 15–23 ms/手、2-ply は 1.2 ms/手。学習の間だけ 3-ply を払い、
-遊ぶときは 2-ply の評価 1 枚で済ませるのが狙いなので、`d3` の 1 ゲームは `tp2` の 15 倍前後になる
-（手数 × 1 手あたりの差）。`par` は `d2` / `d3` では弾く（教師探索が実行時間のほぼ全部で、
-バッチにするとスレッド数だけ倍になる）。
+> 訂正（#208）: 上の `par` 行は `batch_scale = 1.0`（8 ゲーム平均 = 直列の 1/8 の更新回数）で回した「弱めの
+> 学習」。同じ 20 局で測り直すと batch_scale 8 は直列より +17.3k ± 4.5k（18/20）。表中の score は当時の実測値
+> なので残す。
 
-### 比較の走らせ方
-
-遊ぶ側は 2-ply（既定の `.deep`）で測る。数字はまだ無い（走らせた人が埋める）。
-
-`zig build nn -Doptimize=ReleaseFast -- <games> <eval> <seed> <lr> <ranges> d3 30 <tmp_weights> 3`
-
-<<<<<<< HEAD
-## 学習のスループットと、同梱 net の微調整（#159 の実測）
-
-学習は 1 ゲームずつ順に回すので 1 コアしか使わない。`nn` の第 10 引数 `par` は
-`nn.trainBatchOpts` で `min(cpu 数, 8)` ゲームを同時に進めるので、この機械（8 論理 / 4 物理）では
-**2,000 ゲームが 31.8 s → 9.1 s（3.5 倍）**になる。`par` は `mstd` / `dist` / `dson` /
-`dump` 系 / #158 の 2-ply 系を弾く（共有ポインタか実行時間が支配的）。`par` は `replay_k` を
-**無視しない**（各ゲームが自分のバッファを持つので、直列と同じく効く）。計測は `/tmp` にコピーした重みを
-渡す（`zig build nn` は実行の最後に必ず重みを保存するので、作業ツリーのファイルを汚すと
-次の計測が別の net になる）。
-
-> 訂正（#208）: 下の表の `par` 行はすべて `batch_scale = 1.0`、つまり 1 バッチ = 8 ゲームを平均して
-> 1 ステップにする設定で回している。更新回数は直列の 1/8 なので、`par` 行は「弱めの学習」を
-> 測った値。同じ 20 局で比較し直すと、20k ゲーム `base` から学習した net は batch_scale 8 で
-> 直列より +17.3k ± 4.5k（18/20）になる（下の「`par` の move 数と実効学習率を直す（#208）」）。
-> 表中の score 自体は当時その net を測った実測値なので消さない。
-
-同梱 net（`f584d99667f499184d7da2d5d0e9e0a1`, 148,504 B）を起点に 5,000 ゲームだけ追加学習した
-結果。評価は 20 局（seed 9000–9019）、2-ply（`.deep`）、基準は同じ 20 局で 79,657 / 8192 4/20。
-
-| 追加学習 | avg score | 8192 到達 |
-|---|---|---|
-| なし（同梱 net） | 79,657 | 4/20 |
-| `par` lr 1e-4 | 83,161 | 2/20 |
-| `par` lr 3e-4 (seed 1) | 86,064 | 4/20 |
-| `par` lr 3e-4 (seed 5) | 77,760 | 2/20 |
-| `par` lr 5e-4 (seed 1) | 93,126 | 6/20 |
-| `par` lr 5e-4 (seed 2) | 81,661 | 3/20 |
-| `par` lr 5e-4 (seed 3) | 91,066 | 5/20 |
-| `par` lr 5e-4 (seed 4) | 88,062 | 4/20 |
-| `par` lr 1e-3 | 85,544 | 3/20 |
-| 直列 + `replay_k=30` lr 3e-4 (seed 1) | 93,318 | 6/20 |
-| 直列 + `replay_k=30` lr 3e-4 (seed 2) | 84,440 | 3/20 |
-| 直列 + `replay_k=30` lr 3e-4 (seed 4) | 85,971 | 3/20 |
-| 直列 + `replay_k=30` lr 5e-4 (seed 1) | 82,560 | 4/20 |
-| `par` lr 3e-4 を 10,000 ゲーム | 81,777 | 3/20 |
-
-読み方: **5,000 ゲームの追加学習で score は平均 +8%（79.7k → 85.9k）だが、8192 到達率は
-4/20 → 3.7/20 で動かない**。同条件の seed 間ばらつきが ±5k あるので、1 seed の 93k を
-「レシピの効果」と読んではいけない。ゲーム数を 10,000 / 20,000 / 50,000 に増やすと score は
-むしろ下がる（81.8k / 90.1k / 87.2k）。蒸留（#175）は同じ予算で score を壊す（58.4k–63.6k）か、
-浅い局面の価値が崩れる（`dson` は 1-ply が 5k まで落ちる）。
-**結論: 自己対戦の追加学習では 8192 は動かない。** 伸ばすなら価値関数の中身（蒸留のラベル、
-入力、容量）か探索の当て方（共通乱数での比較、終盤の深さ）を変えるしかない。
 ## 行テーブルを 1 エントリ 3 バイトに詰める（#160）
 
-wasm の data セクション 689,801 B のうち 512 KiB は `src/core.zig` の `row_table`
-（`[65536]RowEntry`、`RowEntry` は `row: u16` + `score: u32` + `ok: bool` の 8 B）だった
-（内訳は #154 に記録）。1 行のマージを引く表なので消せないが、情報量はずっと少ない。
+wasm の data（689,801 B）のうち 512 KiB は `src/core.zig` の `row_table`（`[65536]RowEntry`、8 B）だった。
+`[65536][3]u8` に詰める: bits 0..15 = マージ後の行（4 ニブル、0 は空）、bits 16..19 / 20..23 = 1 個目 / 2 個目の
+合体タイルの指数。`score_delta` は 2 つの指数から `1 << exp` の和として厳密に戻る（4 セルは最大 2 回しか合体せず、
+その 2 つは隣接同値ペアなので重複しない）。指数 16（32768 超）はニブルに入らないので `row_overflow`
+（`[65536 / 8]u8` のビットセット）に記録し、`mergeLine` は従来の `ok = false` と同じく `mergeLineSlow` に落とす。
 
-- `row_table` を `[65536][3]u8`（1 エントリ 3 B、リトルエンディアン）にした。詰めるのは
-  bits 0..15 = マージ後の行（log2 の 4 ニブル、0 は空）、bits 16..19 = 1 個目の合体タイルの
-  指数（0 は合体なし）、bits 20..23 = 2 個目（同）。
-- `score_delta` は 2 つの指数から `1 << exp` の和として厳密に戻る。4 セルは最大 2 回しか
-  合体せず、その 2 つは隣り合う同値ペアなので重複しない。生のスコア（最大 131,072）は 8 bit に
-  入らないが、指数（0..15）はニブルに入る。
-- 合体が 32768 を超えるキーは指数 16 でニブルに入らないので、別に `row_overflow`
-  （`[65536 / 8]u8` のビットセット）へ記録し、`mergeLine` は従来の `ok = false` と同じく
-  `mergeLineSlow` に落とす。表の側には行を書かない。
-- `changed = row != key` は従来どおり。`MergeResult` も `mergeLine` のシグネチャも変えていない。
-- 全 65,536 キーについて `mergeLine` と `mergeLineSlow` の `line` / `changed` / `score_delta` が
-  一致すること、ビットセットが「指数 16 が出るキー」とちょうど一致することをテストで固定した。
+`row_table` 524,288 → 196,608 + `row_overflow` 8,192 = 204,800（data は -319,488 B、-31% の見込み）。
+全 65,536 キーで `mergeLine` と `mergeLineSlow` の `line` / `changed` / `score_delta` が一致すること、ビットセットが
+指数 16 のキーとちょうど一致することをテストで固定。`MergeResult` と `mergeLine` のシグネチャは変えていない。
 
-| 項目 | 前 | 後 |
-| --- | ---: | ---: |
-| `row_table` | 524,288（8 B x 65,536） | 196,608（3 B x 65,536） |
-| `row_overflow` | 0（`ok: bool` がエントリ内） | 8,192 |
-| 合計 | 524,288 | 204,800 |
+## 共通乱数でのペア比較（#168）
 
-- data セクションは 689,801 B → 370,313 B（-319,488 B、-31%）になる計算（実測はせず表の
-  サイズからの差分）。wasm 全体でも同じだけ減る見込み。
+同じ設定でも 20 局で ±5,000 ばらつくので、片方の出現列をテープに記録してもう片方に食わせる。
 
-## 共通乱数のペア比較（#168）
+- `nn.Spawn`（cell 8 bit + 指数 8 bit）/ `nn.Tape`（`Recording = enum { record, replay }`）
+- `playTapedValue` / `playTapedWithStatsValue`: record は平文と同じ 2 回の rng draw（セル → 値）を記録し、
+  replay は記録を置くだけで rng を引かない。分岐して記録セルが埋まっていれば最初の空きセルに置き、テープが
+  尽きたら通常抽選に戻る。record の結果は平文 `playValue` と盤面まで一致（テスト）。
+- `nn.pairStats(diffs)` → `PairSummary { games, mean, stderr, better, worse }`。`pair` モードで `deep`(A) と
+  `deep3`(B) を 1 局ずつ比較し、最後に平均差 ± stderr を出す。
+- 分岐後の出現位置は記録と食い違うので、分岐前（序盤）の比較が最も鋭い。それでも独立 2 本よりずっと安定する。
 
-`nn 2-ply` と `nn 3-ply` を別々に走らせると、同じ設定でも 20 局で ±5,000 のばらつきが出る
-（seed ごとのゲームの展開が全く違うため）。そこで**片方のゲームの出現列をテープに記録し、
-もう片方に同じ列を食わせる**（common random numbers）。差の分散は個別の分散よりずっと小さく、
-少ない局数で方針の優劣を判定できる。
+## 並列学習の実効学習率（#137 `batch_scale`）
 
-- `nn.Spawn`（packed struct: cell 8 bit + 指数 8 bit）と `nn.Tape`（`Recording = enum { record, replay }`）
-- `nn.playTapedValue(vfn, rng, mode, tape)` / `nn.playTapedWithStatsValue(...)` — record は
-  平文の対局と同じ 2 回の rng draw（セル → 値）を行って記録し、replay は記録を置くだけ（rng を引かない）。
-  方針が分岐して記録セルが埋まっていれば最初の空きセルに置き、テープが尽きたら通常の抽選に戻る
-  （ゲームは合法に終わる）。record で遊んだ結果は平文の `playValue` と盤面まで一致する。
-- `nn.pairStats(diffs)` → `PairSummary { games, mean, stderr, better, worse }`
-- `zig build nn -Doptimize=ReleaseFast -- 0 10 9000 0.003 1 pair 30 ai/solver/nn_weights.bin 1`
-  で `deep`(A) と `deep3`(B) のペア比較を 1 局ずつ表示し、最後に平均差 ± stderr を出す。
+`par` はゲームごとの差分を平均するので更新回数が 1/8 になり実効学習率が薄まる（#133: 同一 100k・lr 0.003 で
+`par` 30,145 / 直列 87,824）。arg 12 で倍率を渡せるようにした（`Options.batch_scale`、8 = linear 則 / 2.8284 = sqrt 則）。
 
-テープは「出現列を共有する」ので、A と B の**同じ局面から違う手を選んだ後**は盤面が分岐し、
-以降の出現位置は記録と食い違う（空きセルへ置き直す）。分岐前の比較が最も鋭く、終盤は
-別ゲームに近づく。それでも「同じ初期局面・同じ序盤」を共有する効果が大きく、独立 2 本より
-はるかに安定する。
+同梱 net から 5,000 ゲーム、`par`、lr 3e-4、train seed 1、評価 20 局（2-ply）: 基準 79,657 → 1.0 **91,497**（6/20）/
+2.8284 **97,214**（7/20）/ 8 **94,834**（6/20）。直列 + `replay_k=30` は 93,318（6/20）。sqrt 則が一番良い方向だが
+seed ばらつき ±5,000 では 1 回で決められない → #168 で分散を落としてから確定。`Options.batch_scale` の既定は
+1.0 のままで、#208 で CLI の既定だけバッチ数（linear 則）に変えた。
 
-## 並列学習の実効学習率（#137 の batch_scale）
+評価メモ: 評価行は絞り込めないので、行テーブルを 2 行（1-ply と 2-ply）に書き換えて回した。9 行構成では 20 局で 20 分以上。
 
-`par` はゲームごとの重み差分を平均して 1 ステップにするので、同じゲーム数をこなしても更新回数が
-1/8 になり、実効学習率が薄まる（#133 の測定: 同一 100k・lr 0.003 で `par` 30,145 / 直列 87,824）。
-arg 12 で倍率を渡せるようにした（`Options.batch_scale`）。8 で linear scaling rule、2.8284 で
-sqrt 則。既定はここでは 1.0（平均）にしたが、#208 で CLI の既定だけバッチ数（linear 則）に変えた
-（`nn.Options.batch_scale` 自体は 1.0 のまま）。
-
-同梱 net から 5,000 ゲーム、`par`、lr 3e-4、train seed 1、評価 20 局（seed 9000–9019, 2-ply）:
-
-| `batch_scale` | avg score | 8192 到達 |
-|---|---|---|
-| 基準（同梱 net） | 79,657 | 4/20 |
-| 1.0（平均 = 従来） | 91,497 | 6/20 |
-| 2.8284（sqrt 則） | 97,214 | 7/20 |
-| 8（linear 則） | 94,834 | 6/20 |
-
-同条件の直列 + `replay_k=30` は 93,318 / 6/20。**sqrt 則が一番良い方向**だが、この規模の
-seed ばらつきは ±5,000 あり（同じ設定でも実行ごとに 86k〜93k を観測）、1 回の比較では
-決められない。#168（共通乱数ペア比較）で分散を落としてから確定させる。
-
-計測メモ: 評価行は `NN_EVAL_ROWS` 相当の絞り込みができないので、行テーブルを書き換えて
-2 行（1-ply と 2-ply）にした状態で回した。3-ply / phase 行を含む 9 行構成では 20 局でも
-1 回 20 分以上かかる。
-=======
 ## 蒸留の混合比と教師 lr（#206）
 
-`#175` の `dist` は「浅い局面の TD」と「深い局面の教師回帰」を 1:1 で混ぜていた。その 1:1 が
-効かないことは実測済み（`dist` 5,000 ゲームで 58,361〜63,633、基準 79,657）で、原因は
-共有パラメータを深い局面の信号が引っ張ること。混合比と教師側の lr をノブにして、
-「壊さずに効く」点があるかを振る。
+`#175` の `dist` は「浅い局面の TD」と「深い局面の教師回帰」を 1:1 で混ぜ、それが効かないことは実測済み
+（5,000 ゲームで 58,361-63,633、基準 79,657）。原因は共有パラメータを深い局面の信号が引っ張ること。
+ノブを 2 つ足した: `distill_every`（arg 12、1 = 毎手）と `distill_lr` の割り算（arg 13、0 = TD と同じ）。
+`dson` にも同じ 2 つが効く。例: `... dist 30 /tmp/w.bin 1 - /tmp/deep2.dmp.tch 8 10`。**数値は未取得。**
 
-```
-# 教師回帰を 8 手に 1 回、教師側の lr は TD の 1/10
-zig build nn -Doptimize=ReleaseFast -- 5000 1 9000 0.0003 1 dist 30 /tmp/w.bin 1 - /tmp/deep2.dmp.tch 8 10
-```
+## オフライン蒸留（#175 / `tch`）
 
-引数は dump_path（11）の後ろに `distill_every`（12、1 = 毎手）と `distill_lr` の割り算
-（13、0 = TD と同じ）。`dson` にも同じ 2 つが効く。
+`#167` は学習中の全手を 3-ply で値付けするので 30-46 ms/move、100k ゲームで 35-40 時間/seed。`#159` の dump
+（最大タイル 4096 以上の局面を 65,536 個保存）を**一度だけ** 3-ply で値付けすれば 10-20 分で済み、その後の回帰は
+通常速度（~0.5 ms/move）で回る。
 
-| 構成 | 5,000 ゲーム後の 100 局（seed 9000） |
-|---|---|
-| （計測中） | |
+    1. dump:  1000 ゲーム回して深い局面を貯める（1-ply 自己対戦 = dist の学習側と同じ分布）
+    2. tch:   dump 1 局面につき spawn を 1 回引き、post-spawn 盤面を teacherValue(.deep3) で値付け
+    3. dist:  自己対戦 TD と 1/2 ずつ混ぜて回帰
 
-## オフライン蒸留（#175）
+保存する目標は spawn 期待値の 1 サンプル推定（1 盤面 1 回の回帰が表現できるのもそこまでなので意図的）。`dist` は 1 手
+ごとに確率 1/2 で教師ペアを一様抽選して同じ勾配経路で回帰する（深い局面にしか無いデータで序盤が壊れないように）。
+**数値は未取得。**
 
-`#167` の蒸留は学習中の全手を 3-ply で値付けするので 30-46 ms/move、100k ゲームで 35-40 時間/seed
-かかる。`#159` の dump（最大タイル 4096 以上の局面を 65,536 個保存）は**一度だけ** 3-ply で値付け
-すれば済む: 65,536 局面 × 10-20 ms で **10-20 分**。その後の回帰は普通の学習速度（~0.5 ms/move）で
-回る。深さを増やしても 8192 到達率が動かなかった（前節）ので、**V の質を安く上げる**のが本命。
-
-3 段:
-
-    # 1. 深い局面を貯める（dump は 1-ply 自己対戦の局面を記録する = dist の学習側と同じ分布）
-    zig build nn -Doptimize=ReleaseFast -- 1000 1 9000 0.003 1 dump 0 /tmp/w.bin 1 - /tmp/deep.dmp
-    # 2. 教師値を一度だけ計算（deep3 の探索値 = 2-ply が信じる値の 1 手先）
-    zig build nn -Doptimize=ReleaseFast -- 0 1 9000 0.003 1 tch 0 /tmp/w.bin 1 - /tmp/deep.dmp
-    # 3. 自己対戦 TD と 1/2 ずつ混ぜて回帰
-    zig build nn -Doptimize=ReleaseFast -- 1000 10 9000 0.001 1 dist 0 /tmp/w.bin 1 - /tmp/deep.dmp.tch
-
-`tch` は dump 1 局面につき spawn を 1 回だけ引き、その post-spawn 盤面を
-`teacherValue(.deep3)` で値付けする（`V` の定義域が post-spawn 盤面なので）。保存する目標は
-spawn 期待値の 1 サンプル推定で、1 盤面 1 回の回帰が表現できるのもそこまでなので、意図的にこの形。
-`dist` は 1 手ごとに確率 1/2 で教師ペアを一様抽選して同じ勾配経路で回帰する（残り半分は通常の
-自己対戦 TD。深い局面にしか無いデータで序盤が壊れないようにするため）。
-
-| 学習 | eval（2-ply, 10 局）avg score | 4096 | 8192 | ms/move | 備考 |
-| --- | ---: | ---: | ---: | ---: | --- |
-| なし（同梱 net） | 86,565 | 10/10 | 3/10 | 0.58 | 基準線 |
-| `dist` |  |  |  |  |  |
-
-数値は走らせた人が埋める（この節を書いた時点ではまだ回していない）。
->>>>>>> 1501032 (nn: 深い局面の教師値を一度だけ計算してオフライン蒸留する (#175))
 ## 重みの量子化（#170）
 
-`ai/solver/nn_weights.bin` を wasm に埋め込むと 148,504 B がそのままモジュールのサイズになる。
-f32 形式は既存の学習・golden・web のすべてが前提にしているので触らず、**第 2 の形式**として
-int16 の量子化形式を足す。既定の評価経路は f32 のまま。
-
-### 形式
-
-`nn.zig` の `parseQuantized` / `encodeQuantized`。リトルエンディアン固定。
+f32 形式（148,504 B）は学習・golden・web のすべてが前提にしているので触らず、**第 2 の形式**として int16 を足す。
+既定の評価経路は f32 のまま。
 
 | 位置 | 内容 |
 | --- | --- |
-| 0 | magic `2048-NQ1`（8 B、f32 形式の `2048-NN\0` とは別） |
-| 8 | u32 version = 1 |
-| 12 | u32 endian marker = `0x01020304`（f32 形式と同じ確認） |
-| 16 | f32 step x 6（ブロック `w1 b1 w2 b2 w3 b3` の順） |
+| 0 | magic `2048-NQ1`（f32 形式の `2048-NN\0` とは別） |
+| 8 | u32 version = 1 / u32 endian marker = `0x01020304` |
+| 16 | f32 step x 6（ブロック `w1 b1 w2 b2 w3 b3` 順） |
 | 40 | f32 step x 2（活性化 `a1 a2`） |
 | 48 | i16 x 18,561（`Net` のフィールド順） |
 
-ブロックは `w1`(256x64), `b1`, `w2`(32x64), `b2`, `w3`, `b3`。`b3` だけ別ブロックなのは、
-max|w| が 20.39 と `w3` の 1.57 の 13 倍あり、同居させると `w3` の分解能が 13 倍悪くなるため。
-量子化は `step = max|w| / 32767`、`q = round(w / step)`（32767 でクリップ）。`Net` の i16 版
-`QPayload` はフィールドを 1 対 1 で写した `extern struct` なので、ペイロードは `Net` の
-オフセットをそのまま 2 B 幅で読める。
+`b3` だけ別ブロックなのは max|w| が 20.39 と `w3`（1.57）の 13 倍あり、同居させると `w3` の分解能が 13 倍悪く
+なるため。量子化は `step = max|w| / 32767`、`q = round(w / step)`（32767 でクリップ）。`QPayload` はフィールドを
+1 対 1 で写した `extern struct` なのでペイロードをオフセットごと 2 B 幅で読める。**148,504 → 37,170 B（25.0%）。**
 
-### サイズ
+`forwardQuantized` は `forward` と同じ形で、隠れ層の入力は i16 x i16 を i64 で合算する（`a2` の step が 3.2e-2 と
+粗く、i32 では実際に溢れる）。層の境界で f32 に戻し、ReLU のあと次の層用に再量子化する。活性化の step は
+「その層の最大値 / 32767」: 層 1 は `b1[i]` + 列 `i` の正の重み上位 16 個（1 枚が光らせる行は 16 個まで）で 38.78、
+層 2 は 1037.4（`a1 = 1.184e-3` / `a2 = 3.166e-2`）。全正重みを足す素朴な上界だと誤差が 2.4 倍になる。
 
-f32 148,504 B → 量子化 37,170 B（**25.0%、−111,334 B**）。ヘッダ 48 B + i16 37,122 B。
+`zig build nn-quant -- ai/solver/nn_weights.bin /tmp/nn_weights_q.bin [games] [seed]` で 3 つ測る（`nn_weights.bin`
+は読むだけで上書きしない、量子化ファイルはコミットしない）:
 
-### 推論
+- **round trip**: 最悪 `1.026e-4` = step の 0.500 倍（`round` の理論値どおり）。
+- **値の一致**（`games=60, seed=7` の 124,879 盤面）: 重みだけ量子化 mean 5.8e-4 / max 5.1e-3、活性化まで
+  int16 で mean 1.0e-2 / max 6.9e-2（値域 −26〜+37 なので相対 3e-4 程度）。
+- **対局**: 39,326（f32）/ 41,076（int16）、どちらも最大 4096。20 局だと 20% 開くが差は再現しない。
+### 量子化形式の接続（#170 の続き）
 
-`forwardQuantized`。`forward` と同じ形で、隠れ層の入力は i16 x i16 の積を i64 で合算する
-（`a2` の step が 3.2e-2 と粗いので整数は 1e9 台まで伸びる。i32 だと実際に溢れる）。層の
-境界で step を掛けて f32 に戻し、ReLU のあと次の層用に i16 へ再量子化する。
-
-活性化の step は「その層が取りうる最大値 / 32767」で決めた。層 1 は `b1[i]` に列 `i` の正の
-重み上位 16 個（1 枚の盤面が光らせる行は 16 個まで）を足した 38.78、層 2 は
-`b2[j] + Σ max(0, w2[j][i]) * 層1の最大値` で 1037.4。`a1 = 1.184e-3` / `a2 = 3.166e-2`。
-全正重みを足す素朴な上界（100.6 / 2702.8）だと誤差が 2.4 倍になるので、上位 16 個の版を使う。
-
-### 一致率の測り方
-
-```
-zig build nn-quant -- ai/solver/nn_weights.bin /tmp/nn_weights_q.bin [games] [seed]
-```
-
-`nn_quant.zig` が f32 を読んで量子化形式を書き、書き戻したファイルを読み直してから 3 つ測る。
-`ai/solver/nn_weights.bin` は読むだけで上書きしない。量子化ファイルは**コミットしない**
-（`.bin` はサイズ検証のための一時ファイル）。
-
-- **round trip**: 読み直した重みを `dequantize` して元と比べる。最悪 `1.026e-4` = そのブロックの
-  step の 0.500 倍（`round` の理論値どおり）。
-- **値の一致**: 貪欲 f32 で `games` 局指し、通った afterstate 全部で `forward` と比べる。
-  `games=60, seed=7` の 124,879 盤面で、重みだけ量子化（`dequantize` して同じ `forward`）が
-  mean 5.8e-4 / max 5.1e-3、活性化まで int16（`forwardQuantized`）が mean 1.0e-2 / max 6.9e-2。
-  値の範囲が −26〜+37 なので、相対では 3e-4 程度。
-- **対局**: 同じ方策で f32 と量子化を `games` 局ずつ。`games=60, seed=7` で avg score
-  39,326（f32）/ 41,076（int16）、どちらも最大 4096。20 局だと 47,137 / 37,742 と 20% 開くが、
-  20 局では判定できない（同じ 20 局でもう一度振ると差が消える）。
-
-### 接続
-
-`nn.Value` に `.quantized` を足した。`valueAt` が `forwardQuantized` に回すだけで、探索・再生の
-コードは `Value` しか見ていないので、`nn.playValue(.{ .quantized = &q }, rng, .greedy)` がそのまま
-動く。既定は `.{ .single = &net }` なので `nn` / `solver` / wasm の経路は f32 のまま。
-
-### 残り
-
-- wasm の埋め込みを量子化形式に切り替える作業はしていない（形式とロード経路まで）。web 側は
-  `solver.zig` の `@embedFile("nn_weights.bin")` 経由で f32 のまま動く。
-- 誤差の大半は `a2`（層 2 の活性化）の step。層 2 を int16 のままにするなら step を層ごとに
-  詰めるか、層 3 の入力を int8 にする余地がある。
+`nn.Value` に `.quantized` を足した。`valueAt` が `forwardQuantized` に回すだけで、探索・再生のコードは `Value`
+しか見ていないので `nn.playValue(.{ .quantized = &q }, rng, .greedy)` がそのまま動く。既定は `.{ .single = &net }`。
+wasm の埋め込みを量子化形式に切り替える作業はしていない（web は `solver.zig` の `@embedFile("nn_weights.bin")`
+経由で f32 のまま）。誤差の大半は `a2` の step なので、層 2 を int16 のままにするなら step を層ごとに詰めるか、
+層 3 の入力を int8 にする余地がある。
 
 ## `par` の move 数と実効学習率を直す（#208）
 
-`par` の要約行が `moves 0` を出していたのは集計漏れで、学習そのものは動いていた。`use_par` の
-分岐が `total_moves` に足しておらず（直列側だけが足していた）、`nn.trainBatchOpts` が返すのも
-最後の 1 ゲームの score だけだった。`nn.Batch`（`{ score: u32, moves: u64 }`、`sumScores` /
-`sumMoves`）を返すようにして、直列と同じ moves を報告する。
+`par` の要約行が `moves 0` を出していたのは集計漏れ（`use_par` の分岐が `total_moves` に足しておらず、`par` は
+最後の 1 ゲームの score しか返していなかった）。`nn.Batch`（`{ score: u32, moves: u64 }`、`sumScores` / `sumMoves`）
+を返すようにして直列と同じ moves を報告する。
 
-残る差は #107 で分かっていた実効学習率の希釈（8 ゲームの差分を平均して 1 ステップにするので
-更新回数が 1/8）。#137 の `batch_scale` で倍率を渡せるが、既定が 1.0（平均 = 1/8）のままだった
-ので、まず linear scaling rule（倍率 = バッチ数）を既定にした。ただし [#203](#同梱-net-を-base-から焼き直す203)
-の 100,000 ゲームでは linear 則が崩れたので、**今の既定は sqrt 則（倍率 = √バッチ数 = 2.8284）**で、
-linear 則は `8` を明示して使う。`-` で従来の 1.0 に戻せる。下の 20,000 ゲームの表はその時点の計測。
+残る差は #107 の実効学習率の希釈（8 ゲームの差分を平均して 1 ステップ = 更新回数 1/8）。#137 の `batch_scale` の
+既定が 1.0 だったので linear 則（倍率 = バッチ数）を既定にしたが、#203 の 100,000 ゲームで崩れたので**今の既定は
+sqrt 則（2.8284）**。linear 則は `8` を明示し、`-` で従来の 1.0 に戻せる。
 
-計測（この機械: 8 論理 / 4 物理、`base` から 20,000 ゲーム、lr 0.003、train seed 1、評価は
-`pairw` 20 局 seed 9000 の 2-ply、A = 直列 net、B = `par` net）:
+`base` から 20,000 ゲーム、lr 0.003、train seed 1、`pairw` 20 局（A = 直列、B = `par`）:
 
 | `batch_scale` | 学習時間 | moves | B − A（± stderr） | B が勝った局 |
-|---|---|---|---|---|
+| --- | ---: | ---: | --- | --- |
 | 直列 | 112.4 s | 13,346,693 | — | — |
-| 1（従来の平均） | 16.7 s | 6,799,634 | −16,552 ± 4,595 | 2/20 |
-| 2.8284（sqrt 則） | 23.8 s | 9,384,508 | −16,759 ± 4,191 | 4/20 |
-| 8（linear 則） | 31.5 s | 11,784,409 | **+17,298 ± 4,474** | 18/20 |
+| 1（平均） | 16.7 s | 6,799,634 | −16,552 ± 4,595 | 2/20 |
+| 2.8284（sqrt） | 23.8 s | 9,384,508 | −16,759 ± 4,191 | 4/20 |
+| 8（linear） | 31.5 s | 11,784,409 | **+17,298 ± 4,474** | 18/20 |
 
-linear 則なら `par` は直列と同等以上（3.6 倍速い）。sqrt 則と 1.0 は同じだけ負ける（同じ 20 局で
-±4.2k〜4.6k なので差は有意）。moves が直列より少ないのは、学習途中の net が弱くゲームが早く終わる
-ため（linear 則で 88% まで戻る）。
+linear 則なら `par` は直列同等以上（3.6 倍速い）。sqrt 則と 1.0 は同じだけ負ける（差は有意）。moves が直列より
+少ないのは学習途中の net が弱くゲームが早く終わるため（linear 則で 88% まで戻る）。
 
-同梱 net からの微調整（5,000 ゲーム、lr 3e-4、`replay_k=30`、train seed 1、評価は同じ 20 局、
-A = 同梱 net）では差が小さい:
+同梱 net からの微調整（5,000 ゲーム、lr 3e-4、`replay_k=30`、train seed 1）では差が小さい: 直列 −2,920 ± 10,109
+（8/20）、`par` linear −13,766 ± 6,987（6/20）、`par` sqrt −15,037 ± 7,352（7/20）。直列と `par` linear を直接比べると
+−3,546 ± 7,677。**短い微調整では `par` の優位は出ない**（微調整は直列、20k ゲーム以上の長い学習は `par` でよい）。
 
-| 追加学習 | B − A（± stderr） | B が勝った局 |
-|---|---|---|
-| 直列 | −2,920 ± 10,109 | 8/20 |
-| `par` linear 則（既定） | −13,766 ± 6,987 | 6/20 |
-| `par` sqrt 則 | −15,037 ± 7,352 | 7/20 |
-
-互いを直接比べると（A = 直列で微調整、B = `par` linear で微調整）−3,546 ± 7,677 で、20 局では
-どちらが上とは言えない。**短い微調整では `par` の優位は出ない**ので、微調整の比較は直列で、
-長い学習（20k ゲーム以上）は `par` で回してよい、が現時点の目安。
-
-再現:
-
-```
-zig build nn -Doptimize=ReleaseFast -- 20000 0 9000 0.003 1 base 30 /tmp/serial.bin 1
-zig build nn -Doptimize=ReleaseFast -- 20000 0 9000 0.003 1 base 30 /tmp/par.bin  1 par -
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 pairw 30 /tmp/serial.bin 1 - /tmp/par.bin
-```
-
-`eval_games = 0`（第 2 引数）は「学習だけ」で、15 行の評価表を飛ばす。以前は usage エラーだった
-ので、学習だけの run でも評価表（1 局でも 20 分かかる行がある）を必ず払っていた。
+`eval_games = 0`（第 2 引数）は「学習だけ」で 15 行の評価表を飛ばす（以前は usage エラーで、1 局 20 分かかる行も
+必ず払っていた）。
 
 ## 同梱 net を `base` から焼き直す（#203）
 
-同梱 net の素性を確かめるため、`base` から 100,000 ゲームを 3 seed で焼き直し、同梱 net と
-ペア比較した（20 局、seed 9000、2-ply）。学習は `par`（`batch_size = 8`）、lr 0.003、`replay_k=30`。
+`par`（`batch_size = 8`）、lr 0.003、`replay_k=30`、100,000 ゲームを 3 seed。**linear 則は 100k では崩れる**
+（実効 lr 8 倍なので 20k までは直列に勝てたが、そこから overstep する）。A = 同梱 net、`pairw` 20 局（seed 9000、2-ply）:
 
-**linear 則（`batch_scale=8`）は 100,000 ゲームでは崩れる**。実効 lr が 8 倍なので、20,000 ゲーム
-までは直列に勝てた（[#208](#par-の-move-数と実効学習率を直す208)）が、そこから先は overstep する:
+| 学習 | seed | B − A（± stderr） | B が勝った局 |
+| --- | ---: | --- | --- |
+| `par` linear | 1 | −56,038 ± 6,322 | 0/20 |
+| `par` linear | 2 | −26,379 ± 9,668 | 4/20 |
+| `par` linear | 3 | −67,751 ± 6,353 | 0/20 |
+| `par` sqrt | 1 | −1,440 ± 7,544 | 13/20 |
+| `par` sqrt | 2 | −26,547 ± 5,983 | 2/20 |
+| `par` sqrt | 3 | −25,328 ± 7,190 | 2/20 |
 
-| 学習 | seed | B − A（± stderr、A = 同梱 net） | B が勝った局 |
-|---|---|---|---|
-| `par` linear 則 | 1 | −56,038 ± 6,322 | 0/20 |
-| `par` linear 則 | 2 | −26,379 ± 9,668 | 4/20 |
-| `par` linear 則 | 3 | −67,751 ± 6,353 | 0/20 |
-| `par` sqrt 則 | 1 | −1,440 ± 7,544 | 13/20 |
-| `par` sqrt 則 | 2 | −26,547 ± 5,983 | 2/20 |
-| `par` sqrt 則 | 3 | −25,328 ± 7,190 | 2/20 |
+sqrt 則の 3 seed 平均は −17,772 ± 4,008。**同梱 net を上回る seed は無い**ので重みは差し替えない。linear 則の崩れは
+lr でも戻らない（100k、seed 1: lr 0.003 → 33,878、0.001 → 50,956、0.000375 → 16,017。seed 2 の 0.003 は 73,944 なので
+崩れ方に seed 依存が大きい）。
 
-sqrt 則は 3 seed の平均で −17,772 ± 4,008（平均の stderr）。**同梱 net を上回る seed は無い**ので、
-重みの差し替えはしない。linear 則の崩れは lr の問題も疑ったが、lr を下げても戻らない
-（100,000 ゲーム、seed 1、linear 則: lr 0.003 → 33,878、lr 0.001 → 50,956、lr 0.000375 → 16,017。
-seed 2 の lr 0.003 が 73,944 と高いので、崩れ方に seed 依存が大きい）。
+**ペア比較と非ペア表は食い違う。** 非ペア 20 局（`.deep`、seed 9000 / 9100）では sqrt 則 seed 1 が 82,600 / 81,813 で
+同梱 net（79,657 / 91,348）を上回って見えるが、ペアでは −1,440 ± 7,544 で互角。**重みの判定はペア比較だけで行う。**
+非ペア表: linear seed 1 33,878 / seed 2 73,944 / seed 3 22,499、sqrt seed 1 82,600 / seed 2 71,598 / seed 3 81,082
+（8192 到達は 3 以下が多く 0/20）。
 
-**ペア比較と非ペア表は食い違う**。非ペアの 20 局表（`.deep`、seed 9000 / 9100）では sqrt 則の
-seed 1 が 82,600 / 81,813 で同梱 net の 79,657 / 91,348 を上回って見えるが、同じ 20 局を
-ペアで比べると −1,440 ± 7,544 で互角。**同梱 net の判定はペア比較だけで行う**。
-
-| 学習 | 9000 | 9100 | 8192 到達（9000 / 9100） |
-|---|---|---|---|
-| 同梱 net | 79,657 | 91,348 | 4/20 / 5/20 |
-| `par` linear 則 seed 1 | 33,878 | 33,097 | 0/20 / 0/20 |
-| `par` linear 則 seed 2 | 73,944 | 72,135 | 2/20 / 1/20 |
-| `par` linear 則 seed 3 | 22,499 | 22,485 | 0/20 / 0/20 |
-| `par` sqrt 則 seed 1 | 82,600 | 81,813 | 4/20 / 3/20 |
-| `par` sqrt 則 seed 2 | 71,598 | 68,801 | 0/20 / 1/20 |
-| `par` sqrt 則 seed 3 | 81,082 | 87,284 | 3/20 / 7/20 |
-
-再現（`rows` は評価表の行だけを選ぶ。`0` = 1-ply、`2` = 2-ply で、3-ply の行は 20 局に
-数十分かかるので測定では落とす）:
-
-```
-zig build nn -Doptimize=ReleaseFast -- 100000 0 9000 0.003 1 base 30 /tmp/n.bin 1 par -
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 pairw 30 ai/solver/nn_weights.bin 1 - /tmp/n.bin
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/n.bin 1 - - - 0,2
-```
+`rows` 引数で評価表の行を選べる（`0` = 1-ply、`2` = 2-ply。3-ply 行は 20 局で数十分かかるので測定では落とす）。
 
 ## 蒸留の学習率バグ、`ft2` と並列蒸留の否定（#207）
 
-`dist` / `dson`（#175）は「教師ラベルへの回帰」を 1 ステップおきに入れるだけで、TD と同じ
-0.5 ms/move で回る。にもかかわらず今まで収穫が無かったのは、**学習率の単位を取り違えていた**ため。
+`dist` / `dson`（#175）が収穫を出さなかったのは**学習率の単位の取り違え**。`nn.Options.distill_lr` は絶対値なのに
+`nn_main.zig` は `1 / div`（div 10 なら 0.1）を入れていた。TD が lr 0.003 の隣で教師ステップだけ lr 0.1、つまり
+30〜300 倍のステップで回り、どの lr でも NaN に飛んでいた。修正は `distillRate(learning_rate, div) = learning_rate / div`。
 
-`nn.Options.distill_lr` は絶対値の学習率（`ai/solver/nn.zig`）なのに、`ai/solver/nn_main.zig` は
-`1 / div`（div 10 なら 0.1）を入れていた。TD が lr 0.003 で動いている隣で教師ステップだけ lr 0.1、
-つまり **30〜300 倍のステップ**で回り、どの lr でも重みが NaN に飛んでいた。修正は値を割り算する
-こと（`fn distillRate(learning_rate, div) f64 { return if (div > 0) learning_rate / div else 0; }`）で、
-CLI の `div` は「TD の学習率を何分の 1 にするか」という意味のまま変わらない。
+修正後、同梱 net から 5,000 ゲーム（lr 3e-4、教師 65,536 サンプル）: every 8 / div 10（lr 3e-5）82,973 / 8192 5/20 /
+−4,441 ± 8,391（9/20）、every 1 / div 10 61,589 / 0/20 / −32,359 ± 6,553（1/20）。50/50 は教師に引きずられて自己対戦の
+半分が消える。20,000 ゲーム・教師 458,752 サンプル（7 seed の dump を `tchadd` で追記）: every 4 / div 3 が
+**+1,184 ± 9,370**（9/20）、every 8 / div 10 −12,665 / −19,137、every 4 / div 10 −14,937。**採用バー +15,000（2σ）には
+届かない** — 蒸留は同梱 net を「壊さずに保つ」ところまで。
 
-修正後、同梱 net から 5,000 ゲーム（lr 3e-4、教師は 65,536 サンプル、A = 同梱 net）:
+**`ft2` は直せない。** 深い側の教師を自己参照（`pickMove` の値）から `deep3`（`tch` と同じ関数）に差し替えても発散する
+（lr 3e-5〜1e-6、deep_every 1 でも 8 でも NaN 1,250〜2,647 個、max 1e89〜1e201）。原因は**教師が固定でないこと**:
+`teacherValue` は葉を同じ net の `V` で打ち切るので深い局面の `V` が上がると教師も上がる（`FT2BAD out=1074.1
+target=1198.7 wmax=20.82 tile=4096` のように 4096/8192 で `V` が 1,000 台まで育つ）。**`ft2` は非推奨**、同じことを
+するならラベルを 1 回だけ固定する `tch` / `tchadd` → `dist` を使う（`dist` が安定なのは教師ファイルが学習中に変わら
+ないからで、偶然ではなく設計の差）。
 
-| 教師の混ぜ方 | 教師 lr | 2-ply avg | 8192 | B − A（± stderr） | B が勝った局 |
-|---|---|---|---|---|---|
-| every 8 / div 10 | 3e-5 | 82,973 | 5/20 | −4,441 ± 8,391 | 9/20 |
-| every 1 / div 10 | 3e-5 | 61,589 | 0/20 | −32,359 ± 6,553 | 1/20 |
+**`par` + `dist` も駄目**（20,000 ゲーム、every 4 / div 3、A = 同梱 net）: 直列 +1,184 ± 9,370（9/20、2,300 s）に対し
+`par` mean −31,273 ± 6,653（0/20、90 s）/ √8 −34,859（0/20）/ 8 −30,117（1/20、53 s）。25 倍速いがどのスケールでも
+30,000 点負けるので CLI でも拒否する。バッチは 8 ゲーム分の「スナップショットからの差分」を平均するのに教師サンプルは
+ゲームごとに違うので、平均で教師信号が薄まるのだと思われる（未検証）。
 
-50/50（every 1）は教師に引きずられて自己対戦の半分が消える。every 8 は同梱 net とほぼ互角まで
-戻る。20,000 ゲームに伸ばし、教師を 7 seed ぶんの dump（458,752 サンプル、`tchadd` で追記）に
-増やすと:
-
-| 学習 | seed | 2-ply avg（9000） | 8192 | B − A（± stderr） | B が勝った局 |
-|---|---|---|---|---|---|
-| every 8 / div 10 | 1 | — | — | −12,665 ± 9,715 | 5/20 |
-| every 8 / div 10 | 2 | — | — | −19,137 ± 7,579 | 5/20 |
-| every 4 / div 10 | 1 | — | — | −14,937 ± 9,199 | 5/20 |
-| every 4 / div 3 | 1 | — | — | **+1,184 ± 9,370** | 9/20 |
-
-**いちばん良いのは「教師を 4 回に 1 回、TD の 1/3 の lr で」**（+1,184 ± 9,370）。ただし採用の
-目安 +15,000（2σ）には届かない。蒸留は同梱 net を「壊さずに保つ」ところまでで、上回るには
-教師そのものが要る（#207 の残り）。
-
-再現:
-
-```
-zig build nn -Doptimize=ReleaseFast -- 20000 0 9000 0.0003 1 dist 30 /tmp/d.bin 1 - /tmp/merged.tch 4 3
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 pairw 30 ai/solver/nn_weights.bin 1 - /tmp/d.bin
-```
-
-### `ft2` は直せない（オンライン再ラベリングの発散）
-
-`ft2`（#159）の深い側は、毎ステップ dump から 1 局面引いて `pickMove` の値（= 自分の 1-ply
-最大値）を教師にしていた。これは自己参照なので、`deep3` の教師（`tch` と同じ関数）に差し替えた。
-ところが差し替えても発散する:
-
-| lr | deep_every | 2,000 ゲーム後の重み |
-|---|---|---|
-| 3e-5 | 1 | NaN 2,647 / 18,561、max 1.0e129 |
-| 3e-6 | 1 | NaN 1,527、max 5.6e182 |
-| 1e-6 | 1 | NaN 0、max 1.4e7（同梱 net は max 20.35） |
-| 3e-4 | 8 | NaN 1,250、max 5.2e89 |
-| 1e-4 | 8 | NaN 1,513、max 2.1e201 |
-| 3e-5 | 8 | NaN 2,378、max 1.0e103 |
-
-間引いても lr を下げても同じなので、回数や歩幅の問題ではない。原因は**教師が固定でないこと**:
-`teacherValue` は葉の値を同じ net の `V` で打ち切るので、深い局面の `V` が上がると教師も一緒に
-上がる。実測でも `FT2BAD out=1074.1 target=1198.7 wmax=20.82 tile=4096` のように、4096/8192 の
-局面で `V` が 1,000 台まで育ち、そこから抜けられない。
-
-**`ft2` は非推奨**。同じことをするなら、ラベルを 1 回だけ固定してから回す `tch`（+ `tchadd`）→
-`dist` を使う。`dist` が安定なのは、教師ファイルが学習中に変わらないからで、これは偶然ではなく
-設計の差。`ft2` の `deep_every` は引数 12 で指定できるが、上の表のとおり焼け石に水。
-
-### 並列蒸留（`par` + `dist`）も駄目
-
-`dist` は教師バッファを読むだけで race しないので `par` を許可して測った。20,000 ゲーム、
-lr 3e-4、every 4 / div 3、教師 458,752 サンプル、A = 同梱 net:
-
-| 学習 | batch_scale | 時間 | B − A（± stderr） | B が勝った局 |
-|---|---|---|---|---|
-| 直列 | — | 2,300 s | +1,184 ± 9,370 | 9/20 |
-| `par` | 1（mean） | 90 s | −31,273 ± 6,653 | 0/20 |
-| `par` | √8 | 93 s | −34,859 ± 6,566 | 0/20 |
-| `par` | 8 | 53 s | −30,117 ± 5,522 | 1/20 |
-
-25 倍速いが、どのスケールでも 30,000 点負ける。**`par` + `dist` は不可**（CLI でも拒否する）。
-バッチが 8 ゲーム分の「スナップショットからの差分」を平均するのに対し、蒸留の教師サンプルは
-ゲームごとに違うので、平均すると教師信号が薄まるのだと思われる（未検証）。並列化するなら
-別の設計（`#207` の続き）が要る。
-
-なお `opts.batch_scale` が `par` の枝でしか設定されておらず、`sym` / `replay` などを `par` で
-回すと常に 1.0（旧 mean）になっていたのも直した。上の表の 1 / √8 / 8 はこの修正後に測っている。
+`opts.batch_scale` が `par` の枝でしか設定されておらず、`sym` / `replay` を `par` で回すと常に 1.0 になっていたのも直した。
 
 ## lr スケジュールで 200k〜400k まで伸ばす（#204）
 
-`#133` は「100k で頭打ち、200k で −14%、400k で崩壊」としていたが、それは lr を固定したままの
-話で、`par` の `batch_scale`（[#208](#par-の-move-数と実効学習率を直す208)）を入れた今の学習器では
-測っていなかった。`base` から seed 1、`replay_k=30`、`par`（sqrt 則）で 4 構成を回した。
-`resume` はそのまま次の段になるので、スケジュールは run を繋ぐだけで作れる。
+`#133` の「200k で −14%、400k で崩壊」は lr 固定の話で、`batch_scale` 導入後の学習器では測っていなかった。`base` から
+seed 1、`replay_k=30`、`par`（sqrt 則）で 4 構成（`resume` を繋ぐだけでスケジュールになる）:
 
 | 構成 | 段 | 学習時間 | moves |
-|---|---|---|---|
+| --- | --- | ---: | ---: |
 | 固定 lr | 0.003 × 200k | 689 s | 263,788,497 |
-| A: 減衰引き伸ばし | 0.003 × 100k → 0.001 × 100k | 795 s | 282,690,191 |
-| B: 50k ごとに半減 | 0.003 × 100k → 0.0015 → 0.00075 → 0.000375 → 0.0001875（各 50k） | 1,440 s | 490,473,958 |
-| C: 1/4 ずつ 2 段 | 0.003 × 100k → 0.00075 × 150k → 0.0001875 × 150k | 2,080 s | 699,065,146 |
+| A 減衰引き伸ばし | 0.003 × 100k → 0.001 × 100k | 795 s | 282,690,191 |
+| B 50k ごとに半減 | 0.003 × 100k → 0.0015 → 0.00075 → 0.000375 → 0.0001875 | 1,440 s | 490,473,958 |
+| C 1/4 ずつ 2 段 | 0.003 × 100k → 0.00075 × 150k → 0.0001875 × 150k | 2,080 s | 699,065,146 |
 
-ペア比較（20 局、seed 9000、A = 同梱 net）:
+ペア比較（20 局、A = 同梱 net）: 固定 200k −11,260 ± 6,566（7/20）、A −11,076 ± 7,912（3/20）、B 300k −12,723 ± 6,019
+（4/20）、C 400k −9,385 ± 6,870（5/20）。非ペア（`.deep`、9000 / 9100）: 固定 200k 77,095 / 72,057、A 75,236 / 75,219、
+B 83,504 / 80,619、C 76,246 / 73,671。
 
-| 構成 | B − A（± stderr） | B が勝った局 |
-|---|---|---|
-| 固定 lr 200k | −11,260 ± 6,566 | 7/20 |
-| A 200k | −11,076 ± 7,912 | 3/20 |
-| B 300k | −12,723 ± 6,019 | 4/20 |
-| C 400k | −9,385 ± 6,870 | 5/20 |
-
-非ペア表（`.deep` 20 局、seed 9000 / 9100。同梱 net と 100k の値は
-[#203](#同梱-net-を-base-から焼き直す203) の表から）:
-
-| 構成 | 9000 | 9100 | 8192 到達（9000 / 9100） |
-|---|---|---|---|
-| 同梱 net | 79,657 | 91,348 | 4/20 / 5/20 |
-| 100k（#203、sqrt 則） | 82,600 | 81,813 | 4/20 / 3/20 |
-| 固定 lr 200k | 77,095 | 72,057 | 1/20 / 0/20 |
-| A 200k | 75,236 | 75,219 | 0/20 / 0/20 |
-| B 300k | 83,504 | 80,619 | 2/20 / 2/20 |
-| C 400k | 76,246 | 73,671 | 1/20 / 0/20 |
-
-**崩壊は 400k まで再現しない**。固定 lr の 200k でも −11,260 ± 6,566 で、`#133` の「−14%」ほど
-落ちない。200k・300k・400k のペア差は −9.4k〜−12.7k で横ばい、つまり 100k から先はゲーム数を
-増やしても同梱 net との差が縮まない（同時に、大きく開きもしない）。
-
-**lr スケジュールの優劣は 20 局では決まらない**。非ペア表では B 300k が最良（83,504 / 80,619）、
-ペア差では C 400k が最良（−9,385）で、順位が一致しない。stderr が 6k〜8k あるので、この差は
-同じ 20 局を別 seed にすると入れ替わる。1 seed ずつなので、スケジュールを選ぶなら 3 seed 必要。
-
-同梱 net を上回る構成は 4 つとも無い。100k の net（#203）が −1,440 ± 7,544 で最も近く、**同梱 net
-は 100k 規模の学習で頭打ち**に見える。ゲーム数ではなく教師（深い探索・蒸留、#207）を変えるのが
-次の一手。
-
-再現:
-
-```
-zig build nn -Doptimize=ReleaseFast -- 100000 0 9000 0.003 1 base 30 /tmp/b.bin 1 par -
-for lr in 0.0015 0.00075 0.000375 0.0001875; do
-  zig build nn -Doptimize=ReleaseFast -- 50000 0 9000 $lr 1 resume 30 /tmp/b.bin 1 par -
-done
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 pairw 30 ai/solver/nn_weights.bin 1 - /tmp/b.bin
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/b.bin 1 - - - 0,2
-```
+**崩壊は 400k まで再現しない。** 固定 lr 200k でも −11,260 で「−14%」ほど落ちず、200k / 300k / 400k のペア差は
+−9.4k〜−12.7k で横ばい（100k から先はゲーム数を増やしても差が縮まないが、大きく開きもしない）。**スケジュールの優劣は
+20 局では決まらない**（非ペアは B、ペアは C で順位が一致しない）。1 seed ずつなので選ぶなら 3 seed 必要。同梱 net を
+上回る構成は 4 つとも無く、100k の net（#203、−1,440 ± 7,544）が最も近い。**同梱 net は 100k 規模で頭打ち**で、
+次の一手はゲーム数ではなく教師（#207）。
 
 ## 蒸留の配合・教師の深さ・ゲーム数（#207 の続き）
 
-`dist` は「同梱 net を壊さない」上限までは来ているので、次は配合（`distill_every` と教師の学習率 `lr / div`）、
-教師の探索の深さ、ゲーム数を振った。すべて A = 同梱 net、`pairw` 20 局 seed 9000、lr 3e-4、学習 seed 1、
-教師は 7 dump の統合ファイル（458,752 サンプル、`deep3` ラベル）から始めた実験。
+すべて A = 同梱 net、`pairw` 20 局 seed 9000、lr 3e-4、学習 seed 1、教師は 7 dump 統合（458,752 サンプル、`deep3`）:
 
 | 蒸留 | 教師 | B − A（± stderr） | better |
-|---|---|---|---|
-| 20,000、every 4 / div 3 | `deep3` 458,752 | **+1,184 ± 9,370** | 9/20 |
-| 20,000、every 4 / div 2 | `deep3` 458,752 | −16,585 ± 11,599 | 5/20 |
-| 20,000、every 2 / div 3 | `deep3` 458,752 | −20,110 ± 6,303 | 2/20 |
-| 20,000、every 6 / div 3 | `deep3` 458,752 | −30,848 ± 5,586 | 1/20 |
-| 20,000、every 4 / div 3 | `h4` 589,824 | −15,588 ± 6,249 | 6/20 |
-| 100,000、every 4 / div 3 | `deep3` 458,752 | −4,696 ± 8,005 | 5/20 |
+| --- | --- | --- | ---: |
+| 20k、every 4 / div 3 | `deep3` 458,752 | **+1,184 ± 9,370** | 9/20 |
+| 20k、every 4 / div 2 | `deep3` 458,752 | −16,585 ± 11,599 | 5/20 |
+| 20k、every 2 / div 3 | `deep3` 458,752 | −20,110 ± 6,303 | 2/20 |
+| 20k、every 6 / div 3 | `deep3` 458,752 | −30,848 ± 5,586 | 1/20 |
+| 20k、every 4 / div 3 | `h4` 589,824 | −15,588 ± 6,249 | 6/20 |
+| 100k、every 4 / div 3 | `deep3` 458,752 | −4,696 ± 8,005 | 5/20 |
 
-**配合は 1 点だけ互角**で、その両側（every 2 / every 6、div 2）は −17k〜−31k。20 ゲームの stderr が
-6〜12k なので差はほぼノイズだが、`every 4 / div 3` の +1,184 も再現した値ではない（1 seed だけ）。
+配合が互角なのは 1 点だけで両側は −17k〜−31k（20 局の stderr 6〜12k ではほぼノイズ、+1,184 も再現値ではない）。
+**教師を深くしても効かない**（`tch` に教師モード arg 12 を足し、`h4` で 9 dump を貼り直し。4.0 ms/sample 対 `deep3` の
+1.5 ms/sample、ラベル差 mean|Δ| 6.4 / max 44.4。589,824 サンプルで −15,588 と 458,752 の `deep3` より悪い）。
+**ゲーム数も効かない**（100,000 ゲーム 1,788.7 s / 191,593,848 moves で −4,696 ± 8,005、20k の +1,184 と同じ帯で飽和）。
 
-**教師を深くしても効かない。** `tch` に教師モード（arg 12、`deep3` 既定 / `h4` = `phase_h4`、#171）を足し、
-9 dump を `h4` で貼り直した（4.0 ms/sample、`deep3` は 1.5 ms/sample。ラベルの差は mean|Δ| 6.4、max 44.4）。
-589,824 サンプルで蒸留しても −15,588 で、458,752 の `deep3` より悪い。「深い教師ほど良い」は成り立たない。
+**結論**: 教師ラベルを深くする・増やす・蒸留を長くする、のどれも同梱 net を超えない。蒸留は「壊さない」ための道具で、
+伸ばす道具ではない。次に試す価値があるのは教師の中身そのもの（探索の目的関数、局面表現、ネット構造）で配合の調整ではない。
 
-**ゲーム数も効かない。** 100,000 ゲーム（1,788.7 s、191,593,848 moves）で −4,696 ± 8,005。20,000 の
-+1,184 と同じ帯で、蒸留は互角のまま飽和する。
+## ネットの幅を広げる（#220）
 
-再現（`h4` 教師を作るところから。`zz` は `zig build nn -Doptimize=ReleaseFast -- 0 0` で作った exe）:
-```
-for d in /tmp/deep.dmp /tmp/deep2.dmp /tmp/dmp_s{2..7}.bin; do
-  zz 0 0 9000 0.003 1 tch 30 ai/solver/nn_weights.bin 1 - $d h4     # -> $d.tch
-done
-# 8 x 65,536 を 1 本に連結（ヘッダは 12 バイト: "2048-TCH" + u32 count）
-cp ai/solver/nn_weights.bin /tmp/cand.bin
-zz 20000 0 9000 0.0003 1 dist 30 /tmp/cand.bin 1 - /tmp/h4.tch 4 3
-zz 0 20 9000 0.003 1 pairw 30 ai/solver/nn_weights.bin 1 - /tmp/cand.bin
-```
+ゲーム数（#203 / #204）、lr スケジュール（#204）、蒸留（#207）が否定されたので容量を振った。`h1` / `h2` は #205 で
+build option（`-Dh1=128 -Dh2=128`）。同梱 net は 64/32（148,504 B）。`base` からスクラッチ、lr 0.003、seed 1、`par`
+sqrt 既定、評価は 2-ply 20 局（seed 9000）:
 
-**結論**: 教師ラベルを深くする・増やす・蒸留を長くする、のどれも同梱 net を超えない。
-蒸留は「壊さない」ための道具で、伸ばす道具ではない。次に試す価値があるのは教師の中身そのもの
-（探索の目的関数、局面表現、ネット構造）で、配合の調整ではない。
-
-## ネットの幅を広げる（容量、#220）
-
-ゲーム数（#203 / #204）、lr スケジュール（#204）、蒸留の配合と教師の深さ（#207）がすべて否定されたので、
-残る lever としてネットの容量を振った。`h1`（入力側の隠れ層）と `h2`（出力側の隠れ層）は #205 で
-build option になっていて、`zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=128 -- …` で切り替わる。
-同梱 net は 64/32（148,504 B = 16 + 18,561 f64）。
-
-学習条件は全部同じ: `base` から スクラッチ、lr 0.003、学習 seed 1、`par`、`batch_scale` は sqrt 既定、
-評価は `-- 0 20 9000 0.003 1 resume 30 <net> 1 - - - 2`（2-ply のみ、20 局 seed 9000）。
-
-| 幅 (h1/h2) | ゲーム数 | 2-ply avg_score | 8192 | ms/move | 1 局あたりのコスト |
-|---|---|---|---|---|---|
+| 幅 (h1/h2) | ゲーム数 | 2-ply | 8192 | ms/move | 1 局のコスト |
+| --- | ---: | ---: | ---: | ---: | ---: |
 | 64/32（同梱） | — | 79,657.0 | 4/20 | 0.48 | 1.0x |
 | 128/128 | 100,000 | 72,012.4 | 2/20 | 3.02 | 6.3x |
 | 128/128 | 300,000 | **92,952.6** | **7/20** | 5.81 | 12x |
-| 128/128 | 300,000 + 300,000（lr 3e-4 で継続） | 84,118.2 | 2/20 | 5.18 | 11x |
+| 128/128 | 300,000 + lr 3e-4 で 300,000 | 84,118.2 | 2/20 | 5.18 | 11x |
 | 128/32 | 300,000 | 78,499.8 | 3/20 | 1.23 | 2.6x |
 
-**容量はゲーム数を食う。** 128/128 でも 100,000 ゲームでは 72,012 で同梱 net に負ける。300,000 まで
-伸ばして初めて 92,953（+13,296）になり、8192 到達も 7/20 と倍近い。同じ 300,000 ゲームでも
-128/32 は 78,500 なので、**効いているのは `h2` の広さ**（出力層の表現力）で、`h1` を広げても意味がない。
+**容量はゲーム数を食う**（128/128 でも 100k では 72,012 で負ける）。300k で初めて 92,953（+13,296）、8192 は 7/20。
+同じ 300k でも 128/32 は 78,500 なので**効いているのは `h2` の広さ**で、`h1` を広げても意味がない。**継続学習は逆効果**
+（300k の net から lr 3e-4 で 300k 追加すると 84,118 に落ちる）。
 
-**継続学習は逆効果。** 300,000 の net から lr 3e-4 で 300,000 ゲーム追加すると 84,118 に落ちた。
-#204 の「ゲーム数を増やしても伸びない」は容量を上げた場合も同じで、lr を下げて延長するのは損。
+幅が違う net 同士は `pairw` が 1 プロセスで両方を回す都合で同じ `h1`/`h2` ビルドでないと比べられない。`scripts/widen-net.py`
+で同梱 net をゼロ埋めすると**値がビット単位で同じ** 128/128 net が作れる（余分なユニットは `relu(0) = 0`）。ゼロ埋め net の
+2-ply は 79,657.0 / 3,588.1 moves / 4-of-20 で同梱 net と完全一致した。ペア比較は **+8,623.8 ± 7,679.3**（13 勝 7 敗）で
+採用バー（mean − 2·stderr > 0、≒ +15,000）に届かない。非ペアの +13,296 と同じ向きで効果自体は本物だが、12 倍のコストで
++8k は割に合わない。
 
-**ペア比較でも同梱 net を上回る。** 幅が違う net 同士は `pairw` が 1 プロセスで両方を回す都合上、
-同じ `h1`/`h2` でビルドしないと比べられない。`scripts/widen-net.py` で同梱 net をゼロ埋めすると
-**値がビット単位で同じ** 128/128 net が作れる（余分なユニットは `relu(0) = 0` で寄与しない）。
-ゼロ埋め net の 2-ply は 79,657.0 / 3,588.1 moves / 4-of-20 で同梱 net と完全一致した。
+| 続きの試行 | 結果 | 判定 |
+| --- | --- | --- |
+| 128/128 300k → lr 0.0015 で +120k（計 420k） | 2-ply 69,888.0、8192 0/20 | 追加学習は逆効果 |
+| 64/128（`h2` だけ広い）195k | 70,222.8、1/20、2.70 ms/move | 300k には届かない見込みで打ち切り |
+| 128/128 300k を教師に `dson` 30k（7.36M 回帰） | pairw **−68,521 ± 7,048**（0/20）、2-ply 23,080 | 広い net の値を 64/32 に移せない |
+| 128/128 300k を教師に `dist` 100k（every 4 / div 3） | −55,826 ± 6,287（0/20）、39,612 | 同上 |
 
-```
-python3 scripts/widen-net.py ai/solver/nn_weights.bin /tmp/ship_pad128.bin --h1 128 --h2 128
-zz 0 20 9000 0.003 1 pairw 30 /tmp/ship_pad128.bin 1 - /tmp/w128_300k.bin
-# -> pair A vs B: games=20 mean diff=+8,623.8 ± 7,679.3 (stderr) better=13 worse=7
-```
+教師ラベルのスケールはほぼ同じ（128/128 net の `tch` は mean 16.48 / max 55.45、同梱 net は 15.79 / 50.54）なのに、
+生徒（64/32）は真似すると崩壊する。**広い net の `V` はその net 自身の 2-ply 探索とセットで初めて意味を持つ**値で、
+単体の回帰ターゲットには使えない（#185 の「残差だけ学習」も同じ理由で期待できない）。
 
-20 局では +8,624 ± 7,679（13 勝 7 敗）で、採用バー（mean − 2·stderr > 0、≒ +15,000）には届かない。
-非ペア表の +13,296 とペア比較の +8,624 は同じ向きで、幅を広げた効果自体は本物だが、
-1 局あたり 12 倍のコストと引き換えに +8k では割に合わない。
+**seed を変えると再現しない（重要）**: 128/128 を seed 2 で 200k〜280k まで伸ばすと非ペア 85,397.8 だが `pairw` は
+**−12,116.8 ± 5,847.5（5 勝 15 敗）**。seed 1 の +8,624 と合わせて散らばりは ±20k 規模（64/32 の seed 分散と同じ）。
+**128/128 の +8,624 は容量の効果ではなく seed の引き**で、採用候補にならない。
 
-再現（学習は 300,000 ゲームで 2〜4 時間。`zz` は `zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=128 -- 0 0` で作った exe）:
-```
-zz 300000 0 9000 0.003 1 base 30 /tmp/w128_300k.bin 1 par - 2.8284
-zz 0 20 9000 0.003 1 resume 30 /tmp/w128_300k.bin 1 - - - 2
-```
-
-### 幅を広げた net の続き: 追加学習・h1 だけ・蒸留での移植（#220）
-
-| 試行 | 結果 | 判定 |
-|---|---|---|
-| 128/128 300k → lr 0.0015 で +120k（合計 420k） | 2-ply 69,888.0、8192 0/20 | 追加学習は逆効果（300k の 92,953 から大きく落ちる） |
-| 64/128（`h2` だけ広い）195k | 2-ply 70,222.8、8192 1/20、2.70 ms/move | 300k には届かない見込みで打ち切り。`h1` も要る |
-| 128/128 300k を教師に `dson` 30k（lr 3e-4、7.36M 回帰） | pairw **−68,521 ± 7,048**（0/20）、2-ply 23,080 | 広い net の値を 64/32 に移せない |
-| 128/128 300k を教師に `dist` 100k（lr 0.003、every 4 / div 3） | pairw −55,826 ± 6,287（0/20）、2-ply 39,612 | 同上（自己対戦を混ぜても駄目） |
-
-教師のラベルは 128/128 net の `tch`（10.5 ms/sample、7 dump = 458,752 サンプル、mean 16.48 / max 55.45。
-同梱 net のラベルは mean 15.79 / max 50.54）。値のスケールはほぼ同じなのに、**生徒（64/32）は
-教師の値をそのまま真似すると崩壊する**。幅を広げた net の `V` は、その net 自身の 2-ply 探索と
-セットで初めて意味を持つ値で、単体の回帰ターゲットとしては使えない（#185 の「残差だけ学習」も
-同じ理由で期待できない）。
-
-**seed を変えると再現しない（重要）**。128/128 を学習 seed 2 で（base から、同じ lr 0.003、`par` sqrt、
-途中から resume で継続）約 200k〜280k ゲームまで伸ばした net は、非ペア 2-ply が 85,397.8、
-`pairw` は **−12,116.8 ± 5,847.5（5 勝 15 敗）**で同梱 net に負けた。seed 1 の +8,624 と合わせると
-seed 間の散らばりは ±20k 規模で、64/32 で見えていた seed 分散（#203: linear 則 s1 −56k / s2 −26k / s3 −68k）
-と同じ。**128/128 の +8,624 は容量の効果ではなく seed の引き**で、採用候補にはならない。
-
-**現時点の結論**: 容量は `h2` を中心に 128/128 まで広げても、300k ゲームで seed 1 が +8,624、seed 2 が
-−12,117 と再現せず、コストは 12 倍。300k を超えると（lr を下げても）劣化する。この方向の伸びしろは
-300k 付近で止まっており、seed を増やしても平均は同梱 net と区別できない。
+**結論**: `h2` 中心に 128/128 まで広げても seed で再現せず、コスト 12 倍、300k 超は lr を下げても劣化。伸びしろは 300k 付近で
+止まっており、seed を増やしても平均は同梱 net と区別できない。
 
 ## 自己対戦の分布を広げる — 探索ノイズと開幕ランダム（#224）
 
-`#169`/`#159` 系（`restart`、dump カリキュラム）は「深い局面から始める」ことで分布を広げようとして
-全部負けた。同じ発想を自己対戦の側から試したのがこの節で、①`explore`（一定確率で合法手を一様ランダムに
-打つ）と ②`open8`/`open16`（開幕 N 手だけランダムに打ち、その間は学習しない）の 2 種を実装して測った。
-
-学習はすべて `base` から、lr 0.003、train seed 1、`par` の sqrt 則。判定は非ペア 2-ply（seed 9000、
-20 局）で、同梱 net の同じ行は 79,657.0 / 8192 4/20。
+`#169` / `#159` 系（`restart`、dump カリキュラム）は「深い局面から始める」で全滅した。同じ発想を自己対戦側から試した:
+① `explore`（一定確率で合法手を一様ランダムに打つ）、② `open8` / `open16`（開幕 N 手だけランダム、その間は学習しない）。
+`base` から、lr 0.003、train seed 1、`par` sqrt。非ペア 2-ply（seed 9000、20 局）、同梱 net は 79,657.0 / 4/20:
 
 | 変種 | ゲーム数 | moves | 時間 | 2-ply | 8192 |
-|---|---|---|---|---|---|
-| `explore`（5% ランダム） | 100k | 22,806,876 | 64.3 s | **21,224.4** | 0/20 |
-| `explore`（5% ランダム） | 400k | 114,043,957 | 345.7 s | 12,614.2 | 0/20 |
-| `open8`（開幕 8 手ランダム） | 100k | 64,155,562 | 176.1 s | 30,916.6 | 0/20 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `explore` 5% | 100k | 22,806,876 | 64.3 s | **21,224.4** | 0/20 |
+| `explore` 5% | 400k | 114,043,957 | 345.7 s | 12,614.2 | 0/20 |
+| `open8` | 100k | 64,155,562 | 176.1 s | 30,916.6 | 0/20 |
 
-ランダム手を混ぜると 1 ゲームの moves が 1/4〜1/6 に縮む（同梱 net 級の自己対戦は 100k ゲームで
-90〜130M moves）。`explore` は 400k ゲームまで増やして moves を揃えても 12,614 で、**TD のターゲットに
-ランダム手を含めた時点で値が壊れる**（ランダム手で死ぬ系列の価値を学ぶ）。`open8` はランダム手を
-ターゲットから外した（開幕は学習しない）のに 30,917 まで落ちる。理由は分布のずれではなく
-**価値関数の外挿性の無さ**で、greedy の軌道から外れた盤面では `V` の誤差が大きく、そこでの学習が
-良い盤面の `V` まで引きずる。
-
-**結論**: この net は on-policy（greedy 自己対戦の軌道）でしか学習できない。`restart`（深い局面）、
-dump カリキュラム（序盤を飛ばす）、`explore`/`open8`（ランダム手）という 4 系統の分布シフトが
-すべて −50k〜−70k で失敗しており、状態分布を広げる方向は打ち切り。
-
-再現:
-```
-zz 100000 0 9000 0.003 1 explore 30 /tmp/ex5_s1.bin 1 par -
-zz 400000 0 9000 0.003 1 explore 30 /tmp/ex5_400k.bin 1 par -
-zz 100000 0 9000 0.003 1 open8 30 /tmp/op8_s1.bin 1 par -
-zz 0 20 9000 0.003 1 resume 30 /tmp/op8_s1.bin 1 - - - 0,2
-```
+ランダム手を混ぜると 1 ゲームの moves が 1/4〜1/6 に縮む（同梱 net 級の自己対戦は 100k で 90〜130M moves）。
+`explore` は moves を揃えても 12,614 で、**TD のターゲットにランダム手を含めた時点で値が壊れる**。`open8` はランダム手を
+ターゲットから外したのに 30,917 まで落ちる。理由は分布のずれではなく**価値関数の外挿性の無さ**で、greedy の軌道から
+外れた盤面では `V` の誤差が大きく、そこでの学習が
+**結論**: この net は on-policy（greedy 自己対戦の軌道）でしか学習できない。`restart`（深い局面）、dump カリキュラム（序盤を飛ばす）、
+`explore` / `open8`（ランダム手）という 4 系統の分布シフトがすべて −50k〜−70k で失敗しており、状態分布を広げる方向は打ち切り。
 
 ## 同梱 net は現行レシピの不動点（#225）
 
-同梱 net から `resume` で自己対戦を続けると必ず数 % 下がる。lr とゲーム数を振っても同じで、
-**同梱 net はこのレシピ（TD(0) + greedy 自己対戦 + sqrt 則）の不動点**とみてよい。
+同梱 net から `resume` で自己対戦を続けると必ず数 % 下がり、lr とゲーム数を振っても同じ。**同梱 net はこのレシピ
+（TD(0) + greedy 自己対戦 + sqrt 則）の不動点**とみてよい。
 
-| 追学習 | moves | 非ペア 2-ply（seed 9000） | `pairw` vs 同梱 net |
-|---|---|---|---|
-| 100k ゲーム、lr 3e-4 | 214,702,634 | 84,839.4（8192 3/20） | −5,495.6 ± 6,887.4（8 勝 12 敗） |
-| 300k ゲーム、lr 1e-4 | 652,561,501 | 81,283.8（8192 2/20） | −5,341.4 ± 9,281.0（5 勝 15 敗） |
+| 追学習 | moves | 非ペア 2-ply（9000） | `pairw` vs 同梱 net |
+| --- | ---: | ---: | --- |
+| 100k、lr 3e-4 | 214,702,634 | 84,839.4（8192 3/20） | −5,495.6 ± 6,887.4（8 勝 12 敗） |
+| 300k、lr 1e-4 | 652,561,501 | 81,283.8（8192 2/20） | −5,341.4 ± 9,281.0（5 勝 15 敗） |
 
-非ペア表では +5,182 / +2,628 と「改善」に見えるが、ペア比較ではどちらも負ける（seed 9000 の
-非ペア表は同梱 net 自身の 79,657 に対して ±5k 動く）。同梱 net から TD(0) で離れると、
-スコア分布の裾（8192 到達）が先に落ち、平均は互角から少し下に張り付く。
+非ペア表では +5,182 / +2,628 と「改善」に見えるがペアでは負ける（seed 9000 の非ペア表は同梱 net 自身の 79,657 に対して ±5k
+動く）。TD(0) で離れると裾（8192 到達）が先に落ち、平均は互角から少し下に張り付く。
 
-**結論**: 学習ゲーム数・lr・lr スケジュール・蒸留（配合/教師/移植）・容量・探索ノイズ・開幕ランダム・
-対称性・backward・`mstd` のすべてが同梱 net を超えない（13 ラウンド）。現行の目的関数と入力表現の
-範囲では、同梱 net がほぼ最適点で、残る伸びしろは局面表現（入力特徴）か報酬系の変更だけ。
-
-再現:
-```
-cp ai/solver/nn_weights.bin /tmp/ft100k_s1.bin
-zz 100000 0 9000 0.0003 1 resume 30 /tmp/ft100k_s1.bin 1 par -
-zz 0 20 9000 0.003 1 pairw 30 ai/solver/nn_weights.bin 1 - /tmp/ft100k_s1.bin
-```
+**結論**: 学習ゲーム数・lr・スケジュール・蒸留（配合/教師/移植）・容量・探索ノイズ・開幕ランダム・対称性・backward・`mstd` の
+すべてが同梱 net を超えない（13 ラウンド）。現行の目的関数と入力表現の範囲では同梱 net がほぼ最適点で、残る伸びしろは局面表現
+（入力特徴）か報酬系の変更だけ。
 
 ## 入力に手作り特徴を足す（`-Dfeat`、#226）
 
-one-hot（16 セル × 16 レベル = 256 入力）に、2048 の定番ヒューリスティックを**大域特徴**として
-足せるようにした: 空きセル数 / 最大レベル / 単調性 / 滑らかさ / 最大タイルが角か / レベルの総和。
-すべて 0..1 に正規化し、`Net.wf[feature_count][h1]` の行として入力層に足す（既定 `-Dfeat=0` は
-現行の 256 入力とファイル形式のまま。`-Dfeat=6` は 6 行ぶんファイルが伸びる）。
+one-hot 256 入力に大域特徴を足せるようにした（空きセル数 / 最大レベル / 単調性 / 滑らかさ / 最大タイルが角か / レベルの総和。
+0..1 に正規化し `Net.wf[feature_count][h1]` の行として入力層に足す。既定 `-Dfeat=0` は現行の 256 入力とファイル形式のまま）。
+`scripts/widen-net.py --feat 6` でゼロ埋めするとビット一致（79,657.0 / 4/20 を再現）。`base` から、lr 0.003、seed 1、64/32:
 
-`scripts/widen-net.py --feat 6` で同梱 net をゼロ埋めすると値はビット一致（同梱 net が
-79,657.0 / 8192 4/20 をそのまま再現）。学習は `base` から、lr 0.003、seed 1、64/32。
-
-| 条件 | ゲーム数 | 学習 | 2-ply（seed 9000） |
-|---|---|---|---|
+| 条件 | ゲーム数 | 学習 | 2-ply（9000） |
+| --- | ---: | --- | ---: |
 | 特徴なし（対照） | 20k | 直列 | 48,279.2 |
-| `-Dfeat=1`（空きセル数だけ） | 20k | 直列 | **60,776.4**（約 20k moves / 20k ゲームではない: 14.1M moves） |
-| 特徴なし（対照、#203 の sqrt 則 s1） | 100k | `par` sqrt | 82,600 |
+| `-Dfeat=1`（空きセル数だけ） | 20k | 直列 | **60,776.4**（14.1M moves） |
+| 特徴なし（#203 sqrt s1） | 100k | `par` sqrt | 82,600 |
 | `-Dfeat=1` | 100k | 直列 | 81,959.0（8192 2/20） |
 | `-Dfeat=1` | 100k | `par` sqrt | 27,432.6（壊れる） |
 | `-Dfeat=6` | 100k | `par` sqrt | 46,200.2（壊れる） |
 
-読み: **20k ゲームでは特徴が効く**（48,279 → 60,776、+12.5k）。ところが 100k ゲームまで回すと
-82,600 → 81,959 で**差が消える**（one-hot の net が同じ情報を自力で覚えてしまう）。つまり特徴は
-「学習の初速」を上げるだけで、収束先は変わらない。
-
-`par` + 特徴は明確に壊れる（直列 81,959 に対し 27,433）。原因は特定していないが、**バッチ経路は
-特徴ビルドを拒否する**ようにした（`parSupported` が `nn.feature_count != 0` で false）。重みの
-スケールも小さく（max|w| 1.76 対 同梱 20.39）、バッチ平均で特徴行の方向が打ち消されている可能性がある。
-
-**結論**: 大域特徴は「同じ精度に早く着く」だけで +2σ には届かない。学習コストを下げる用途
-（20k で 60k 点）には使えるが、同梱 net の差し替え理由にはならない。
-
-再現:
-```
-zig build nn -Doptimize=ReleaseFast -Dfeat=1 -- 20000 0 9000 0.003 1 base 30 /tmp/f1_20k.bin 1 - - - 0
-zig build nn -Doptimize=ReleaseFast -Dfeat=1 -- 0 20 9000 0.003 1 resume 30 /tmp/f1_20k.bin 1 - - - 2
-python3 scripts/widen-net.py ai/solver/nn_weights.bin /tmp/ship_f6.bin --src-h1 64 --src-h2 32 --h1 64 --h2 32 --feat 6
-```
+**20k では特徴が効く**（+12.5k）が、100k では 82,600 → 81,959 で差が消える（one-hot の net が同じ情報を自力で覚える）。特徴は
+「学習の初速」を上げるだけで収束先を変えない。`par` + 特徴は明確に壊れる（原因未特定。重みのスケールが小さく max|w| 1.76 対
+同梱 20.39 で、バッチ平均が特徴行の方向を打ち消している可能性）。**バッチ経路は特徴ビルドを拒否する**ようにした
+（`parSupported` が `nn.feature_count != 0` で false）。
 
 ## 2-ply に揃えた学習を測る — `t2` は発散し `p2` だけが残る（#228）
 
-#158 で `t2`（目標を 2-ply 探索値に）/ `p2`（自己対戦を `.deep` に）/ `tp2`（両方）を作ったが、
-数字が無いままだった。評価は 2-ply で手を選ぶのに学習は 1-ply greedy + `reward + V(next)` で、
-同梱 net はその不動点（#225）なので、評価側に寄せるのは最後の未測定の軸だった。
+測る前に 2 つ修正: (1) `search2Value` と `pickTeacherValue` は重み更新をまたいで `sharedValueCache()` を読んでいた
+（`ValueCache.clear` 自身のコメントが「重み更新の間の価格計算は空の表から始めろ」と言っているのに `teacherValue` だけが clear
+していた）。両方の入口で clear し、`test "search2 target and deep2 pick price with the current weights, not the shared cache
+(#228)"` で固定。(2) `parSupported` が `td1` + `greedy1` 以外を拒否していたので `search2` + `greedy1|deep2` を許可（価値表は
+threadlocal で手ごとに clear するので衝突しない）。`use_resume` に `t2`/`p2`/`tp2` を足した。
 
-測る前に 2 つ直した。(1) `search2Value` と `pickTeacherValue`（`p2` の手選び、`d2`/`d3` の教師）は
-重み更新をまたいで `sharedValueCache()` を読んでいた。`ValueCache.clear` 自身のコメントが
-「重み更新の間の価格計算は空の表から始めろ」と言っているのに、`teacherValue` だけが clear して
-いた。両方の入口で clear するようにし、`test "search2 target and deep2 pick price with the current
-weights, not the shared cache (#228)"` で固定した。(2) `parSupported` が `td1` + `greedy1` 以外を
-拒否していたので、`search2` + `greedy1|deep2` を許可した（価値表は threadlocal で、手ごとに
-clear するのでバッチ経路でも衝突しない）。`use_resume` に `t2`/`p2`/`tp2` を足して同梱 net から
-始められるようにした。
-
-同梱 net から、seed 9000、lr 3e-4（`par` は sqrt 則で 1e-3）で回した。
+同梱 net から、seed 9000、lr 3e-4（`par` は sqrt 則で 1e-3）:
 
 | variant | ゲーム数 | moves/ゲーム | 結果 |
-|---|---|---|---|
-| `resume`（対照、td1） | 200 | 1,932 | 安定 |
-| `t2`（`lr=0`） | 5 | 1,875 | 方策は `resume` と同一（9,376 moves が一致） |
-| `t2` | 1 | 1,795 | まだ普通 |
-| `t2` | 2 | 2,358 | まだ普通 |
-| `t2` | 5 | 1,752 | 崩れ始め |
-| `t2` | 10 | 929 | 崩壊 |
-| `t2` | 20 | 645 | 崩壊 |
-| `t2` | 50 | 378 | 崩壊 |
+| --- | ---: | ---: | --- |
+| `resume`（td1、対照） | 200 | 1,932 | 安定 |
+| `t2`（`lr=0`） | 5 | 1,875 | 方策は `resume` と同一（9,376 moves 一致） |
+| `t2` | 1 / 2 | 1,795 / 2,358 | まだ普通 |
+| `t2` | 5 / 10 / 20 / 50 | 1,752 / 929 / 645 / 378 | 崩壊 |
 | `t2` | 5,000 | 212 | 崩壊（最後の 1 局 1,864 点） |
-| `tp2` | 50 | 692 | 崩壊（目標が同じなので当然） |
-| `p2` | 50 | 4,180 | 安定（2-ply の評価は約 3,600 moves/ゲーム） |
+| `tp2` | 50 | 692 | 崩壊 |
+| `p2` | 50 | 4,180 | 安定（2-ply 評価は約 3,600 moves/ゲーム） |
 
-lr を下げても崩壊は遅れるだけ（200 ゲームで lr 1e-4 は 357、lr 1e-3 は 219 moves/ゲーム）。
-`lr=0` では `t2` と `resume` のゲームが 1 手も変わらないので、目標の計算そのものは正しい。
+lr を下げても崩壊は遅れるだけ（200 ゲームで lr 1e-4 は 357、1e-3 は 219 moves/ゲーム）。`lr=0` では `t2` と `resume` のゲームが
+1 手も変わらないので目標の計算自体は正しい。`diag` では `lr=0` の `t2` の平均 |TD 誤差| が 0.17〜0.30 で `resume`（0.13〜0.23）と
+ほぼ同じ、100 ゲーム後は全体 2.77 / 空き 0〜3 で 7.01、`V(s') - V(s)` の平均 −3.5（終盤で楽観側に発散）。
 
-`diag` で見ると、`lr=0` の `t2` の平均 |TD 誤差| は 0.17〜0.30 で `resume`（0.13〜0.23）とほぼ同じ。
-100 ゲーム回した後は全体 2.77、空き 0〜3 の終盤 7.01 まで膨らみ、`V(s') - V(s)` の平均が −3.5
-（終盤で V が上がる = 楽観側に発散）。
+**読み**: `search2` の目標は `r_{t-1} + max_d [r_t + E_spawn max_d' V(A_{t+1})]`、つまり目標の中に max が入った 2 段の値反復
+（γ=1、関数近似あり）。`td1` は方策評価で max が無いから同じ lr で安定する。max を内側に入れると V のノイズが楽観側に増幅され、
+argmax がノイズで選ばれ、ゲームが数百手に縮み、崩れた盤面（最大タイル 256 以下が 74%）で学習する悪循環になる。`bootValue` /
+`bootChance` の正規化（`mass` で割るので `p` に `/empties` が無くても比は正しい）は正しく、直すべきは演算子の側だった。
 
-**読み**: `search2` の目標は
-`r_{t-1} + max_d [r_t + E_spawn max_d' V(A_{t+1})]`、つまり**目標の中に max が入った 2 段の
-値反復**（割引なし γ=1、関数近似あり）。`td1` の `r_{t-1} + V(A_t)` は方策評価で、目標に max が
-無いので同じ lr で安定する。max を内側に入れると V のノイズが楽観側に増幅され、argmax が
-ノイズで選ばれ、ゲームが数百手に縮み、そこからは崩れた盤面（最大タイル 256 以下が 74%）で
-学習する悪循環になる。`bootValue`/`bootChance` の正規化（`mass` で割るので `p` に `/empties`
-が無くても比は正しい）は正しく、直すべきは演算子の側だった。
+`p2`（自己対戦だけ `.deep`、目標は `td1`）は安定するので **#158 で残ったセルは `p2` だけ**。評価が訪れる深い盤面を自分で訪ねる
+ので、`dumpp2` / `restart`（古い方策の深い盤面）と違って分布が今の方策に一致する。ところが測ると**負ける**。同梱 net から
+1,000 ゲーム（lr 3e-4、直列、100 ゲームずつ 10 本）:
 
-`p2`（自己対戦だけ `.deep`、目標は `td1`）は同じ lr で安定するので、**#158 で残ったセルは `p2`
-だけ**。`p2` は評価が訪れる深い盤面を自分で訪ねるので、`dumpp2`/`restart`（古い方策で作った
-深い盤面）と違って分布が今の方策に一致する。ところが測ると**負ける**。同梱 net から 1,000 ゲーム
-（lr 3e-4、直列、100 ゲームずつ 10 本）回した net は
-
-| 指標 | 同梱 | `p2` 1,000 ゲーム |
-|---|---|---|
-| pairw 20 局 seed 9000 | — | **−23,980.6 ± 7,205.4**（better 4 / worse 16） |
-| 2-ply 20 局 seed 9000 | 79,657.0（8192 4/20） | 71,903.0（2/20） |
+| 指標 | 同梱 | `p2` 1,000 |
+| --- | --- | --- |
+| `pairw` 20 局 seed 9000 | — | **−23,980.6 ± 7,205.4**（4 勝 16 敗） |
+| 2-ply 20 局 seed 9000 | 79,657.0（4/20） | 71,903.0（2/20） |
 | 2-ply 20 局 seed 9100 | 91,348.0（5/20） | 81,754.0（4/20） |
 
-学習中のゲームは 3,251〜3,966 moves/ゲームで崩れない（`t2` の崩壊とは別物）。それでも評価は
-両方向に負ける。#135 で「2-ply 側に寄せると 1-ply は +24%、2-ply は −8%」だったのと同じ向きで、
-**探索の上乗せは V が 1-ply greedy の分布で鍛えられているから効く**、という説明と一致する。
+学習中のゲームは 3,251〜3,966 moves で崩れない（`t2` とは別物）が、評価は両方向に負ける。#135 の「2-ply 側に寄せると 1-ply は
++24%、2-ply は −8%」と同じ向きで、**探索の上乗せは V が 1-ply greedy の分布で鍛えられているから効く**という説明と一致する。
 
-`p2` を `par` で回すとバッチの待ち合わせで詰まる: 8 ゲームのバッチは最も長い 1 局を待つので、
-4 時間で 2,700 ゲームしか進まず（CPU 時間 597 分、平均 2.5 コア）、終盤は 1 コア相当まで落ちた。
-`t2`/`tp2` の崩壊した net が長いゲームを出すのも同じで、**ゲーム長の上限が無い**のが効いている。
-`p2` の実測は直列 100 ゲーム刻みで取った（1 本 9〜11 分）。
-
-結論: #158 の軸はここで閉じる。`t2`/`tp2` は学習が発散し、`p2` は安定するが評価を悪化させる。
-同梱 net を超えるには価値関数そのもの（報酬・状態表現）を変える必要がある（#184/#185）。
-
-再現:
-```
-zig build nn -Doptimize=ReleaseFast
-B=.zig-cache/o/*/nn
-cp ai/solver/nn_weights.bin /tmp/t2.bin
-$B 5000 0 9000 0.0003 1 t2 30 /tmp/t2.bin 9000 -          # 崩壊する
-$B 100 0 9000 0.0003 1 p2 30 /tmp/p2.bin 9000 -   # 直列 100 ゲームを 10 回
-$B 100 0 9000 0.0003 diag t2 30 /tmp/z.bin 9000 -
-```
+`p2` を `par` で回すと詰まる（8 ゲームのバッチが最も長い 1 局を待つので 4 時間で 2,700 ゲーム、CPU 時間 597 分・平均 2.5 コア、
+終盤は 1 コア相当）。`t2`/`tp2` の崩壊 net が長いゲームを出すのも同じで、**ゲーム長の上限が無い**のが効いている。`p2` の実測は
+直列 100 ゲーム刻み（1 本 9〜11 分）。**#158 の軸はここで閉じる**（`t2`/`tp2` は発散、`p2` は安定するが悪化）。
 
 ## 容量の切り分けをやり直す: 入力側を広げた 128/32 が +57,424 で採用（#233）
 
-**動機。** #220 は「128/128 は seed の引きで、128/32 は 78,500 なので効いているのは `h2` だけ」と
-結論していた。しかし 128/32 の 300,000 ゲームを同条件（`base` スクラッチ、lr 0.003、学習 seed 1、
-`par`、`batch_scale` = sqrt(8) = 2.8284271247461903、評価 20 局 seed 9000）で回し直すと
-**113,682.2** が出て、記録の 78,500 と食い違った。今回の測定は次の 2 点で裏が取れている。
-
-- 生成物のサイズが 296,472 B = 16 + 37,057 × 8 で、37,057 = 256×128 + 128 + 32×128 + 32 + 32 + 1。
-  つまり本当に h1=128 / h2=32 の net。
-- 対照に使う同梱 net（64/32）を `scripts/widen-net.py --h1 128 --h2 32 --src-h1 64 --src-h2 32` で
-  ゼロ埋めすると、**79,657.0 を小数まで完全再現**する（ゼロ行は活性 0 なので値が変わらない）。
-
-#220 の 78,500 は 64/32 の 300k（#204 の平坦域と同じ 78,500 前後）とほぼ一致するので、
-`-Dh1` が exe に届いていなかった（ビルドオプションの取り違え）か、`batch_scale` のスロットに
-`2` を渡していた（64/32 では 51,483 まで落ちる罠、#231）可能性が高い。**以後、容量の測定は
-重みファイルのサイズとゼロ埋め対照で必ず裏を取る。**
-
-```
-zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 300000 0 9000 0.003 - base 30 \
-    /tmp/w128_32_300k.bin 1 par - 2.8284271247461903 0,2
-# trained 300000 games, 553202634 moves in 3638.9 s (lr=0.003, seed=1, variant=base+par)
-```
+#220 は「128/128 は seed の引き、効いているのは `h2`」と結論していたが、128/32 の 300,000 ゲームを同条件（`base` スクラッチ、
+lr 0.003、seed 1、`par`、`batch_scale` = sqrt(8) = 2.8284271247461903、評価 20 局 seed 9000）で回し直すと **113,682.2** が出て
+記録の 78,500 と食い違った。今回の測定は 2 点で裏が取れている: 生成物が 296,472 B = 16 + 37,057 × 8 で 37,057 =
+256×128 + 128 + 32×128 + 32 + 32 + 1（本当に 128/32）、同梱 64/32 を `scripts/widen-net.py --h1 128 --h2 32 --src-h1 64
+--src-h2 32` でゼロ埋めすると **79,657.0 を小数まで完全再現**する。78,500 は 64/32 の 300k とほぼ一致するので、`-Dh1` が exe に
+届いていなかったか `batch_scale` のスロットに `2` を渡していた（64/32 では 51,483 まで落ちる罠、#231）可能性が高い。
+**以後、容量の測定は重みファイルのサイズとゼロ埋め対照で必ず裏を取る。**
 
 | 評価 | 128/32 300k（採用） | 同梱 net（64/32） |
-|---|---|---|
+| --- | --- | --- |
 | 非ペア 2-ply seed 9000 | **113,682.2**（8192 11/20、4,919 手、0.89 ms/move） | 79,657.0（4/20、0.87〜0.97） |
 | 非ペア 2-ply seed 9100 | **129,456.2**（14/20、5,486 手、0.98） | 91,348（5/20） |
 | 非ペア 1-ply seed 9000 / 9100 | 57,285.0 / 57,133.8 | 48,873.6 / — |
-| `pairw` 20 局 seed 9000（A = ゼロ埋め同梱） | **mean diff +57,424.4 ± 7,567.9、19 勝 1 敗**（681〜682 s） | — |
+| `pairw` 20 局 seed 9000（A = ゼロ埋め同梱） | **+57,424.4 ± 7,567.9、19 勝 1 敗**（681〜682 s） | — |
 
-`mean diff − 2*stderr = +57,424.4 − 15,135.8 = +42,288` で、採用条件（≒ +15,000）を 3 倍近く上回る。
-**出力層 `h2` を広げる必要は無く、入力側 `h1` を 64 → 128 にするだけで足りる**（#220 の結論の逆で、
-128/128 の 300k は 92,953 なので `h2` はむしろ邪魔）。コストは学習 2.6 倍（100k で 5 分 → 300k で 61 分）、
-推論 1.2 倍（ms/move 0.87 → 0.89〜1.05）。
+`mean diff − 2*stderr = +42,288` で採用条件（≒ +15,000）を 3 倍近く上回る。**`h2` を広げる必要は無く、`h1` を 64 → 128 に
+するだけで足りる**（128/128 の 300k は 92,953 なので `h2` はむしろ邪魔）。コストは学習 2.6 倍（100k で 5 分 → 300k で 61 分）、
+推論 1.2 倍。
 
-**採用した変更。**
-
-- `ai/solver/nn_weights.bin` を 128/32 の 296,472 B に差し替え（旧 64/32 は 148,504 B。
-  `/tmp/ship64_32.bin` に退避して計測に使用）。
+採用した変更:
+- `ai/solver/nn_weights.bin` を 128/32 の 296,472 B に差し替え（旧 64/32 は `/tmp/ship64_32.bin` に退避）。
 - `build.zig` の `-Dh1` / `-Dh2` の既定を 128 / 32 に変更（既定ビルドが同梱重みと一致する）。
-- `nn.Staged` は 7 net（128/32 で約 2 MB）になったので、`nn_main` とテストでヒープに置く
-  （スタックだとテストランナーがセグメンテーション違反、`heapStaged` を追加）。
-- 重みが変わったことで固定値が動くテストを更新: golden play（`nn` 32,380 → 81,104 / `nn2` 77,164 →
-  132,164、moves・checksum も）、学習チェックサム（1621370333 → 3042928886、4199351724 → 3379822721）、
-  量子化の重み数（18,561 → 37,057）とファイル長（37,170 → 74,162）、`mid_board` の greedy/chance
-  （.left/.left → .up/.down）、death の学習ゲーム数（60 → 200、64 ゲームでは値が 0 付近で動かない）、
+- `nn.Staged` は 7 net（128/32 で約 2 MB）になったので `heapStaged` を足してヒープに置く（スタックだとテストランナーが
+  セグメンテーション違反）。
+- 固定値のテスト更新: golden play（`nn` 32,380 → 81,104 / `nn2` 77,164 → 132,164、moves・checksum も）、学習チェックサム
+  （1621370333 → 3042928886、4199351724 → 3379822721）、量子化の重み数（18,561 → 37,057）とファイル長（37,170 → 74,162）、
+  `mid_board` の greedy/chance（.left/.left → .up/.down）、death の学習ゲーム数（60 → 200、64 ゲームでは値が 0 付近で動かない）、
   量子化の丸め許容（step/2 + step×1e-6 → ×1e-3、f32 の丸めで比が 0.5003 になる）。
-- `zig build test` は exit 0（約 50 分）。`zig build wasm -Doptimize=ReleaseFast` は 538,377 B で
-  `node scripts/wasm-smoke.mjs` が OK（nn2/nn3 の 2 方策、10 手、最遅 solve 595 ms）。
+- `zig build test` は exit 0（約 50 分）。`zig build wasm -Doptimize=ReleaseFast` は 538,377 B で `node scripts/wasm-smoke.mjs`
+  が OK（nn2/nn3 の 2 方策、10 手、最遅 solve 595 ms）。
 
-**当時残った宿題。** 学習 seed 2 の再現（#220 では 128/128 の seed 2 が −12,117 で崩れた）は #234 に分けた。
-300k より先は lr を下げた延長が #204/#220 で否定済み。`h1` 96/192/256 の追試は下記の通り、
-128/32 を超えなかった。
+seed 2 の再現は #234、300k より先は #204 / #220 で否定済み、`h1` 96/192/256 の追試は下記。
 
-## 追試: h1=96/192/256 は 128/32 を超えない（#233 継続、2026-11-07）
+### 追試: h1=96/192/256 は 128/32 を超えない（#233 継続）
 
-#233 で残していた `h1` sweep を完了した。条件は `h2=32`、300,000 ゲームをスクラッチから、
-`base` / lr 0.003 / `par` / `batch_scale=sqrt(8)=2.8284271247461903`、train seed 1 と 2。
-各重みのバイト数も `16 + 8 × (256×h1 + h1 + 32×h1 + 2×32 + 1)` と一致することを確認した
-（96/32: 222,488 B、192/32: 444,440 B、256/32: 592,408 B）。
+`h2=32`、300,000 ゲームをスクラッチから、lr 0.003、`par`、`batch_scale=2.8284271247461903`、train seed 1 と 2。重みのバイト数が
+`16 + 8 × (256×h1 + h1 + 32×h1 + 2×32 + 1)` と一致することも確認（96/32 222,488 B、192/32 444,440 B、256/32 592,408 B）。
+評価は同梱 128/32 を候補幅へゼロ拡張し同じ幅で回した（`pairw` 20 局 seed 9000 + 非ペア 2-ply）。
 
-評価は同梱 128/32 を候補幅へゼロ拡張し、同じ幅で `scripts/eval-net.sh` を実行した
-（20 局 `pairw`, seed 9000、および非ペア 2-ply seed 9000/9100）。比較 A の基準は 128/32 の
-113,682.2（8192 11/20）/ 129,456.2（14/20）。pairw は #237 の board-independent spawn tape を使用。
+| h1 | seed | moves / train s | pairw B−A ± stderr（勝/敗） | 2-ply 9000（8192） | 2-ply 9100（8192） |
+| ---: | ---: | ---: | --- | ---: | ---: |
+| 96 | 1 | 518,762,880 / 2,192.3 | −42,002.4 ± 9,381.9（4/16） | 78,799.0（1/20） | 75,376.8（0/20） |
+| 96 | 2 | 469,812,682 / 2,136.2 | −46,028.2 ± 10,577.7（3/17） | 77,286.4（0/20） | 75,743.0（0/20） |
+| 192 | 1 | 570,706,944 / 5,218.7 | −94,978.0 ± 8,382.3（0/20） | 25,003.2（0/20） | 25,018.2（0/20） |
+| 192 | 2 | 565,281,160 / 4,932.2 | −50,149.4 ± 9,327.7（2/18） | 75,324.8（0/20） | 75,277.4（0/20） |
+| 256 | 1 | 562,207,909 / 6,878.0 | −64,878.2 ± 8,466.6（0/20） | 54,514.8（0/20） | 54,789.0（0/20） |
+| 256 | 2 | 598,721,027 / 7,272.5 | −75,009.2 ± 11,080.3（2/18） | 66,123.8（0/20） | 66,254.0（0/20） |
 
-| h1 | train seed | moves / train s | pairw B−A ± stderr (B wins/losses) | 2-ply seed 9000 (8192) | 2-ply seed 9100 (8192) |
-|---:|---:|---:|---:|---:|---:|
-| 96 | 1 | 518,762,880 / 2,192.3 | −42,002.4 ± 9,381.9 (4/16) | 78,799.0 (1/20) | 75,376.8 (0/20) |
-| 96 | 2 | 469,812,682 / 2,136.2 | −46,028.2 ± 10,577.7 (3/17) | 77,286.4 (0/20) | 75,743.0 (0/20) |
-| 192 | 1 | 570,706,944 / 5,218.7 | −94,978.0 ± 8,382.3 (0/20) | 25,003.2 (0/20) | 25,018.2 (0/20) |
-| 192 | 2 | 565,281,160 / 4,932.2 | −50,149.4 ± 9,327.7 (2/18) | 75,324.8 (0/20) | 75,277.4 (0/20) |
-| 256 | 1 | 562,207,909 / 6,878.0 | −64,878.2 ± 8,466.6 (0/20) | 54,514.8 (0/20) | 54,789.0 (0/20) |
-| 256 | 2 | 598,721,027 / 7,272.5 | −75,009.2 ± 11,080.3 (2/18) | 66,123.8 (0/20) | 66,254.0 (0/20) |
-
-全 6 run で pairw は負け、非ペアの平均点・8192 到達率も 128/32 を大きく下回った。
-192/32 と 256/32 は推論も遅く、h1 を増やすほどよくなる傾向は見られない。**判定: 不採用**。
-300k・現行レシピでは h1=128 が最良であり、同条件の単純な h1 拡大は追加しない。
+全 6 run で負け、非ペアの平均点・8192 到達率も大きく下回る。192/256 は推論も遅い。**判定: 不採用**。300k・現行レシピでは
+h1=128 が最良で、同条件の単純な h1 拡大は追加しない。
 
 ## 128/32 は seed で当たり外れが出る: 発散・lr・clamp（#234）
 
-採用した 128/32（#233）は seed 1 で 113,682 を出したが、**学習 seed 2 では発散した**。
-同じレシピを seed 2 で回すと 300,000 ゲームが 96,836,342 手（**323 手/ゲーム**）で終わり、
-重みは `|w|` 1.685e86・**37,057 個のうち 6,334 個が NaN**。評価は 1-ply 2,091.6 / 2-ply 11,478.4
-（4096 到達 0/20、死 <2048 が 20/20）で、ゲームが続かない。
+採用した 128/32 は seed 1 で 113,682 を出したが **seed 2 では発散した**: 300,000 ゲームが 96,836,342 手（**323 手/ゲーム**）で
+終わり、`|w|` 1.685e86・**37,057 個のうち 6,334 個が NaN**。1-ply 2,091.6 / 2-ply 11,478.4（4096 到達 0/20、死 <2048 が 20/20）。
+崩壊は 100,000 と 300,000 の間で起きる（seed 2 の 100,000 ゲームは 143,217,467 手 / 1,041.8 s で正常、2-ply **84,040.6**・8192 4/20）。
+「学習の途中で値が暴走する」型で、急に別の解に落ちるわけではない。
 
-```
-zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - base 30 /tmp/w128_32_300k_s2.bin 2 par - 2.8284271247461903
-# trained 300000 games, 96836342 moves in 606.7 s  ← 崩壊（seed 1 は 553,202,634 手 / 3,638.9 s）
-```
-
-崩壊は 100,000 と 300,000 の間で起きる。seed 2 の 100,000 ゲーム（143,217,467 手 / 1,041.8 s）は
-正常で 2-ply **84,040.6**（8192 4/20）まで来ている。したがって「学習の途中で値が暴走する」型で、
-急に別の解に落ちるわけではない。
-
-安定化を 2 方向試したが、どちらも**裾（8192 到達）を失う**。
-
-| 条件（すべて seed 2、128/32、300k） | 2-ply seed 9000 | 8192 | 2-ply seed 9100 | 手/ゲーム | max\|w\| |
-|---|---|---|---|---|---|
+| 条件（seed 2、128/32、300k） | 2-ply 9000 | 8192 | 2-ply 9100 | 手/ゲーム | max\|w\| |
+| --- | ---: | ---: | ---: | ---: | ---: |
 | lr 0.003（発散） | 11,478.4 | 0/20 | — | 323 | 1.685e86 |
 | lr 0.0015 | 76,366.6 | 0/20 | — | 1,818 | 21.96 |
 | lr 0.003 + `clamp` 200 | 70,131.8 | 0/20 | 71,369.0 | 1,862 | 29.93 |
 | （参考）seed 1、lr 0.003、採用 net | **113,682.2** | **11/20** | **129,456.2** | 1,844 | 27.06 |
 
-**読み。** 採用 net の 8192 到達 11/20 は、lr 0.003 が安定域のぎりぎり外側にある状態でしか出ていない。
-lr を半分に落としても、TD 目標を 200（= スコア 200,000）で切って発散を止めても、学習は
-「4096 で終わる」安定な解に落ち着き、**裾が出ない**（`clamp` は 3-ply の代わりに V の上限を作るので、
-終盤の「まだ伸びる」局面の価値を押し下げる）。1 本 61 分の当たり外れなので、
-**seed を 2〜3 回振って bar を超えたものを採る**のが実務的な運用になる（#233 の +57,424 は
-19 勝 1 敗なので、採択した net 自体が引きである可能性は低い）。
+**読み**: 採用 net の 8192 11/20 は、lr 0.003 が安定域のぎりぎり外側にある状態でしか出ていない。lr を半分に落としても、TD 目標を
+200（スコア 200,000）で切っても、学習は「4096 で終わる」安定な解に落ち着き**裾が出ない**（`clamp` は 3-ply の代わりに V の上限を
+作るので、終盤の「まだ伸びる」局面の価値を押し下げる）。1 本 61 分の当たり外れなので、**seed を 2〜3 回振って bar を超えたものを
+採る**のが実務的な運用（#233 の +57,424 は 19 勝 1 敗なので採択 net 自体が引きである可能性は低い）。
 
-**発散ガード（実装済み）。** 発散した実行は最後の良いチェックポイントを上書きしてしまう
-（5,000 ゲームごとに `nn.save` するため）ので、毎ゲーム `nn.weightsFinite` を見て、
-非有限か `|w| > 1e6` なら `diverged at N/M games (non-finite or |w| > 1e6), not saving <path>` を出して
-exit 1 する。lr 0.05 の人工発散では 1,976/20,000 ゲーム目で発火し、ファイルが作られないことを確認した。
-`mstd` は 7 net すべてを見る（`stagedFinite`）。
+**発散ガード（実装済み）**: 発散した実行は最後の良いチェックポイントを上書きしてしまう（5,000 ゲームごとに `nn.save`）ので、毎ゲーム
+`nn.weightsFinite` を見て非有限か `|w| > 1e6` なら `diverged at N/M games (non-finite or |w| > 1e6), not saving <path>` を出して exit 1
+する。lr 0.05 の人工発散では 1,976/20,000 ゲーム目で発火しファイルが作られないことを確認。`mstd` は 7 net すべてを見る
+（`stagedFinite`）。
 
-**`clamp` variant（#234）。** `-- 300000 0 9000 0.003 - clamp 30 <path> 2 par - 2.828 200` のように
-13 番目に上限を渡す（既定 200 = スコア 200,000）。`par` と併用できる。上の表のとおり
-**不採用**（対照 113,682 に対して −43,550 / −58,087、裾 0/20）。
-
-再現:
-```
-zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.0015 - base 30 /tmp/s2_lr15_300k.bin 2 par - 2.8284271247461903
-zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - clamp 30 /tmp/s2_clamp_300k.bin 2 par - 2.8284271247461903 200
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 - resume 30 /tmp/s2_clamp_300k.bin 2 - - - 0,2
-```
+**`clamp` variant**: 13 番目の引数に上限を渡す（既定 200 = スコア 200,000、`par` と併用可）。上の表のとおり**不採用**。
 
 ## 反復 DAgger は「壊した分を戻す」だけ（#236）
 
-監査で「L2 が求める反復 DAgger を測っていない」と指摘された。`ft2` は #207 で発散する
-（教師が学習中に動くので自分のラベルを押し上げる）と分かっているので、**凍結ラベルの
-`tch` → `dist` を 1 周とみなし、dump → tch → dist を 2 周** 回した。A = 同梱 128/32。
+`ft2` は #207 で発散すると分かっているので、**凍結ラベルの `tch` → `dist` を 1 周とみなし 2 周**回した（A = 同梱 128/32）。
+dump は 1 周目 288 局 / 2 周目 144 局を lr 0 の `dumpp2` で集める（lr > 0 だとゲームが進むほど方策が壊れて 4096 に届かず dump が
+0 件になる）。
 
-```
-# 1 周目: 同梱 net から 2-ply 自己対戦で深い局面を集める（lr 0 で回す。lr > 0 だと
-# ゲームが進むほど方策が壊れて 4096 に届かず、dump が 0 件になる）
-zig build nn -Doptimize=ReleaseFast -- 288 0 9000 0 - dumpp2 30 /tmp/dg0.bin 1 - /tmp/dg1.dump
-zig build nn -Doptimize=ReleaseFast -- 0 0 9000 0 - tch 30 /tmp/dg0.bin 1 - /tmp/dg1.dump
-cp /tmp/dg0.bin /tmp/dg1.bin   # dist は weights_path から読み、同じパスへ書く
-zig build nn -Doptimize=ReleaseFast -- 20000 0 9000 0.0003 1 dist 30 /tmp/dg1.bin 1 - /tmp/dg1.dump.tch 4 3
-# 2 周目: 1 周目の net で同じことをする
-zig build nn -Doptimize=ReleaseFast -- 144 0 9100 0 - dumpp2 30 /tmp/dg1.bin 1 - /tmp/dg2.dump
-zig build nn -Doptimize=ReleaseFast -- 0 0 9100 0 - tch 30 /tmp/dg1.bin 1 - /tmp/dg2.dump
-cp /tmp/dg1.bin /tmp/dg2.bin
-zig build nn -Doptimize=ReleaseFast -- 20000 0 9100 0.0003 1 dist 30 /tmp/dg2.bin 1 - /tmp/dg2.dump.tch 4 3
-```
+| 周 | dump（局 / 記録 / 破棄 / 時間） | 教師 | `dist` 20k every4 div3 | 2-ply（9000 / 9100） | 8192 | `pairw` vs 同梱 |
+| --- | --- | --- | ---: | --- | --- | --- |
+| 1 | 288 / 65,536 / 918,953 / 96 分 | 65,536（214 s、3.3 ms/sample） | 1,048 s | 103,142.4 / 96,618.8 | 9/20, 7/20 | **−27,244.4 ± 12,873.1**（6 勝 14 敗） |
+| 2 | 144 / 65,536 / 325,584 / 43 分 | 65,536（209 s） | 1,014 s | **114,409.8** / 115,239.8 | 13/20, 11/20 | **+2,366.8 ± 9,601.5**（10 勝 10 敗） |
 
-| 周 | dump（局 / 記録 / 時間） | 教師 | `dist` 20k every4 div3 | 非ペア 2-ply（9000 / 9100） | 8192 | `pairw` vs 同梱 |
-|---|---|---|---|---|---|---|
-| — | 同梱 net | — | — | 113,682.2 / 129,456.2 | 11/20, 14/20 | — |
-| 1 | 288 / 65,536（918,953 破棄）/ 96 分 | 65,536（214 s、3.3 ms/sample） | 1,048 s | 103,142.4 / 96,618.8 | 9/20, 7/20 | **−27,244.4 ± 12,873.1**（6 勝 14 敗） |
-| 2 | 144 / 65,536（325,584 破棄）/ 43 分 | 65,536（209 s） | 1,014 s | **114,409.8** / 115,239.8 | 13/20, 11/20 | **+2,366.8 ± 9,601.5**（10 勝 10 敗） |
+1 周目で −27k まで落ち、2 周目は「壊した分」を戻して同梱と同点。seed 9000 の 8192 到達は 13/20 と多いがペアでは 10 勝 10 敗。
+65,536 個の `deep3` ラベルへ 20,000 ゲームかけて引っ張るので方策が「深い局面で教師が指す手」に寄り、裾を作っていた自己対戦の
+多様性が削がれる。**DAgger は安定化の道具**で、教師が同梱より強いときにしか上積みしない（今の `tch` の教師は #167 で終局前の
+誤差 0.30 と測られ、同梱より強い保証がない）。コストは 1 周 2〜2.5 時間。
 
-**読み**: 1 周目で −27k まで落ち、2 周目は「1 周目に壊した分」を戻して同梱と同点になる。
-seed 9000 の 8192 到達は 13/20 と同梱（11/20）より多いが、ペア比較では 10 勝 10 敗で差が出ない。
-上積みが出ない理由は蒸留の性質で、65,536 個の `deep3` ラベルの方へ 20,000 ゲームかけて引っ張る
-ので、方策は「深い局面で教師が指す手」に寄り、同梱 net の裾を作っていた自己対戦の多様性が削がれる。
-**DAgger は安定化の道具**で、教師が同梱より強いときにしか上積みしない。今の `tch` の教師
-（`deep3` の V）は #167 で「終局前の誤差 0.30」と測られていて、同梱 net より強い保証がない。
+## `pairw` の共通 spawn を盤面ごとに一様に写像する（#237）
 
-コストは 1 周 2〜2.5 時間（dump 43〜96 分 + 教師 3.5 分 + dist 17 分 + 評価 20 分）。dump は
-「深い局面だけ」（4096 以上）を集めるので、`dumpp2` の自己対戦は 1 局 4,500 手・10〜20 s かかる。
+#235 は spawn の記録を「空きマス index」に直したが、A と B の空き数が違うと B 側で index を末尾へ clamp するため穴の分布が偏る
+（4 穴の A から 2 穴の B へ渡す例では B の 2 番目の穴が 75%）。tape は盤面に依存しない一様な `u32 pick` を記録し、各盤面が
+`floor(pick × empty_count / 2^32)` で自身の row-major 空きマスへ写像する（各 hole bucket は `floor(2^32 / n)` か `ceil(...)` なので
+偏りは最大 1 pick / 2^32）。
 
-## pairw の共通 spawn を盤面ごとに一様に写像する（#237）
-
-#235 は spawn の記録を「空きマス index」に直したが、A と B の空き数が違うと、B 側で index を末尾へ
-clamp するため穴の分布が偏る（4 穴の A から 2 穴の B へ渡す例では、B の 2 番目の穴が 75%）。
-pairw の tape は盤面に依存しない一様な `u32 pick` を記録し、各盤面が `floor(pick × empty_count / 2^32)`
-で自身の row-major 空きマスへ写像する。各 hole bucket の大きさは `floor(2^32 / n)` または
-`ceil(2^32 / n)` なので、有限の 32-bit 入力で生じる偏りは最大 1 pick / 2^32。A/B は同じ乱数列を
-使いながら、それぞれの盤面でほぼ一様な spawn 分布を保つ。
-
-`Spawn` は 1 byte から 8 bytes になった。テストの `tape_capacity = 8192` は 64 KiB、実際の `pairw`
-は `ai/solver/nn_main.zig` で 20,000 件を heap に確保するため 20 KB → 160 KB（+140 KB）。記録側の
-cell draw も bounded `usize` index から full-range `u32` に変わるので、同じ seed の `playValue` と
-byte-for-byte 同じゲームになる保証はなくなった。tape を使った記録と replay の再現性は維持する。
-
-回帰テストは空き数 1..16 の全 bucket 境界・サイズ、4-hole → 2-hole の偏り例、raw pick の記録/replay、
-ゼロ容量と通常容量でゲーム・乱数状態が一致することを確認する。学習・強さのベンチマークはこの修正では
-実行していない。**#237 より前の pairw 結果は index+clamp の旧テープで得た歴史値**であり、今後候補を
-採否判定するときは現在の実装で A/B を比較し直す。
+`Spawn` は 1 → 8 bytes、`tape_capacity = 8192` は 64 KiB、`pairw` は 20,000 件を heap に確保するので 20 KB → 160 KB。記録側の
+cell draw が bounded `usize` index から full-range `u32` に変わるので、同じ seed の `playValue` と byte-for-byte 同じゲームになる
+保証はなくなった（tape の record / replay の再現性は維持）。テストは空き数 1..16 の全 bucket 境界、4-hole → 2-hole の偏り例、raw
+pick の記録/replay、ゼロ容量と通常容量でゲーム・乱数状態が一致することを確認。**#237 より前の pairw 結果は index+clamp の旧テープ
+による歴史値**で、今後候補を判定するときは現在の実装で A/B を取り直す。
 
 ## 学習 seed 3 は 60k で病的な長ゲームに落ちる（#241）
 
-#234 の「seed を 2〜3 回振る」の 1 本として、採用レシピ（128/32、300k、`base` スクラッチ、
-lr 0.003、`par`、`batch_scale` = sqrt(8) = 2.8284271247461903）を train seed 3 で回した。
-
-```
-zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - base 30 /tmp/w128_32_300k_s3.bin 3 par - 2.8284271247461903
-# train 55000/300000 last game score 12208   ← 開始 8 分
-# train 60000/300000 last game score 51200   ← 開始 61 分（この 5,000 ゲームに 53 分）
-```
-
-**60,000/300,000 ゲームで打ち切った。** 55,000 → 60,000 の 1 バッチ（8 ゲーム）に 53 分かかった。
-その間も CPU は動いており（`sample` では `nn.forward` / `nn.train` が回っていた）、8 ゲームのうち
-少なくとも 1 本が異常に長い。`nn.weightsFinite` は有限のままなので `diverged at N/M games` は出ない。
-seed 2（#234）の「`|w|` 1.685e86・6,334 NaN」とは別の失敗形で、**重みは壊れないがゲームだけが
-異常に長くなる**。このまま 300k まで回すのは非現実的なので、開始 62 分でプロセスを止めた。
-
-| 項目 | seed 3 |
-|---|---|
-| 到達ゲーム数 | 60,000 / 300,000（開始 61 分、プロセスは 62 分で kill） |
-| 手数 | 不明（最終サマリ行が出る前に停止） |
-| 発散ガード | 不発（`\|w\|` は有限） |
-| 重み | `/tmp/w128_32_300k_s3.bin` は 60k チェックポイント 296,472 B として残存 |
-| 8192 到達・2-ply | 未評価（完走していないため `eval-net.sh` の対象外） |
-
-**判定: 不採用（未完走）。** 学習 seed 1 の 113,682.2 を超える net は seed 3 からは得られていない。
-seed 2 と合わせて、lr 0.003 の 128/32 レシピは 3 seed 中 2 seed で実用にならない。次に seed を
-振るなら、1 ゲーム（または 1 バッチ）の手数上限を入れて「長すぎるゲーム」を検出して止めるのが先。
+採用レシピ（128/32、300k、`base` スクラッチ、lr 0.003、`par`、sqrt 8）を train seed 3 で回したところ、
+`train 55000/300000 last game score 12208`（開始 8 分）→ `train 60000/300000 last game score 51200`（開始 61 分）で、
+55,000 → 60,000 の 1 バッチ（8 ゲーム）に 53 分かかった。CPU は動いており（`sample` で `nn.forward` / `nn.train`）、8 ゲームの
+うち少なくとも 1 本が異常に長い。`nn.weightsFinite` は有限のままなので発散ガードは不発。seed 2 の「NaN」とは別の失敗形で、
+**重みは壊れないがゲームだけが異常に長くなる**。開始 62 分でプロセスを止め、60k チェックポイント 296,472 B が残った。
+**判定: 不採用（未完走）。** seed 3 の 300k から seed 1 の 113,682.2 を超える net は出ていない。
 
 ## 手数上限で病的な長ゲームを止め、seed 3 の 300k を判定する（#242）
 
-`#241` の結論どおり、1 ゲームの手数上限を既定で入れた。
+- `ai/solver/nn.zig`: `default_move_cap = 100_000` と `Options.move_cap`（0 で無効、既定 100,000）。`trainGameOpts` の 3 経路
+  （per-move / `nstep` / `backward`・`replay`・`death`）と `trainGameStaged` が上限で打ち切り `GameResult.capped = true` を返す。
+  `par` は `BatchOutcome.capped_game` / `capped_moves` で「バッチの何番目が何手で上限か」を返す。
+- CLI はどの経路でも `game 60001/300000 hit the 100000-move cap at 100000 moves, stopping the run and not saving <path>` を出して
+  `error.MoveCap`（exit 1）。`diverged` と同じく最後の good checkpoint を書かない。
+- 上限チェックは rng を引かないので、上限未満のゲームは従来と同じ乱数列・更新・`moves`。テスト
+  `move cap leaves a normal game bit-identical and stops a long one (#242)` と
+  `the parallel batch reports and aggregates the capped game (#242)` が固定。
 
-- `ai/solver/nn.zig`: `default_move_cap = 100_000` と `Options.move_cap`（0 で無効）。
-  `trainGameOpts` の 3 経路（既定の per-move / `nstep` / `backward`・`replay`・`death`）と
-  `trainGameStaged` が上限で打ち切り、`GameResult.capped = true` を返す。`par` は
-  `BatchOutcome.capped_game` / `capped_moves` で「バッチ内の何番目が何手で上限に達したか」を返す。
-- CLI（`ai/solver/nn_main.zig`）は serial / `par` / `mstd` のどの経路でも
-  `game 60001/300000 hit the 100000-move cap at 100000 moves, stopping the run and not saving <path>`
-  を出して `error.MoveCap`（exit 1）で止まる。`diverged` と同じく最後の good checkpoint は書かない。
-- 上限チェックは rng を引かず、上限未満のゲームは従来と同じ乱数列・更新・`moves` 集計。
-  テスト 2 本が固定する: `move cap leaves a normal game bit-identical and stops a long one (#242)`
-  （同じ seed の重みがバイト一致、rng 状態と `moves` も一致、上限 0 で従来どおり）と
-  `the parallel batch reports and aggregates the capped game (#242)`（serial の集計と一致）。
-  上限を 10 手に下げた CLI スモークでも、上記メッセージ・exit 1・`weights_path` を書かないことを確認。
-
-### 実測: seed 3 300k は 49.9 分で完走し、上限は発火しなかった
-
-```
-zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - base 30 /tmp/w128_32_300k_s3_cap.bin 3 par - 2.8284271247461903
-# trained 300000 games, 508236212 moves in 2995.3 s (lr=0.003, seed=3, variant=base+par)
-# 開始 08:08:50 → 08:58:25（wall 50.6 分）
-```
-
-- 上限メッセージは出ず**完走**した。1 ゲーム平均 1,694 手。病的な長ゲームはこの再走では現れなかった。
-- 再走は決定的: 同じコマンドで 60,000 ゲームまでを 2 回回すと、checkpoint（296,472 B）もログも
-  バイト一致（`trained 60000 games, 53164118 moves`、292.7 s / 308.1 s の差は wall だけ）。
-- ただし `#241` の 60k checkpoint `/tmp/w128_32_300k_s3.bin` とは一致しない。あの run は何かの
-  環境差（バッチ幅など）で別の軌道を走っており、「55k→60k に 53 分」は今日のこのマシンでは
-  再現しない。手数上限はその再発に対する保険として残す（上限未満のゲームの結果は変えない）。
-
-`scripts/eval-net.sh /tmp/w128_32_300k_s3_cap.bin`（20 局、seed 9000）:
+**実測（seed 3、128/32、300k、lr 0.003、`par`、sqrt 8）**: `508,236,212 moves / 2,995.3 s`（wall 50.6 分）、上限メッセージなしで
+**完走**。1 ゲーム 1,694 手。同コマンドを 60k で 2 回回すと checkpoint（296,472 B）とログがバイト一致で**再走は決定的**
+（`trained 60000 games, 53164118 moves`、292.7 s と 308.1 s の差は wall だけ）。ただし #241 の 60k checkpoint とは**一致しない**
+——あの run は環境差で別の軌道を走っており、「55k→60k に 53 分」は今日のこのマシンでは再現しない。上限は再発への保険。
 
 | net | seed | avg_score | 8192 | ms/move |
-|---|---:|---:|---:|---:|
-| 同梱 128/32 | 9000 | 113,682.2 | 11/20 | 0.89 |
-| seed 3 300k | 9000 | 22,924.0 | 0/20 | 0.91 |
-| 同梱 128/32 | 9100 | 129,456.2 | 14/20 | 0.85 |
-| seed 3 300k | 9100 | 22,774.0 | 0/20 | 0.89 |
+| --- | ---: | ---: | ---: | ---: |
+| 同梱 128/32 | 9000 / 9100 | 113,682.2 / 129,456.2 | 11/20 / 14/20 | 0.89 / 0.85 |
+| seed 3 300k | 9000 / 9100 | 22,924.0 / 22,774.0 | 0/20 / 0/20 | 0.91 / 0.89 |
 
-`pairw`（A = 同梱、B = seed 3、20 局、seed 9000）: **−97,245.0 ± 8,392.3**（0 勝 20 敗、468.5 s）。
-
-**判定: REJECT。** seed 3 は完走するが、300k の net は 2-ply で 22.9k、8192 到達 0/20 で、同梱 net の
-約 1/5。`#241` の失敗形（長ゲームで止まる）とは別で、重みは有限のまま方策だけが壊れている。
-したがって lr 0.003 の 128/32 は 3 seed 中 1 seed（seed 1 = 113,682.2）だけが実用で、seed 2 は発散、
-seed 3 は完走しても弱すぎる。同梱 `ai/solver/nn_weights.bin` は差し替えない。
-
-同じレシピで seed を増やすのは打ち切り（当たりは 1/3）。次は安定化を入れて seed 2/3 を作り直す
-（`clip` は既に 8192 の裾を失って 70,131.8 なので、より弱い介入が要る）。
+`pairw`（A = 同梱、B = seed 3、20 局、seed 9000）: **−97,245.0 ± 8,392.3**（0 勝 20 敗、468.5 s）。**判定: REJECT**（同梱 net の
+約 1/5）。重みは有限のまま方策だけが壊れている。#241 の失敗形（長ゲームで止まる）とは別。lr 0.003 の 128/32 は **3 seed 中
+1 seed だけが実用**（seed 1 = 113,682.2、seed 2 は発散、seed 3 は完走しても弱い）。seed を増やす方向は打ち切り、次は安定化。
 
 ### clamp の上限を緩めても seed 2 の裾は戻らない（#244）
 
-`clamp` は TD 目標を ±ceiling で切る（#234）。200 では完走したが 8192 到達 0/20 だったので、上限を
-300 / 500 / 1000 / 2000 に緩めれば「完走し、かつ裾が戻る」点があるかを seed 2 / 128/32 / 300k /
-lr 0.003 / `par` / `batch_scale` = sqrt(8) で測った。結果は **上限は on/off のスイッチとして効く**:
-300 まで下げれば完走するが裾は戻らず、500 以上は一度も効かない（clamp なしとバイト単位で同じ）。
+`clamp` は TD 目標を ±ceiling で切る。200 は完走したが 8192 0/20 だったので 300 / 500 / 1000 / 2000 を seed 2 / 128/32 / 300k /
+lr 0.003 / `par` / sqrt 8 で測った。**上限は on/off のスイッチ**として効く。
 
-| 条件（すべて seed 2、128/32、300k） | 完走 | 停止位置 | max\|w\| | moves | 手/ゲーム | 2-ply seed 9000 | 8192 |
-|---|---|---|---|---|---|---|---|
+| 条件（すべて seed 2） | 完走 | 停止位置 | max\|w\| | moves | 手/ゲーム | 2-ply 9000 | 8192 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | `clamp` 200（#234） | ○ | — | 29.93 | — | 1,862 | 70,131.8 | 0/20 |
 | `clamp` 300 | ○ | — | 29.19 | 552,475,563 | 1,842 | 71,981.8 | 0/20 |
-| `clamp` 500 | × | 50,440 | 17.17（50k） | — | — | 69,586.6（50k） | 1/20（50k） |
-| `clamp` 1000 | × | 50,440 | 17.17 | — | — | 同上 | 同上 |
-| `clamp` 2000 | × | 50,440 | 17.17 | — | — | 同上 | 同上 |
-| `clamp` なし（対照） | × | 50,440 | 17.17 | — | — | 同上 | 同上 |
-| （参考）seed 1、lr 0.003、採用 net | ○ | — | 27.06 | 553,202,634 | 1,844 | **113,682.2** | **11/20** |
+| `clamp` 500 / 1000 / 2000 / なし | × | 50,440 | 17.17（50k） | — | — | 69,586.6（50k） | 1/20（50k） |
+| （参考）seed 1 採用 net | ○ | — | 27.06 | 553,202,634 | 1,844 | **113,682.2** | **11/20** |
 
-**500 以上は効いていない。** 500 / 1000 / 2000 と clamp なしの 4 本は、停止位置（50,440）だけでなく
-50,000 ゲームのチェックポイントの md5 まで一致する（`38818bb4c8b3cfa2fd2481ab3b946f25`、max\|w\| 17.17）。
-つまり目標が 500 を超える前に、値の側が `|w| > 1e6` に達してガードが止めている。上限を上げる方向に
-解はない。
+500 以上は**一度も効かない**: 500 / 1000 / 2000 / なし の 4 本は停止位置（50,440）だけでなく 50k checkpoint の md5 まで一致
+（`38818bb4c8b3cfa2fd2481ab3b946f25`、max\|w\| 17.17）。目標が 500 を超える前に `|w| > 1e6` へ達してガードが止めている。
+300 は完走するが 71,981.8 / 0/20、best tile 4096、評価で 3,269 手/ゲーム（`clamp` は V の上限を作り、終盤の「まだ伸びる」局面を
+押し下げる）。
 
-**300 は完走するが裾を捨てる。** 2-ply 71,981.8（1-ply 63,964.0）、8192 は 0/20 で best tile 4096、
-平均 3,269 手/ゲーム（採用 net は 2-ply で 0.85 ms/move、学習時の手/ゲームは 1,844）。
-学習中の手/ゲームは 1,842 と正常に見えるが、評価では 4096 で終わる長ゲームに落ちる。`clamp` は V の
-上限を作るので、終盤の「まだ伸びる」局面の価値が押し下げられたままになる（#234 の読みと同じ）。
-
-**発散の原因は目標の大きさではない。** 目標が 500 未満でも |w| は 50k の 17.17 から 440 ゲームで
-1e6 を超える。次に試すべきは**更新量**の制限（1 step あたりの `|Δw|` か勾配ノルムの上限）で、
-目標値のクリップをもう一段いじる方向ではない。なお 50k の時点で既に 2-ply 3,221 手/ゲーム
-（8192 1/20）と長ゲーム側に寄っており、ガードが止めたのは「重みが壊れた瞬間」であって
-「方策が壊れ始めた瞬間」ではない。
-
-**判定: 不採用。** bar（2-ply 113,682.2、8192 11/20）に対して 71,981.8 / 0/20 なので、`eval-net.sh` の
-ADOPT 判定に進める候補ではない（規則どおり `pairw` も未実施）。`ai/solver/nn_weights.bin` は
-差し替えない。
-
-再現:
-```
-zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - clamp 30 /tmp/s2_clamp300_300k.bin 2 par - 2.8284271247461903 300
-# trained 300000 games, 552475563 moves in 3155.7 s (lr=0.003, seed=2, variant=clamp+par)
-zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - clamp 30 /tmp/s2_clamp500_300k.bin 2 par - 2.8284271247461903 500
-# diverged at 50440/300000 games (non-finite or |w| > 1e6), not saving /tmp/s2_clamp500_300k.bin
-zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - base 30 /tmp/s2_base_300k_ctrl.bin 2 par - 2.8284271247461903
-# diverged at 50440/300000 games (non-finite or |w| > 1e6), not saving /tmp/s2_base_300k_ctrl.bin
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/s2_clamp300_300k.bin 1 - - - 0,2
-# nn 2-ply (deep): avg score=71981.8 ... avg moves=3269.0 reach8192=0/20
-```
+**発散の原因は目標の大きさではない**: 目標 500 未満でも |w| は 50k の 17.17 から 440 ゲームで 1e6 を超える。次は**更新量**
+（1 step の `|Δw|` か勾配ノルム）の制限。なお 50k 時点で既に 2-ply 3,221 手/ゲーム（8192 1/20）と長ゲーム側に寄っており、ガードが
+止めたのは「重みが壊れた瞬間」で「方策が壊れ始めた瞬間」ではない。**判定: 不採用**（`pairw` も未実施）。
 
 ### 弱い clamp（300）は seed 3 でも効かず、net は clamp なしとバイト一致（#245）
 
-`#244` で「完走した中で最も良い」= `clamp` 300 を、seed 3 / 128/32 / 300k / lr 0.003 / `par` /
-`batch_scale` = sqrt(8) にそのまま適用した。seed 2 の 300 は「完走するが裾を捨てる」だったので、
-seed 3 でも `clamp` が弱すぎて効かない可能性を確かめるのが目的。
+seed 3 / 128/32 / 300k / lr 0.003 / `par` / sqrt 8 に `clamp` 300 を適用: 300,000 games / 508,236,212 moves / 3,053.8 s /
+max\|w\| 28.80。できた net の md5 `78ed71734004c9a994abd7224193764b` は #243 の clamp なし seed 3 と一致し、サイズも同じ
+296,472 B ——**`variant=clamp+par` と表示されても学習の軌道は `base+par` とバイト単位で同じ**。評価は 22,924.0 / 22,774.0
+（0/20）、`pairw` −97,245.0 ± 8,392.3、`eval-net.sh` の VERDICT は REJECT（paired margin −114,029.6）。
 
-```
-zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - clamp 30 /tmp/s3_clamp300_300k.bin 3 par - 2.8284271247461903 300
-# trained 300000 games, 508236212 moves in 3053.8 s (lr=0.003, seed=3, variant=clamp+par)
-```
-
-| 項目 | seed 3 + `clamp` 300 |
-|---|---|
-| 完走 | ○（300,000 / 300,000、上限メッセージなし） |
-| moves | 508,236,212（1,694 手/ゲーム） |
-| max\|w\| | 28.80 |
-| 2-ply seed 9000 | 22,924.0（8192 0/20） |
-| 2-ply seed 9100 | 22,774.0（8192 0/20） |
-
-**`clamp` 300 は seed 3 では一度も発火していない。** できた net の md5
-（`78ed71734004c9a994abd7224193764b`）は `#243` の clamp なし seed 3
-（`/tmp/w128_32_300k_s3_cap.bin`）と一致し、ファイルサイズも同じ 296,472 B。つまり
-`variant=clamp+par` と表示されていても、学習の軌道は `base+par` とバイト単位で同じ。
-`#244` の seed 2 では 300 が効いた（max\|w\| 29.19、2-ply 71,981.8）が、seed 3 は目標が 300 に
-届く前に学習が終わる（重みも 28.80 で seed 1 の 27.06 と同程度）。**clamp の上限は seed ごとに
-効く/効かないが変わる on/off スイッチで、seed 3 の弱さは clamp では動かない。**
-
-`scripts/eval-net.sh /tmp/s3_clamp300_300k.bin`（20 局、seed 9000）:
-
-| net | seed | avg_score | 8192 | ms/move |
-|---|---:|---:|---:|---:|
-| 同梱 128/32 | 9000 | 113,682.2 | 11/20 | 0.91 |
-| seed 3 300k + clamp 300 | 9000 | 22,924.0 | 0/20 | 0.99 |
-| 同梱 128/32 | 9100 | 129,456.2 | 14/20 | 0.88 |
-| seed 3 300k + clamp 300 | 9100 | 22,774.0 | 0/20 | 1.02 |
-
-`pairw`（A = 同梱、B = seed 3 + clamp 300、20 局、seed 9000）: **−97,245.0 ± 8,392.3**
-（0 勝 20 敗、466.7 s）。`eval-net.sh` の VERDICT は **REJECT**（paired margin −114,029.6、
-seed 9000 / 9100 の avg_score と 8192 到達が両方とも band 外）。
-
-**判定: 不採用。** 数値は `#243` の clamp なし seed 3 と同一（net がバイト一致なので当然）。
-seed 3 の失敗は「clamp が強すぎて裾を捨てる」型ではなく、そもそも clamp がかからないまま
-方策が弱い型なので、`clamp` の上限を動かす方向では改善しない。`#244` の結論どおり、次は
-更新量（1 step の `|Δw|` か勾配ノルム）の制限を試す。同梱 `ai/solver/nn_weights.bin` は
-差し替えない（bar は seed 1 の 113,682.2 / 8192 11/20 のまま）。
+**clamp の上限は seed ごとに効く/効かないが変わる on/off スイッチ**で、seed 3 の弱さは clamp では動かない（seed 3 は目標が 300 に
+届く前に学習が終わる）。**判定: 不採用。**
 
 ### 更新量の上限 variant `clip` を足した（#246）
 
-`#234` / `#244` / `#245` の結論は「発散も seed 3 の弱さも TD 目標の大きさでは動かない」だったので、
-次は 1 step の更新量そのものに上限をかける variant を入れた。**採否の 300k 測定はまだで、ここにあるのは
-実装とスモーク確認だけ**（次の測定の入力になる）。
-
-- `nn.Options.grad_clip`（a）: `par` が 1 バッチで適用するマージ済み delta の L2 ノルム上限。
-  `sym_batch_clip` と同じ流儀で、上限を超えたら delta 全体を同じ比で縮める（方向は保つ）。
-- `nn.Options.step_clip`（b）: 1 step の要素ごとの `|Δw|` 上限。直列の 1 手 1 更新と、`par` が 1 バッチで
-  適用する 1 step の両方に効く（バッチ内の各ゲームは勾配を貯めるだけなので切らない = 切るのは 1 step）。
-- どちらも既定 0 = 上限なし。0 では演算を足さないので、既存 run はバイト一致のまま。
-
-CLI は variant `clip`（arg 13 = 上限、既定 1 = `sym_batch_clip` と同じスケール、arg 14 = `norm`|`step`）。
-`norm` はマージ済みバッチ delta にしか効かないので `par` 必須、`step` は直列でも可。ログは
-`variant=clip:norm+par` / `variant=clip:step+par` と、どちらの上限が動いたかを出す。
-
-確認（128/32、200 ゲーム、`par`、batch_scale sqrt(8)、train seed 1、`/tmp/nn246_*.bin`）:
-
-```
-zig build nn -Doptimize=ReleaseFast -- 200 0 9000 0.003 1 base 30 /tmp/nn246_base.bin 1 par - 2.8284271247461903
-# trained 200 games, 24930 moves in 0.2 s (lr=0.003, seed=1, variant=base+par)   md5 976fea58b0c4b1e28eca694e5b78c445
-zig build nn -Doptimize=ReleaseFast -- 200 0 9000 0.003 1 clip 30 /tmp/nn246_step_huge.bin 1 par - 2.8284271247461903 1000000000 step
-# variant=clip:step+par, md5 976fea58... = base と一致（上限が発火しない run は従来と同一）
-zig build nn -Doptimize=ReleaseFast -- 200 0 9000 0.003 1 clip 30 /tmp/nn246_step.bin 1 par - 2.8284271247461903 0.001 step
-# variant=clip:step+par, md5 ddc4a1101382af9720be0dc6e4c1d0ff（重みが変わる）
-zig build nn -Doptimize=ReleaseFast -- 200 0 9000 0.003 1 clip 30 /tmp/nn246_norm.bin 1 par - 2.8284271247461903 1e-5
-# variant=clip:norm+par, md5 b1a79e29bbd5604b80457b62ada778e1（重みが変わる）
-```
-
-`zig build test` は通過。上限 0 が直列・バッチとも従来とバイト一致すること、`step_clip` が 1 step の
-全要素を切り、`grad_clip` がマージ済み delta のノルムを上限にし方向を保つことをテストで固定した。
-同梱 `ai/solver/nn_weights.bin` は差し替えない（bar は seed 1 の 113,682.2 / 8192 11/20 のまま）。
+- `nn.Options.grad_clip`: `par` が 1 バッチで適用するマージ済み delta の L2 ノルム上限。超えたら delta 全体を同じ比で縮める
+  （方向は保つ）。`sym_batch_clip` と同じ流儀。
+- `nn.Options.step_clip`: 1 step の要素ごとの `|Δw|` 上限。直列の 1 手 1 更新と `par` の 1 バッチ 1 step の両方に効く
+  （バッチ内の各ゲームは勾配を貯めるだけなので切らない）。
+- どちらも既定 0 = 上限なし、0 では演算を足さないので既存 run はバイト一致。CLI は variant `clip`（arg 13 = 上限、既定 1 =
+  `sym_batch_clip` と同スケール、arg 14 = `norm`|`step`、`norm` は `par` 必須）。ログは `variant=clip:norm+par` / `clip:step+par`。
+- 200 ゲームのスモークで、上限 1e9 は base と md5 一致（`976fea58b0c4b1e28eca694e5b78c445`）、`step` 0.001 は
+  `ddc4a1101382af9720be0dc6e4c1d0ff`、`norm` 1e-5 は `b1a79e29bbd5604b80457b62ada778e1` と重みが変わる。
 
 ### 更新量の上限は seed 2 を完走させるが、8192 の裾は戻らない（#247）
 
-`#246` で足した `clip`（1 step の更新量の上限）を、seed 2 / 128/32 / 300k / lr 0.003 / `par` /
-`batch_scale` = sqrt(8) で測った。`#244` で発散は「1 回の巨大な step」だと分かっているので、
-上限は弱い側から振る。
+60k のスクリーニング（norm 1 / 3 / 5）は 3 本とも完走し、3 と 5 は上限なしと md5 一致（`bd70b6e0d4f7d17b893d6d759cc73cb8`、
+59,774,960 moves）、1 だけ重みが変わった（`033f8fb2cd2716af43ef5d36353946ce`、max\|w\| 12.33 対 12.56）。ただし 60k は lr 減衰が
+速く上限なしでも発散しないので**60k の完走では 300k の可否を予測できない**。実測した delta ノルムは序盤 2.3e-2 から 35k〜41k で
+5e-1（要素最大 1e-2 → 1e-1）なので、300k には 3 と 10 を進めた。
 
-**上限の選び方。** 60k のスクリーニング（seed 2、128/32、`par`）は 1 / 3 / 5 の 3 本とも完走し、
-3 と 5 は上限なしと md5 まで一致した（`bd70b6e0d4f7d17b893d6d759cc73cb8`、59,774,960 moves）。
-1 だけが重みを変えた（`033f8fb2cd2716af43ef5d36353946ce`、59,646,102 moves、max\|w\| 12.33 対 12.56）。
-ただし 60k は lr の減衰が速く上限なしでも発散しないので、**60k の完走では 300k の可否を予測できない**。
-効いたのは delta のノルム実測で、`par` が 1 バッチで適用するマージ済み delta のノルムは序盤 2.3e-2 から
-35k〜41k で 5e-1 程度まで育つ（要素ごとの最大は 1e-2 → 1e-1）。そこで「正常域では効かず、発散の
-step だけを切る」3 と、余裕を見た 10 の 2 点を 300k へ進めた。
+| 条件（seed 2、300k） | 完走 | max\|w\| | moves | 手/ゲーム | 2-ply 9000 / 9100 | 8192 | ms/move |
+| --- | --- | ---: | ---: | ---: | ---: | --- | --- |
+| `clip` norm 3 | ○ | 30.38 | 559,274,117 | 1,864 | 69,415.8 / 68,284.4 | 0/20 | 1.09 / 1.10 |
+| `clip` norm 10 | ○ | 28.13 | 552,796,927 | 1,843 | 73,388.0 / 73,560.2 | 0/20 | 0.95 / 0.97 |
+| `clamp` 300 | ○ | 29.19 | 552,475,563 | 1,842 | 71,981.8 / — | 0/20 | — |
+| 上限なし（対照） | × | 17.17（50k） | — | — | 69,586.6（50k） | 1/20（50k） | — |
+| 同梱 net | ○ | 27.06 | 553,202,634 | 1,844 | **113,682.2 / 129,456.2** | **11/20** | 0.91 / 0.88 |
 
-**結果: どちらも完走し、裾は戻らない。**
+**上限は「完走」だけを買う。** 有限・NaN なし・move cap 不発・手/ゲームも正常（1,864 / 1,843）なのに、評価は 4096 で終わる
+3,000 手超の長ゲームに落ち、`clamp` 300 とほぼ同じ位置に着地する。発火は**1 回だけ**、50,4xx の巨大 step（`clipbind` の
+`norm=4.960741e86 scale=2.016e-86`、位置は #244 の停止位置の直後）。3 と 10 の差は seed 内ばらつき程度で、**3〜10 のどこに
+置いても結果は同じ**。**判定: 不採用**（`pairw` 未実施）。次に疑うのは上限の値ではなく発散前（40k〜50k）の軌道そのもの。
 
-| 条件（すべて seed 2、128/32、300k） | 完走 | max\|w\| | moves | 手/ゲーム | 2-ply 9000 | 2-ply 9100 | 8192 | ms/move |
-|---|---|---|---|---|---|---|---|---|
-| `clip` norm 3 | ○ | 30.38 | 559,274,117 | 1,864 | 69,415.8 | 68,284.4 | 0/20 | 1.09 / 1.10 |
-| `clip` norm 10 | ○ | 28.13 | 552,796,927 | 1,843 | 73,388.0 | 73,560.2 | 0/20 | 0.95 / 0.97 |
-| `clamp` 300（#244 の最良完走） | ○ | 29.19 | 552,475,563 | 1,842 | 71,981.8 | — | 0/20 | — |
-| `clip` / `clamp` なし（#244 の対照） | × | 17.17（50k） | — | — | 69,586.6（50k） | — | 1/20（50k） | — |
-| 同梱 net（seed 1） | ○ | 27.06 | 553,202,634 | 1,844 | **113,682.2** | **129,456.2** | **11/20** | 0.91 / 0.88 |
+### seed 2 の 300k を 5k 境界で評価（#249）
 
-8192 はどの行も best tile 4096。2-ply の平均手数は 3,134 / 3,076（norm 3）、3,327 / 3,335（norm 10）。
-1-ply は 53,224.2 / 58,493.2（norm 3）、45,655.8 / 54,544.2（norm 10）。
+`train_games=300000` 固定で 20k〜50k の checkpoint を採取（50,440 で発散する前に 50k まで書けた。50k の md5
+`38818bb4c8b3cfa2fd2481ab3b946f25` が #244 と一致し同じ軌道を確認）。
 
-**上限は「完走」だけを買う。** 50,440 ゲームで止まっていた run が 300,000 ゲームを完走し、重みも
-有限（max\|w\| 30.38 / 28.13、NaN なし）、move cap も発火していない。学習中の手/ゲームも
-1,864 / 1,843 で正常（`clamp` 300 の 1,842、同梱 net の 1,844 と同じ）。それでも評価では 4096 で
-終わる 3,000 手超の長ゲームに落ち、`clamp` 300（71,981.8、0/20、3,269 手）とほぼ同じ位置に着地する。
-**1 step の上限は発散ガードを黙らせるが、方策の裾は戻さない。**
-
-**発火は 1 回だけ、50,4xx の巨大 step。** 発火を数えるための print を足したビルド（HEAD と数学的に
-同一。200 ゲームの md5 で確認済み）で norm 10 を走らせると、`clipbind` は
-`norm=4.960741e86 scale=2.016e-86` の 1 行だけで、位置は `#244` の停止位置と同じ 50,440 の直後。
-`#244` の読み（発散は 1 回の巨大な step）はそのままで、上限はその 1 回を切る。3 と 10 の差
-（69,415.8 対 73,388.0）は seed 内のばらつき程度なので、**3〜10 のどこに置いても結果は同じ**。
-`#244` の「50k で既に 2-ply 3,221 手/ゲームと長ゲーム側に寄っている」と合わせると、裾を失う判断は
-発散より前に済んでいる。
-
-**判定: 不採用。** bar（2-ply 113,682.2 / 129,456.2、8192 11/20）に対して 69,415.8 / 73,388.0、
-8192 0/20、ms/move も 1.09 / 0.95 と遅い。`eval-net.sh` の ADOPT 判定に進める候補ではないので、
-規則どおり `pairw` も未実施。`ai/solver/nn_weights.bin` は差し替えない（bar は seed 1 の
-113,682.2 / 8192 11/20 のまま）。次に疑うのは上限の値ではなく、発散より前（40k〜50k）の軌道そのもの。
-
-再現:
-```
-zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - clip 30 /tmp/s2_clip_norm3_300k.bin 2 par - 2.8284271247461903 3 norm
-# trained 300000 games, 559274117 moves in 6567.1 s (lr=0.003, seed=2, variant=clip:norm+par)
-zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - clip 30 /tmp/s2_clip_norm10_300k.bin 2 par - 2.8284271247461903 10 norm
-# trained 300000 games, 552796927 moves in 6505.1 s（md5 7f98dca9b2bfeb47c851d042ee96522a、発火 1 回）
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/s2_clip_norm3_300k.bin 1 - - - 0,2
-# nn 2-ply (deep): avg score=69415.8 ... avg moves=3134.0 reach8192=0/20
-```
-
-上 2 本の所要時間は 2 本を同時に走らせた状態の値なので、1 本だけ走らせた 300k
-（`#244` の 3,155.7 s、`#245` の 3,053.8 s）とは比べない。moves / md5 / 評価は同時実行でも変わらない
-（学習は決定的）。
-
-### seed 2 の 300k レシピを 5k 境界で評価（#249）
-
-#244 / #247 の「seed 2 / 128/32 / 300k / lr 0.003 / `par` / batch_scale = √8」について、学習 horizon を
-300,000 に固定したまま 20k〜50k の各 5k checkpoint を保存して評価した。`par` の通常 checkpoint は
-5,000 ゲームごとに書かれる。50k 時点で停止したので、50,440 ゲームの発散前に記録できた。50k の md5
-`38818bb4c8b3cfa2fd2481ab3b946f25` は #244 の 50k checkpoint と一致し、同じ軌道であることを確認した。
-
-| checkpoint | 学習ログ last game score | 2-ply avg_score (9000) | avg moves/game (9000) | reach8192 (9000) | max\|w\| |
-|---:|---:|---:|---:|---:|---:|
+| checkpoint | last game score | 2-ply 9000 | 手/ゲーム | 8192 | max\|w\| |
+| ---: | ---: | ---: | ---: | ---: | ---: |
 | 20k | 27,476 | 45,651.6 | 2,216.1 | 0/20 | 6.7368 |
 | 25k | 15,360 | 55,266.8 | 2,620.0 | 0/20 | 9.6964 |
 | 30k | 15,308 | 52,510.6 | 2,487.9 | 0/20 | 12.4800 |
@@ -3339,1029 +1880,320 @@ zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/s2_clip_
 | 45k | 51,392 | 63,885.6 | 2,982.0 | 0/20 | 16.1464 |
 | 50k | 34,476 | 69,586.6 | 3,221.2 | 1/20 | 17.1687 |
 
-50k の追加評価（seed 9100）: 2-ply avg_score **75,496.2**, avg moves **3,454.7**, reach8192 **2/20**。
+50k の seed 9100 は 75,496.2 / 3,454.7 手 / 2/20。**結論: 8192 の裾が「落ちた」checkpoint は 20k〜50k に観測されない**（最初の
+計測点 20k が既に 0/20 なので、消失は 20k 以前か、seed 9000 の 20 局では見えていない）。50k で 1/20 に戻ったので、#244 の
+「50k で 1/20」は tail が突然落ちた位置ではなく、20k〜45k で見えず 50k で一度戻った結果。`last game score` は 15,308〜51,392 と
+大きく揺れ、単独では長ゲーム化の開始点を指さない。評価の手/ゲームと max\|w\| は 2,216→3,221、6.74→17.17 と増える。
 
-**結論: 8192 の裾が「落ちた」checkpoint は 20k〜50k の間には観測されなかった。** 最初の計測点である
-20k が既に 0/20（したがって消失時点は 20k 以前か、seed 9000 の 20 局では裾を観測できていない）で、
-25k〜45k も 0/20。50k で 1/20 に戻った。2-ply avg_score は 45k まで上下しながら上がり、50k で
-69,586.6 に伸びた。従って #244 の「50k で 1/20、3,221 手/ゲーム」は突然 tail が落ちた位置ではなく、
-20k〜45k には tail が見えず 50k で一度戻った結果。学習ログの last game score も 15,308〜51,392 と
-大きく揺れ、単独では長ゲーム化の開始点を示さない。評価 moves/game と max|w| は 20k→50k で
-2,216→3,221、6.74→17.17 と増え、長ゲーム化と重み増大は確認できるが、この 20k 刻みでは発生点を
-さらに絞れない。`ai/solver/nn_weights.bin` は変更していない。
+（注意: 各 N を `train_games` にして独立学習すると lr 減衰が `frac = g / train_games` に依存するので N ごとに別スケジュールになり、
+300k レシピの途中 checkpoint とは別軌道になる。上の表は 300k horizon を固定して実際の 5k checkpoint を採った結果を優先。比較の
+ために回した独立 N run は 20k〜50k のすべてで 8192 0/20 だったが、300k レシピの回答には混ぜない。）
 
-なお、#249 の例示コマンドどおり各 N を `train_games` にして独立学習すると、CLI の学習率減衰は
-`frac = g / train_games` に依存するため、N ごとに異なる学習スケジュールになり、300k レシピの途中
-checkpoint とは別軌道になる。上表は 300k horizon を固定して実際の 5k checkpoint を採取した結果を
-優先した。なお、比較のために走らせた独立 N run では 20k〜50k の全てで seed 9000 の 8192 は 0/20
-だったが、300k レシピの回答には混ぜない。
+### seed 2 の 300k を 5k〜15k で評価（#250）
 
-再現（seed 2、300k horizon の 50k checkpoint を含む run。終了前に 20k〜50k を 5k 刻みで退避）:
-```
-zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - base 30 /tmp/s2_300k_horizon_live.bin 2 par - 2.8284271247461903
-# checkpoint 50k md5 38818bb4c8b3cfa2fd2481ab3b946f25; stopped after saving 50,000, before divergence at 50,440
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/s2_300k_50000.bin 1 - - - 0,2
-# nn 2-ply (deep): avg score=69586.6 ... avg moves=3221.2 reach8192=1/20
-zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 resume 30 /tmp/s2_300k_50000.bin 1 - - - 0,2
-# nn 2-ply (deep): avg score=75496.2 ... avg moves=3454.7 reach8192=2/20
-```
+同じ run の序盤 checkpoint（5k の md5 `9668ecdfc0de7e3b10ddecfa981d4a63`、10k `813c330ba2a4af1e614ad33aaf8bd274`、15k
+`9d551ef0a83fe4e3af91e823377eef6e`、20k `2b541e6f1df0fb550906ed4bdf3ac9d6`）。
 
-### seed 2 の 300k レシピを 5k〜15k で評価（#250）
-
-#249 と同じ seed 2 / 128/32 / `base` / lr 0.003 / `par` / batch_scale √8 の学習を、`train_games=300000`
-のまま再実行した。5k ごとの通常 checkpoint を保存し、50,440 ゲームで発散した。50k checkpoint は
-md5 `38818bb4c8b3cfa2fd2481ab3b946f25` で #249 と一致し、序盤も同じ軌道であることを確認した。
-学習ログの last game score と、seed 9000 の 20 局 2-ply 評価を含める。
-
-| checkpoint | 学習ログ last game score | 2-ply avg_score (9000) | avg moves/game (9000) | reach8192 (9000) | max|w| |
-|---:|---:|---:|---:|---:|---:|
+| checkpoint | last game score | 2-ply 9000 | 手/ゲーム | 8192 | max\|w\| |
+| ---: | ---: | ---: | ---: | ---: | ---: |
 | 5k | 2,944 | 22,583.8 | 1,236.5 | 0/20 | 0.7573 |
 | 10k | 8,736 | 28,080.0 | 1,474.9 | 0/20 | 2.0638 |
 | 15k | 15,476 | **34,053.6** | **1,729.5** | 0/20 | 4.1976 |
-| 20k (#249) | 27,476 | 45,651.6 | 2,216.1 | 0/20 | 6.7368 |
-
-15k が 5k〜15k の最高だったため seed 9100 でも確認した: 2-ply avg_score **33,017.6**, avg moves
-**1,680.0**, reach8192 **0/20**。同じ seed 9100 の同梱 net は **129,456.2**, **5,486.0 moves**,
-reach8192 **14/20**（seed 9000 は 113,682.2 / 11/20）。早期 checkpoint は同梱 net に及ばない。
-
-**結論: 5k〜15k に有望な checkpoint は見つからず、悪化開始点もこの窓では特定できない。** avg_score と
-moves は 5k から 20k まで順に伸びるが、8192 は全点で 0/20。よって 15k の最高値は 20k より低く、
-8192 の裾も回復していない。単一 seed の 20 局では裾の消失を 20k より前と断定できず、#249 と合わせても
-「20k 以前に落ちた」か「seed 9000 の試行で観測できなかった」かは未解決。`max|w|` は 5k 0.76 から
-20k 6.74 へ増え、学習の進行に伴う重みの増大は確認できる。`ai/solver/nn_weights.bin` は変更していない。
-
-再現（固定 300k horizon。run は 50k checkpoint 後、50,440 で発散）:
-```
-zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - base 30 /tmp/s2_300k_horizon_issue250b.bin 2 par - 2.8284271247461903
-# 5k/10k/15k checkpoint md5: 9668ecdfc0de7e3b10ddecfa981d4a63 / 813c330ba2a4af1e614ad33aaf8bd274 / 9d551ef0a83fe4e3af91e823377eef6e
-# 20k checkpoint md5 2b541e6f1df0fb550906ed4bdf3ac9d6; 50k matches #249; diverged at 50440/300000
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/issue250-5000.bin 1 - - - 0,2
-# nn 2-ply (deep): avg score=22583.8 ... avg moves=1236.5 reach8192=0/20
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/issue250-10000.bin 1 - - - 0,2
-# nn 2-ply (deep): avg score=28080.0 ... avg moves=1474.9 reach8192=0/20
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/issue250-15000.bin 1 - - - 0,2
-# nn 2-ply (deep): avg score=34053.6 ... avg moves=1729.5 reach8192=0/20
-zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 resume 30 /tmp/issue250-15000.bin 1 - - - 0,2
-# nn 2-ply (deep): avg score=33017.6 ... avg moves=1680.0 reach8192=0/20
-zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 resume 30 ai/solver/nn_weights.bin 1 - - - 0,2
-# nn 2-ply (deep): avg score=129456.2 ... avg moves=5486.0 reach8192=14/20
-```
-
-### seed 2 の 128/32・300k で `clip` norm 1 を測定（#251）
-
-#247 の norm 3 / 10 は完走するものの両 seed で 8192 が 0/20 だった。さらに低い norm 1 なら、40k〜50k の
-発散前に起きる軌道変化で裾を保てるかを確認した。条件は seed 2、128/32、300,000 games、`base` 相当、
-lr 0.003、`par`、batch_scale √8 = 2.8284271247461903。候補は 300k を完走し、547,999,305 moves、
-max|w| = 27.2242、NaN なし。重みは 296,472 B（md5 `cd786cd1b7f9a74bd9a96c17d2102d92`）。学習コマンドの
-報告時間は 2,997.5 s（49m57s）、shell の wall time は 99m22.7s だった。CLI は clip 発火回数を記録しないが、
-上限なしの同条件が #244 のとおり 50,440 games で発散するのに対して本 run は完走したため、上限は少なくとも
-1 回発火した。正確な回数は未計測。
-
-2-ply 20 games / seed 9000, 9100 の結果（avg moves と ms/move も記録）:
-
-| 候補 | avg_score 9000 / 9100 | avg moves 9000 / 9100 | reach8192 9000 / 9100 | ms/move 9000 / 9100 |
-|---|---:|---:|---:|---:|
-| `clip` norm 1 (#251) | 46,417.4 / 46,907.4 | 2,069.6 / 2,072.6 | 0/20 / 0/20 | 1.08 / 1.03 |
-| `clip` norm 3 (#247) | 69,415.8 / 68,284.4 | 3,134 / 3,076 | 0/20 / 0/20 | 1.09 / 1.10 |
-| `clip` norm 10 (#247) | 73,388.0 / 73,560.2 | 3,327 / 3,335 | 0/20 / 0/20 | 0.95 / 0.97 |
-| 同梱 net 128/32 | 113,682.2 / 129,456.2 | — / 5,486 | 11/20 / 14/20 | 0.91 / 0.88 |
-
-同梱 net の seed 9000 の avg moves は未記録。seed 9100 の 5,486 は #250 の値。
-
-norm 1 は norm 3 より 9000 で約23k、9100 で約21k低く、norm 10 より約27k / 27k低い。両 seed で
-avg_score は同梱 net に大きく劣り、8192 到達も 0/20 のまま。したがって裾を保つ仮説は否定され、
-`eval-net.sh` の採用判定・`pairw` には進まない（両 seed の非ペア評価ですでに悪化）。**不採用。**
-`ai/solver/nn_weights.bin` は変更しない。clip norm 1 は軌道を変えて完走させても方策を改善せず、norm 3/10
-よりさらに弱いので、この clip 上限を下げる方向は打ち切る。
-
-再現（ReleaseFast）:
-```
-zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - clip 30 /tmp/s2_clip_norm1_300k.bin 2 par - 2.8284271247461903 1 norm
-# trained 300000 games, 547999305 moves in 2997.5 s (lr=0.003, seed=2, variant=clip:norm+par)
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/s2_clip_norm1_300k.bin 1 - - - 0,2
-# nn 2-ply (deep): avg score=46417.4 ... avg moves=2069.6 ... ms/move=1.08 ... reach8192=0/20
-zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 resume 30 /tmp/s2_clip_norm1_300k.bin 1 - - - 0,2
-# nn 2-ply (deep): avg score=46907.4 ... avg moves=2072.6 ... ms/move=1.03 ... reach8192=0/20
-```
-
-### 学習 seed 4 の 128/32・300k を測定（#252）
-
-seed 1 の採用 net が再現するか確認するため、128/32、300,000 games、`base`、lr 0.003、`par`、batch_scale √8 = 2.8284271247461903 を固定して train seed 4 を実行した。5,000 games ごとに checkpoint を保存し、300k を完走。合計 512,708,842 moves、学習 CLI の報告時間は 2,903.6 s（48m23.6s）、重みは 296,472 B（md5 `ef6248aed329fa2ae9c64c4d5bd721c7`、SHA-256 `697bfac28373bdedd8e9bf32928b8d37682a7412e9bd803dbc52883bbf4544b8`）。発散・move cap 停止なし。
-
-2-ply 20 games / seed 9000, 9100 で同梱 net と比較:
-
-| net | avg_score 9000 / 9100 | avg moves 9000 / 9100 | reach8192 9000 / 9100 | ms/move 9000 / 9100 |
-|---|---:|---:|---:|---:|
-| train seed 4 | 67,497.8 / 66,838.0 | 3,036.0 / 2,987.3 | 0/20 / 0/20 | 0.94 / 0.89 |
-| 同梱 net (train seed 1) | 113,682.2 / 129,456.2 | 4,919.0 / 5,486.0 | 11/20 / 14/20 | 0.85 / 0.87 |
-
-両 seed で avg_score が同梱 net より大幅に低く（約40.6% / 48.4%減）、8192 到達も 0/20。avg moves も低く、ms/move は同等〜やや遅い。事前条件「両 seed で大きく悪化しない」を満たさないため `scripts/eval-net.sh` / `pairw` の正式判定には進まず、**不採用**。学習 seed 1 の強さは seed 4 では再現せず、同梱 `ai/solver/nn_weights.bin` は変更しない。
-
-再現（ReleaseFast、batch_scale を明示）:
-```
-zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 1 base 30 /tmp/252-s4-candidate.bin 4 par - 2.8284271247461903
-# trained 300000 games, 512708842 moves in 2903.6 s (lr=0.003, seed=4, variant=base+par)
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/252-s4-candidate.bin 1 - - - 0,2
-# nn 2-ply (deep): avg score=67497.8 ... avg moves=3036.0 ... ms/move=0.94 ... reach8192=0/20
-zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 resume 30 /tmp/252-s4-candidate.bin 1 - - - 0,2
-# nn 2-ply (deep): avg score=66838.0 ... avg moves=2987.3 ... ms/move=0.89 ... reach8192=0/20
-```
-
-### 128/32 の train seed 5 は 300k 完走したが同梱 net を大きく下回る（#254）
-
-既知の `base` レシピを変えず train seed 5 で実行。300,000 games を完走し、548,853,567 moves、3,089.6 s
-（51m29.6s）、最終ゲーム score 56,324。重みは 296,472 B、md5 `2a8e37fa81284b6085fe532d5986b36a`。
-5,000 games ごとの checkpoint（5k〜295k）を保存し、完走時の 300k 重みも退避した。発散・長ゲーム停止はなし。
-
-2-ply / 20 games の評価:
-
-| net | seed | avg_score | avg moves | reach8192 | ms/move |
-|---|---:|---:|---:|---:|---:|
-| 同梱 128/32 | 9000 | 113,682.2 | 4,919.0 | 11/20 | 0.87 |
-| seed 5 / 300k | 9000 | 55,401.6 | 2,509.0 | 0/20 | 1.05 |
-| 同梱 128/32 | 9100 | 129,456.2 | 5,486.0 | 14/20 | 0.85 |
-| seed 5 / 300k | 9100 | 55,363.8 | 2,504.7 | 0/20 | 0.93 |
-
-**判定: 不採用。** 両 seed で avg_score が同梱の約半分、8192 到達は 0/20。ms/move も悪化した。
-両 seed とも明確な大幅回帰なので、issue の条件どおり `scripts/eval-net.sh` / `pairw` の正式判定には進まない。
-`ai/solver/nn_weights.bin` は変更しない。seed 5 でも同梱 net を超える候補は再現せず、seed 1 の成功は train seed に敏感という結論を補強した。
-
-再現（ReleaseFast、128/32、300k horizon、`base`、lr 0.003、`par`、batch_scale √8）:
-```
-zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 1 base 30 /tmp/issue254-seed5/seed5-live.bin 5 par - 2.8284271247461903
-# trained 300000 games, 548853567 moves in 3089.6 s (lr=0.003, seed=5, variant=base+par)
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 /tmp/issue254-seed5/seed5-live.bin 1 - - - 0,2
-# nn 2-ply (deep): avg score=55401.6 ... avg moves=2509.0 ... ms/move=1.05 ... reach8192=0/20
-zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 resume 30 /tmp/issue254-seed5/seed5-live.bin 1 - - - 0,2
-# nn 2-ply (deep): avg score=55363.8 ... avg moves=2504.7 ... ms/move=0.93 ... reach8192=0/20
-```
-
-### 同梱 128/32 net の探索深度を再評価（#255）
-
-現行 net を固定して、2-ply (`deep`)、3-ply (`deep3`)、空き 2 以下だけ 4-ply (`phase_h4`) を比較した。Zig 0.17.0 / native ReleaseFast、各設定とも seed 9000 と 9100 から 20 局ずつ（9000–9019 / 9100–9119）。重みは run 前に `/tmp/issue255-128-32.bin` へコピーし、SHA-256 `c98ea27cf723cc96258173bd7be74630e80c2f1f358777c5ddaec059ec19a6c1`（296,472 B）を確認。リポジトリの重みは変更していない。
-
-| policy | seed 9000 avg_score / reach8192 / ms/move | seed 9100 avg_score / reach8192 / ms/move | 40 局 avg_score | reach8192 | pooled ms/move |
-|---|---:|---:|---:|---:|---:|
-| 2-ply (`deep`) | 113,682.2 / 11/20 / 0.89 | 129,456.2 / 14/20 / 0.88 | 121,569.2 | 25/40 | 0.884 |
-| 3-ply (`deep3`) | 140,438.2 / 17/20 / 18.34 | 134,245.0 / 16/20 / 20.35 | **137,341.6** | **33/40** | 19.326 |
-| 終盤 4-ply (`phase_h4`) | 139,068.8 / 15/20 / 42.80 | 134,117.8 / 15/20 / 43.76 | 136,593.3 | 30/40 | 43.272 |
-
-Pooled ms/move は両 seed の経過時間合計 / 総手数。3-ply は 2-ply より両 seed で avg_score が高く、40 局平均で +15,772.4（+13.0%）、8192 到達は +8 局。一方コストは 21.9 倍。avg score を優先する次の候補は 3-ply とするが、約 22 倍の遅さを許容する用途に限る。2-ply を既定から置き換える変更は行わない。サンプルは各 20 局 × 2 seed 範囲で、統計的有意差を示す測定ではない。
-
-`phase_h4` は 3-ply より avg_score が 748.3 低く、8192 到達も 3 局少ない一方、2.24 倍遅い。2-ply からの改善はあるが、同じ seed 上でその上積みを 3-ply より得られず追加コストに見合わないため、4-ply は次候補にしない。比較は同じ開始 seed 範囲だが、方策が分岐した後の spawn は共通乱数テープで揃えていない。
-
-再現コマンド（各 policy を独立実行。`rows`: 2 = 2-ply、4 = 3-ply、8 = phase_h4）:
-```
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 /tmp/issue255-128-32.bin 1 - - - 2
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 /tmp/issue255-128-32.bin 1 - - - 4
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 /tmp/issue255-128-32.bin 1 - - - 8
-zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 base 30 /tmp/issue255-128-32.bin 1 - - - 2
-zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 base 30 /tmp/issue255-128-32.bin 1 - - - 4
-zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 base 30 /tmp/issue255-128-32.bin 1 - - - 8
-```
-
-### 現行 128/32 net で downside risk を再評価（#258）
-
-#187 の `risk_weight=0.3` が現行 net で avg score を上げるか、標準 2-ply (`deep`, policy 2) と
-downside risk (policy 13) を比較した。Zig 0.17.0 / native ReleaseFast。同梱
-`ai/solver/nn_weights.bin` は 296,472 B、SHA-256 `c98ea27cf723cc96258173bd7be74630e80c2f1f358777c5ddaec059ec19a6c1`。
-各方策を seed 9000–9019 と 9100–9119 の各20局、非ペアで評価した（row selection `2,13`）。
-重みと既定方策は変更していない。
-
-| policy | seed 9000 avg_score / reach8192 / ms/move | seed 9100 avg_score / reach8192 / ms/move | 40局 avg_score | reach8192 | pooled ms/move |
-|---|---:|---:|---:|---:|---:|
-| `deep`, risk 0 | 113,682.2 / 11/20 / 0.91 | 129,456.2 / 14/20 / 0.98 | **121,569.2** | **25/40** | **0.95** |
-| `deep` + downside risk 0.3 | 117,421.0 / 10/20 / 0.95 | 121,558.6 / 13/20 / 1.01 | 119,489.8 | 23/40 | 0.98 |
-
-Pooled ms/move は両 seed の経過時間合計 / 総手数（出力された0.1秒単位の経過時間から算出）。risk は seed 9000 で
-+3,738.8 点だが seed 9100 で −7,897.6 点となり、40局平均では **−2,079.4 点（−1.7%）**、8192 到達は2局減、
-探索コストは約3%増えた。改善は再現せず、現行 net でも downside risk は不採用。`nn_main` の既定 policy 2 を維持する。
-各 seed 範囲20局の非ペア比較であり、統計的有意差を示す測定ではない。
-
-再現（両 policy を同時に選択。`rows`: 2 = `deep`、13 = downside risk）:
-```
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 resume 30 ai/solver/nn_weights.bin 1 - - - 2,13
-zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 resume 30 ai/solver/nn_weights.bin 1 - - - 2,13
-```
-
-### 葉の直前の報酬を省く評価（#260、2026-11-11）
-
-`Search.value` が葉へ直接進む手の報酬 `r` も `V(A)` に足す既定 `r + V(A)` と、直前の報酬だけを省く `V(A)` を比較した。変更は opt-in の評価専用 (`omit_leaf_reward=false` が既定) とし、訓練ターゲット・重み・スポーン・合法手・同点順は変更していない。深さ境界と全スポーン枝を刈った場合を直接葉として扱う。盤面に空きがないときは従来どおり同じ深さで続行し、合法手のない終局値は 0 のまま。
-
-同梱 128/32 net (`nn_weights.bin`, SHA-256 `c98ea27cf723cc96258173bd7be74630e80c2f1f358777c5ddaec059ec19a6c1`) で、ReleaseFast、同じ #237 32-bit spawn tape、seed 9000 の20局を `.deep` でペア評価した。A は既定、B は葉の直前の報酬を省く候補。
-
-| 比較 | B−A 平均 ± stderr | B勝 / A勝 | mean − 2×stderr |
-|---|---:|---:|---:|
-| `pairleaf deep`, 20局 | −1,911.6 ± 12,264.9 | 12 / 8 | **−26,441.4** |
-
-paired 判定 `mean − 2×stderr > 0` を満たさないため候補は有望とは言えず、`.deep3` の追加測定は行わなかった。非ペア `.deep` を seed 9000 と 9100 で各20局測定した結果も、片方のseedでスコア・裾・速度が悪化した。
-
-| 方策 | seed 9000 avg_score / reach8192 / ms/move | seed 9100 avg_score / reach8192 / ms/move | 40局 avg_score / reach8192 | elapsed / search volume (9000; 9100) |
-|---|---:|---:|---:|---:|
-| 既定 | 113,682.2 / 11/20 / 0.91 | 129,456.2 / 14/20 / 0.86 | 121,569.2 / 25/40 | 89.7 s / 98,006,119 leaves; 94.2 s / 106,310,853 leaves |
-| 葉報酬省略 | 131,587.4 / 15/20 / 0.83 | 114,746.2 / 11/20 / 0.96 | 123,166.8 / 26/40 | 92.1 s / 106,408,350 leaves; 95.0 s / 96,794,002 leaves |
-
-候補の40局平均は +1,597.6 点だが seed 9100 では −14,710.0 点、8192 到達は3局減、ms/move は0.86から0.96（+11.6%）となり、全seedで悪化しない条件を満たさない。**不採用**。既定方策・同梱重みは維持し、 opt-in の比較スイッチのみ残す。統計的な勝ちも速度・裾の一貫した改善も確認できなかった。
-
-再現（weights は同梱ファイル、`rows=2` のみで `.deep` を測定）:
-```
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 pairleaf 30 ai/solver/nn_weights.bin 1 - deep
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 2
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 leaf 30 ai/solver/nn_weights.bin 1 - - - 2
-zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 2
-zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 leaf 30 ai/solver/nn_weights.bin 1 - - - 2
-```
-
-`zig build test-nn -Dtest-filter='search leaf reward can be omitted'` と `zig build test-nn-main -Dtest-filter='pairleaf accepts'` を通した。テストは既定式、葉境界、全枝カット、空き無し盤面の継続、終局値0、root search と option 無効時の同一手、および `deep`/`deep3` CLI mode を確認する。
-
-### NN の内部探索値を再利用する node TT は同じ手で 39.5% 速い（#263）
-
-`ValueCache` は探索の葉（afterstate）だけを覚えており、`Search.value` / `Search.chance` が返した内部ノードの
-値は、同じ盤面が別経路から再訪されても毎回計算し直していた。深さ 3 の `deep3` は spawn の組み合わせで
-同じ盤面に何度も到達するため、1 探索内で完了した内部ノードを再利用する direct-mapped の `NodeCache` を
-`Options.node_tt` として追加した。当時は既定 off で、off の探索結果は従来とビット単位で同じだった
-（#266 で 3-ply 以上だけ既定 on にした）。
-
-キーは盤面の厳密な 16 バイト表現（タイルの `log2 + 1`、空き 0）、`value` / `chance` の別、残り深さ、
-そして cprob。cprob は固定 spawn カットが効く深さ（`chance` は depth > 1、`value` は depth > 2）だけ
-キーに入れ、浅いノードは cprob 非依存なので 1 キーを共有する。ハッシュはスロット選択だけに使い、
-衝突時は 16 バイト全部を比較してミスにする。予算切れの探索で得た値は保存せず、テーブルはトップレベル
-探索ごとにクリアする（net / cutoff / risk_weight をキーに含めない代わりに、重み更新や設定変更をまたがない）。
-1 スロット 48 B（#260 の `direct_leaf` も一緒に保存するため）、desktop 4096 スロット = 192 KiB/thread、wasm 512 スロット = 24 KiB/thread。
-
-同梱 128/32 net、seed 9000–9009 の 10 局を、同じプロセスで row 4 (`deep3`, cutoff 1e-2) と row 15
-(`deep3` + node TT) に同じ spawn で打たせた。avg score / moves / 8192 到達は完全に一致し、
-node TT は 23.87 → 14.45 ms/move（−39.5%）、leaves/move は 19,278.4 → 10,675.8 になった。
-node TT の probe 661,724,183 回に対し hit 132,069,729 回（20.0%）。
-
-| row | policy | avg score | avg moves | reach8192 | elapsed | leaves/move | ms/move | node hit rate |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| 4 | `deep3` (cutoff 1e-2) | 138,669.6 | 5,862.8 | 8/10 | 1399.6 s | 19,278.4 | 23.87 | — |
-| 15 | `deep3` + node TT | 138,669.6 | 5,862.8 | 8/10 | 847.2 s | 10,675.8 | 14.45 | 20.0% |
-
-節約した時間を 1e-3 の spawn カットに使う案も、#237 の 32-bit spawn tape で A = `deep3` + TT (1e-2)、
-B = 同じ (1e-3) として seed 9000–9019 の 20 局をペアで比較した。B は 10 勝 10 敗、平均差
-−14,324.4 ± 11,574.6 点（B−A）、`mean − 2*stderr = −37,473.5` で採用条件を満たさない。avg score は
-A 149,533.6、B 135,209.2。B は 1 局あたり 80k 前後まで落ちる負け方が 5 局あり、カットを緩めると
-探索が別の手を選んで悪いゲームに入る影響が大きい。ms/move は A 69.47、B 96.12（8 並列実行なので
-絶対値は参考、比は約 1.38 倍）。node hit rate は A 19.9%、B 21.4%。
-
-node TT は `Options.node_tt` と評価 row 15 として追加し、#266 で 3-ply 以上の既定 on にした。
-`deep3` の既定 cutoff は 1e-2 のまま（1e-3 は paired で負けたため不採用）。
-row 16 は 1e-3 を再測定するための候補として残す。
-1e-3 の非ペア 9000/9100 各 20 局は、paired で採用条件を満たさなかったため実施していない。
-
-再現（row 4 と 15 を同時に。`rows`: 4 = `deep3` の明示 off、15 = 既定の 3-ply）:
-```
-zig build nn -Doptimize=ReleaseFast -- 0 10 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 4,15
-```
-20 局ペア比較は一時的な `pairtt` variant（A: `deep3` + TT 1e-2、B: 同 1e-3、同じ tape）で行い、
-再現用には残していない。テストは `zig build test-nn -Dtest-filter='#263'`（key の分離、衝突ミス、
-予算切れの非保存、TT あり/なしの値と手の一致、テーブルのクリア、48 B/slot と direct_leaf の保持）。
-
-### node TT を 3-ply の既定にする（#266）
-
-#263 の node TT は opt-in だったが、`deep3` は #108 以来の既定の 3-ply 方策で、同じ手・同じ値のまま
-39.5% 速くなることが分かっていた。`Options.node_tt` を `?bool = null` にして、未指定なら探索深さが
-3-ply 以上のときだけテーブルを確保する既定にした。`null` は「3-ply 以上で on」、`false` は明示 off で、
-#263 の比較テストと TT なしの測定に使う。2-ply の `deep`（`id_budget` の初回反復を含む）は従来どおり
-テーブルを確保も probe もしないので、結果はビット単位で変わらない。テーブルの有無は探索開始後に
-深さが決まってから選び、確保したテーブルはトップレベル探索ごとにクリアする。既定の phase 行では
-3-ply のパート（`h1`〜`h3` の深い側、`h4` の 4-ply を含む）が on、2-ply のパートは off のまま。
-1 スロット 48 B、desktop 4096 スロット = 192 KiB/thread、wasm 512 スロット = 24 KiB/thread。
-
-同梱 128/32 net、seed 9000–9009 の 10 局を、同じプロセスで row 4（明示 off）と row 15（既定）に
-同じ spawn で打たせた。avg score / moves / 8192 到達は完全に一致し、22.95 → 12.80 ms/move（−44.2%）、
-leaves/move は 19,278.4 → 10,675.8 になった。node TT の probe 661,724,183 回に対し hit 132,069,729 回（20.0%）。
-
-| row | policy | avg score | avg moves | reach8192 | elapsed | leaves/move | ms/move | node hit rate |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| 4 | `deep3` (node TT off) | 138,669.6 | 5,862.8 | 8/10 | 1345.4 s | 19,278.4 | 22.95 | — |
-| 15 | `deep3` (既定、node TT on) | 138,669.6 | 5,862.8 | 8/10 | 750.3 s | 10,675.8 | 12.80 | 20.0% |
-
-wasm は `zig build wasm -Doptimize=ReleaseFast` で、変更前 540,957 B（初期メモリ 29 ページ = 1,856 KiB）→
-変更後 566,031 B（同じ 29 ページ）。増分は 24 KiB のテーブル像（data +24,628 B）とクリア処理の
-コード +446 B。`clear` を `@splat` 代入のままにすると同サイズの定数が data にもう 1 つ入り
-590,156 B になったため、1 エントリずつの代入にして約 24 KiB 減らした。
-
-テストは `node TT defaults on for 3-ply and never for 2-ply (#266)` を追加し、2-ply の既定が明示 off と
-同じ手・同じ leaves/hits で probe 0、3-ply の既定がクリア・probe・hit すること、明示 off がテーブルを
-触らないことを固定した。#263 の「ゲームに沿って同じ手」テストは 4 手に延ばし、既定経路も比較する。
-`zig build test` 全通過、wasm ビルド通過。
-
-再現（row 4 と 15 を同時に。`rows`: 4 = `deep3` の明示 off、15 = 既定の 3-ply）:
-```
-zig build nn -Doptimize=ReleaseFast -- 0 10 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 4,15
-```
-
-### node TT 付き 4-ply は同じ tape で負け、探索コストは約26倍（#267）
-
-#255 で `deep3` が既定の 2-ply を上回り、#263 では node TT が同じ手のまま `deep3` を 39.5% 速くした。
-この節では、節約した時間を 1 ply 深くするのに使えるかを確かめるため、`deep3` にもう 1 手と spawn 層を
-足した `deep4`（`ply=4`、cutoff は `deep3` と同じ 1e-2）に node TT を組み合わせ、row 15
-（`deep3` + node TT、既定）と同じ net・同じ #237 32-bit spawn tape で比較した。既定方策・同梱重みは
-変更していない。`deep4` は評価専用の row 17、比較は同じプロセスで A/B を順に打つ `pairrow` variant として追加し、再現用に残した。
-
-seed 9000 の 1 局を同じ tape で打った結果は次のとおり。A は row 15、B は row 17。
-
-| 方策 | row | avg score | moves | reach8192 | leaves/move | ms/move |
-|---|---:|---:|---:|---:|---:|---:|
-| `deep3` + node TT（既定） | 15 | 174,680 | 7,267 | 1/1 | 10,352.5 | 77.67* |
-| `deep4` + node TT | 17 | 130,656 | 5,423 | 1/1 | 253,901.0 | 2,015.90* |
-
-\* 10 局スクリーニングを 10 並列で走らせた中の値で、絶対値は CPU 競合で膨らんでいる。同じ run の
-B/A 比は ms/move で 25.95 倍、leaves/move で 24.53 倍。10 並列を始める前のクリーンな row 15 は
-12.80 ms/move（#266）なので、4-ply の絶対コストはこの表の値よりかなり小さい可能性があるが、
-それでも 3-ply の 20 倍前後という探索量の増加と整合する。
-
-B は A より 44,024 点低く、手数も 5,423 対 7,267 と短い。10 局スクリーニングは 10 本の
-単局プロセス（seed 9000–9009）で開始したが、3 時間 22 分時点で B の完了が 1 局もなく、
-1 局あたりのコストが非現実的なため 9 本を停止した。残した seed 9000 の 1 本は起動から約 4 時間で
-完了し、上記の結果になった。1 局目で明確に負け、コストも約 26 倍だったため、10 局への延長、
-20 局ペア、seed 9100 の非ペア測定は行っていない。したがってこの節の結果は統計的有意差ではなく、
-「この実装の 4-ply は採用候補にならない」というスクリーニング判定である。
-
-探索葉の増加は、空き 4/6/8 の probe で `deep3` の 20.1/21.8/22.6 倍だった。`deep4` は
-1 手あたり約 20 倍の葉を読むため、node TT があっても既定の 3-ply と同じ時間予算には収まらない。
-**不採用**。row 17 と `pairrow` は再現・将来の高速化用に opt-in で残し、既定 policy と
-`nn_weights.bin` は変更しない。
-
-再現（1 局。A = row 15、B = row 17。B は数時間かかることがある）:
-```
-zig build nn -Doptimize=ReleaseFast -- 0 1 9000 0.003 - pairrow 30 ai/solver/nn_weights.bin 1 - 15 17
-```
-10 局スクリーニングは、同じコマンドの seed だけを 9000–9009 に変えた単局プロセスを 10 本並列で
-走らせた（スコア比較用。ms/move の測定には使わない）。
-
-テストは `zig build test` と
-`zig build test-nn -Dtest-filter='deep4 searches one row'`、
-`zig build test-nn-main -Dtest-filter='pairrow reads two eval row indices'` を通した。
-`deep4` の phase 行が全空き数で `ply=4`・cutoff 1e-2 になること、`deep4` が `deep3` より多い葉を
-読むこと、row 17 が `deep4` + node TT に対応すること、`pairrow` が row 3 を拒否することを固定した。
-
-### 凍結 target net で TD の bootstrap を固定する `tnet`（#262）
-
-#234 の 128/32・seed 2 は 300k の途中で発散し、#244 / #247 の clamp と更新量の上限は発散を止めても
-8192 の裾を戻さなかった。どれも 1 手の更新は「次の afterstate の V」を更新中の自分自身で見積もる
-on-policy TD のままで、目標が重みと一緒に動く。ここでは目標だけを止める。自己プレーの手と spawn tape は
-従来どおり live net が決め、TD 目標の次状態 V だけを、live net の読み取り専用コピー（target net）から取る。
-
-- `nn.Options.target_net`（既定 `null` = 従来の live bootstrap とバイト一致）。`bootstrapValue` が
-  `target_net orelse net` を引く。
-- 効く経路は 4 つ。通常の 1 手 1 更新（`tdBootstrap` の `.td1`）、`replay_k > 0` の online 更新
-  （この経路は `tdBootstrap` を通らない）、backward / replay の末尾、priority の追加更新。
-  terminal の最終 afterstate は従来どおり reward だけを目標にする。
-- CLI variant `tnet`。`par` 必須で、arg 13 が「何バッチごとに target を同期するか」（既定 100）。
-  `par` の各バッチは同じ target を読み、バッチが終わってからだけ live net をコピーするので、
-  バッチ内のゲームが途中で同期した target を見ることはない。`tnet` は scratch 開始（`resume` ではない）。
-  重みの保存は他 variant と同じ 5,000 ゲームごとと完走時。
-
-確認した契約:
-
-- `bootstrapValue` は target net の V を返し、`target_net = null` では live net の V と一致する。
-- target を渡しても、lr = 0 のゲームは score / moves / live 重み / target 重みが live のみの run と一致する
-  （手の選択と spawn は live のまま）。
-- target を渡すと、1 手 1 更新・`replay_k > 0` の online 更新・replay 末尾の 3 経路すべてで
-  更新後の重みが live のみの run と変わり、ゲーム中に target は書き換わらない。
-- `TargetSync` は同期間隔の途中で live net が変わってもコピーせず、間隔が来たバッチの終わりにだけコピーする。
-- arg 13 は既定 100、`-` も 100、0 は `error.InvalidTargetEvery`。
-
-テストは `zig build test` 全通過（Debug）。
-
-### 測定: 300k は安定するがゲームが伸びない（seed 2）
-
-条件は 128/32、lr 0.003、`par`、`batch_scale=sqrt(8)=2.8284271247461903`、300,000 ゲーム。
-`tnet` の arg 13 が同期間隔（バッチ数）。対照は同じ条件の `replay 30`。
-
-| 条件 | moves / train s | 最後のゲーム | 2-ply seed 9000 / 9100（8192） | 判定 |
-|---|---:|---:|---|---|
-| `replay 30`（対照、seed 2） | 539,243,727 / 3,184.9 | 65,476 | 66,186.0 / 66,126.8（0/20） | 安定、裾なし |
-| `tnet 30`、同期 100（seed 2） | 79,205,713 / 694.2 | 3,156 | 7,213.4 / 7,784.8（0/20） | 不採用 |
-| `tnet 30`、同期 100（seed 1） | 80,097,021 / 627.9 | 3,480 | — | 崩壊（267 手/ゲーム） |
-| `tnet 0`、同期 100 | 90,486,323 / 649.6 | 6,324 | — | 崩壊（302 手/ゲーム） |
-| `tnet 0`、同期 1 | 108,272,536 / 753.4 | 5,480 | — | 崩壊（361 手/ゲーム） |
-| `tnet 30`、同期 1、`batch_scale=0.25` | 101,230,912 / 742.4 | 4,352 | — | 崩壊（337 手/ゲーム） |
-
-`tnet 30` の pairw は shipped に対して **−112,444.4 ± 8,419.5**、0 勝 20 敗。非ペア 2-ply は
-seed 9000 が 7,213.4（0/20、1.39 ms/手）、seed 9100 が 7,784.8（0/20、1.32 ms/手）。
-対照 `replay 30` は 1-ply 55,836.2 / 2-ply 66,186.0（seed 9000、0/20、0.96 ms/手）、
-1-ply 53,161.2 / 2-ply 66,126.8（seed 9100、0/20、1.19 ms/手）だったので、
-`tnet` は発散は止めたが、対照よりさらにゲームを短くする。
-
-**切り分け。** target を shipped net に固定したまま（同期を実質無効化）5,000 ゲームだけ回すと、
-最後のゲーム 31,356 / 5,708,577 手で安定した。したがって `target_net` の読み出しや
-`TargetSync` のコピーは壊れていない。同期間隔を 1 にしても、`replay_k` を 0 にしても、
-`batch_scale` を 0.25 にしても 300k では同じ崩壊になったので、原因は
-「greedy 1-ply の on-policy データで、live net から target を更新する閉ループ」にある。
-target を固定した場合だけ値が保たれるが、それは学習ではなく shipped net への回帰である。
-
-**読み。** 凍結 target は #234 の seed 2 発散を有限重みに留めるが、その代償として
-「今の手の価値」を目標にできず、即時 reward だけを追う短いゲームに落ちる。lr を下げた
-#234 の追試や clamp と同じく、安定と 8192 の裾は両立しなかった。**判定: 不採用**。
-重みは置き換えず、`tnet` は再現用の opt-in variant として残す（既定の学習経路には入らない）。
-同期間隔・replay_k・batch_scale を変えても 300k で崩壊するため、この形の target net を
-既定レシピに採用しない。
-
-再現:
-
-```
-zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - tnet 30 /tmp/s2_tnet100_300k.bin 2 par - 2.8284271247461903 100
-zig build nn -Doptimize=ReleaseFast -- 300000 0 9000 0.003 - tnet 0 /tmp/s2_tnet1_300k.bin 2 par - 2.8284271247461903 1
-./scripts/eval-net.sh /tmp/s2_tnet100_300k.bin --games 20 --seed 9000
-```
-
-## 1手ごとのランダムな8対称変換 rsym は入力だけ回すと発散する（#271）
-
-#72 の `sym` は 1 局面を 8 回更新して過剰更新になり、`symbatch` は平均 1 回にしたが clip で
-学習を止めた。この節では、1 手につき 1 回だけランダムな対称変換を選んで入力に適用する `rsym` を
-試した。狙いは更新回数を base と同じに保ったまま、8 方向のデータを 1/8 ずつ使うこと。
-
-実装は `nn.Options.rsym`（既定 false）と CLI variant `rsym`。`trainGamePerMove` の TD 更新で
-`p.after` を `T_k(p.after)`（`k = rng.uintLessThan(usize, symmetry_count)`）に差し替えて
-`trainStep` に渡す。`distill_only` は TD 更新を行わないため対象外。base は rng を引かず、
-乱数列も更新も従来と同一。`par` も同じ経路を通る。
-
-CLI の `base` と `rsym` は arg 7 の `30` を `opts.replay_k` に渡さない（`replay_k` は `replay`
-variant 専用）。どちらも `replay_k=0` の `trainGamePerMove` を通るので、比較条件は揃っている。
-
-正しさ: 非対称な盤面で 256 回引くと 8 方向がすべて現れ、base は同じ 2 本の rng 列を消費しない
-（テスト）。推論経路は変更していない。
-
-100k の base は `zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 100000 0 9000 0.003 1 base 30 /tmp/base.bin 1 par`
-で 100,000 局 / 134,574,330 moves / 767.2 s（130.3 games/s）で完走し、296,472 B の checkpoint を
-保存した。同じ設定の rsym は par で 40/100000 局、serial で 8/100 局で
-`diverged at ... (non-finite or |w| > 1e6)` となり、checkpoint を保存しなかった。
-
-初期化直後のネットを連続 rng で 10 局回すと、rsym の max|w1| は 0.2500 → 0.2503 → 0.2544 →
-0.2578 → 0.2652 → 0.3170 → 0.8955（6 局目）と増え、base は 10 局を通して 0.2500 のままだった。
-非対称な probe 盤の V を 8 方向で見ると、開始時 0.16–0.37、5 局目 13.2–16.1、6 局目に負、
-7 局目 0.87–0.93 と、過大評価のあと崩壊する。spawn 列だけを rsym と同じにした対照（変換は
-適用しない）では max|w1| が base と同じく安定したので、乱数列の変化だけが原因ではない。
-
-我々の解釈では、TD 目標 `r + V(s')` の `V(s')` は自己対戦方策が常に正準の向きで評価する。
-ネットが対称になる前は V が向きに依存するので、回した入力に対する目標はその盤面の値に
-ならない。正準の向きは方策の評価にも使われ、更新は 8 方向に分散するため、正準の向きの補正は
-1/8 しか入らない。過大評価が次の目標に入る帰還で重みが成長し、発散ガードに掛かる、という筋。
-これは「TD 目標はスカラーなので向きに依らない」という前提が、V がまだ対称でない時点では
-成り立たないことを示す。
-
-lr を 1/8（0.000375）にすると 5,000 局は完走した（745,686 moves、4.4 s、最終局 1,240 点）。
-ただしこれは指定の 0.003 ではなく、5,000 局だけの smoke なので採用判断には使わない。
-
-**不採用**。指定 lr 0.003 の rsym は 100k を完走できず、pairw を打てる checkpoint がない。
-したがって「avg score が上がるか」の比較は成立せず、300k の追試もしない。既定 policy と
-`ai/solver/nn_weights.bin` は変更しない。`rsym` は再現用の opt-in variant として残す。
-
-次の候補は、入力と目標を同じ k で回す（`r + V(T_k s')`）、8 方向の目標を平均する、target を
-clamp する、のいずれか。入力だけを回す案はここで否定する。
-
-再現（rsym は 0.2 s で発散する）:
-```
-zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 100000 0 9000 0.003 1 base 30 /tmp/base.bin 1 par
-zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 100000 0 9000 0.003 1 rsym 30 /tmp/rsym.bin 1 par
-zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 100 0 9000 0.003 1 rsym 30 /tmp/rsym.bin 1 -
-```
-
-コスト: base 100k が 767 s、rsym の発散は par 0.2 s / serial 数秒、lr/8 の 5k smoke が 4.4 s。
-pairw は rsym の checkpoint ができないため未実施。`zig build test` は既存の checksum テストを
-含めて全通過。
-
-## 入力と目標を同じ対称変換で回す rtgt も avg score を下げる（#273）
-
-#271 の rsym は入力だけを回し、TD 目標 `r + V(s')` の `s'` は正準のままだった。この節では、
-1 手につき 1 回だけ `k` を引き、入力 `p.after` と目標の次盤面 `next.after` を同じ `T_k` で回す
-`rtgt` を試した。`t2`/teacher では `spawned`（post-spawn 盤）を同じ `k` で回す。終端の目標は
-`p.reward` だけで、回さない。`base` は rng を引かず、更新も従来と同一。`rsym` の意味は変えない。
-
-実装は `nn.Options.rtgt`（既定 false）と CLI variant `rtgt`。`trainGamePerMove` の
-非終端・終端更新を `tdUpdate`/`tdTerminalUpdate` に切り出し、`updateSym` が 1 回だけ
-`k = rng.uintLessThan(usize, symmetry_count)` を引いて入力と目標の両方に渡す。`tdBootstrap` は
-`next_sym` を受け取り、`td1` は `V(T_k next.after)`、`t2`/teacher は `T_k spawned` を評価する。
-`par` も同じ経路を通る。
-
-正しさ: 非対称な盤面で k=0..7 を固定した rng から作り、各 k の `tdUpdate` が
-`trainStep(T_k(after), reward + V(T_k(next)), ...)` と一致することをテストした。k=0 は base と
-一致し、base が rng を引かないことも確認した。終端は入力だけ回り、目標は reward のまま。
-既存の checksum テスト（5 局、seeds 11/12）は `Crc32 3042928886` のまま通った。
-
-5k smoke は指定レシピ（128/32、lr 0.003、seed 9000、par）で 5,000 局 / 745,635 moves / 5.0 s で
-完走した。100k の base は 100,000 局 / 134,574,330 moves / 785.6 s（#271 と同じ move 数）、
-同じ設定の rtgt は 100,000 局 / 28,086,194 moves / 208.8 s で、最終局は 6,964 点だった。
-base の checkpoint は 296,472 B、max|w1| 3.25。rtgt も 296,472 B だが max|w1| 0.61 で、
-1 局あたり 281 moves（base は 1,346 moves）と短い局に流れた。
-
-20 局 seed 9000 の pairw（A=/tmp/base.bin, B=/tmp/rtgt.bin）は
-`mean diff=-77064.0 ± 5507.7`、B の勝ち 0 / 負け 20（374.9 s）。非ペア 2-ply は
-base が seed 9000 で 83,796.0（8192 4/20、0.93 ms/move）、seed 9100 で 93,993.4（5/20、0.91）、
-rtgt が 10,159.6（0/20、1.19）と 12,042.8（0/20、1.22）。`scripts/eval-net.sh` の判定は
-**REJECT**（paired margin -88,079.4、score/reach/ms の全項目で fail）。
-
-解釈: 同じ k で回しても、`td1` の目標 `V(T_k next.after)` の `next.after` は正準盤面で方策が
-選んだ手の回転であって、回転盤面で方策が選ぶ最善手ではない。ネットが対称になる前は
-`V(T_k next.after)` が `T_k spawned` の値より低く出る（off-policy のバイアス）。このバイアスで
-値が縮み、短い局に流れた、という筋。実装の契約テストは各 k で指定どおりの更新になっており、
-k=0 が base と一致するので、実装ミスではなく「同じ k で回すだけでは足りない」という結果。
-回転盤面で search し直す `t2` 経路ならこのバイアスは入らないが、`rtgt`+`t2` は今回測っていない。
-
-**不採用**。既定 policy と `ai/solver/nn_weights.bin` は変更しない。`rtgt` は再現用の
-opt-in variant として残す。300k の追試はしない。
-
-再現:
-```
-zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 100000 0 9000 0.003 1 base 30 /tmp/base.bin 1 par
-zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 100000 0 9000 0.003 1 rtgt 30 /tmp/rtgt.bin 1 par
-scripts/eval-net.sh /tmp/rtgt.bin --shipped /tmp/base.bin --games 20 --seed 9000
-```
-
-コスト: base 100k 785.6 s、rtgt 100k 208.8 s、pairw 20 局 374.9 s。
-`zig build test` は checksum を含めて全通過。
+| 20k | 27,476 | 45,651.6 | 2,216.1 | 0/20 | 6.7368 |
+
+15k の seed 9100 は 33,017.6 / 1,680.0 手 / 0/20（同梱 net は 129,456.2 / 5,486 手 / 14/20）。**結論: 5k〜15k に有望な
+checkpoint は無く、悪化開始点もこの窓では特定できない**（avg_score と手数は 5k から 20k まで順に伸びるが 8192 は全点 0/20）。
+単一 seed の 20 局では裾の消失を 20k より前と断定できず、「20k 以前に落ちた」か「20 局では観測できなかった」かは未解決。
+
+### `clip` norm 1 はさらに弱い（#251）
+
+seed 2 / 128/32 / 300k / lr 0.003 / `par` / sqrt 8 / `clip` norm 1: 300k 完走、547,999,305 moves（1,826 手/ゲーム）、
+max\|w\| 27.2242、NaN なし、296,472 B（md5 `cd786cd1b7f9a74bd9a96c17d2102d92`）、2,997.5 s（shell wall 99m22.7s）。上限なしが
+50,440 で発散するので上限は少なくとも 1 回発火（回数は未計測）。
+
+| 候補 | avg_score 9000 / 9100 | 手/ゲーム | 8192 | ms/move |
+| --- | ---: | ---: | --- | --- |
+| `clip` norm 1 | 46,417.4 / 46,907.4 | 2,069.6 / 2,072.6 | 0/20 | 1.08 / 1.03 |
+| `clip` norm 3 | 69,415.8 / 68,284.4 | 3,134 / 3,076 | 0/20 | 1.09 / 1.10 |
+| `clip` norm 10 | 73,388.0 / 73,560.2 | 3,327 / 3,335 | 0/20 | 0.95 / 0.97 |
+| 同梱 net | **113,682.2 / 129,456.2** | — / 5,486 | **11/20 / 14/20** | 0.91 / 0.88 |
+
+norm 1 は norm 3 より約 23k / 21k、norm 10 より約 27k / 27k 低い。**判定: 不採用**、clip 上限を下げる方向は打ち切り。
+
+### 学習 seed 4 は同梱 net の 6 割（#252）
+
+128/32 / 300k / `base` / lr 0.003 / `par` / sqrt 8 / train seed 4: 完走、512,708,842 moves、2,903.6 s、296,472 B
+（md5 `ef6248aed329fa2ae9c64c4d5bd721c7`、SHA-256 `697bfac28373bdedd8e9bf32928b8d37682a7412e9bd803dbc52883bbf4544b8`）、
+発散・move cap なし。
+
+| net | avg_score 9000 / 9100 | 手/ゲーム | 8192 | ms/move |
+| --- | ---: | ---: | --- | --- |
+| train seed 4 | 67,497.8 / 66,838.0 | 3,036.0 / 2,987.3 | 0/20 | 0.94 / 0.89 |
+| 同梱 net（seed 1） | **113,682.2 / 129,456.2** | 4,919.0 / 5,486.0 | **11/20 / 14/20** | 0.85 / 0.87 |
+
+両 seed で約 40.6% / 48.4% 減、8192 0/20。事前条件「両 seed で大きく悪化しない」を満たさないので `eval-net.sh` / `pairw` の
+正式判定には進まず**不採用**（seed 1 の強さは seed 4 で再現しない）。
+
+### 128/32 の train seed 5 も同梱 net を大きく下回る（#254）
+
+seed 5: 300k 完走、548,853,567 moves、3,089.6 s（51m29.6s）、最終ゲーム score 56,324、296,472 B
+（md5 `2a8e37fa81284b6085fe532d5986b36a`）、5k〜295k の checkpoint と 300k を退避、発散・長ゲーム停止なし。
+| net | seed | avg_score | 手/ゲーム | 8192 | ms/move |
+| --- | ---: | ---: | ---: | --- | ---: |
+| 同梱 128/32 | 9000 / 9100 | 113,682.2 / 129,456.2 | 4,919.0 / 5,486.0 | 11/20 / 14/20 | 0.87 / 0.85 |
+| seed 5 / 300k | 9000 / 9100 | 55,401.6 / 55,363.8 | 2,509.0 / 2,504.7 | 0/20 / 0/20 | 1.05 / 0.93 |
+
+**判定: 不採用**（両 seed で同梱の約半分、8192 0/20）。seed 1 の成功は train seed に敏感、という結論が補強された。
+
+## 探索深度の再評価（#255、#267）
+
+同梱 128/32 net を固定し、40 局（seed 9000–9019 と 9100–9119、各 20 局、非ペア):
+
+| policy | 40 局 avg_score | 8192 | pooled ms/move |
+| --- | ---: | ---: | ---: |
+| 2-ply（`deep`） | 121,569.2 | 25/40 | 0.884 |
+| 3-ply（`deep3`） | **137,341.6** | **33/40** | 19.326 |
+| 終盤 4-ply（`phase_h4`） | 136,593.3 | 30/40 | 43.272 |
+
+3-ply は 2-ply より +15,772.4（+13.0%）、8192 は +8 局、コストは 21.9 倍。`phase_h4` は 3-ply より 748.3 低く 8192 も 3 局
+少ないのに 2.24 倍遅いので次候補にしない。**既定の 2-ply は置き換えない**（avg score 優先の用途では 3-ply）。
+
+`deep4`（`ply=4`、cutoff 1e-2、node TT 付き、row 17）は seed 9000 の 1 局で `deep3` に 44,024 点差で負け（130,656 対
+174,680）、ms/move 25.95 倍・leaves/move 24.53 倍。空き 4/6/8 の probe で `deep3` の 20.1/21.8/22.6 倍の葉を読む。10 局
+スクリーニングは 3 時間 22 分で 1 局も終わらず 9 本を停止した。**不採用**（row 17 と `pairrow` は高速化検討用に opt-in で残す）。
+
+## 探索の枝葉を削る評価（#258、#260）
+
+downside risk（policy 13、40 局）: `deep` 121,569.2 / 25/40 / 0.95 ms → +risk 0.3 で 119,489.8 / 23/40 / 0.98。seed 9000 は
++3,738.8 だが seed 9100 は −7,897.6(sic)、40 局で **−2,079.4（−1.7%）**、8192 は 2 局減。**不採用**（#187 の `risk_weight=0.3` は
+現行 net でも効かない）。
+
+葉の直前の報酬を省く `omit_leaf_reward`（#260、opt-in の評価専用、既定 false）: 20 局ペアで −1,911.6 ± 12,264.9
+（12 勝 8 敗、mean−2σ = −26,441.4）。非ペア 40 局は +1,597.6 だが seed 9100 で −14,710.0、8192 3 局減、ms/move 0.86 → 0.96。
+**不採用**（スイッチのみ残す）。
+
+## node TT: 内部探索値の再利用で 3-ply が 39.5% 速い（#263、#266）
+
+`ValueCache` は葉（afterstate）だけを覚え、`Search.value` / `Search.chance` の内部ノード値は再訪されても毎回計算していた。
+`Options.node_tt` に direct-mapped の `NodeCache` を足す。キーは盤面 16 バイト（`log2 + 1`、空き 0）、`value`/`chance` の別、残り深さ、
+cprob（固定 spawn カットが効く深さだけ: `chance` は depth > 1、`value` は depth > 2。浅いノードは cprob 非依存で 1 キー共有）。
+ハッシュはスロット選択だけ、衝突は 16 バイト全比較でミス。予算切れの値は保存せず、トップレベル探索ごとにクリア。1 スロット 48 B
+（#260 の `direct_leaf` も同居）、desktop 4096 スロット = 192 KiB/thread、wasm 512 = 24 KiB。
+
+#266 で `Options.node_tt` を `?bool = null` にし、**未指定なら 3-ply 以上で on、`false` で明示 off**。2-ply の `deep` は確保も probe も
+せず結果はビット単位で不変。深さは探索開始後に決まるのでテーブル確保もその後。phase 行では 3-ply のパート（`h1`〜`h3` の深い側、
+`h4` の 4-ply）が on、2-ply のパートは off。
+
+10 局（seed 9000–9009）を row 4（明示 off）と 15（既定）で同じ spawn:
+
+| row | policy | avg score | 手/ゲーム | 8192 | ms/move | leaves/move | node hit |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | `deep3` TT off | 138,669.6 | 5,862.8 | 8/10 | 22.95（#263 では 23.87） | 19,278.4 | — |
+| 15 | `deep3` 既定（TT on） | 138,669.6 | 5,862.8 | 8/10 | **12.80**（#263 では 14.45） | 10,675.8 | 20.0% |
+
+probe 661,724,183 回 / hit 132,069,729 回。節約分を spawn カット 1e-3 に回す案（`pairtt`、A = TT 1e-2、B = 1e-3、20 局）は
+10 勝 10 敗、−14,324.4 ± 11,574.6（mean−2σ = −37,473.5）、A 149,533.6 対 B 135,209.2、ms/move 69.47 対 96.12。**1e-3 は不採用**
+（row 16 に候補として残す）。wasm は 540,957 B（29 ページ）→ 566,031 B（同ページ、data +24,628 B と code +446 B）。`clear` を
+`@splat` にすると同サイズ定数が data にもう 1 つ入って 590,156 B になるため 1 エントリずつ代入する（約 24 KiB 減）。
+
+テスト `node TT defaults on for 3-ply and never for 2-ply (#266)` が、2-ply 既定 = 明示 off と同じ手・同じ leaves/hits で probe 0、
+3-ply 既定がクリア・probe・hit することを固定。
+
+## 凍結 target net で bootstrap を止める `tnet` は短いゲームに流れる（#262）
+
+`nn.Options.target_net`（既定 null = 従来とバイト一致）。`bootstrapValue` が `target_net orelse net` を引く。効く経路は 4 つ
+（`td1` の 1 手 1 更新、`replay_k > 0` の online 更新（`tdBootstrap` を通らない）、backward/replay の末尾、priority の追加更新）。
+終端の最終 afterstate は reward だけ。CLI variant `tnet` は `par` 必須・arg 13 = 何バッチごとに同期（既定 100）・scratch 開始。
+`par` の各バッチは同じ target を読み、バッチ終了後にだけ live をコピーする。arg 13 の 0 は `error.InvalidTargetEvery`。
+契約テスト: `target_net = null` で live と一致、lr=0 のゲームは live のみと完全一致、3 経路すべてで更新後の重みが変わる、
+`TargetSync` は同期間隔の途中でコピーしない。
+
+300k（128/32、lr 0.003、`par`、sqrt 8、seed 2、対照 `replay 30`）:
+
+| 条件 | moves / train s | 最後のゲーム | 2-ply 9000 / 9100 | 判定 |
+| --- | ---: | ---: | --- | --- |
+| `replay 30`（対照） | 539,243,727 / 3,184.9 | 65,476 | 66,186.0 / 66,126.8（0/20） | 安定、裾なし |
+| `tnet 30`、同期 100 | 79,205,713 / 694.2 | 3,156 | 7,213.4 / 7,784.8（0/20） | 崩壊（267 手/ゲーム） |
+| `tnet 30`、同期 100（seed 1） | 80,097,021 / 627.9 | 3,480 | — | 崩壊 |
+| `tnet 0`、同期 100 | 90,486,323 / 649.6 | 6,324 | — | 崩壊（302 手） |
+| `tnet 0`、同期 1 | 108,272,536 / 753.4 | 5,480 | — | 崩壊（361 手） |
+| `tnet 30`、同期 1、`batch_scale` 0.25 | 101,230,912 / 742.4 | 4,352 | — | 崩壊（337 手） |
+
+`pairw` は同梱に対して **−112,444.4 ± 8,419.5**（0 勝 20 敗）。target を同梱 net に固定したまま（同期を実質無効化）5,000 ゲームだけ回すと
+最後のゲーム 31,356 点 / 5,708,577 手で安定するので、`target_net` の読み出しと `TargetSync` は壊れていない。同期間隔・`replay_k`・
+`batch_scale` を変えても 300k では同じ崩壊なので、原因は「greedy 1-ply の on-policy データで live から target を更新する閉ループ」。
+target を固定した場合だけ値が保たれるが、それは学習ではなく同梱 net への回帰。**不採用**（opt-in variant として残す）。
+
+## 対称変換を 1 手ごとにランダムに引く `rsym` / `rtgt` は発散・悪化（#271、#273）
+
+`rsym`（`nn.Options.rsym`、既定 false）: `trainGamePerMove` の TD 更新で `p.after` を `T_k(p.after)`
+（`k = rng.uintLessThan(usize, symmetry_count)`）に差し替える。`distill_only` は対象外、`base` は rng を引かず従来と同一。100k base は
+134,574,330 moves / 767.2 s で完走（296,472 B）だが、同じ設定の `rsym` は `par` で 40/100000 局、serial で 8/100 局で
+`diverged (non-finite or |w| > 1e6)`。初期化直後の net で 10 局続けると max|w1| が 0.2500 → 0.3170 → 0.8955（6 局目）と増え、非対称 probe の
+V は 0.16–0.37 → 13.2–16.1 → 負 → 0.87–0.93。spawn 列だけ rsym と同じ対照は安定するので乱数列の変化が原因ではない。解釈: `r + V(s')` の
+`V(s')` は方策が常に正準の向きで評価する値なので、net が対称になる前は回した入力の目標がその盤面の値にならず、正準の補正が 1/8 しか
+入らない。lr 1/8 なら 5,000 局は完走する（smoke のみ）。**不採用**。
+
+`rtgt`（`nn.Options.rtgt`、既定 false）: 1 手につき 1 回 `k` を引き、入力 `p.after` と目標の `next.after` を同じ `T_k` で回す
+（`t2`/teacher は `spawned` を回す）。終端は入力だけ回し目標は reward。5k smoke 完走、100k は 100,000 局 / 28,086,194 moves / 208.8 s・
+最終局 6,964 点 / max|w1| 0.61（base は 134,574,330 moves・3.25）。`pairw` 20 局 **−77,064.0 ± 5,507.7**（0 勝 20 敗）、非ペア 2-ply は
+seed 9000 10,159.6 / seed 9100 12,042.8（base は 83,796.0 / 93,993.4）。`eval-net.sh` は REJECT（paired margin −88,079.4）。解釈: 同じ
+`k` で回しても `V(T_k next.after)` は「正準盤面で方策が選んだ手の回転」の値で、回転盤面で方策が選ぶ最善手の値ではない（off-policy
+バイアス）。値が縮み短い局（281 対 1,346 手）に流れた。契約テストは各 k で指定どおりの更新になることを固定しているので実装ミスではない。
+**不採用**。回転盤面で search し直す `t2` 経路ならこのバイアスは入らないが未測定。
 
 ## h2 を 32→64 に広げると 2-ply が大きく下がる（#275）
 
-#233 で h1=128/h2=32 を採用したが、h2 を動かした測定は #220 の 128/128（300k、92,953）だけであり、
-しかも #233 の調査で #220 の `-Dh1` が exe に届いていなかった疑いがあった。h1=128 を固定したまま
-h2 だけを 32→64 に広げ、同じ 300k レシピ（`base`、lr 0.003、`par`、batch_scale √8、`replay_k=30`）で
-avg score が伸びるかを測った。
-
-学習は 300,000 局 / 503,885,360 moves / 4,923.5 s（CLI 報告。wall 8,303.19 s はホストのスリープを
-含む）/ 最終局 76,448 点 / 329,752 B / SHA-256
-`d1d063755f4a19ff933a10843173b3460fa16cdd3afffb8dcdf712de9727f9e0` で完走し、move cap・発散は
-なかった。パラメータは 37,057→41,217（1.11 倍）、学習時間は #233 の 61 分に対して awake 82 分
-（1.34 倍）だった。
-
-A は `scripts/widen-net.py` で同梱 128/32 の重みを 128/64 にゼロ拡張し、非ペア 2-ply が seed 9000
-で 113,682.2（8192 11/20）、seed 9100 で 129,456.2（14/20）と、同梱 net の記録を再現することを
-先に確認した。
+h1=128 固定で h2 32→64、300k（`base`、lr 0.003、`par`、sqrt 8、`replay_k=30`）: 300,000 局 / 503,885,360 moves / 4,923.5 s /
+最終局 76,448 点 / 329,752 B / SHA-256 `d1d063755f4a19ff933a10843173b3460fa16cdd3afffb8dcdf712de9727f9e0`、move cap・発散なし。
+パラメータ 37,057 → 41,217（1.11 倍）、学習 61 分 → awake 82 分（1.34 倍）。A = 同梱 128/32 を `scripts/widen-net.py` で 128/64 に
+ゼロ拡張（非ペア 113,682.2 / 129,456.2 を再現）:
 
 | net | seed 9000 | 8192 | ms/move | seed 9100 | 8192 | ms/move |
-|---|---:|---:|---:|---:|---:|---:|
+| --- | ---: | --- | ---: | ---: | --- | ---: |
 | A: 128/32 ゼロ拡張 | 113,682.2 | 11/20 | 1.47 | 129,456.2 | 14/20 | 1.41 |
-| B: 128/64、300k | **75,074.0** | **0/20** | 1.63 | **74,915.0** | **0/20** | 1.73 |
+| B: 128/64、300k | **75,074.0** | 0/20 | 1.63 | **74,915.0** | 0/20 | 1.73 |
 
-`pairw`（A=ゼロ拡張同梱、B=候補、20 局 seed 9000）は mean diff **−60,678.0 ± 8,993.0**、
-B の勝ち 1 / 負け 19（1,163.5 s）。mean−2σ = **−78,664.0**。
+`pairw` 20 局: **−60,678.0 ± 8,993.0**（1 勝 19 敗、mean−2σ = −78,664.0）。**判定: REJECT**（score / reach / ms すべて fail。
+ms は seed 9100 で +23%）。h2 は 32 が上限で、128/32 は現行レシピの局所最適。次の lever は報酬関数・局面表現（#184 / #185）。
 
-**判定: REJECT。** 非ペア 2-ply は A 比 −38,608 / −54,541（A の 66% / 58%）で、8192 は両 seed とも
-0/20。ms/move は seed 9000 では +11% だが seed 9100 では +23%（1.73 vs 1.41）で 1.20 倍の帯も超える。
-paired margin も大きく負けており、score・reach・ms のいずれも adoption 条件を満たさない。
+## 空きマス potential による reward shaping（#277）
 
-解釈: h2 の拡大はパラメータを 11% 増やすが、この TD レシピでは値の精度にも裾にも結びつかず、
-むしろ 128/32 より悪化した。128/128 の 300k が 92,953 だったことと合わせ、h2 は 32 が上限である。
-h1=128/h2=32 の容量点は現行レシピの局所最適で、次の lever は報酬関数・局面表現（`#184` / `#185`）。
-
-既定 policy と `ai/solver/nn_weights.bin` は変更しない。`build.zig` の h2 も 32 のまま。
-コード・重みを変更しないため `zig build test` は実行していない（docs のみ）。
-
-再現:
-```
-scripts/widen-net.py ai/solver/nn_weights.bin /tmp/ship128_64.bin --src-h1 128 --src-h2 32 --h1 128 --h2 64
-zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=64 -- 300000 0 9000 0.003 - base 30 /tmp/w128_64_300k_s1.bin 1 par - 2.8284271247461903
-scripts/eval-net.sh /tmp/w128_64_300k_s1.bin --shipped /tmp/ship128_64.bin --h1 128 --h2 64
-```
-
-コスト: 学習 4,923.5 s（awake、wall 8,303 s）、pairw 1,163.5 s、非ペア 1 本 111〜118 s。
-`scripts/eval-net.sh` の判定基準に当てはめると REJECT（score/reach/ms の全項目で fail）。
-
-## 空きマス potential による reward shaping を opt-in で実装（#277）
-
-報酬系の次の候補として、空きマス数だけを使う potential-based reward shaping を実装した。盤面
-`b` の potential を `Phi(b) = shape_c * empties(b) / 15` とし、非終端の TD 目標を
-`reward + Phi(next.after) - Phi(p.after) + V(next.after)`、終端を `reward - Phi(p.after)` にする
-（γ=1、終端の potential は 0）。`shape_c` は `nn.Options.shape_c`（既定 0）で、CLI では variant
-`shape` の row-spec slot（arg 13）に係数を置く。既定と `-` は 1、0 は `base` と同じ実行になるため
-拒否する。負の係数は potential shaping として有効なので許可する。
-
-`shape_c == 0` は `shapedReward` / `shapedTerminalReward` の先頭で生の報酬を返す分岐にし、
-`reward + 0.0` のような演算を挟まない。これにより既存の `base` / `par` の学習結果は
-bit-identical のまま。`base` と `shape_c=0`、および `par` と `shape_c=0` の全重み一致をテストで
-固定し、既存の 5 局 checksum（seeds 11/12、Crc32 `3042928886`）も変更していない。
-
-potential shaping を実装していない経路（replay、tnet、teacher、nstep、death、backward、priority、
-distill、rsym、rtgt、lambda、td1/greedy1 以外の target/selfplay など）は `validateOptions` が
-`error.ShapeRequiresPlainTd1` で明示的に拒否する。後から afterstate を再学習したり別の target を
-使う経路で生の報酬に黙って落ちると、shape を指定した意味が消えるため。`par` は同じ
-`trainGameOptsUnchecked` を各ゲームで走らせるので `shape` に対応する。
-
-正しさ: `Phi` の empties 0/15 と係数、非終端・終端の目標式、`shape_c=0` の生報酬一致、
-`shape` の `par` 実行、未対応 variant の拒否をテストした。CLI は係数の省略・`-`・明示・負値・
-0/非有限/typo をテストし、usage に `shape` を追加した。
-
-**avg score は #278 で測った。** 既定 policy・`ai/solver/nn_weights.bin`・採用レシピは変更せず、
-`shape` は再現用の opt-in variant として残す。#278 は同じ 128/32 の 100k で `shape_c=0.5` を
-`base` と比べ、Gate 1 で不採用（下の #278）。300k は回していない。当時の実行例:
-
-```
-zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 300000 0 9000 0.003 1 shape 30 /tmp/shape.bin 1 par
-```
-
-`zig build test` は既存 checksum を含めて全通過（実装時点）。
+報酬系の次の候補として、空きマス数だけを使う potential-based reward shaping を実装した。
+盤面 `b` の potential を `Phi(b) = shape_c * empties(b) / 15` とし、非終端の TD 目標を `reward + Phi(next.after) - Phi(p.after) + V(next.after)`、
+終端を `reward - Phi(p.after)` にする（γ=1、終端 `Phi=0`）。`nn.Options.shape_c`（既定 0）、CLI は variant `shape` の arg 13 に係数
+（既定と `-` は 1、0 は `base` と同じなので拒否、負値は有効）。`shape_c == 0` は生の報酬を返す分岐にして `reward + 0.0` を挟まないので
+既存の `base`/`par` は bit-identical（5 局 checksum `3042928886` も不変、テストで固定）。potential shaping を実装していない経路
+（replay、tnet、teacher、nstep、death、backward、priority、distill、rsym、rtgt、lambda、`td1`/`greedy1` 以外）は `validateOptions` が
+`error.ShapeRequiresPlainTd1` で拒否する（afterstate を再学習する経路で生の報酬に黙って落ちると指定の意味が消えるため）。
 
 ## 空きマス potential shaping は 100k の一次判定で対照に負ける（#278）
 
-#277 で opt-in 実装した空きマス potential shaping を、同じ 128/32・100k レシピの `base` 対照と
-`shape_c=0.5` 候補で比べた。`Phi = 0.5 * empties / 15` は 1 空きあたり 0.0333 で、平均
-score_delta/1000（約 0.03〜0.04）と同じ桁。300k は Gate 1 を通った場合だけ回す計画だった。
-
-学習（train seed 1、lr 0.003、`par`、batch_scale 2.8284271247461903、replay_k=30）:
-
-| run | games | moves | 学習時間 | 最終局 | 重み | SHA-256 |
-|---|---:|---:|---:|---:|---:|---|
-| 対照 `base` | 100,000 | 134,574,330 | 777.1 s | 54,340 | 296,472 B | `5cd1ffc6f54f7d81db07595ee366247a9ecea35da09e28f811ffa5d52fd09148` |
-| 候補 `shape 0.5` | 100,000 | 122,551,827 | 743.5 s | 36,144 | 296,472 B | `14ca7e0e1c218759759dcaec5c58e41af64049c223983ff384327361d3ead16b` |
-
-発散・move cap 停止はどちらもなし。候補は同じ 100,000 局で moves が 8.9% 少なく、1 局が短い。
-
-Gate 1 評価（2-ply `deep`、20 局）:
-
-- `pairw` A=対照 B=候補、seed 9000: mean diff **−12,442.4 ± 6,702.5**（B の勝ち 7 / 負け 13、
-  574.4 s）。mean−2σ = **−25,847.4** で採用バー +0 に届かない。
-- 非ペア:
-
-| net | seed | avg score | avg moves | 8192 | ms/move |
-|---|---:|---:|---:|---:|---:|
-| 対照 | 9000 | 83,796.0 | 3,729.1 | 4/20 | 0.93 |
-| 対照 | 9100 | 93,993.4 | 4,138.0 | 5/20 | 0.91 |
-| 候補 | 9000 | 75,298.0 | 3,407.8 | 1/20 | 0.85 |
-| 候補 | 9100 | 80,757.2 | 3,631.3 | 2/20 | 0.86 |
-
-候補は対照比 −8,498.0（seed 9000、89.9%）/ −13,236.2（seed 9100、85.9%）で、8192 到達も
-4→1 / 5→2 と落ちる。ms/move は候補の方が速い（`shape_c` は学習時だけ効く）。
-
-**判定: Gate 1 不採用。** `mean diff − 2*stderr > 0` を満たさず、非ペアの avg score と reach8192 が
-両 seed で悪化しているため、300k（Gate 2）は回さない。`ai/solver/nn_weights.bin` と既定 policy・
-既存の評価値は変更しない。
-
-解釈: γ=1・終端 `Phi=0` の potential shaping はエピソード収益を定数 `−Phi(start)` だけずらすので、
-厳密な最適方策は変わらない。しかし TD 目標は状態ごとに `V − Phi` へ移り、空きマス数は候補手の
-afterstate 間で異なるため、近似 `V` では greedy の順位が変わる。実際に学習中の 1 局が短くなり
-（moves 134.6M→122.6M）、評価でも avg moves が 3,729→3,408 / 4,138→3,631 と短命化して
-score と裾が落ちた。空きマス入力が 100k で差を失うという #226 の観察とも整合し、この方向は
-100k で打ち切る。
-
-再現:
-```sh
-# 対照
-zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 100000 0 9000 0.003 1 base 30 /tmp/w_base_100k_s1.bin 1 par
-# 候補
-zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 100000 0 9000 0.003 1 shape 30 /tmp/w_shape05_100k_s1.bin 1 par - 2.8284271247461903 0.5
-# pairw + 非ペア表（score/reach/ms）
-scripts/eval-net.sh /tmp/w_shape05_100k_s1.bin --shipped /tmp/w_base_100k_s1.bin
-# 非ペアの avg moves は生の row から（seed を 9100 に替えて 4 本）
-zig build nn -Doptimize=ReleaseFast -Dh1=128 -Dh2=32 -- 0 20 9000 0.003 1 resume 30 /tmp/w_shape05_100k_s1.bin 1 - - - 0,2
-```
-
-コスト: 学習 2 本で 1,520.6 s、`eval-net.sh` 1 回 2,660 s（pairw 574.4 s + 非ペア 4 行）、
-avg moves 用の非ペア 4 本。コード・重みを変更しないため `zig build test` は実行していない。
-
-### spawn カット 0.02 は葉を半減するが平均スコアは改善しない（#281）
-
-`deep3` の chance node は各空きマスに tile 2/4 を置く枝を持ち、tile probability は 0.9/0.1 である
-（`ai/solver/nn.zig:692`）。`ChanceBranch.p` は `cprob * spawn.p`（同 `:695`）で、`depth > 1` のとき
-`branch.p / empties < self.cutoff` の枝を落とす（同 `:999`）。残った枝の質量は再正規化される。
-`cprob=1` のノードなら、4 の枝は空きマス数が 11 以上で既定 1e-2、6 以上で 0.02、3 以上で 0.05 の cutoff に掛かり、
-2 の枝は最大16空きでも掛からない。ただし `cprob<1` の後続ノードでは値が小さくなるため、この閾値より少ない空き数でも
-枝が刈られ、2 の枝も対象になり得る。cutoff を上げると探索木は小さくなるが、刈った枝の寄与も失う。どちらが得かは
-葉の数とスコアの両方で決まるので、同梱 128/32 net で比較した。
-
-row 15 は既定の 3-ply（cut 1e-2、node TT on）、row 18 は同じ探索で cut 0.02、row 19 は cut 0.05。
-seed 9000–9019 と seed 9100–9119 で row 15/18/19 の20局結果を記録した。node TT は全行で on。
-row 19 の初期2局（seed 9000–9001）はともに 8192 に届かず約8万点で、screening の停止判断になった。
-記録には row 19 の完全な20局出力も両 seed range について存在するため、追加実行はせず、その結果を下表に含めた。
-
-| seed range | row | spawn cut | avg score | avg moves | reach8192 | leaves/move | ms/move | node hit rate |
-|---|---:|---|---:|---:|---:|---:|---:|---:|
-| 9000–9019 | 15 | 1e-2（既定） | 140,438.2 | 5,918.9 | 17/20 | 10,574.3 | 86.05 | 19.9% |
-| 9000–9019 | 18 | 0.02 | 141,353.0 | 5,964.7 | 16/20 | 5,173.7 | 32.83 | 16.7% |
-| 9000–9019 | 19 | 0.05 | 128,791.6 | 5,463.1 | 14/20 | 3,653.8 | 3.72 | 16.8% |
-| 9100–9119 | 15 | 1e-2（既定） | 134,245.0 | 5,678.2 | 16/20 | 10,786.4 | 10.19 | 19.9% |
-| 9100–9119 | 18 | 0.02 | 128,816.6 | 5,420.5 | 14/20 | 5,232.9 | 5.92 | 16.7% |
-| 9100–9119 | 19 | 0.05 | 133,044.4 | 5,668.6 | 13/20 | 3,594.2 | 3.83 | 16.7% |
-
-同じ seed 範囲の非ペア平均では row 18−15 は seed 9000 で +914.8 点、seed 9100 で −5,428.4 点。
-40局平均は row 15 が 137,341.6 点・33/40 reach8192、row 18 が 135,084.8 点・30/40 reach8192 で、差は
-−2,256.8 点。row 19 の40局平均は 130,918.0 点・27/40 reach8192 で、row 15 より −6,423.6 点だった。
-leaves/move は row 18 が seed 9000 で 10,574.3→5,173.7（−51.1%）、seed 9100 で 10,786.4→5,232.9
-（−51.5%）。ms/move は計測負荷に依存する。row 18 の別々の測定値では row 15/18 が seed 9000 で
-86.05/32.83（2.62倍）、seed 9100 で 10.19/5.92（1.72倍）だが、同一実行ログの seed 9000 では
-10.00/5.01（2.00倍）、common-spawn pairrow では 38.09/18.40（2.07倍）だった。したがって 2.62倍は
-安定した速度比ではなく、load-dependent な測定値として扱う。node hit rate は row 15→18 が両 seed とも
-19.9%→16.7% で、木が小さいぶん再利用も減る。
-
-seed 9000 の #237 common-spawn `pairrow` 20局では row 15 を A、row 18 を B とし、B−A は
-−9,258.4 ± 15,571.7 点（Bが8勝、Aが12勝、mean − 2*stderr = −40,401.8）。A は avg 142,778.8 / reach8192
-17/20、B は avg 133,520.4 / reach8192 12/20 だった。ペア比較の採用条件 `mean − 2*stderr > 0` は満たさない。
-
-row 19 の初期2局はともに 8192 に届かず、平均 79,854 点だった。併記した完全な非ペア20局結果でも、40局平均は
-130,918.0 点・27/40 reach8192 で、row 15 の 137,341.6 点・33/40 より低い。cutoff 0.05 を不採用とし、これ以上の
-row 19 計測は行わない。
-
-判定: row 18 は葉を約半減し、同seedの ms/move も下がるが、40局平均スコアと reach8192 は row 15 より低く、
-common-spawn pair も正の改善を示さなかった。既定 cutoff 1e-2 を維持する。row 19 も40局の平均スコアと reach8192 が
-row 15 より低く、不採用。評価用 row 18/19 は比較再現のため残すが、既定方針・同梱重みは変更しない。
-
-再現（weights は同梱ファイル）:
-```
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 15,18
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 19
-zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 15,18,19
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 pairrow 30 ai/solver/nn_weights.bin 1 - 15 18
-```
-
-`zig build test-nn-main -Dtest-filter='high spawn-cut rows'` で row 18/19 が row 15 と同じ `deep3` の
-まま cutoff と node TT だけを変えることを確認する。
-
-コスト: 既存 seed 9000 の screening を含む非ペア測定は約14,300 s。追加した seed 9100 の row 15/18 は
-1,799.3 s、seed 9000 の20局 pairrow は 6,649.5 s（合計約22,749 s）。
-
-### 1e-3 の spawn カットは 40 局で平均スコアを改善しない（#256）
-
-`deep3` の spawn カットは 1e-2 が既定で、1e-3 は探索を広げる代わりにコストが増える。
-#263 は 1e-3 を #237 の tape を使うペア比較 20 局で検証し、10 勝 10 敗・平均差 −14,324.4 点
-（mean − 2*stderr = −37,473.5）で採用条件を満たさないと結論した。issue の再測定条件に合わせ、同梱
-128/32 net で seed 9000–9019 と 9100–9119 の各20局（ゲーム i はそれぞれ seed 9000+i / 9100+i）を
-row 15（既定 1e-2）と row 16（1e-3）で比較した。各行は別々の1レンジ実行なので、表示された ±0.0 は
-標準誤差がゼロという意味ではなく、複数レンジ間の stderr を計算していないことを示す。
-
-| seed range | row | spawn cut | avg score | avg moves | reach8192 | leaves/move | ms/move | node hit rate |
-|---|---:|---|---:|---:|---:|---:|---:|---:|
-| 9000–9019 | 15 | 1e-2（既定） | 140,438.2 | 5,918.9 | 17/20 | 10,574.3 | 86.05 | 19.9% |
-| 9000–9019 | 16 | 1e-3 | 133,123.0 | 5,598.6 | 16/20 | 15,349.4 | 131.56 | 21.4% |
-| 9100–9119 | 15 | 1e-2（既定） | 134,245.0 | 5,678.2 | 16/20 | 10,786.4 | 10.19 | 19.9% |
-| 9100–9119 | 16 | 1e-3 | 141,380.4 | 5,965.8 | 16/20 | 14,698.5 | 16.07 | 21.3% |
-
-40局（各20局の avg score を等重みで統合）では row 15 が 137,341.6 点、33/40 reach8192、row 16 が
-137,251.7 点、32/40 reach8192 で、差は −89.9 点。seed 9000 では row 16 が −7,315.2 点、seed 9100 では
-+7,135.4 点と方向が逆転し、改善は再現しなかった。leaves/move は両 seed とも row 16 の方が約36–45%多い。
-ms/move は seed 9000 で 86.05→131.56（1.53倍）、seed 9100 で 10.19→16.07（1.58倍）。実行負荷が異なる
-ため ms/move の絶対値は seed 間で合算せず、同じ seed range 内の比で比較する。#263 のペア比較も不採用の
-方向であり、cutoff を下げるスコア上の根拠は得られなかった。
-
-両 seed range の row 15 / row 16 はそれぞれ同梱 net で完了した非ペア計測で、#263 のペア比較とは独立な
-ゲーム列である。
-
-判定: 不採用。40局平均で差はほぼゼロ、reach8192 も row 15 が 1局多く、row 16 は両 seed で約1.5倍の
-ms/move と36–45%多い leaves/move を要した。既定の 1e-2 を維持し、探索コストの低い既定設定を変えない。
-
-再現:
-```
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 15
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 16
-zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 15
-zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 16
-```
-
-追加した seed 9100 の実行 elapsed は row 15 が 1,157.4 s、row 16 が 1,916.9 s（合計 3,074.3 s）。
-既存 seed 9000 の計測コストは 2 行 40 局で約 25,000 s。
-
-### phase_h1 は同梱 net で 3-ply にスコアでもコストでも勝てない（#259）
-
-phase_h1 は空き 8 以上を 2-ply、8 未満を 3-ply で打つ段階的な深さで、深さ 3 の一部を 2-ply に置き
-換えて同じ手数あたりのコストを下げる狙いだった。しかし #157 の時点で deep3 に対する速度利得は
-出ておらず、同梱 128/32 net では測り直していなかった。
-
-同梱 net、seed 9000–9019 の 20 局（ゲーム i の seed は 9000+i）を row 2 (`deep`)、row 15
-(`deep3` + node TT)、row 5 (`phase_h1`) で打ち比べた。node TT は 3-ply 以上のパートで on。
-
-| row | policy | avg score | avg moves | reach8192 | leaves/move | ms/move | node hit rate |
-|---|---|---:|---:|---:|---:|---:|---:|
-| 2 | `deep` | 113,682.2 | 4,918.9 | 11/20 | 996.2 | 7.54 | — |
-| 15 | `deep3` + TT（既定） | 140,438.2 | 5,918.9 | 17/20 | 10,574.3 | 86.05 | 19.9% |
-| 5 | `phase_h1` | 130,887.8 | 5,577.9 | 13/20 | 10,014.3 | 100.61 | 19.4% |
-
-row 5 は row 15 に対して −9,550.4 ± 10,052.8 点（7 勝 9 敗 4 分、mean − 2*stderr = −29,656.0）。
-leaves/move は 10,014.3 で 5.3% 少ないだけ、ms/move は 100.61 で row 15 より遅い（8 並列なので比だけ:
-1.17 倍）。空き 8 以上の 2-ply パートは、ゲームの大部分を占める空き 8 未満の 3-ply パートのコストに
-埋もれ、深さ 3 の一部を 2-ply に置き換えても探索木はほとんど小さくならない。
-
-判定: 不採用。既定方針は deep3 のまま。seed 9100 は row 5 が 2 局だけ（127,040.0、1/2）で、40 局は
-揃っていない。
-
-再現:
-```
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 2
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 15
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 5
-```
-
-コスト: 3 行 60 局を 8 並列で約 22,150 s。
-
-### phase_h2/h3 を同梱 net で測り直すと 3-ply を安定して上回らない（#257）
-
-phase_h2/h3 は空きマス数に応じて 2-ply と 3-ply（h3 は 4-ply も）を切り替える段階的な深さで、
-#157 の時点では h2 110,843 / h3 108,901 対 deep3 100,728（3 局、当時の net）と、3-ply をわずかに
-上回る数字が出ていた。ただし 3 局だけで、同梱 128/32 net では測っていなかった。
-
-同梱 net、seed 9000–9003 の 4 局を row 15 (`deep3` + node TT)、row 6 (`phase_h2`)、row 7 (`phase_h3`)
-で打ち比べた（一次判定）。node TT は 3-ply 以上のパートで on。
-
-| row | policy | avg score | avg moves | reach8192 | leaves/move | ms/move | node hit rate |
-|---|---|---:|---:|---:|---:|---:|---:|
-| 15 | `deep3` + TT（既定） | 129,335.0 | 5,503.5 | 3/4 | 10,978.5 | 61.79 | 20.1% |
-| 6 | `phase_h2` | 130,215.0 | 5,543.2 | 3/4 | 11,639.1 | 95.63 | 19.6% |
-| 7 | `phase_h3` | 144,060.0 | 6,041.0 | 4/4 | 13,065.3 | 111.61 | 20.1% |
-
-同じ 4 seed で対応させると row 6 は +880.0 ± 21,438.0（2 勝 2 敗）、row 7 は +14,725.0 ± 27,938.9
-（2 勝 1 敗 1 分）。leaves/move は row 6 が +6.0%、row 7 が +19.0% で、h3 はスコアが伸びる可能性は
-あるがコストも増える。4 局では stderr が点差より大きく、採用条件（ペア比較で mean − 2*stderr > 0）は
-満たさない。
-
-判定: 一次判定では h2 は横ばい、h3 はプラスの可能性があるが確定に足りない。既定方針は deep3 のまま。
-40 局の確定は未実施（この環境では 1 局 20 分超で、#281 の screening と同じ 10 局に届かなかった）。
-
-再現:
-```
-zig build nn -Doptimize=ReleaseFast -- 0 4 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 15
-zig build nn -Doptimize=ReleaseFast -- 0 4 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 6
-zig build nn -Doptimize=ReleaseFast -- 0 4 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 7
-```
-
-コスト: 3 行 12 局を 15 並列の一部で約 6,180 s。
-
-### deep3 の刈り枝を浅く補完する row 20 を同梱 net で再計測（#261）
-
-`.deep3` は spawn の確率が 1e-2 未満の枝を捨て、残りを再正規化する。`.deep3_recover` は保持枝を元の
-深さで探索し、捨てる枝も実際に spawn した子盤面から自分の手・報酬を一段浅く評価して、全 spawn を
-元の確率で加重する。確率質量を捨てずに評価する一方、異なる深さの V の較正差で悪化する可能性もある。
-候補は opt-in の row 20、現行の既定は row 15（`deep3` + node TT）。同梱 128/32 net の SHA-256 は
-`c98ea27cf723cc96258173bd7be74630e80c2f1f358777c5ddaec059ec19a6c1`。
-
-まず、seed 9000–9019 の 20 局を現行の row 15 / row 20 で再測定した。1 局 1 プロセスで実行し、各局は
-同じ seed を使う。これは同じ spawn stream を対応させる比較だが、#237 の 32-bit tape を使う `pairrow`
-比較ではない。
-
-| row | policy | avg score | avg moves | reach8192 | leaves/move | ms/move | node hit rate |
-|---|---|---:|---:|---:|---:|---:|---:|
-| 15 | `deep3` + TT（現行既定） | 140,438.2 | 5,918.9 | 17/20 | 10,574.3 | 86.05 | 19.9% |
-| 20 | `deep3_recover` + TT | 147,891.4 | 6,225.6 | 16/20 | 10,625.9 | 116.45 | 23.1% |
-
-同じ 20 seed で個別ゲームの score を対応させると、row 20 は +7,453.2 点（12 勝 / 8 敗、標準誤差
-10,695.1、mean − 2×stderr = −13,937.0）。この差は採用目安の 0 を超えず、有意な改善とは言えない。
-leaves/move はほぼ同じ（+0.5%）、reach8192 は 17/20 から 16/20。ms/move は row 20 が大きいが、長時間の
-8 並列計測中にホストの性能低下が進んだため、絶対値・比とも厳密な速度比較には使えない。
-
-この 20 局の row 15 / row 20 の score と到達数は、2026-11-12 に記録した seed 9000 の非ペア測定と一致する。
-当時の測定（TT-off、当時の row 4=`deep3` / row 15=`deep3_recover`）では、seed 9100 も各 20 局実施済み:
-
-| 方策 | seed 9000 score / reach8192 / ms/move / leaves/move | seed 9100 score / reach8192 / ms/move / leaves/move | 40局 avg score / reach8192 / pooled ms/move / leaves/move |
-|---|---:|---:|---:|
-| `deep3` | 140,438.2 / 17/20 / 21.38 / 19,028.7 | 134,245.0 / 16/20 / 24.13 / 19,455.2 | 137,341.6 / 33/40 / 22.73 / 19,237.4 |
-| `deep3_recover` | 147,891.4 / 16/20 / 22.26 / 18,867.3 | 131,919.8 / 15/20 / 23.62 / 20,011.7 | 139,905.6 / 31/40 / 22.90 / 19,408.2 |
-
-旧測定では row 20 相当は 40 局平均で +2,564 点だが、seed 9100 では −2,325.2 点、8192 到達は 2 局減、
-pooled ms/move は約 0.8% 増。seed ごとに 1 範囲だけの非ペア値であり、これだけでは有意差を示さない。
-2026-11-12 の tape 比較（A=`deep3`、B=`deep3_recover`、seed 9000、20 局）は mean diff
-**+17,141.2 ± 12,838.7**、B勝 / A勝 / 同点 = **10 / 9 / 1**、mean − 2×stderr = **−8,536.1**。
-これも採用目安 `mean − 2×stderr > 0` を満たさない。旧 pair は row 20 追加前の `pairdeep3` 経路で、今回
-の現行 row 15 / 20 を使った同一 tape の再測定ではない。
-
-判定: `.deep3_recover` は opt-in の row 20 として残すが、既定への採用は見送る。paired の下限が負で、
-40 局評価でも seed 間で方向が揃わず、reach8192 は減り、コストの確かな改善もない。既定方針・同梱重みは
-変更しない。
-
-再現（現行 CLI。row 15=`deep3` + TT、row 20=`deep3_recover` + TT）:
-```
-# 20 局の同一 seed 列（1 局 1 プロセス）
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 15
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 20
-# 32-bit spawn tape による現行 paired 比較（この再計測では実行していない）
-zig build nn -Doptimize=ReleaseFast -- 0 20 9000 0.003 1 pairrow 30 ai/solver/nn_weights.bin 1 - 15 20
-# seed 9100 の現行 baseline / 候補
-zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 15
-zig build nn -Doptimize=ReleaseFast -- 0 20 9100 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 20
-```
-
-`zig build test-nn -Dtest-filter='fallback'`、`zig build test-nn-main -Dtest-filter='recovered cut branch'` と
-`zig build nn -Doptimize=ReleaseFast` は通過済み。テストは合成木で全 spawn の確率総和、刈った子の浅い評価、
-全枝 cut、cutoff 無効時の一致、終局値を確認する。
-
-### 2026 extended-TD 論文の入手性判定（#291、2026-11-17）
-
-対象は Wang・Matsuzaki, “Refining Evaluation Functions for Game 2048 by Extended Temporal Difference Learning,”
-*IEEE Transactions on Games*, 18(1), 56–65 (2026), DOI [10.1109/TG.2025.3606517](https://doi.org/10.1109/TG.2025.3606517)。
-IEEE Xplore の [論文ページ](https://ieeexplore.ieee.org/document/11151781) では abstract と導入冒頭だけが表示され、続きは “Sign in to Continue Reading” となる。
-調査時点で Crossref の全文リンク先 PDF は取得できず、OpenAlex は `best_oa_location: null`、Semantic Scholar の `openAccessPdf.url` は空、arXiv と著者所属機関の検索でも著者版を確認できなかった。よって、公開アクセス可能な全文・著者稿はこの環境では得られていない。
-
-Abstract は二つの refinement algorithm を述べ、NN / n-tuple のスコア向上値を報告するが、更新則・前提・評価条件の詳細は得られない。これらの別実装の数値を本プロジェクトの期待値にはしない。#107 の optimistic initialization / multi-stage TD、#231 の Adam と混同しないためにも、方法を推測して実装するのは不適切と判断した。
-
-判定: **no-go（全文未入手のため実装・評価しない）**。既定方針・重みは変更しない。合法な全文または著者稿が入手できた場合は、方法と互換性を確認して再検討する。
-
-### replay 掃引を TD(λ) にする推測実装（#300、2026-11-18）
-
-#291 の論文は full text が取れず更新則が分からないままなので、既に検証済みの読み方を避けて、まだ空いていた seam を一つだけ埋めた。
-このプロジェクトの「refinement」は 128/32 net の fine-tune で、ゲーム末尾の `replay_k`（=30）局をやり直す掃引が本家の refinement 手順に当たる。
-その掃引は `ai/solver/nn.zig` の `trainAfter` による **TD(0)** だった（1 局ごとに独立の one-step 更新）。ここを 1 本の accumulating
-eligibility trace での **TD(λ)**（backward view）に置き換えた。#72 の `lambda` は online per-move の trace で、掃引側は未着手だった。
-
-実装は opt-in のみ:
-- `nn.Options.sweep_lambda`（既定 0 = 従来の TD(0) 掃引そのまま、bit-identical）。
-- variant `lam`（scratch から `replay_k` + TD(λ) sweep、index 13 = λ、既定 0.7）、`rlam`（同じものを `weights_path` から resume）。
-
-測定（128/32、from scratch、`par`、lr 0.003、`replay_k` 30、train seed 1、評価は同梱 net と同じ
-`nn 0 100 9000 0.003 1 base 30 <net> 1 - - - 1` の row 1 = nn + 1 spawn lookahead、seed 9000..9099 の 100 局）:
-
-| λ | 20,000 games | 100,000 games (seed 1) | 100,000 games (seed 2) |
-|---|---|---|---|
-| 0（TD(0)、従来） | **13,196.0**（782.8 moves） | 16,081.1（920.8） | 18,104.5（1,015.5） |
-| 0.3 | 13,065.1（776.7） | 17,775.5（1,003.0） | 18,029.5（1,013.2） |
-| 0.5 | 12,238.1（735.7） | 13,934.4（808.4） | — |
-| 0.7 | 10,656.5（661.7） | — | — |
-| 0.9 | 10,732.6（660.7） | — | — |
-
-- 20,000 games では λ を上げるほど単調に悪化（λ0.5 で −7.3%、λ0.7/0.9 で −19%）。
-- 100,000 games の λ0.3 は seed 1 で +1,694.4、seed 2 で −75.0（平均 +809.7）。λ0 の seed 間差が ±1,012 なので seed ノイズの内側。
-  λ0.5 は 100,000 でも −2,147（−13.3%、best tile 1024 止まり）。
-- 学習中の総 move 数も λ とともに減る（20k: 7.31M → 5.51M）。trace が末尾の短い trajectory に長く効き、伸ばす方向に働いていない。
-
-副産物として分かったこと: **収束済み net の fine-tune（`rlam`、resume + `replay_k`）は λ に関係なく即発散する**。
-`par` では 2,552/20,000 局、serial では 5/20,000 局で `|w| > 1e6` を検出して停止した。原因は online 側の bootstrap が
-自分の 1-ply `pick.value` で、stale な盤面に replay が乗る形になるため（`ai/solver/nn.zig` の `deepStep` の注記と同じ機構）。
-つまり「収束済み net を refinement する」という論文の前提自体が、今の self-play bootstrap では測れない。測るには
-`tnet` の凍結 bootstrap か teacher label（`tch` / `dist` 系）で target を切る必要がある。
-
-判定: **no-go（replay 掃引の TD(λ) は既定にしない）**。`sweep_lambda` は既定 0 の opt-in として残し、再現用に variant とテストだけ置く。
-`ai/solver/nn_weights.bin` は変更しない。次に試すなら λ ではなく、収束済み net を壊さない target（凍結 bootstrap / teacher label）側。
-
-### 4-ply の spawn を有限個サンプルすると同じ予算で deep3 に勝てない（#320、2026-11-19）
-
-#267 で full-width の `deep4` は `deep3` の約 26 倍の葉を読み、実測でも負けた。そこで #320 は、
-評価関数と合法手を変えずに **chance node の spawn だけを有限個サンプル**し、4-ply を 3-ply と同じ
-時間予算に収める案を試した。ここでは実装・スクリーニング・ペア測定・判定を記録する。
-既定方策と `nn_weights.bin` は変更していない。
-
-**実装（`ai/solver/nn.zig` の `Search` / `Depth` / `Options`、`ai/solver/nn_main.zig` の row 21–26）**
-
-- 各 chance node で branch を **重み付き・非復元抽出**する。重みは従来どおり `cprob × spawn.p`
-  （2 タイル 0.9 / 4 タイル 0.1 を empty セルに均等）。Efraimidis–Spirakis の key
-  `-log(u)/p` を全 branch について計算し、小さい順に K 個を残す（`sampleMask`）。
-- 残した branch の確率で **残存 mass に再正規化**する。分母は「残した branch の p の和」なので、
-  サンプル後も kept 内の 2:4 の比は 0.9:0.1 のまま。cut で落ちた branch と同じ経路を通るため、
-  値のスケールは full-width の平均と揃う。
-- **復元抽出ではない**。同じ branch が二度選ばれることはなく、K はそのまま葉の分岐数になる。
-- 乱数は **ゲームの spawn tape を消費しない**。node の board hash・chance depth・`sample_seed`
-  （既定 `0x9e3779b97f4a7c15`）から splitmix64 で作る per-branch の一様乱数なので、同じ盤面・
-  同じ深さ・同じ seed は常に同じサンプルになる。したがって
-  (a) 同じ探索のやり直しは同じ手を返し、(b) node TT の内部値は再探索と一致し、
-  (c) `pairrow` の A/B は同じ tape のまま比較できる。`cprob` は key に混ぜない（全重みを同倍する
-  だけなのでサンプル集合も再正規化値も変わらない）。
-- `ValueCache` の key は変えていない。葉はサンプルに関係なく net の exact な V だから。
-- `sample = 0`（既定）は分岐も key も従来と同一で、bit-identical。
-- 深さの knob は `sample_min_depth`（既定 1 = すべての spawn 層）。`2` にすると **葉の直上の
-  spawn 層だけ full width** になる。最後の 1 手が死ぬかどうかを決める層を正確に残したまま、
-  2 spawn 先より深い層だけを間引く配分で、K=2 + min depth 2 は K=3・全層とほぼ同じコストになる。
-
-**スクリーニング（1 局 seed 9000、同梱 net、`0 1 9000 0.003 1 base 30 <net> 1 - - - 15,21,22,23`）**
-
-| 方策 | row | avg score | moves | best | leaves/move | ms/move |
-|---|---:|---:|---:|---:|---:|---:|
-| `deep3` + node TT（既定） | 15 | 80,708 | 3,747 | 4096 | 11,914.3 | 42.69 |
-| 4-ply, K=2・全層 | 21 | 71,420 | 3,262 | 4096 | 2,938.7 | 10.47 |
-| 4-ply, K=3・全層 | 22 | 79,540 | 3,647 | 4096 | 8,500.2 | 30.46 |
-| 4-ply, K=4・全層 | 23 | 168,352 | 6,998 | 8192 | 16,161.9 | 57.80 |
-
-K=3 が deep3 の 0.71 倍の葉・0.71 倍の時間で、同程度の予算に最も近い。K=4 は 1.36 倍で予算超過
-（この 1 局は 8192 に到達したが、1 局では判断しない）。よって以後は **K=3・全層（row 22）** を
-本命、**K=2・min depth 2（row 25）** を「最後の spawn 層を正確に残す」対照として測った。
-
-**ペア測定（row 15 = A、row 22 = K=3 = B。seed 9000 の同じ tape、12 局）**
-
-| 方策 | row | avg score | 10 万点超 | leaves/move | ms/move |
-|---|---:|---:|---:|---:|---:|
-| `deep3` + node TT（既定） | 15 | 153,229 | 10/12 | 11,914.3* | 39.94 |
-| 4-ply, K=3・全層 | 22 | 105,217 | 4/12 | 8,500.2* | 31.16 |
-
-\* leaves/move は上のスクリーニング 1 局の値（同じプロセスで葉と時間を数えたもの）。ms/move は
-12 ペアの平均で、B/A = 0.78。
-
-- ペア差の平均は **−48,012.3 点**（stderr 21,388.0、2 勝 10 敗）。採用目安 `mean − 2×stderr > 0` は
-  −90,788 で満たさず、むしろ `mean + 2×stderr = −5,236 < 0` で **95% 水準でも deep3 より悪い**。
-- B の負け方は揃っている。12 局中 8 局が 75,560–80,488 点（4096 止まり、約 3,500–3,700 手）に密集し、
-  A が 10 局で 10 万点を超えたのに対して B は 4 局。長時間の計画が続かない。
-- 直接の原因はサンプルが **死ぬ枝を消す**こと。空き 6 セルのノードは 12 branch で、4 タイル branch の
-  重みは 0.1/6。K=3 の非復元抽出では 1 本の 4 タイル branch が入る確率は約 5%、6 本のどれかが入る
-  確率でも 25% 前後しかない。残り 3/4 のノードは 4 タイル spawn を見ないまま「安全」と再正規化され、
-  さらに max はノイズの乗った推定の上振れを選ぶ（sparse sampling の optimism）。3-ply が full width で
-  守っていた「最後の 1 手が死ぬ確率」を、サンプルは層ごとに薄くしてしまう。
-- 最後の spawn 層だけ full width にしても戻らなかった。row 25（K=2・min depth 2）は 4 ペアの
-  スクリーニングで **0 勝 4 敗、平均 −100,932 点**（sd 85,815、B の score は 59,544–79,716）。
-  深い 2 層を K=2 まで削ると、今度は 3 手先の読み自体がノイズになる。
-
-**判定: 不採用**。row 21–26 は再現と将来の改良用に opt-in で残すが、既定 policy・`nn_weights.bin`・
-`all_rows` の既存行は変えない。次に試すなら、サンプル数を増やすのではなく
-「4 タイル branch を必ず 1 本残す層化サンプル」か「root の各手で同じサンプル集合を共有する
-common random numbers」で、比較ノイズと tail の欠落を分けて潰す必要がある（本 issue では
-「deep3 と同予算で K を 1 つ決める」に絞ったため未実施）。
-
-再現（スクリーニング 1 局。rows 21=K2、22=K3、23=K4、25=K2/min depth 2）:
-```
-zig build nn -Doptimize=ReleaseFast -- 0 1 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 15,21,22,23
-zig build nn -Doptimize=ReleaseFast -- 0 1 9000 0.003 1 base 30 ai/solver/nn_weights.bin 1 - - - 15,25
-```
-再現（ペア。A = row 15、B = row 22。`eval_games` を 12 にすると上の 12 局）:
-```
-zig build nn -Doptimize=ReleaseFast -- 0 12 9000 0.003 1 pairrow 30 ai/solver/nn_weights.bin 1 - 15 22
-zig build nn -Doptimize=ReleaseFast -- 0 4 9000 0.003 1 pairrow 30 ai/solver/nn_weights.bin 1 - 15 25
-```
-テストは `zig build test`、`zig build test-nn -Dtest-filter='#320'`、
-`zig build test-nn-main -Dtest-filter='spawn-sample'`。サンプルが seed と node の純関数であること、
-K 本ちょうど残ること、幅以上の K が full-width と bit-identical であること、`sample_min_depth = 2` が
-depth 1 の chance を変えないこと、4-ply サンプルが決定的であることを固定した。
+100k・128/32・train seed 1・lr 0.003・`par`・sqrt 8・`replay_k` 30 で `shape_c=0.5`（`Phi = 0.5*empties/15`、1 空き 0.0333 は平均
+score_delta/1000 の 0.03〜0.04 と同じ桁）:
+
+| run | moves | 学習 | 最終局 | SHA-256 |
+| --- | ---: | ---: | ---: | --- |
+| 対照 `base` | 134,574,330 | 777.1 s | 54,340 | `5cd1ffc6f54f7d81db07595ee366247a9ecea35da09e28f811ffa5d52fd09148` |
+| 候補 `shape 0.5` | 122,551,827 | 743.5 s | 36,144 | `14ca7e0e1c218759759dcaec5c58e41af64049c223983ff384327361d3ead16b` |
+
+候補は moves が 8.9% 少なく 1 局が短い。`pairw` 20 局 **−12,442.4 ± 6,702.5**（7 勝 13 敗、mean−2σ = −25,847.4）。非ペア 2-ply:
+
+| net | seed 9000 | seed 9100 | 8192 |
+| --- | ---: | ---: | --- |
+| 対照 | 83,796.0 | 93,993.4 | 4/20・5/20 |
+| 候補 | 75,298.0 | 80,757.2 | 1/20・2/20 |
+
+**判定: Gate 1 不採用**（300k は回さない）。γ=1・終端 0 の potential shaping はエピソード収益を定数 `−Phi(start)` ずらすだけで最適方策は
+変わらないが、TD 目標が状態ごとに `V − Phi` へ移り、空きマス数は候補手の afterstate 間で異なるので近似 V では greedy の順位が変わる。
+学習中の 1 局が短くなり（134.6M → 122.6M moves）、評価でも 3,729→3,408 / 4,138→3,631 手と短命化して score と裾が落ちた。空きマス入力が
+100k で差を失う #226 の観察とも整合し、この方向は 100k で打ち切る。
+
+## 3-ply の spawn カットと深さ配分（#281、#256、#259、#257、#261）
+
+`deep3` の chance node は各空きに 2/4 を置く枝（`ai/solver/nn.zig:692`、`ChanceBranch.p = cprob * spawn.p` 同 `:695`）。`depth > 1` で
+`branch.p / empties < cutoff` の枝を落とし（同 `:999`）、残りを再正規化する。既定 cutoff 1e-2 は 4 タイル枝を空き 11 以上で刈る
+（2 タイル枝は 16 空きでも刈られない。ただし `cprob < 1` の後続ノードでは 2 タイル枝も対象になり得る）。
+
+| row | 変更 | 40 局 avg_score | 8192 | leaves/move（seed 9000 / 9100） | 判定 |
+| --- | --- | ---: | ---: | ---: | --- |
+| 15 | 既定（cut 1e-2、TT on） | 137,341.6 | 33/40 | 10,574 / 10,786 | — |
+| 18 | cut 0.02 | 135,084.8 | 30/40 | 5,174 / 5,233（−51%） | 不採用 |
+| 19 | cut 0.05 | 130,918.0 | 27/40 | 3,654 / 3,594 | 不採用 |
+| 16 | cut 1e-3 | 137,251.7 | 32/40 | 15,349 / 14,699（+36〜45%） | 不採用 |
+
+- #281（cut 0.02 / 0.05）: 40 局平均で row 18 は −2,256.8、row 19 は −6,423.6。common-spawn `pairrow` 20 局は −9,258.4 ± 15,571.7
+  （8 勝 12 敗、mean−2σ = −40,401.8）。node hit は 19.9% → 16.7%。ms/move は負荷依存で、同一 run ログの seed 9000 は
+  10.00 / 5.01（2.00 倍）、`pairrow` は 38.09 / 18.40（2.07 倍）——安定した 2.62 倍ではない。
+- #256（cut 1e-3）: 40 局で差 −89.9 点（seed 9000 −7,315.2、seed 9100 +7,135.4 と逆転）、ms/move は約 1.53〜1.58 倍。
+- #259（`phase_h1` = 空き 8 以上 2-ply / 未満 3-ply）: 20 局 130,887.8 / 13/20 対 row 15 の 140,438.2 / 17/20 で **−9,550.4 ± 10,052.8**
+  （mean−2σ = −29,656.0）。leaves/move は −5.3% だけ、ms/move は 1.17 倍遅い。空き 8 以上の 2-ply パートはゲームの大半を占める
+  空き 8 未満の 3-ply のコストに埋もれる。
+- #257（`phase_h2` / `phase_h3`、4 局の一次判定）: row 15 129,335.0 / 3/4 に対し h2 +880.0 ± 21,438.0（2 勝 2 敗）、h3
+  +14,725.0 ± 27,938.9（2 勝 1 敗 1 分、leaves +19.0%）。stderr が点差より大きく採用条件を満たさない（40 局は未実施）。
+- #261（`deep3_recover` = 刈った枝も子盤面から一段浅く評価して全 spawn を元の確率で加重、row 20）: seed 9000 の 20 局で
+  +7,453.2（12 勝 8 敗、stderr 10,695.1、mean−2σ = −13,937.0）、leaves +0.5%、8192 は 17→16。旧測定の 40 局は +2,564 だが
+  seed 9100 で −2,325.2、pooled ms +0.8%。旧 tape 比較 20 局は +17,141.2 ± 12,838.7（10 勝 9 敗 1 分、mean−2σ = −8,536.1）。
+  **どれも採用目安 `mean − 2σ > 0` を満たさず既定にしない**（row 18/19/20 は再現用に opt-in で残す）。
+
+既定 cutoff 1e-2、既定方針 `deep3` + node TT を維持。
+
+## extended-TD 論文は全文が入手できず実装しない（#291）
+
+Wang・Matsuzaki, "Refining Evaluation Functions for Game 2048 by Extended Temporal Difference Learning," *IEEE Transactions on Games*
+18(1), 56–65 (2026), DOI 10.1109/TG.2025.3606517（IEEE Xplore document 11151781）。abstract と導入冒頭のみ公開で、続きは
+"Sign in to Continue Reading"。Crossref の全文 PDF は取得できず、OpenAlex `best_oa_location: null`、Semantic Scholar の
+`openAccessPdf.url` は空、arXiv と著者所属の検索でも著者版が見つからない。abstract は 2 つの refinement algorithm と NN / n-tuple の
+スコア向上を述べるが、更新則・前提・評価条件は不明で、別実装の数値を期待値にはしない（#107 の optimistic initialization /
+multi-stage TD、#231 の Adam と混同しないため方法を推測して実装するのは不適切）。
+
+**判定: no-go**（全文または著者稿が入手できたら方法と互換性を確認して再検討）。
+
+## replay 掃引を TD(λ) にする推測実装は既定にしない（#300）
+
+このプロジェクトの refinement は 128/32 net の fine-tune で、末尾 `replay_k`（=30）局をやり直す掃引が本家の refinement に当たる。
+その掃引は `trainAfter` による **TD(0)**（1 局ごとに独立の one-step 更新）だったので、1 本の accumulating eligibility trace での
+**TD(λ)**（backward view）に置き換えた（#72 の `lambda` は online per-move の trace で、掃引側は未着手だった）。opt-in のみ:
+`nn.Options.sweep_lambda`（既定 0 = 従来の TD(0) で bit-identical）、variant `lam`（scratch + `replay_k` + TD(λ)、arg 13 = λ、既定 0.7）、
+`rlam`（同じものを resume）。
+
+128/32・scratch・`par`・lr 0.003・`replay_k` 30・train seed 1、評価は row 1 = nn + 1 spawn lookahead、seed 9000..9099 の 100 局:
+
+| λ | 20,000 games | 100,000 games（seed 1） | 100,000 games（seed 2） |
+| --- | ---: | ---: | ---: |
+| 0（TD(0)） | **13,196.0**（782.8 手） | 16,081.1（920.8） | 18,104.5（1,015.5） |
+| 0.3 | 13,065.1 | 17,775.5 | 18,029.5 |
+| 0.5 | 12,238.1 | 13,934.4 | — |
+| 0.7 | 10,656.5 | — | — |
+| 0.9 | 10,732.6 | — | — |
+
+20k では λ を上げるほど単調に悪化（λ0.5 で −7.3%、0.7/0.9 で −19%）。100k の λ0.3 は seed 1 で +1,694.4、seed 2 で −75.0（平均 +809.7）で
+λ0 の seed 間差 ±1,012 の内側。λ0.5 は 100k でも −13.3%（best tile 1024 止まり）。総 moves も λ とともに減る（20k: 7.31M → 5.51M）——
+trace が末尾の短い trajectory に長く効き、伸びる方向に働かない。
+
+副産物: **収束済み net の fine-tune（`rlam` = resume + `replay_k`）は λ に関係なく即発散**する（`par` で 2,552/20,000 局、serial で
+5/20,000 局で `|w| > 1e6`）。online 側の bootstrap が自分の 1-ply `pick.value` で、stale な盤面に replay が乗る形になるため（`deepStep` の
+注記と同じ機構）。「収束済み net を refinement する」という論文の前提自体が今の self-play bootstrap では測れず、測るには `tnet` の凍結
+bootstrap か teacher label（`tch` / `dist`）で target を切る必要がある。
+
+**判定: no-go**（`sweep_lambda` は既定 0 の opt-in、variant とテストだけ残す）。
+
+## 4-ply の spawn を有限個サンプルすると同じ予算で deep3 に勝てない（#320）
+
+#267 の full-width `deep4` は `deep3` の約 26 倍の葉を読み実測でも負けたので、評価関数と合法手を変えず **chance node の spawn だけを
+有限個サンプル**して 4-ply を 3-ply と同じ時間予算に収める案を試した。
+
+実装（`Search` / `Depth` / `Options`、row 21–26）:
+- 各 chance node で branch を**重み付き・非復元抽出**。重みは `cprob × spawn.p`（2 タイル 0.9 / 4 タイル 0.1 を空きに均等）。
+  Efraimidis–Spirakis の key `-log(u)/p` を全 branch で計算し小さい順に K 個を残す（`sampleMask`）。
+- 残した branch の p の和で**残存 mass に再正規化**するので、kept 内の 2:4 は 0.9:0.1 のまま、スケールは full-width の平均と揃う。
+  復元抽出ではないので K がそのまま葉の分岐数。
+- 乱数は**ゲームの spawn tape を消費しない**。node の board hash・chance depth・`sample_seed`（既定 `0x9e3779b97f4a7c15`）から splitmix64 で
+  作る per-branch 一様乱数なので同じ盤面・深さ・seed は常に同じサンプル → 再探索は同じ手、node TT の値と一致、`pairrow` の A/B は
+  同じ tape で比較できる。`cprob` は key に混ぜない（全重みを同倍するだけでサンプル集合も再正規化値も変わらない）。
+- `ValueCache` の key は不変（葉はサンプルに関係なく net の exact V）。`sample = 0`（既定）は bit-identical。
+- `sample_min_depth`（既定 1 = すべての spawn 層）を 2 にすると**葉の直上の spawn 層だけ full width** になり、最後の 1 手が死ぬかを
+  正確に残したまま深い層だけ間引ける（K=2 + min depth 2 が K=3・全層とほぼ同じコスト）。
+
+スクリーニング（1 局 seed 9000、同梱 net）:
+
+| 方策 | row | score | leaves/move | ms/move |
+| --- | ---: | ---: | ---: | ---: |
+| `deep3` + TT | 15 | 80,708 | 11,914.3 | 42.69 |
+| 4-ply K=2 全層 | 21 | 71,420 | 2,938.7 | 10.47 |
+| 4-ply K=3 全層 | 22 | 79,540 | 8,500.2 | 30.46 |
+| 4-ply K=4 全層 | 23 | 168,352 | 16,161.9 | 57.80 |
+
+K=3 が deep3 の 0.71 倍の葉・0.71 倍の時間で予算に最も近い（K=4 は 1.36 倍で超過）。以後 K=3 を本命、K=2 + min depth 2 を対照にした。
+
+ペア測定（row 15 = A、row 22 = K=3 = B、同じ tape、12 局）: A 153,229 / 10 万点超 10/12、B 105,217 / 4/12、ms/move 比 B/A = 0.78。
+平均差 **−48,012.3**（stderr 21,388.0、2 勝 10 敗、`mean + 2σ = −5,236 < 0` で 95% 水準でも deep3 より悪い）。row 25（K=2・
+min depth 2）は 4 ペアで **0 勝 4 敗、−100,932 点**（sd 85,815）。
+
+**原因**: サンプルが**死ぬ枝を消す**。空き 6 のノードは 12 branch で 4 タイル枝の重みは 0.1/6、K=3 の非復元抽出で 4 タイル枝が 1 本入る
+確率は約 5%（6 本のどれかでも 25% 前後）。残り 3/4 のノードは 4 タイル spawn を見ないまま「安全」に再正規化され、さらに max が
+ノイズの乗った推定の上振れを選ぶ（sparse sampling の optimism）。full width が守っていた「最後の 1 手が死ぬ確率」を層ごとに薄く
+してしまう。B の負け方は揃っており、12 局中 8 局が 75,560–80,488 点（4096 止まり、3,500–3,700 手）に密集する。
+
+**判定: 不採用**（row 21–26 は opt-in で残す）。次に試すなら K を増やすのではなく「4 タイル branch を必ず 1 本残す層化サンプル」か
+「root の各手で同じサンプル集合を共有する common random numbers」で、比較ノイズと tail の欠落を分けて潰す。

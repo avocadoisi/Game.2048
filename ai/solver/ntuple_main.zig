@@ -125,7 +125,7 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
-    // A `.q16.bin` path writes (or, for an eval-only run, reads) the int16 quantized file (#129).
+    // A `.q16.bin` path writes (or, for an eval-only run, reads) the int16 quantized file.
     const quantized_path = std.mem.endsWith(u8, table_path, ".q16.bin");
     if (train_games == 0 or variant.resume_from_file) {
         if (quantized_path) {
@@ -158,7 +158,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         const elapsed = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
-        // Report throughput for every learner: the A/B of #290 compares TD(0) and widedelay on games/s.
+        // Report throughput for every learner: the A/B of compares TD(0) and widedelay on games/s.
         const rate_seconds = @max(@as(f64, @floatFromInt(elapsed)) / 1e9, 1e-9);
         std.debug.print("trained {d} games, {d} moves in {d:.1} s ({d:.2} games/s, {d:.1} moves/s; lr={d}, seed={d}, variant={s})\n", .{
             train_games,
@@ -208,7 +208,7 @@ pub fn main(init: std.process.Init) !void {
         parallel.map(ntuple.PlayResult, res_all, EvalCtx{ .net = &net, .policy = idx, .eval_seed = eval_seed }, playGame);
         stats.rangeTotals(ntuple.PlayResult, Eval, r, res_all, eval_games);
         // `seed_ranges` is 1, so the between-range stderr above is always zero; a single-range row is
-        // only judgeable with the per-game standard error (#288).
+        // only judgeable with the per-game standard error.
         const game_scores = try init.arena.allocator().alloc(f64, games);
         for (res_all, 0..) |res, i| game_scores[i] = @as(f64, @floatFromInt(res.score));
         r.game_stderr = stats.meanStderr(game_scores).stderr;
@@ -218,7 +218,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("eval: games={d}/range ranges={d} seeds={d}..{d}\n", .{ eval_games, seed_ranges, eval_seed, last_seed });
     for (results) |r| {
         const st = stats.meanStderr(r.range_scores);
-        // Same row as `zig build nn`: `avg_score` holds the mean over seed ranges (#141).
+        // Same row as `zig build nn`: `avg_score` holds the mean over seed ranges.
         bench.printEvalRow(r.name, st.stderr, seed_ranges, .{
             .games = games,
             .avg_score = st.mean,

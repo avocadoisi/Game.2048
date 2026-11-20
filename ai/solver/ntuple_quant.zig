@@ -1,4 +1,4 @@
-//! Converts an n-tuple table from the f32 format to the int16 quantized one (#129).
+//! Converts an n-tuple table from the f32 format to the int16 quantized one.
 //! `zig build ntuple-quant -- ai/solver/ntuple_wide.bin ai/solver/ntuple_wide_q16.bin`
 
 const std = @import("std");

@@ -27,7 +27,7 @@ pub const patterns = [_]Pattern{
     .{ .len = 4, .cells = .{ 1, 2, 5, 6, 0, 0 } }, // 2x2 middle column
     .{ .len = 4, .cells = .{ 0, 5, 10, 15, 0, 0 } }, // main diagonal
     .{ .len = 6, .cells = .{ 0, 1, 2, 4, 5, 6 } }, // 2x3 top-left
-    // #106: the 2x3 rectangles split into two translation orbits under the 8 dihedral transforms
+    // : the 2x3 rectangles split into two translation orbits under the 8 dihedral transforms
     // (8 positions around the edge, 4 positions through the middle). The first 6-tuple above is the
     // `min` index of orbit 0 for every board, so orbit 1 needs exactly this one more table.
     .{ .len = 6, .cells = .{ 4, 5, 6, 8, 9, 10 } }, // 2x3 middle-left (orbit 1)
@@ -124,7 +124,7 @@ pub const offsets = blk: {
 };
 
 /// Table set: `.light` keeps only the five 4-tuples, `.full` adds the first 2x3 6-tuple (the
-/// committed `ntuple_weights.bin` and every existing policy), `.wide` adds both 2x3 orbits (#106).
+/// committed `ntuple_weights.bin` and every existing policy), `.wide` adds both 2x3 orbits.
 pub const Set = enum { light, full, wide };
 
 pub const light_count = 5;
@@ -199,7 +199,7 @@ pub const TupleNet = struct {
     }
 };
 
-/// Paper defaults for the opt-in delayed TD(lambda) learner (#290).
+/// Paper defaults for the opt-in delayed TD(lambda) learner.
 pub const delayed_td_horizon: usize = 3;
 pub const delayed_td_lambda: f64 = 0.5;
 
@@ -258,7 +258,7 @@ pub fn delayedTDLambdaExtraMemoryBytes() usize {
     return @sizeOf(DelayedTDLambda);
 }
 
-/// TC(λ) horizon and trace decay from the paper's informal parameter search; β uses the existing learning-rate schedule (#288).
+/// TC(λ) horizon and trace decay from the paper's informal parameter search; β uses the existing learning-rate schedule.
 pub const tc_horizon: usize = 3;
 pub const tc_lambda: f64 = 0.5;
 
@@ -333,7 +333,7 @@ pub const TemporalCoherence = struct {
 };
 
 /// int16 view of a table: one scale per pattern, so the 4-tuples can use a coarser step than the
-/// 6-tuples. `q * scale` reproduces the f32 value to within half a step (129 MiB -> 64.6 MiB, #129).
+/// 6-tuples. `q * scale` reproduces the f32 value to within half a step (129 MiB -> 64.6 MiB).
 pub const Quantized = struct {
     storage: []i16,
     /// Value = `storage[i] * scales[p]` for pattern `p`; 0 for an all-zero table.
@@ -397,7 +397,7 @@ pub fn quantize(gpa: std.mem.Allocator, net: *const TupleNet) !Quantized {
 }
 
 /// Write the quantized values back into an f32 net, so the rounding can be A/B'd with the same
-/// evaluation code that reads float tables (#129).
+/// evaluation code that reads float tables.
 pub fn dequantizeInto(q: *const Quantized, net: *TupleNet) void {
     std.debug.assert(q.count == net.count);
     for (0..q.count) |p| {
@@ -526,10 +526,10 @@ pub const Mode = enum {
 };
 
 /// Where the TD target comes from: the afterstate the game actually reached, or the best move's
-/// afterstate on the post-spawn board (`r + max_a V(after(s', a))`, the two-stage #131 target).
+/// afterstate on the post-spawn board (`r + max_a V(after(s', a))`, the two-stage target).
 pub const Target = enum { on_policy, max_backup };
 
-/// Learning algorithm selected by the runner; TD(0) stays the default (#290, #288).
+/// Learning algorithm selected by the runner; TD(0) stays the default.
 pub const Learner = enum { td_zero, delayed_td_lambda, temporal_coherence };
 
 /// Runner variant: policy mode, table set, learner, TD target, and whether to load `table_path` first.
@@ -727,7 +727,7 @@ pub fn bestMoveWithStats(net: *const TupleNet, state: core.GameState, mode: Mode
     return if (chooseMove(net, state, mode, stats)) |p| p.dir else null;
 }
 
-/// 1-ply greedy move from a quantized table; this is what `algo=ntuple` plays (#129).
+/// 1-ply greedy move from a quantized table; this is what `algo=ntuple` plays.
 pub fn bestMoveQuantized(q: *const Quantized, state: core.GameState) ?core.Direction {
     var best: ?core.Direction = null;
     var best_value: f64 = 0;
@@ -769,7 +769,7 @@ pub fn trainGame(net: *TupleNet, rng: std.Random, lr: f64, mode: Mode) GameResul
     return trainGameWith(net, rng, lr, mode, .on_policy);
 }
 
-/// `trainGame` with a selectable TD target (#131). `.max_backup` replaces the value of the move the
+/// `trainGame` with a selectable TD target. `.max_backup` replaces the value of the move the
 /// game actually played with the max over the four moves available on the post-spawn board, so the
 /// table learns the afterstate value of the *best* continuation rather than of the sampled one.
 pub fn trainGameWith(net: *TupleNet, rng: std.Random, lr: f64, mode: Mode, target: Target) GameResult {
@@ -793,7 +793,7 @@ pub fn trainGameWith(net: *TupleNet, rng: std.Random, lr: f64, mode: Mode, targe
     return .{ .score = state.score, .moves = moves };
 }
 
-/// Opt-in delayed TD(lambda) self-play, with the on-policy afterstate target only (#290).
+/// Opt-in delayed TD(lambda) self-play, with the on-policy afterstate target only.
 pub fn trainGameDelayedTDLambda(net: *TupleNet, rng: std.Random, lr: f64, mode: Mode) GameResult {
     var state = core.GameState.gameStart(rng);
     var learner = DelayedTDLambda.init(net, lr);
@@ -815,7 +815,7 @@ pub fn trainGameDelayedTDLambda(net: *TupleNet, rng: std.Random, lr: f64, mode: 
     return .{ .score = state.score, .moves = moves };
 }
 
-/// Opt-in on-policy TD(λ) with per-weight Temporal Coherence (#288); the TD(0) path is unchanged.
+/// Opt-in on-policy TD(λ) with per-weight Temporal Coherence; the TD(0) path is unchanged.
 pub fn trainGameTemporalCoherence(tc: *TemporalCoherence, rng: std.Random, beta: f64, mode: Mode) GameResult {
     const net = tc.net;
     tc.beginEpisode();

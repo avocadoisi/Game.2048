@@ -4,8 +4,8 @@ const core = @import("core");
 const parallel = @import("parallel");
 const eval_stats = @import("stats");
 const blob = @import("blob");
-/// Hidden layer widths (#205). Compile-time because the net is an `extern struct` whose layout is the
-/// weights file; `zig build nn -Dh1=… -Dh2=…` gives a capacity sweep without three edited copies.
+/// Hidden layer widths. Compile-time because the net is an `extern struct` whose layout is the weights
+/// file; `zig build nn -Dh1=… -Dh2=…` sweeps capacity without editing copies of the net.
 const width = @import("nn_width");
 
 const Board = core.Board;
@@ -17,9 +17,9 @@ pub const levels = 16;
 pub const input_count = core.BoardCellCount * levels;
 pub const h1_size: u32 = width.h1;
 pub const h2_size: u32 = width.h2;
-/// Hand-engineered global board features (#226): 0 (the default build) keeps the 256 one-hot inputs and
-/// the current weights file; `zig build nn -Dfeat=6` adds the first `feature_count` of `feature_all` as
-/// extra input rows (`Net.wf`), so the net no longer has to learn empty-count/monotonicity from scratch.
+/// Hand-engineered global board features: 0 (the default build) keeps the 256 one-hot inputs and the current
+/// weights file; `zig build nn -Dfeat=6` adds the first `feature_count` of `feature_all` as extra input rows
+/// (`Net.wf`), so the net need not learn empty-count/monotonicity from scratch.
 pub const feature_count: u32 = width.feat;
 /// Every feature is normalised to 0..1 so one learning rate serves all of them, in this order:
 /// empties, max level, monotonicity, smoothness, max tile in a corner, total level mass.
@@ -36,7 +36,7 @@ pub const Net = extern struct {
     b2: [h2_size]f64,
     w3: [h2_size]f64,
     b3: f64,
-    /// (#226) One row per global feature; zero width unless the build sets `-Dfeat`.
+    /// One row per global feature; zero width unless the build sets `-Dfeat`.
     wf: [feature_count][h1_size]f64,
 
     pub fn init(rng: std.Random) Net {
@@ -48,9 +48,9 @@ pub const Net = extern struct {
             w.* = uniform(rng, 1.0 / 8.0);
         };
         for (&net.w3) |*w| w.* = uniform(rng, 1.0 / @sqrt(@as(f64, h2_size)));
-        // `wf` stays zero (#226): the features then contribute nothing to a fresh net (so a build with
-        // `-Dfeat` reproduces the plain one until training moves them) and they still get their gradient
-        // on the first step, because the update uses `cache.feat`, not the current weight.
+        // `wf` stays zero: these rows contribute nothing to a fresh net, so a `-Dfeat` build reproduces
+        // the plain one until training moves them, and they still get their gradient on the first step
+        // because the update uses `cache.feat`, not the current weight.
         return net;
     }
 };
@@ -59,11 +59,9 @@ fn uniform(rng: std.Random, scale: f64) f64 {
     return (rng.float(f64) * 2 - 1) * scale;
 }
 
-/// Optimistic initialization (#107): multiply every weight by `k`, so the initial value surface has
-/// `k` times more spread and the self-play policy explores more early on. Only the spread can matter:
-/// a constant shift of `b3` adds the same amount to every afterstate, so the argmax over moves is
-/// unchanged and such an "optimistic" bias is a no-op for the data the learner sees.
-/// `shortcut: one scalar for all layers, per-layer scales if this shows an effect.`
+/// Optimistic initialization: multiply every weight by `k`, so the initial value surface has more spread and
+/// the self-play policy explores more early on. Only the spread can matter: a constant shift of `b3` adds the
+/// same amount to every afterstate, so the argmax over moves is unchanged.
 pub fn scaleInit(net: *Net, k: f64) void {
     for (&net.w1) |*row| {
         for (row) |*w| w.* *= k;
@@ -82,7 +80,7 @@ pub const Cache = struct {
     z2: [h2_size]f64 = undefined,
     a2: [h2_size]f64 = undefined,
     out: f64 = 0,
-    /// (#226) the global features of the same board (empty array unless the build sets `-Dfeat`).
+    /// The global features of the same board (empty array unless the build sets `-Dfeat`).
     feat: [feature_count]f64 = undefined,
 };
 
@@ -91,7 +89,7 @@ pub fn levelOf(value: core.Tile) usize {
     return @min(levels - 1, std.math.log2_int(core.Tile, value));
 }
 
-/// (#226) The global features of `board`, in `feature_all` order, each in 0..1.
+/// The global features of `board`, in `feature_all` order, each in 0..1.
 pub fn featureValues(board: Board) [feature_all]f64 {
     var empties: f64 = 0;
     var max_level: f64 = 0;
@@ -144,7 +142,7 @@ pub fn featureValues(board: Board) [feature_all]f64 {
     };
 }
 
-/// (#226) The first `feature_count` values of `featureValues`, which is what the net consumes.
+/// The first `feature_count` values of `featureValues`, which is what the net consumes.
 pub fn features(board: Board) [feature_count]f64 {
     const all = featureValues(board);
     var out: [feature_count]f64 = undefined;
@@ -208,14 +206,14 @@ pub fn train(net: *Net, cache: *const Cache, target: f64, lr: f64) void {
     trainCapped(net, cache, target, lr, 0);
 }
 
-/// (#246) One element of a step, cut to +-`cap` when `cap > 0`. A non-positive cap returns the delta
-/// unchanged, so `train` (which passes 0) stays bit-identical to the historical update.
+/// One element of a step, cut to +-`cap` when `cap > 0`. A non-positive cap returns the delta unchanged, so
+/// `train` (which passes 0) is a plain SGD step.
 fn capStep(delta: f64, cap: f64) f64 {
     return if (cap > 0) std.math.clamp(delta, -cap, cap) else delta;
 }
 
-/// `train` with a per-element ceiling on `|dw|` (#246, candidate b): the serial per-move step and the
-/// merged `par` step are the two places that apply a step, and both pass their `step_clip` here.
+/// `train` with a per-element ceiling on `|dw|`: the serial per-move step and the merged `par` step are the
+/// two places that apply a step, and both pass their `step_clip` here.
 pub fn trainCapped(net: *Net, cache: *const Cache, target: f64, lr: f64, step_clip: f64) void {
     const d = cache.out - target;
     var dz2: [h2_size]f64 = undefined;
@@ -245,7 +243,7 @@ pub fn trainCapped(net: *Net, cache: *const Cache, target: f64, lr: f64, step_cl
 }
 
 /// PopArt uses exponential target moments in the existing reward_scale units; the weight file still
-/// stores the ordinary raw-value network, while the optimizer sidecar stores these statistics (#289).
+/// stores the ordinary raw-value network, while the optimizer sidecar stores these statistics.
 pub const popart_beta: f64 = 1e-3;
 const popart_min_variance: f64 = 1e-6;
 const popart_state_magic = "2048-PA\x00";
@@ -356,7 +354,7 @@ pub const PopArtState = struct {
     }
 };
 
-/// Adam (#231) moment estimates, one per weight. The optimizer state lives outside the weight file, so the
+/// Adam moment estimates, one per weight. The optimizer state lives outside the weight file, so the
 /// format, the shipped net and every existing variant stay untouched.
 pub const Adam = struct {
     m: Net = std.mem.zeroes(Net),
@@ -366,9 +364,7 @@ pub const Adam = struct {
 
 /// One Adam step on `net` from the raw gradient `g` (= d loss / d w, the gradient of `train`'s
 /// 0.5 * (out - target)^2). `lr` is Adam's own step size: every parameter moves about `lr` per step
-/// regardless of how large `g` is, which is the point of the change — the shipped recipe scales the SGD
-/// rate against the number of updates per move (#227), and a per-parameter normaliser is free of that
-/// coupling.
+/// regardless of how large `g` is, so the step does not couple to the number of updates per move.
 ///
 /// `par` feeds it one gradient per batch (the per-game SGD deltas divided by `lr`, i.e. the summed
 /// gradient of the games in the batch) and steps once, which is the batch update Adam wants.
@@ -387,7 +383,7 @@ pub fn applyAdam(net: *Net, g: *const Net, state: *Adam, lr: f64) void {
     }
 }
 
-/// MS-TD (#107): one value net per afterstate stage, staged by the number of empty cells.
+/// Multi-stage TD value function: one value net per afterstate stage, staged by the number of empty cells.
 /// Boundaries: 0..2, 3..4, 5..6, 7..8, 9..10, 11..12, 13..16 empties.
 pub const stage_count: usize = 7;
 
@@ -403,9 +399,9 @@ pub fn stageOfEmpties(empties: usize) usize {
     };
 }
 
-/// Value function used by the search: one net for every board, or one net per empty-cell stage (#107).
-/// `.quantized` is the opt-in int16 path of #170: same policy code, weights from the quantized file.
-/// Nothing selects it on its own; `nn.forward` over the f32 net stays the default.
+/// Value function used by the search: one net for every board, or one net per empty-cell stage.
+/// `.quantized` is the opt-in int16 path: same policy code, weights from the quantized file. Nothing selects
+/// it on its own; `nn.forward` over the f32 net stays the default.
 pub const Value = union(enum) { single: *const Net, staged: *const Staged, quantized: *const Quantized };
 
 /// `forward` for a `Value`; `cache` belongs to the net being evaluated and is unused for staged and
@@ -422,8 +418,8 @@ pub fn valueAt(value: Value, board: Board, cache: *Cache) f64 {
 const netForward = forward;
 const netTrain = train;
 
-/// Multi-stage TD value function (#107): `stage_count` nets of the `Net` architecture, chosen by the
-/// afterstate's empty-cell count. Search and training reach it through `Value`.
+/// Multi-stage TD value function: `stage_count` nets of the `Net` architecture, chosen by the afterstate's
+/// empty-cell count. Search and training reach it through `Value`.
 pub const Staged = struct {
     nets: [stage_count]Net,
 
@@ -483,7 +479,7 @@ pub const Staged = struct {
     }
 };
 
-/// Dihedral symmetry (issue #72): 8 cell-index permutations, rotations 0..3 then their mirrors 4..7.
+/// Dihedral symmetry: 8 cell-index permutations, rotations 0..3 then their mirrors 4..7.
 /// `symmetryMap(k, cell)` is the cell that `cell` moves to under transform `k` (k = 0 is identity).
 pub const symmetry_count = 8;
 
@@ -519,8 +515,8 @@ const Pick = struct {
     value: f64,
 };
 
-/// One legal move drawn uniformly (#224): the exploration half of `Options.explore`. The pick's `value`
-/// is `V(after)` so the TD step and the priority buffer see the same numbers as a greedy pick.
+/// One legal move drawn uniformly: the exploration half of `Options.explore`. The pick's `value` is
+/// `V(after)` so the TD step and the priority buffer see the same numbers as a greedy pick.
 fn randomPick(vfn: Value, state: GameState, rng: std.Random, death: bool) ?Pick {
     var picks: [4]Pick = undefined;
     var n: usize = 0;
@@ -542,7 +538,7 @@ fn pickMove(net: *const Net, state: GameState, death: bool) ?Pick {
     return pickMoveValue(.{ .single = net }, state, death);
 }
 
-/// `pickMove` for a single or staged value function (#107).
+/// `pickMove` for a single or staged value function.
 fn pickMoveValue(vfn: Value, state: GameState, death: bool) ?Pick {
     var best: ?Pick = null;
     for ([_]Direction{ .up, .left, .down, .right }) |d| {
@@ -594,18 +590,18 @@ fn chanceMove(vfn: Value, state: GameState) ?Direction {
     return best;
 }
 
-/// Search statistics for one move (issue #69): afterstate evaluations and value-cache hits, plus the
-/// interior-node lookups of the transposition table (#263; both counters stay 0 when it is off).
+/// Search statistics for one move: afterstate evaluations and value-cache hits, plus the interior-node
+/// lookups of the transposition table (both counters stay 0 when it is off).
 pub const Stats = struct { leaves: u64 = 0, hits: u64 = 0, node_probes: u64 = 0, node_hits: u64 = 0 };
 
-/// #320: the default seed of the per-chance-node spawn sampler. Any fixed value does; it only has to
-/// make a sampled run reproducible, so an A/B on the same spawn tape sees only the policy difference.
+/// Default seed of the per-chance-node spawn sampler. Any fixed value does; it only has to make a sampled
+/// run reproducible, so an A/B on the same spawn tape sees only the policy difference.
 pub const default_sample_seed: u64 = 0x9e3779b97f4a7c15;
 
 /// Depth one search runs at: `ply` own moves deep, dropping spawn branches under path probability
 /// `cutoff` (`0` keeps every branch) and dropping the lowest-probability branches up to a share
-/// `mass_cutoff` of each chance node's mass (#182, `0` keeps every branch). Part of the value-cache
-/// key (#157), because a phase game asks for the same board at two depths.
+/// `mass_cutoff` of each chance node's mass (`0` keeps every branch). Part of the value-cache key,
+/// because a phase game asks for the same board at two depths.
 pub const Depth = struct {
     ply: u8 = 0,
     cutoff: f64 = 0,
@@ -613,19 +609,19 @@ pub const Depth = struct {
     risk_weight: f64 = 0,
     omit_leaf_reward: bool = false,
     recover_cut_branches: bool = false,
-    /// #320: at most this many spawn branches per chance node, drawn by weighted sampling without
-    /// replacement. `0` (the default) keeps every branch, bit for bit as before.
+    /// At most this many spawn branches per chance node, drawn by weighted sampling without replacement.
+    /// `0` (the default) keeps every branch.
     sample: usize = 0,
-    /// #320: the seed of that sampler. Same board, depth and seed give the same spawns, so a re-search
-    /// (or the interior-node table) is consistent with a fresh one.
+    /// The seed of that sampler. Same board, depth and seed give the same spawns, so a re-search (or the
+    /// interior-node table) is consistent with a fresh one.
     sample_seed: u64 = default_sample_seed,
-    /// #320: the shallowest chance node the sample applies to. `1` samples every spawn layer; `2` keeps
-    /// the layer directly above the leaves at full width, so the spawn that decides whether the last
-    /// move survives is never thinned (K=2 + min depth 2 costs the same as K=3 at every layer).
+    /// The shallowest chance node the sample applies to. `1` samples every spawn layer; `2` keeps the layer
+    /// directly above the leaves at full width, so the spawn that decides whether the last move survives is
+    /// never thinned.
     sample_min_depth: u8 = 1,
 };
 
-/// A completed search node: its value and whether that value is a direct leaf (#260). The node table
+/// A completed search node: its value and whether that value is a direct leaf. The node table
 /// stores both, because the parent of a direct leaf omits that move's reward.
 const SearchResult = struct { value: f64 = 0, direct_leaf: bool = false };
 
@@ -644,7 +640,7 @@ pub const ValueCache = struct {
 
     /// Drops every entry. `getValue` keys on the board contents alone, so a table filled by an older
     /// weight snapshot silently answers for the current one: anything that prices a board *between*
-    /// weight updates (every teacher label, #167 / #207) has to start from an empty table.
+    /// weight updates (every teacher label, / ) has to start from an empty table.
     pub fn clear(self: *ValueCache) void {
         self.entries = @splat(.{});
     }
@@ -657,7 +653,7 @@ pub const ValueCache = struct {
         return h;
     }
 
-    /// `keyOf` mixed with the search depth (#157). The stored value is the depth-free leaf value
+    /// `keyOf` mixed with the search depth. The stored value is the depth-free leaf value
     /// today, but a phase game asks for one board at 2-ply and at 3-ply: without the depth in the key
     /// one entry would stand in for the other, and any depth-dependent leaf or backup would then be
     /// silently wrong. Both fields are mixed here, so the table keeps one key space.
@@ -665,16 +661,16 @@ pub const ValueCache = struct {
         var h = keyOf(board);
         h = (h ^ @as(u64, depth.ply)) *% 0x100000001b3;
         h = (h ^ @as(u64, @bitCast(depth.cutoff))) *% 0x100000001b3;
-        // the mass cut (#182) changes the value too, so it is part of the key as well; a zero mass
+        // the mass cut changes the value too, so it is part of the key as well; a zero mass
         // cut does not mix, which keeps every pre-#182 key (and the recorded golden values) as is.
-        // The #320 spawn sample stays out on purpose: a leaf is the net's exact V whatever the sample
+        // The spawn sample stays out on purpose: a leaf is the net's exact V whatever the sample
         // size, and this table holds leaves only. Sampled interior values live in the per-search node
         // table, which is cleared before every top-level search, so its config cannot leak across runs.
         if (depth.mass_cutoff == 0) return h;
         return (h ^ @as(u64, @bitCast(depth.mass_cutoff))) *% 0x100000001b3;
     }
 
-    /// `keyOfDepth` mixed with the #178 leaf flag. The false case keeps the old key bit for bit, so a
+    /// `keyOfDepth` mixed with the leaf flag. The false case keeps the old key bit for bit, so a
     /// cache behaves exactly as before; the true case is a bijection of the key, which adds no new
     /// collision risk (a collision would be a miss, never a wrong value).
     fn keyOfDepthSym(board: Board, depth: Depth, sym_leaf: bool) u64 {
@@ -688,7 +684,7 @@ pub const ValueCache = struct {
         return self.getValue(.{ .single = net }, board, stats);
     }
 
-    /// `get` for a single or staged value function (#107).
+    /// `get` for a single or staged value function.
     pub fn getValue(self: *ValueCache, vfn: Value, board: Board, stats: *Stats) f64 {
         return self.getValueAtDepth(vfn, board, leaf_depth, stats);
     }
@@ -698,7 +694,7 @@ pub const ValueCache = struct {
         return self.getValueAtDepthSym(vfn, board, depth, false, stats);
     }
 
-    /// `getValueAtDepth` with the #178 leaf flag: a symmetrically averaged leaf is another value, so
+    /// `getValueAtDepth` with the leaf flag: a symmetrically averaged leaf is another value, so
     /// it gets its own key instead of sharing the entry of the single-forward one.
     pub fn getValueAtDepthSym(self: *ValueCache, vfn: Value, board: Board, depth: Depth, sym_leaf: bool, stats: *Stats) f64 {
         const key = keyOfDepthSym(board, depth, sym_leaf);
@@ -714,7 +710,7 @@ pub const ValueCache = struct {
     }
 };
 
-/// The #178 leaf: `sym_leaf = false` is the single forward pass as before; `true` averages the value
+/// The leaf: `sym_leaf = false` is the single forward pass as before; `true` averages the value
 /// over the 8 dihedral transforms (`symmetryMap`), so one leaf costs `symmetry_count` forward passes
 /// instead of one.
 fn leafValueSym(vfn: Value, board: Board, sym_leaf: bool, stats: *Stats) f64 {
@@ -726,7 +722,7 @@ fn leafValueSym(vfn: Value, board: Board, sym_leaf: bool, stats: *Stats) f64 {
     return total / @as(f64, @floatFromInt(symmetry_count));
 }
 
-/// Per-thread cache reused across moves (issue #88). A value is a pure function of the board and
+/// Per-thread cache reused across moves. A value is a pure function of the board and
 /// the net, so a warm cache can only change speed, never the chosen move; there is no shared
 /// mutable state because each thread keeps its own workspace.
 threadlocal var move_cache: ValueCache = .{};
@@ -736,7 +732,7 @@ pub fn sharedValueCache() *ValueCache {
     return &move_cache;
 }
 
-/// Bounded transposition table for the completed interior nodes of one search (#263), direct-mapped
+/// Bounded transposition table for the completed interior nodes of one search, direct-mapped
 /// and deterministic like `ValueCache`. A node is identified by its exact board fingerprint, whether
 /// it is a `value` or a `chance` node, its remaining depth, and the path probability where that
 /// probability can still change the result. The full fingerprint is compared on a probe, so a slot
@@ -830,7 +826,7 @@ pub const NodeCache = struct {
     }
 };
 
-/// Per-thread interior-node table reused by the opt-in search (issue #263). The search clears it, so
+/// Per-thread interior-node table reused by the opt-in search. The search clears it, so
 /// a warm table changes speed only and can never answer across a weight update.
 threadlocal var node_cache: NodeCache = .{};
 
@@ -839,7 +835,7 @@ pub fn sharedNodeCache() *NodeCache {
     return &node_cache;
 }
 
-/// shortcut: branch probability cut for `deep3` (issue #108), the same idea as `solver.zig`'s
+/// shortcut: branch probability cut for `deep3`, the same idea as `solver.zig`'s
 /// `prob_cutoff` at a coarser scale. A 4 under a 4 is already ~1e-3 of the path at the second spawn
 /// layer, so 1e-2 drops those subtrees (about 10% of a node's mass, renormalized away) while the
 /// last spawn layer next to the leaves stays full width. Raise it for speed, lower it for accuracy,
@@ -849,7 +845,7 @@ const deep3_cutoff: f64 = 1e-2;
 /// The two spawns of one empty cell, with their probabilities.
 const spawn_tiles = [_]struct { value: core.Tile, p: f64 }{ .{ .value = 2, .p = 0.9 }, .{ .value = 4, .p = 0.1 } };
 
-/// One spawn branch of a chance node (#182): where the tile lands, what it is, and its probability
+/// One spawn branch of a chance node: where the tile lands, what it is, and its probability
 /// `cprob * spawn.p`. Collected in board order, which is also the tie-break of the mass cut.
 const ChanceBranch = struct { r: usize, c: usize, tile: core.Tile, p: f64 };
 
@@ -874,11 +870,11 @@ fn weightedChanceValue(values: []const f64, probabilities: []const f64) f64 {
 /// A full board's worth of branches: at most one spawn pair per cell.
 const max_chance_branches = core.BoardSize * core.BoardSize * spawn_tiles.len;
 
-/// The tail of the downside-risk mix (#187): a chance node's CVaR is the probability-weighted mean
+/// The tail of the downside-risk mix: a chance node's CVaR is the probability-weighted mean
 /// of its branches below this lower quantile of the node's mass.
 const risk_alpha: f64 = 0.25;
 
-/// The CVaR of one chance node (#187): the probability-weighted mean of the branches below the node's
+/// The CVaR of one chance node: the probability-weighted mean of the branches below the node's
 /// lower `alpha` quantile, so a node that is mostly good but sometimes ruinous scores worse than one
 /// that is always equally good. `values` and `probs` are the kept branches of the node in board order;
 /// ties keep that order, so the result is deterministic and the search stays tie-break stable.
@@ -908,7 +904,7 @@ fn downsideRisk(values: []const f64, probs: []const f64, alpha: f64) f64 {
     return tail_v / tail_p;
 }
 
-/// The #187 score of a chance node: its probability-weighted `mean` moved toward the node's CVaR by
+/// The score of a chance node: its probability-weighted `mean` moved toward the node's CVaR by
 /// `risk_weight` (`0` = the plain mean, the pre-#187 value, with no tail work at all; `1` = CVaR
 /// alone). Because the tail mean of the lowest branches never exceeds the mean over all of them,
 /// `risk_weight` in `0..1` only ever lowers a node's score and never reorders it above its own mean.
@@ -917,7 +913,7 @@ fn riskScore(mean: f64, values: []const f64, probs: []const f64, risk_weight: f6
     return (1 - risk_weight) * mean + risk_weight * downsideRisk(values, probs, risk_alpha);
 }
 
-/// Marks the branches `mass_cutoff` drops (#182) and returns the share of the node's mass they carry:
+/// Marks the branches `mass_cutoff` drops and returns the share of the node's mass they carry:
 /// the lowest `p` first, dropped while their cumulative share stays within `mass_cutoff`; a branch that
 /// would push it over stays. Equal probabilities keep `branches` order, and the heaviest branch is never
 /// dropped, so `mass_cutoff` below 1 always keeps at least one branch. `0` (and the full-width
@@ -943,7 +939,7 @@ fn massCutMask(branches: []const ChanceBranch, mass_cutoff: f64, dropped: *[max_
     return dropped_p / all_p;
 }
 
-/// #320: a deterministic uniform in (0, 1) for one branch of one chance node. The node's board hash,
+/// a deterministic uniform in (0, 1) for one branch of one chance node. The node's board hash,
 /// depth and the branch's index in board order are hashed with the run seed, so the same node under
 /// the same seed always proposes the same spawns. `cprob` is deliberately not an input: it scales
 /// every branch weight of a node equally, which leaves a weighted sample unchanged.
@@ -961,7 +957,7 @@ fn sampleUniform(seed: u64, board_hash: u64, depth: u8, index: usize) f64 {
     return (@as(f64, @floatFromInt(h >> 11)) + 0.5) / 9007199254740992.0;
 }
 
-/// #320: marks all but `keep` branches of one chance node as dropped, choosing them by weighted
+/// marks all but `keep` branches of one chance node as dropped, choosing them by weighted
 /// sampling without replacement (Efraimidis-Spirakis: keep the largest `u^(1/p)`, equivalently the
 /// smallest `-ln(u)/p`). Probabilities are the same `cprob * spawn.p` the full enumeration averages
 /// with, so a kept set still renormalizes over its own mass below and the 2/4 ratio is preserved.
@@ -998,37 +994,37 @@ fn sampleMask(branches: []const ChanceBranch, keep: usize, seed: u64, board_hash
 const Search = struct {
     vfn: Value,
     cache: *ValueCache,
-    /// Optional #263 interior-node table; null (the default) searches exactly as before.
+    /// Optional interior-node table; null (the default) searches exactly as before.
     nodes: ?*NodeCache = null,
     stats: Stats = .{},
     /// Spawn branches under this path probability are dropped; 0 searches every branch (`.deep`).
     cutoff: f64 = 0,
     /// Chance nodes may drop their lowest-probability branches while the dropped share of the node's
-    /// mass stays within this value (#182); 0 searches every branch, as `cutoff = 0` did.
+    /// mass stays within this value; 0 searches every branch, as `cutoff = 0` did.
     mass_cutoff: f64 = 0,
-    /// #187: how far a chance node's score moves from its mean toward its CVaR. `0` (the default)
+    /// : how far a chance node's score moves from its mean toward its CVaR. `0` (the default)
     /// returns `total / mass` exactly as before, bit for bit; `1` scores the node by its CVaR alone.
     /// Only the aggregation at chance nodes changes, never a leaf, so it is not part of the cache key.
     risk_weight: f64 = 0,
-    /// Own-move plies this whole search runs at; with `cutoff` it keys every leaf lookup (#157).
+    /// Own-move plies this whole search runs at; with `cutoff` it keys every leaf lookup.
     ply: u8 = 0,
-    /// #260: omit the reward of a move whose following chance node resolves directly to a leaf.
+    /// : omit the reward of a move whose following chance node resolves directly to a leaf.
     omit_leaf_reward: bool = false,
-    /// #261: evaluate cutoff spawn children one own-move layer shallower instead of dropping their mass.
+    /// : evaluate cutoff spawn children one own-move layer shallower instead of dropping their mass.
     recover_cut_branches: bool = false,
-    /// #178: average every leaf over the 8 dihedral transforms instead of one forward pass.
+    /// : average every leaf over the 8 dihedral transforms instead of one forward pass.
     sym_leaf: bool = false,
-    /// #320: at most this many spawn branches per chance node (0 keeps every branch). The draw is a
+    /// : at most this many spawn branches per chance node (0 keeps every branch). The draw is a
     /// pure function of the node's board, its depth and `sample_seed`, so the search still never
     /// touches the game's spawn RNG.
     sample: usize = 0,
     sample_seed: u64 = default_sample_seed,
-    /// #320: chance nodes shallower than this keep every branch (see `Depth.sample_min_depth`).
+    /// : chance nodes shallower than this keep every branch (see `Depth.sample_min_depth`).
     sample_min_depth: u8 = 1,
-    /// #183: `leaf` calls this search may still make (cache hits count too). Unbounded by default, so
+    /// : `leaf` calls this search may still make (cache hits count too). Unbounded by default, so
     /// every pre-#183 tree is searched exactly as before; the iterative deepening sets it per iteration.
     nodes_left: usize = std.math.maxInt(usize),
-    /// #183: a `leaf` found `nodes_left == 0`. The tree above it is incomplete, so its value is
+    /// : a `leaf` found `nodes_left == 0`. The tree above it is incomplete, so its value is
     /// meaningless and whoever set the budget throws the whole iteration away.
     out_of_budget: bool = false,
 
@@ -1046,7 +1042,7 @@ const Search = struct {
         }, self.sym_leaf, &self.stats);
     }
 
-    /// Completed-node lookup in the #263 table; null when this search has no table or the slot holds
+    /// Completed-node lookup in the table; null when this search has no table or the slot holds
     /// another node. The counters stay at 0 without a table, so every pre-#263 search is unchanged.
     fn nodeGet(self: *Search, board: Board, kind: NodeCache.NodeKind, depth: u8, cprob: f64) ?SearchResult {
         const nodes = self.nodes orelse return null;
@@ -1054,7 +1050,7 @@ const Search = struct {
     }
 
     /// Store a completed node. A value computed after the leaf budget ran out is meaningless (its
-    /// caller discards the iteration), so it must never be reused as if it were exact (#183).
+    /// caller discards the iteration), so it must never be reused as if it were exact.
     fn nodePut(self: *Search, board: Board, kind: NodeCache.NodeKind, depth: u8, cprob: f64, result: SearchResult) void {
         const nodes = self.nodes orelse return;
         if (self.out_of_budget) return;
@@ -1066,7 +1062,7 @@ const Search = struct {
     /// average below it, `bootValue(S, r) = max_d (score_delta / reward_scale +
     /// E_spawn[bootValue(S', r - 1)])`. So `bootValue(S, r)` is `r` rewards and the value of the
     /// afterstate `r + 1` moves ahead: exactly one move past the last reward it summed. A leaf taken
-    /// at the last reward's afterstate (what `value` does) would count that reward twice (#158).
+    /// at the last reward's afterstate (what `value` does) would count that reward twice.
     fn bootValue(self: *Search, state: GameState, rewards: u8, cprob: f64) f64 {
         if (self.out_of_budget) return 0; // #183: the caller discards this iteration
         var best: f64 = -std.math.inf(f64);
@@ -1143,7 +1139,7 @@ const Search = struct {
     /// Expected value of a post-move board after spawning; depth 0 is the value leaf (the afterstate itself).
     /// `cprob` is the probability of reaching this node. Kept branches are averaged over their own
     /// mass, so a cut node keeps the scale of a full average instead of shrinking with the dropped ones.
-    /// Two passes (#182): the first collects every branch's probability, the second evaluates the ones
+    /// Two passes: the first collects every branch's probability, the second evaluates the ones
     /// the fixed `cutoff` and the mass `mass_cutoff` both keep.
     /// Direct leaves include both the depth boundary and all-pruned chance nodes; a full board instead
     /// keeps moving at the same depth, and a terminal board's value remains 0 (no legal move).
@@ -1174,14 +1170,14 @@ const Search = struct {
         // the mass cut drops the smallest branches first, the fixed cut its usual depth > 1 way
         var dropped: [max_chance_branches]bool = @splat(false);
         _ = massCutMask(branches[0..count], self.mass_cutoff, &dropped);
-        // #320: keep only a finite weighted sample of this node's spawns. The dropped branches follow
+        // : keep only a finite weighted sample of this node's spawns. The dropped branches follow
         // the cut path below, so the kept ones renormalize over their own mass exactly as a cut node
-        // does and the value keeps the scale of a full average. Not combined with the #261 recovery:
+        // does and the value keeps the scale of a full average. Not combined with the recovery:
         // that row evaluates every branch one layer shallower, which sampling would silently undo.
         if (self.sample > 0 and depth >= self.sample_min_depth and !self.recover_cut_branches) {
             sampleMask(branches[0..count], self.sample, self.sample_seed, ValueCache.keyOf(state.board), depth, &dropped);
         }
-        // #261: if the fixed cutoff removes any branch, evaluate every spawn from its real child
+        // : if the fixed cutoff removes any branch, evaluate every spawn from its real child
         // board. Kept branches retain this depth; cut branches lose one own-move/reward layer. Their
         // local probabilities sum to 1, so no mass is discarded or renormalized.
         var has_cut_branch = false;
@@ -1250,7 +1246,7 @@ const dir_order = [4]Direction{ .up, .left, .down, .right };
 const RootBest = struct {
     dir: ?Direction = null,
     value: f64 = -std.math.inf(f64),
-    /// The runner-up, which only `Rerank` (#189) and the tie-margin deepening (#188) read.
+    /// The runner-up, which only `Rerank` and the tie-margin deepening read.
     second_dir: ?Direction = null,
     second_value: f64 = -std.math.inf(f64),
 };
@@ -1268,7 +1264,7 @@ fn rootMoveScore(search: *Search, state: GameState, dir: Direction) ?f64 {
 }
 
 /// The root layer of `deepMove`: max over `order` of reward + expected value after the spawn. `order`
-/// is the fixed one except in iterative deepening (#183), where the previous iteration's best move
+/// is the fixed one except in iterative deepening, where the previous iteration's best move
 /// goes first; moving a later direction earlier only breaks ties differently if the two scores are
 /// bit-identical, which can only happen on a symmetric board.
 fn rootMove(search: *Search, state: GameState, order: [4]Direction, rerank: ?Rerank) RootBest {
@@ -1282,12 +1278,12 @@ fn rootMove(search: *Search, state: GameState, order: [4]Direction, rerank: ?Rer
         } else if (second.dir == null or v > second.value) {
             second = .{ .dir = d, .value = v };
         }
-        // #183: out of budget, so this root's score is garbage — stop before spending another branch
+        // : out of budget, so this root's score is garbage — stop before spending another branch
         if (search.out_of_budget) return best;
     }
     best.second_dir = second.dir;
     best.second_value = second.value;
-    // #189: only a near tie is worth a second opinion, and only a nonzero weight can change the pick.
+    // : only a near tie is worth a second opinion, and only a nonzero weight can change the pick.
     if (rerank) |r| {
         if (best.dir != null and second.dir != null and r.weight != 0 and best.value - second.value <= r.margin) {
             const best_other = rerankScore(r, state, best.dir.?);
@@ -1298,7 +1294,7 @@ fn rootMove(search: *Search, state: GameState, order: [4]Direction, rerank: ?Rer
     return best;
 }
 
-/// Opt-in heterogeneous rerank of the top two moves (#189). The 2-ply search still scores every
+/// Opt-in heterogeneous rerank of the top two moves. The 2-ply search still scores every
 /// legal move with the net; if the gap between its best and its second move is within `margin`, only
 /// those two are re-scored with a cheap foreign evaluator and the move with the larger
 /// `nn + weight * other` wins. `null` (the default) or `weight = 0` keeps the plain argmax.
@@ -1323,7 +1319,7 @@ fn rerankScore(r: Rerank, state: GameState, d: Direction) f64 {
 
 /// `depth.ply` own moves deep: my move -> spawn -> ... -> afterstate value + score_delta/reward_scale.
 /// `ply` 2 is `deep` (full width); `ply` 3 is `deep3`, whose cost only fits with a spawn-probability cut;
-/// `ply` 4 is `deep4` (#267) or `phase_h4` (#171), the former everywhere at that cut and the latter
+/// `ply` 4 is `deep4` or `phase_h4`, the former everywhere at that cut and the latter
 /// only where the board is nearly full.
 fn deepMove(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, nodes: ?*NodeCache, depth: Depth, sym_leaf: bool, rerank: ?Rerank, risk_weight: f64) ?Direction {
     var search = newSearch(vfn, cache, nodes, depth, sym_leaf, risk_weight);
@@ -1347,7 +1343,7 @@ fn newSearch(vfn: Value, cache: *ValueCache, nodes: ?*NodeCache, depth: Depth, s
         .sample = depth.sample,
         .sample_seed = depth.sample_seed,
         .sample_min_depth = depth.sample_min_depth,
-        // a phase row may carry its own #187 weight; the caller's option is the one every other row uses
+        // a phase row may carry its own weight; the caller's option is the one every other row uses
         .risk_weight = if (depth.risk_weight != 0) depth.risk_weight else risk_weight,
     };
 }
@@ -1356,7 +1352,7 @@ fn newSearch(vfn: Value, cache: *ValueCache, nodes: ?*NodeCache, depth: Depth, s
 /// the cap only keeps a huge budget from running away into a tree no cache can hold.
 const max_id_ply: u8 = 6;
 
-/// Result of `deepMoveId` (#183).
+/// Result of `deepMoveId`.
 pub const IdMove = struct {
     /// The move of the deepest *completed* iteration; `null` only when no iteration completed (a budget
     /// too small for one full 2-ply tree, e.g. 0), in which case the caller falls back to a legal move.
@@ -1367,7 +1363,7 @@ pub const IdMove = struct {
     leaves: u64,
 };
 
-/// Iterative deepening over the ply (#183): search the start depth, then one ply deeper, and keep the
+/// Iterative deepening over the ply: search the start depth, then one ply deeper, and keep the
 /// best move of the last iteration that finished, which is what makes a truncated iteration harmless
 /// (a partial tree is never adopted). The budget is leaf evaluations, never wall clock, so the same
 /// board and budget always give the same move.
@@ -1396,7 +1392,7 @@ fn deepMoveId(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, n
         node_hits += search.stats.node_hits;
         // a partial iteration (or a dead board) keeps the previous iteration's move
         if (search.out_of_budget or root.dir == null) break;
-        // #188: with a tie margin, only the first iteration's near tie justifies a deeper tree. A root
+        // : with a tie margin, only the first iteration's near tie justifies a deeper tree. A root
         // move that is already clearly better than its runner-up gains nothing from the extra ply, so
         // the search stops here and returns it (its value does not enter the comparison, only the gap).
         const first_iteration = best == null;
@@ -1426,7 +1422,7 @@ fn deepMoveId(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, n
     return .{ .dir = best, .ply = best_ply, .leaves = spent };
 }
 
-/// #183: the last-resort move when no iteration completed (budget 0 included): the first legal
+/// the last-resort move when no iteration completed (budget 0 included): the first legal
 /// direction in the fixed order, which needs no leaf evaluation at all.
 fn firstLegalMove(state: GameState) ?Direction {
     for (dir_order) |d| {
@@ -1436,11 +1432,11 @@ fn firstLegalMove(state: GameState) ?Direction {
     return null;
 }
 
-/// Lookahead of the #158 2-ply training variants: `search2_ply` own moves below the board being
+/// Lookahead of the 2-ply training variants: `search2_ply` own moves below the board being
 /// valued, with a spawn layer before each of them — the tree `Mode.deep` visits at this ply.
 const search2_ply: u8 = 2;
 
-/// Bootstrap of the `search2` TD target (#158) of a post-spawn board: the `.deep` tree's shape with
+/// Bootstrap of the `search2` TD target of a post-spawn board: the `.deep` tree's shape with
 /// its last reward moved into the leaf, `search2_ply - 1` searched rewards and then `V` of the
 /// afterstate one own move past the last of them.
 ///
@@ -1451,8 +1447,8 @@ const search2_ply: u8 = 2;
 /// the *last* reward reached, so that last reward lands in the target twice and the fixed point of
 /// the `search2` target sits ~1.5x above the true value on a 1-reward-per-move chain.
 fn search2Value(vfn: Value, state: GameState, cache: *ValueCache, sym_leaf: bool) f64 {
-    // (#228) a target is priced between weight updates, so a table filled by an older snapshot would
-    // answer for the current weights; start empty, as `teacherValue` does (#207). The search inside
+    // a target is priced between weight updates, so a table filled by an older snapshot would
+    // answer for the current weights; start empty, as `teacherValue` does. The search inside
     // this call still reuses its own entries, which all come from the current weights.
     cache.clear();
     // The leaf sits one own move deeper than `value` at the same reward count: key it as such.
@@ -1460,13 +1456,13 @@ fn search2Value(vfn: Value, state: GameState, cache: *ValueCache, sym_leaf: bool
     return search.bootValue(state, search2_ply - 1, 1);
 }
 
-/// Self-play move under `Options.teacher` (#167): the mode's own move ranking, `reward +
+/// Self-play move under `Options.teacher`: the mode's own move ranking, `reward +
 /// `Search.chance(afterstate)` at the mode's phase row — the moves `Mode.deep` / `Mode.deep3` pick —
 /// so `Pick.value` is that chance value (not `V`) and `reward + value` is the teacher's q of the move.
 /// `teacherValue` of the board this move is made on is the tree one own move deeper, exactly as
 /// `deepMove` scores the same move. Spawns are enumerated, so this draws nothing from the rng.
 fn pickTeacherValue(vfn: Value, state: GameState, mode: Mode, cache: *ValueCache, sym_leaf: bool) ?Pick {
-    // (#228) same as `search2Value`: this pick is priced after the previous move's weight update, so
+    // same as `search2Value`: this pick is priced after the previous move's weight update, so
     // it must not read leaves cached with the older weights.
     cache.clear();
     const depth = phaseDepth(mode, state.board);
@@ -1499,7 +1495,7 @@ fn pickTeacherValue(vfn: Value, state: GameState, mode: Mode, cache: *ValueCache
     return best;
 }
 
-/// `pickMoveValue` for the 2-ply self-play policy (#158): candidates are ranked by the eval's `.deep`
+/// `pickMoveValue` for the 2-ply self-play policy: candidates are ranked by the eval's `.deep`
 /// value, `reward + Search.chance(afterstate)` — the `1 + search2_ply` own moves deep that `deepMove`
 /// at `ply = search2_ply` scores — so `Pick.value` is that chance value (not `V`), covering
 /// `search2_ply` moves and a reward-bearing leaf below the afterstate. `search2Value` bootstraps the
@@ -1507,7 +1503,7 @@ fn pickTeacherValue(vfn: Value, state: GameState, mode: Mode, cache: *ValueCache
 /// rewards and V one move past the last of them. Spawns are enumerated, so this draws nothing from
 /// the rng and the spawn sequence of the game is the same as with `greedy1`.
 /// The `.deep` phase row is `(ply = search2_ply, full width)`, so this is `pickTeacherValue(.., .deep)`:
-/// the `d2` cell of #167 plays exactly this move.
+/// the `d2` cell of plays exactly this move.
 fn pickSearch2Value(vfn: Value, state: GameState, cache: *ValueCache, sym_leaf: bool) ?Pick {
     return pickTeacherValue(vfn, state, .deep, cache, sym_leaf);
 }
@@ -1519,56 +1515,56 @@ pub const Mode = enum {
     chance,
     /// 2-ply: one more own move and spawn layer below `chance` (see `deepMove`).
     deep,
-    /// 3-ply: `deep` plus one more own move and spawn layer, with the probability cut (issue #108).
+    /// 3-ply: `deep` plus one more own move and spawn layer, with the probability cut.
     deep3,
-    /// 4-ply: `deep3` plus one more own move and spawn layer at the same 1e-2 cut (#267).
+    /// 4-ply: `deep3` plus one more own move and spawn layer at the same 1e-2 cut.
     deep4,
-    /// #261: `deep3` with cutoff spawn children evaluated one own-move layer shallower.
+    /// : `deep3` with cutoff spawn children evaluated one own-move layer shallower.
     deep3_recover,
-    /// 2-ply with the cumulative-mass cut of #182 instead of the fixed probability cut: the same tree as
+    /// 2-ply with the cumulative-mass cut of instead of the fixed probability cut: the same tree as
     /// `deep`, minus the lowest-probability spawn branches up to `mass2_ply_cutoff` of each node's mass.
     deep_mass,
-    /// 2-ply while the board has 8+ empty cells, then 3-ply with the 1e-2 cut (#157).
+    /// 2-ply while the board has 8+ empty cells, then 3-ply with the 1e-2 cut.
     phase_h1,
-    /// Same start, 3-ply from 5..7 empty cells, and the 1e-4 cut once 4 or fewer are left (#157).
+    /// Same start, 3-ply from 5..7 empty cells, and the 1e-4 cut once 4 or fewer are left.
     phase_h2,
-    /// 2-ply only down to 10 empty cells, then 3-ply from 6 and the 1e-4 cut near the end (#157).
+    /// 2-ply only down to 10 empty cells, then 3-ply from 6 and the 1e-4 cut near the end.
     phase_h3,
-    /// 3-ply everywhere, then 4-ply once 2 or fewer empty cells are left (#171): the endgame is where
+    /// 3-ply everywhere, then 4-ply once 2 or fewer empty cells are left: the endgame is where
     /// the branching factor collapses, so the extra ply is cheap there and it is the ply that decides
     /// 4096 -> 8192.
     phase_h4,
 };
 
-/// One row of a phase schedule (#157): a board with at least `min_empty` empty cells searches `ply`
+/// One row of a phase schedule: a board with at least `min_empty` empty cells searches `ply`
 /// own moves deep, dropping spawn branches under path probability `cutoff` (`full_width_cutoff` keeps
 /// every branch) and dropping the lowest-probability branches up to `mass_cutoff` of a chance node's
-/// mass (#182, 0 keeps every branch).
+/// mass.
 pub const Phase = struct { min_empty: u8, ply: u8, cutoff: f64, mass_cutoff: f64 = 0, risk_weight: f64 = 0, sample: usize = 0, sample_min_depth: u8 = 1 };
 
 /// A row cutoff that keeps every spawn branch: no branch probability ever reaches 1.
 const full_width_cutoff: f64 = 1;
 
-/// Tighter cut for the last rows of `phase_h2` / `phase_h3` (#157): the board is nearly full there, so
+/// Tighter cut for the last rows of `phase_h2` / `phase_h3`: the board is nearly full there, so
 /// the 3-ply tree stays small even with more spawn branches kept.
 const phase_tight_cutoff: f64 = 1e-4;
 
-/// The mass cut of the `deep_mass` row (#182): 5% of every chance node's mass may be dropped, which is
+/// The mass cut of the `deep_mass` row: 5% of every chance node's mass may be dropped, which is
 /// the low-probability tail (the 4s under a wide board) rather than a fixed probability floor.
 const mass2_ply_cutoff: f64 = 0.05;
 
-/// The search depth of every `Mode`, one table (#139 style): rows are in descending `min_empty`, so the
+/// The search depth of every `Mode`, one table: rows are in descending `min_empty`, so the
 /// first row the board's empty cells reach is its phase. `deep` and `deep3` are one row each, which is
 /// what keeps their behavior exactly the pre-#157 search.
 const phase_schedules = struct {
     const deep = [_]Phase{.{ .min_empty = 0, .ply = 2, .cutoff = full_width_cutoff }};
     const deep3 = [_]Phase{.{ .min_empty = 0, .ply = 3, .cutoff = deep3_cutoff }};
-    /// #267: one row, `deep3` plus one more own move and spawn layer at the same cut, so the only
+    /// : one row, `deep3` plus one more own move and spawn layer at the same cut, so the only
     /// difference from `deep3` is the extra ply.
     const deep4 = [_]Phase{.{ .min_empty = 0, .ply = 4, .cutoff = deep3_cutoff }};
-    /// #261: the `deep3` tree with the cut spawn children evaluated one own-move layer shallower.
+    /// : the `deep3` tree with the cut spawn children evaluated one own-move layer shallower.
     const deep3_recover = [_]Phase{.{ .min_empty = 0, .ply = 3, .cutoff = deep3_cutoff }};
-    /// #182: one row, the `deep` tree with the cumulative-mass cut
+    /// : one row, the `deep` tree with the cumulative-mass cut
     const deep_mass = [_]Phase{.{ .min_empty = 0, .ply = 2, .cutoff = full_width_cutoff, .mass_cutoff = mass2_ply_cutoff }};
     const phase_h1 = [_]Phase{
         .{ .min_empty = 8, .ply = 2, .cutoff = full_width_cutoff },
@@ -1584,7 +1580,7 @@ const phase_schedules = struct {
         .{ .min_empty = 6, .ply = 3, .cutoff = deep3_cutoff },
         .{ .min_empty = 0, .ply = 3, .cutoff = phase_tight_cutoff },
     };
-    /// #171: `deep3` is the baseline and the only row that changes is the very end, so the rows above
+    /// : `deep3` is the baseline and the only row that changes is the very end, so the rows above
     /// the 3-empty boundary are one row. 4-ply keeps the `deep3` cut because the tree it searches is
     /// already tiny — at 2 empties it is a handful of spawns, not a midgame branching factor.
     const phase_h4 = [_]Phase{
@@ -1615,7 +1611,7 @@ fn searchCutoff(cutoff: f64) f64 {
     return if (cutoff >= full_width_cutoff) 0 else cutoff;
 }
 
-/// `searchCutoff` for the mass cut (#182): `0` and its full-width spelling 1 both mean keep everything.
+/// `searchCutoff` for the mass cut: `0` and its full-width spelling 1 both mean keep everything.
 fn searchMassCutoff(mass_cutoff: f64) f64 {
     return if (mass_cutoff >= full_width_cutoff) 0 else mass_cutoff;
 }
@@ -1663,7 +1659,7 @@ pub fn bestMove(net: *const Net, state: GameState, mode: Mode) ?Direction {
     return bestMoveValue(.{ .single = net }, state, mode);
 }
 
-/// `bestMove` for a single or staged value function (#107).
+/// `bestMove` for a single or staged value function.
 pub fn bestMoveValue(vfn: Value, state: GameState, mode: Mode) ?Direction {
     var stats: Stats = .{};
     return bestMoveWithCacheValue(vfn, state, mode, &stats, sharedValueCache());
@@ -1676,7 +1672,7 @@ pub fn bestMoveWithStats(net: *const Net, state: GameState, mode: Mode, stats: *
     return bestMoveWithCache(net, state, mode, stats, &cache);
 }
 
-/// `bestMoveWithStats` with a caller-owned cache: reuse it across moves (issue #88) for speed.
+/// `bestMoveWithStats` with a caller-owned cache: reuse it across moves for speed.
 /// A warm cache returns the same moves as a fresh one — only faster.
 pub fn bestMoveWithCache(net: *const Net, state: GameState, mode: Mode, stats: *Stats, cache: *ValueCache) ?Direction {
     return bestMoveWithCacheValue(.{ .single = net }, state, mode, stats, cache);
@@ -1686,9 +1682,9 @@ pub fn bestMoveWithCacheValue(vfn: Value, state: GameState, mode: Mode, stats: *
     return bestMoveWithCacheValueOpts(vfn, state, mode, stats, cache, .{});
 }
 
-/// `bestMoveWithCacheValue` with the search options (#178): `sym_leaf` averages every leaf, and
-/// `id_budget` (#183) swaps the fixed-depth search for a node-budgeted iterative deepening.
-/// `rerank` (#189) re-scores the top two moves of a near tie with a foreign evaluator.
+/// `bestMoveWithCacheValue` with the search options: `sym_leaf` averages every leaf, and
+/// `id_budget` swaps the fixed-depth search for a node-budgeted iterative deepening.
+/// `rerank` re-scores the top two moves of a near tie with a foreign evaluator.
 pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stats: *Stats, cache: *ValueCache, opts: Options) ?Direction {
     // `.greedy` / `.chance` have no phase schedule (and no search), so only search modes resolve a depth.
     var depth: Depth = undefined;
@@ -1704,15 +1700,15 @@ pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stat
             searching = true;
         },
     }
-    // #263: one interior-node table per top-level search, cleared here because settings and net are
+    // : one interior-node table per top-level search, cleared here because settings and net are
     // not part of its key (a table surviving a weight update would price boards with the old net).
-    // #266: 3-ply and deeper default to the table (same moves, ~40% cheaper); 2-ply keeps no table.
+    // : 3-ply and deeper default to the table (same moves, ~40% cheaper); 2-ply keeps no table.
     const nodes: ?*NodeCache = if (opts.node_tt orelse (searching and depth.ply >= 3)) blk: {
         const table = sharedNodeCache();
         table.clear();
         break :blk table;
     } else null;
-    // #183: a node budget means iterative deepening. `mode` only sets the first iteration's depth (its
+    // : a node budget means iterative deepening. `mode` only sets the first iteration's depth (its
     // phase row, so `.deep` starts at ply 2 and `.deep3` at ply 3) and the spawn cut every ply keeps.
     if (opts.id_budget) |budget| {
         const dir = switch (mode) {
@@ -1725,7 +1721,7 @@ pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stat
     return switch (mode) {
         .greedy => if (pickMoveValue(vfn, state, false)) |p| p.dir else null,
         .chance => chanceMove(vfn, state),
-        // every search mode takes its (ply, cutoff, mass cutoff) for this board from the phase table (#157)
+        // every search mode takes its (ply, cutoff, mass cutoff) for this board from the phase table
         .deep, .deep3, .deep4, .deep3_recover, .deep_mass, .phase_h1, .phase_h2, .phase_h3, .phase_h4 => deepMove(vfn, state, stats, cache, nodes, depth, opts.sym_leaf, opts.rerank, opts.risk_weight),
     };
 }
@@ -1737,10 +1733,10 @@ pub const PlayResult = struct {
     /// `forward` leaf evaluations summed over the game (0 for modes that do not search).
     leaves: u64 = 0,
     /// Interior-node lookups and hits summed over the game (#263; both 0 for a 2-ply search or with
-    /// `Options.node_tt = false`, #266).
+    /// `Options.node_tt = false`).
     node_probes: u64 = 0,
     node_hits: u64 = 0,
-    /// The board the game ended on (the tape replay test compares it, #168). Zero for callers that
+    /// The board the game ended on (the tape replay test compares it). Zero for callers that
     /// build a `PlayResult` without playing (the expectimax row of `nn_main`).
     board: Board = std.mem.zeroes(Board),
 };
@@ -1750,12 +1746,12 @@ pub fn play(net: *const Net, rng: std.Random, mode: Mode) PlayResult {
     return playValue(.{ .single = net }, rng, mode);
 }
 
-/// `play` for a single or staged value function (#107).
+/// `play` for a single or staged value function.
 pub fn playValue(vfn: Value, rng: std.Random, mode: Mode) PlayResult {
     return playValueOpts(vfn, rng, mode, .{});
 }
 
-/// `playValue` with the search options (#178): `sym_leaf` averages every search leaf over the 8
+/// `playValue` with the search options: `sym_leaf` averages every search leaf over the 8
 /// dihedral transforms. Modes without a search (`.greedy`, `.chance`) are unchanged.
 pub fn playValueOpts(vfn: Value, rng: std.Random, mode: Mode, opts: Options) PlayResult {
     var stats: Stats = .{};
@@ -1770,7 +1766,7 @@ pub fn playWithStatsValue(vfn: Value, rng: std.Random, mode: Mode, stats: *Stats
     return playWithOptsValue(vfn, rng, mode, stats, .{});
 }
 
-/// `playWithStatsValue` with the search options (#178).
+/// `playWithStatsValue` with the search options.
 pub fn playWithOptsValue(vfn: Value, rng: std.Random, mode: Mode, stats: *Stats, opts: Options) PlayResult {
     var state = GameState.gameStart(rng);
     var moves: u32 = 0;
@@ -1789,17 +1785,17 @@ pub fn playWithOptsValue(vfn: Value, rng: std.Random, mode: Mode, stats: *Stats,
     return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves, .leaves = stats.leaves, .node_probes = stats.node_probes, .node_hits = stats.node_hits, .board = state.board };
 }
 
-/// One spawn of a game (#168): a board-independent random pick and which of the two values the tile had.
-/// The pick gives each board an almost-uniform hole choice, even when the policies diverge (#237).
+/// One spawn of a game: a board-independent random pick and which of the two values the tile had.
+/// The pick gives each board an almost-uniform hole choice, even when the policies diverge.
 pub const Spawn = struct {
-    /// A common random number, uniform over all `u32` values (#237). Both boards map it onto their own
+    /// A common random number, uniform over all `u32` values. Both boards map it onto their own
     /// empty cells with `slotFor`. Each hole owns either floor(2^32 / n) or ceil(2^32 / n) picks, so
     /// the distribution is exact when n divides 2^32 and otherwise differs by at most one pick.
     ///
-    /// Recording an index and clamping it to the other board's hole count was biased (#235): with 4 holes
+    /// Recording an index and clamping it to the other board's hole count was biased: with 4 holes
     /// on A and 2 on B, A's index 2 and 3 both became B's hole 1, which then took 75% of B's spawns.
     /// Mapping one common pick into nearly equal-width buckets on both boards keeps each marginal
-    /// uniform to 32-bit precision — the textbook common-random-numbers construction (#168's whole point).
+    /// uniform to 32-bit precision — the textbook common-random-numbers construction.
     pick: u32,
     /// 1 for the 1-in-10 draw that spawns a 4, 0 for a 2.
     four: u1,
@@ -1829,9 +1825,9 @@ pub const Spawn = struct {
     }
 };
 
-/// Spawn tape for common random numbers (#168): one game's spawn sequence, recorded while policy A
+/// Spawn tape for common random numbers: one game's spawn sequence, recorded while policy A
 /// plays and replayed while policy B plays the same game. Spawn luck alone is worth ±5,000 points
-/// between two seeds (`docs/solver-history.md`, #159), so two policies compared on the same tapes
+/// between two seeds (`docs/solver-history.md`), so two policies compared on the same tapes
 /// leave only their own difference in the paired statistics.
 pub const Tape = struct {
     pub const Recording = enum { record, replay };
@@ -1887,7 +1883,7 @@ pub const Tape = struct {
                 const recorded = self.spawns[self.cursor];
                 self.cursor += 1;
                 // Use the same row-major empty-cell order as `spawnRandomTile`; map the common pick
-                // independently for this board so its own holes retain an almost-uniform distribution (#237).
+                // independently for this board so its own holes retain an almost-uniform distribution.
                 var empties: [core.BoardCellCount]core.Position = undefined;
                 var empty_count: usize = 0;
                 for (0..core.BoardSize) |row| for (0..core.BoardSize) |col| {
@@ -1898,7 +1894,7 @@ pub const Tape = struct {
                 };
                 if (empty_count == 0) return false;
                 // the same uniform number, mapped onto this board's holes: B draws from its own uniform
-                // distribution over its own holes instead of inheriting a clamped index (#237)
+                // distribution over its own holes instead of inheriting a clamped index
                 const slot = Spawn.slotFor(recorded.pick, empty_count);
                 const pos = empties[slot];
                 state.board[pos.row][pos.col] = recorded.tile();
@@ -1908,7 +1904,7 @@ pub const Tape = struct {
     }
 };
 
-/// Play with a spawn tape (#168). Record mode generates a tape-specific sequence of common random picks;
+/// Play with a spawn tape. Record mode generates a tape-specific sequence of common random picks;
 /// replay mode maps those picks onto this policy's board so two policies can be compared on shared randomness.
 pub fn playTapedValue(vfn: Value, rng: std.Random, mode: Mode, tape: *Tape) PlayResult {
     return playTapedValueOpts(vfn, rng, mode, tape, .{});
@@ -1927,7 +1923,7 @@ pub fn playTapedWithStatsValue(vfn: Value, rng: std.Random, mode: Mode, tape: *T
 }
 
 /// `playTapedWithStatsValue` with the search options, so a tape recorded by one policy can be
-/// replayed with a search option (#263's node table) on exactly the same spawns.
+/// replayed with a search option on exactly the same spawns.
 pub fn playTapedWithStatsValueOpts(vfn: Value, rng: std.Random, mode: Mode, tape: *Tape, stats: *Stats, opts: Options) PlayResult {
     var state = GameState.initEmpty();
     _ = tape.spawn(&state, rng);
@@ -1949,7 +1945,7 @@ pub fn playTapedWithStatsValueOpts(vfn: Value, rng: std.Random, mode: Mode, tape
     return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves, .leaves = stats.leaves, .node_probes = stats.node_probes, .node_hits = stats.node_hits, .board = state.board };
 }
 
-/// Paired comparison of two policies on the same spawn tape (#168): `diffs[i]` is `score_b - score_a`
+/// Paired comparison of two policies on the same spawn tape: `diffs[i]` is `score_b - score_a`
 /// of game `i`, summarized as mean ± standard error over the games themselves (not over seed ranges,
 /// which would make a single range's stderr 0 and hide the pairing).
 pub const PairSummary = struct {
@@ -1962,7 +1958,7 @@ pub const PairSummary = struct {
 };
 
 /// Aggregate the per-game score differences of a paired run; the mean is the paired effect and the
-/// standard error is its uncertainty (the paired design shrinks it, which is the point of #168).
+/// standard error is its uncertainty (the paired design shrinks it, which is the point of ).
 pub fn pairStats(diffs: []const f64) PairSummary {
     var out: PairSummary = .{ .games = diffs.len };
     if (diffs.len == 0) return out;
@@ -1975,7 +1971,7 @@ pub fn pairStats(diffs: []const f64) PairSummary {
     return out;
 }
 
-/// Buckets for the training diagnostic (issue #32): empty cells 0..3, 4..7, 8+; moves left 0..9, 10..29, 30+.
+/// Buckets for the training diagnostic: empty cells 0..3, 4..7, 8+; moves left 0..9, 10..29, 30+.
 pub fn emptyBucket(empties: usize) usize {
     return if (empties <= 3) 0 else if (empties <= 7) 1 else 2;
 }
@@ -1984,8 +1980,8 @@ pub fn distBucket(moves_left: usize) usize {
     return if (moves_left < 10) 0 else if (moves_left < 30) 1 else 2;
 }
 
-/// Max-tile buckets of the deep-position diagnostic (issue #159): <=256, 512, 1024, 2048, 4096, 8192+.
-/// The tail beyond 4096 is where the value error is concentrated (#28/#32), so the table has to show
+/// Max-tile buckets of the deep-position diagnostic: <=256, 512, 1024, 2048, 4096, 8192+.
+/// The tail beyond 4096 is where the value error is concentrated, so the table has to show
 /// how many training steps ever reach it.
 pub const tile_buckets = 6;
 
@@ -2006,7 +2002,7 @@ pub const Diag = struct {
     const window = 30;
 
     stats: [3][3]Stat = @splat(@splat(.{})),
-    /// Steps and |TD error| by max tile (#159). No window: the bucket of an afterstate is known at once.
+    /// Steps and |TD error| by max tile. No window: the bucket of an afterstate is known at once.
     tiles: [tile_buckets]Stat = @splat(.{}),
     ring: [window]Pending = undefined,
     pushed: usize = 0,
@@ -2045,241 +2041,219 @@ pub const Diag = struct {
 };
 
 /// Thin alias so the existing `nn.countEmpty` callers (training diagnostics, replay buckets) keep
-/// compiling; the scan itself is the core board predicate (#139).
+/// compiling; the scan itself is the core board predicate.
 pub fn countEmpty(board: Board) usize {
     return core.countEmpty(board);
 }
 
-/// TD target of the per-move trainer (#158); see `Options.target`.
+/// TD target of the per-move trainer; see `Options.target`.
 pub const Target = enum { td1, search2 };
 
-/// Self-play policy of the per-move trainer (#158); see `Options.selfplay`.
+/// Self-play policy of the per-move trainer; see `Options.selfplay`.
 pub const SelfPlay = enum { greedy1, deep2 };
 
-/// (#242) Default upper bound on the moves of one self-play game. A healthy game ends in a few
+/// Default upper bound on the moves of one self-play game. A healthy game ends in a few
 /// thousand moves, so this is far past anything normal; a game that reaches it is pathological.
 pub const default_move_cap: u32 = 100_000;
 
-/// Opt-in training variants (issue #33). Default `.{}` is the plain per-move TD(0) of `trainGame`.
+/// Opt-in training variants. The default `.{}` is the plain per-move TD(0) of `trainGame`; every
+/// option whose default is 0/false/null leaves that path bit-identical.
 pub const Options = struct {
-    /// (#242) Upper bound on the moves of one self-play game, 0 = no cap. Reaching it ends the game
-    /// with `GameResult.capped = true` and trains nothing more; the CLI then stops the run before the
-    /// checkpoint write. Seed 3 at 60,000 games spent 53 minutes in one 8-game batch while the weights
-    /// stayed finite (the #234 guard only checks weights), so the run could not finish (#241).
+    /// Upper bound on the moves of one self-play game, 0 = no cap. Reaching it ends the game with
+    /// `GameResult.capped = true` and trains nothing more, and the CLI stops the run before the
+    /// checkpoint write. Without it one pathological game can hang a batch for the whole run.
     move_cap: u32 = default_move_cap,
-    /// Candidate #289: adaptive target normalization for the plain TD(0) path only.
+    /// Candidate : adaptive target normalization for the plain TD(0) path only.
     popart: ?*PopArtState = null,
     /// Candidate A: no per-move update during the game; afterwards train every stored afterstate from last to first.
     backward: bool = false,
-    /// Candidate B: after the game, re-train the last `replay_k` afterstates once more (0 = off), oldest first.
+    /// After the game, re-train the last `replay_k` afterstates once more (0 = off), oldest first.
     replay_k: usize = 0,
-    /// Learning rate of the replay pass, as a factor of the training lr.
+    /// Learning rate of that replay pass, as a factor of the training lr.
     replay_lr_scale: f64 = 0.5,
-    /// Candidate (#262): frozen bootstrap net. When set, the V of the next afterstate in every TD
-    /// target (online TD, priority replay and the backwards/replay sweeps) comes from this net instead
-    /// of the live one. The self-play move is still chosen and ranked by the live net, so the policy and
-    /// the spawn tape are unchanged; only the regression target stops moving with the weights being
-    /// trained. `null` (the default) is the historical live bootstrap, bit for bit. The caller owns the
-    /// net and must not mutate it during a parallel batch (the CLI refreshes it between batches only).
+    /// Frozen bootstrap net: the V of the next afterstate in every TD target (online TD, priority
+    /// replay, backward/replay sweeps) comes from this net instead of the live one. Self-play still
+    /// moves and ranks by the live net, so policy and spawn tape are unchanged. The caller owns the net
+    /// and must not mutate it during a parallel batch.
     target_net: ?*const Net = null,
-    /// Candidate D (#34): prioritized replay buffer; null = off. Normal per-move updates run as well.
+    /// Prioritized replay buffer; null = off. Normal per-move updates run as well.
     priority: ?*Priority = null,
-    /// Candidate E (#59): with `priority` set, the `m` extra updates draw uniformly from buffer entries
-    /// with 4..7 empty cells (midgame) instead of by |TD error|.
+    /// With `priority`, the `m` extra updates draw uniformly from entries with 4..7 empty cells
+    /// (midgame) instead of by |TD error|.
     midgame: bool = false,
-    /// Candidate (#63): with `priority` set, the `m` extra updates keep the uniform share over the whole
-    /// buffer and draw the rest by |TD error| from the 4..7 empty-cell bucket only.
+    /// With `priority`, keep the uniform share over the whole buffer and draw the rest by |TD error|
+    /// from the 4..7 empty-cell bucket only.
     midmix: bool = false,
-    /// Candidate (#224): probability that a self-play move is a uniformly random legal move instead of
-    /// the policy's pick (0 = the historical greedy-only walk). Widens the state distribution the net
-    /// is trained on; the TD target of the random move is the same `reward + V(after)` form.
+    /// Probability that a self-play move is a uniformly random legal move instead of the policy's
+    /// pick. Widens the state distribution; such a move's TD target is the usual `reward + V(after)`.
     explore: f64 = 0,
-    /// Candidate (#224): with `warm_open` > 0 the first `warm_open` moves of every game are uniformly
-    /// random and train nothing; the game then continues greedily and trains as usual. Differently from
-    /// `explore`, the random moves never enter a TD target, so only the start distribution widens.
+    /// With `warm_open` > 0 the first `warm_open` moves of every game are random and train nothing;
+    /// they never enter a TD target, so only the start distribution widens (unlike `explore`).
     warm_open: u32 = 0,
-    /// Candidate (#72): apply every per-move TD update to all 8 dihedral transforms of the afterstate,
-    /// with the same target (8 samples per visited board, deterministic).
+    /// Apply every per-move TD update to all 8 dihedral transforms of the afterstate, with the same
+    /// target (8 samples per visited board, deterministic).
     symmetry: bool = false,
-    /// Candidate (#271): apply each per-move TD update to one uniformly random dihedral transform of the
-    /// afterstate, drawn per update. Keeps one update per move (unlike `symmetry`'s 8), so the cost is
-    /// `base`'s. The target was assumed scalar so the orientation would only augment the input; #271
-    /// measured that this fails before the net is symmetric (see docs/solver-history.md). Draws one
-    /// rng value per update, so the self-play spawn stream differs from `base` after the first move.
+    /// Apply each per-move TD update to one uniformly random dihedral transform of the afterstate.
+    /// Keeps one update per move, at `base`'s cost, but draws one rng value per update, so the self-play
+    /// spawn stream differs from `base` after the first move.
     rsym: bool = false,
-    /// Candidate (#273): draw one uniformly random dihedral transform per per-move TD update and apply
-    /// it to both the trained afterstate and the TD target's next board (`next.after` for `td1`, the
-    /// post-spawn board for `search2` and a teacher), so the update is the TD update of the rotated
-    /// transition. A terminal target is the reward alone and is not rotated. Draws one rng value per
-    /// update, the same as `rsym`; `base` draws nothing. See docs/solver-history.md.
+    /// Draw one random dihedral transform per per-move TD update and apply it to both the trained
+    /// afterstate and the target's next board, so the update is that of the rotated transition. A
+    /// terminal target is the reward alone and is not rotated. Draws one rng value per update.
     rtgt: bool = false,
-    /// Candidate (#277): potential-based reward shaping with the empty-cell potential
-    /// `Phi(board) = shape_c * countEmpty(board) / 15`. With gamma = 1 the non-terminal target becomes
-    /// `reward + Phi(next.after) - Phi(p.after) + V(next.after)` and the terminal target
-    /// `reward - Phi(p.after)`. `0` (the default) returns the historical raw reward through a branch,
-    /// not `reward + 0.0`, so `base`/`par` stay bit-identical. Only the per-move `td1` + `greedy1`
-    /// path implements it; `validateOptions` refuses combinations that would silently drop the shape.
+    /// Potential-based reward shaping with `Phi(board) = shape_c * countEmpty(board) / 15` and
+    /// gamma = 1: the target becomes `reward + Phi(next.after) - Phi(p.after) + V(next.after)`
+    /// (`reward - Phi(p.after)` when terminal). `0` returns the raw reward through a branch, not
+    /// `reward + 0.0`, so `base`/`par` stay bit-identical. Only the per-move `td1` + `greedy1` path
+    /// implements it; `validateOptions` refuses combinations that would silently drop the shape.
     shape_c: f64 = 0,
-    /// Candidate (#101): reward every move with -1 and sweep the afterstates backward at game over, so
-    /// the value learns V ≈ -(moves to game over) and the self-play policy plays the fastest game over
-    /// (a death net). Backward full return instead of per-move TD(0): with -1 per move the TD target is
-    /// the same for every board and the net collapses to a constant (observed while building #101).
+    /// Reward every move with -1 and sweep the afterstates backward at game over, so the net learns
+    /// V ≈ -(moves to game over) and the policy plays the fastest game over (a death net). With -1 per
+    /// move the TD target is the same for every board, so this must keep the backward full return:
+    /// plain TD(0) collapses the net to a constant.
     death: bool = false,
-    /// Candidate (#72): TD(lambda) with accumulating eligibility traces over the parameters; 0 = TD(0).
+    /// TD(lambda) with accumulating eligibility traces over the parameters; 0 = TD(0).
     lambda: f64 = 0,
-    /// Candidate (#300): TD(lambda) eligibility trace over the `replay_k` sweep. The sweep re-trains the
-    /// last K afterstates after the game (`trainAfter` = plain TD(0) today); with `sweep_lambda > 0` it
-    /// instead carries one accumulating trace across the whole sweep and steps with it, so the tail is
-    /// refined by a backward-view TD(lambda) rather than K independent one-step updates. `0` (the
-    /// default) keeps the TD(0) sweep bit for bit; `replay_k = 1` is a single-step trace, i.e. the
-    /// gradient itself, so it matches the TD(0) sweep up to float associativity (#72's `lambda` is the
-    /// online per-move trace, this one is the replay trace).
+    /// TD(lambda) over the `replay_k` sweep `trainAfter` runs: one accumulating trace across the whole
+    /// sweep instead of K independent one-step updates. `0` keeps the TD(0) sweep bit for bit;
+    /// `replay_k = 1` makes it the gradient itself, matching the sweep up to float associativity.
     sweep_lambda: f64 = 0,
-    /// (#137) Multiplier on the merged batch delta in `trainBatchOpts`. One batch applies a single
-    /// SGD step built from `games` per-game deltas, so the mean is `1/games` of the work a serial run
-    /// spends on the same number of games; `batch_scale` recovers it (`games` = the linear scaling
-    /// rule, `sqrt(games)` = the noise-only correction). 1.0 keeps the historical behaviour.
+    /// Multiplier on the merged batch delta in `trainBatchOpts`. One batch applies a single SGD step
+    /// built from `games` per-game deltas, so the mean step is `1/games` of the serial work for the same
+    /// games; `batch_scale` recovers it (`games` = linear scaling rule, `sqrt(games)` = noise-only).
     batch_scale: f64 = 1.0,
-    /// Candidate (#231): take an Adam step on the merged batch gradient instead of the SGD step, so the
-    /// step size of every parameter is normalised. Only `par` (the batch path) implements it: the serial
-    /// path would need per-sample Adam state, and the batch gradient is the better input anyway.
+    /// Take an Adam step on the merged batch gradient instead of the SGD step, normalising every
+    /// parameter's step size. Only `par` implements it: the serial path would need per-sample state.
     adam: ?*Adam = null,
-    /// Adam's own step size (independent of `lr`, which only sets how far the per-game nets walk while the
-    /// batch gradient is accumulated and therefore cancels out of the normalised step).
+    /// Adam's own step size, independent of `lr` (which only sets how far the per-game nets walk while
+    /// the batch gradient accumulates, and cancels out of the normalised step).
     adam_lr: f64 = 0.01,
-    /// Candidate (#232): weight each per-move TD sample by how few empty cells its board has, so the late
-    /// game (the tail that decides the 8192 rate) takes a larger step than the midgame. 0 = off, which is
-    /// bit-identical to the historical run: for plain SGD a per-sample loss weight *is* an `lr` multiplier,
-    /// so `tailWeight` scales the step instead of touching the loss (`1 + alpha` at 0 empties, 1 at 15).
+    /// Weight each per-move sample by how few empty cells its board has, so the tail that decides the
+    /// 8192 rate takes a larger step. 0 = off, bit-identical to the historical run: for plain SGD a
+    /// per-sample loss weight *is* an `lr` multiplier, so this scales the step (`1 + alpha` at 0 empties,
+    /// 1 at 15) instead of touching the loss.
     tail_alpha: f64 = 0,
-    /// (#234) Ceiling on the TD target, in `reward_scale` units (0 = off). TD(0) with function approximation
+    /// Ceiling on the TD target, in `reward_scale` units (0 = off). TD(0) with function approximation
     /// has no fixed point when the bootstrapped value runs away, and the 128/32 net did exactly that on
-    /// training seed 2 (|w| 1e86, 6,334 NaN between 100,000 and 300,000 games). A score is bounded by the
-    /// board (1,000 x score, so ~131 for a 16k tile), so clamping the target keeps every sane update and
-    /// cuts the V -> target -> V feedback that explodes.
+    /// training seed 2 (|w| 1e86, 6,334 NaN between 100,000 and 300,000 games). A score is bounded by
+    /// the board (~131 for a 16k tile), so the ceiling keeps every sane update and cuts the
+    /// V -> target -> V feedback that explodes.
     clamp: f64 = 0,
-    /// Candidate (#246, a) L2-norm ceiling on the delta one merged `par` batch applies, 0 = off (#234
-    /// left the update side, not the target, as the suspect: the batch delta is `lr x the sum of the
-    /// games' gradients`, so its norm can grow with the batch while a single sample's cannot). Same
-    /// style as `sym_batch_clip`: scale the whole delta down to the cap, never up.
+    /// L2-norm ceiling on the delta one merged `par` batch applies, 0 = off. The batch delta is
+    /// `lr x the sum of the games' gradients`, so its norm grows with the batch while a single sample's
+    /// cannot. Scales the whole delta down to the cap, never up — same style as `sym_batch_clip`.
     grad_clip: f64 = 0,
-    /// Candidate (#246, b) per-element ceiling on one step's `|dw|`, 0 = off. Cuts every parameter
-    /// update to +-`step_clip`. Applies to the serial per-move step and to the single merged `par`
-    /// step; the per-game nets inside a batch only accumulate gradient, so they stay uncapped.
+    /// Per-element ceiling on one step's `|dw|`, 0 = off. Applies to the serial per-move step and to
+    /// the single merged `par` step; the per-game nets inside a batch only accumulate gradient.
     step_clip: f64 = 0,
-    /// Candidate (#98): true batch symmetry augmentation — one averaged step per afterstate, where all 8
-    /// transformed gradients come from one net snapshot (unlike `symmetry`, which steps 8 times sequentially).
+    /// True batch symmetry augmentation: one averaged step per afterstate, all 8 transformed gradients
+    /// from one net snapshot (unlike `symmetry`, which steps 8 times sequentially).
     sym_batch: bool = false,
-    /// Candidate (#84): fixed n-step TD on the afterstate chain; 0 = off. Standalone: when set it owns the
-    /// game loop and the other options are ignored. 1 is TD(0), larger n propagates rewards faster.
+    /// Fixed n-step TD on the afterstate chain; 0 = off. When set it owns the game loop and the other
+    /// options are ignored. 1 is TD(0); larger n propagates rewards faster.
     nstep: usize = 0,
-    /// Candidate (#158): TD target of the per-move path (`trainGamePerMove`, the default). `td1` is the
-    /// historical reward + V(next afterstate). `search2` keeps the eval's `.deep` tree (the same spawn
-    /// layers) with `search2_ply - 1` searched rewards and then V of the afterstate one move past the
-    /// last of them, so no reward is in the target twice (see `search2Value`). The
-    /// `backward`/`death`/`nstep` paths keep the 1-ply policy.
+    /// TD target of the per-move path (`trainGamePerMove`, the default). `td1` is
+    /// `reward + V(next afterstate)`. `search2` keeps the eval's `.deep` tree with `search2_ply - 1`
+    /// searched rewards and then V of the afterstate one move past the last of them, so no reward is in
+    /// the target twice (see `search2Value`). The `backward`/`death`/`nstep` paths keep the 1-ply policy.
     target: Target = .td1,
-    /// Candidate (#158): self-play move of the per-move path. `greedy1` is the historical 1-ply argmax;
-    /// `deep2` plays the eval's 2-ply search (`.deep`: same tie-break, spawns enumerated, no rng use).
+    /// Self-play move of the per-move path. `greedy1` is the 1-ply argmax; `deep2` plays the eval's
+    /// 2-ply search (`.deep`: same tie-break, spawns enumerated, no rng use).
     selfplay: SelfPlay = .greedy1,
-    /// Candidate (#167) `d2` / `d3`: distillation. When set, the per-move target is the search value of
-    /// the post-spawn board under this mode (`teacherValue`: the mode's phase row, `ply` own moves and
-    /// the eval's `V` at the leaf) and the self-play move is that same mode's move (`pickTeacherValue`),
-    /// so policy and target look at one tree. `.deep` distils the 2-ply value, `.deep3` the 3-ply one a
-    /// 2-ply eval could not afford at play time. `null` (the default) keeps `target` / `selfplay`; when
-    /// set, both are ignored. Modes with a phase schedule only (`.greedy` / `.chance` have none).
+    /// Distillation. When set, the per-move target is the search value of the post-spawn board under
+    /// this mode (`teacherValue`: the mode's phase row, `ply` own moves and the eval's `V` at the leaf)
+    /// and the self-play move is that mode's move (`pickTeacherValue`), so policy and target look at one
+    /// tree: `.deep` distils the 2-ply value, `.deep3` the 3-ply one a 2-ply eval could not afford at
+    /// play time. `null` keeps `target`/`selfplay`; when set both are ignored. Modes with a phase
+    /// schedule only (`.greedy`/`.chance` have none).
     teacher: ?Mode = null,
-    /// Candidate (#159) `dump`: append every afterstate the plain per-move path visits whose max tile
-    /// reached `dump_min_tile` to `dump` (bounded, overflow dropped). The updates are unchanged.
+    /// Append every afterstate the plain per-move path visits whose max tile reached `dump_min_tile`
+    /// to `dump` (bounded, overflow dropped). The updates are unchanged.
     dump_record: bool = false,
-    /// Deep-position buffer (#159): written by `dump_record`, read by the variants that train from it.
+    /// Deep-position buffer: written by `dump_record`, read by the variants that train from it.
     dump: ?*Dump = null,
-    /// Candidate (#159) `ft2`: one extra TD(0) update from a uniformly drawn deep afterstate of `dump`
-    /// per self-play step, so half the update budget stays on the self-play trajectory (uniform over the
-    /// whole game, shallow positions included) and half lands on the deep tail.
+    /// One extra TD(0) update from a uniformly drawn deep afterstate of `dump` per self-play step, so
+    /// half the update budget stays on the self-play trajectory and half lands on the deep tail.
     deep_mix: bool = false,
-    /// Search depth of the drawn deep half's teacher label (#207). `.deep3` matches `tch`; the deep
-    /// searches cost ~1.5 ms/sample, so `ft2` is slower than `base` per game by about that much.
+    /// Search depth of the drawn deep half's teacher label. `.deep3` matches `tch`; a deep search costs
+    /// ~1.5 ms/sample, so `ft2` is slower than `base` per game by about that much.
     deep_mode: Mode = .deep3,
-    /// One deep update every `deep_every` self-play steps (#207). `1` (the #159 `ft2`) is 50% deep and
-    /// diverges; `dist`'s stable offline mix is 1 in 4..8, which is what the CLI now passes.
+    /// One deep update every `deep_every` self-play steps. `1` is 50% deep and diverges; the stable
+    /// offline mix is 1 in 4..8, which is what the CLI passes.
     deep_every: u32 = 1,
-    /// Candidate (#159) `restart`: every game starts on a uniformly drawn deep afterstate of `dump`
-    /// instead of an empty board. Requires `dump`.
+    /// Every game starts on a uniformly drawn deep afterstate of `dump` instead of an empty board.
+    /// Requires `dump`.
     restart: bool = false,
-    /// Candidate (#178): average every search leaf (`Search.leaf`) over the 8 dihedral transforms of
-    /// the board instead of one forward pass, so the evaluation noise drops at 8x the leaf cost. The
-    /// 1-ply modes (`.greedy` / `.chance`) have no `Search` and are unchanged, as is the default
-    /// (`false`), which keeps the single forward pass bit for bit.
+    /// Average every search leaf (`Search.leaf`) over the 8 dihedral transforms of the board instead of
+    /// one forward pass: less evaluation noise at 8x the leaf cost. The 1-ply modes (`.greedy`/`.chance`)
+    /// have no `Search` and are unchanged.
     sym_leaf: bool = false,
-    /// Candidate (#260): omit only a move reward whose next chance node resolves directly to a leaf.
+    /// Omit only a move reward whose next chance node resolves directly to a leaf.
     omit_leaf_reward: bool = false,
-    /// Reuse completed `Search.value` / `Search.chance` nodes inside one top-level search (#263).
-    /// The table is cleared per move, so the same board/depth/cprob gives the same value as without
-    /// it. `null` (the default, #266) turns the table on for a search whose phase row is 3-ply or
-    /// deeper and leaves 2-ply (`deep`) without it, so `deep` stays byte-identical to pre-#263 and
-    /// allocates nothing; `false` is the explicit off switch for tests and #263 comparisons.
+    /// Reuse completed `Search.value` / `Search.chance` nodes inside one top-level search. The table is
+    /// cleared per move, so the same board/depth/cprob gives the same value as without it. `null` turns
+    /// it on for a search whose phase row is 3-ply or deeper and leaves 2-ply (`deep`) without it, so
+    /// `deep` stays byte-identical and allocates nothing; `false` is the explicit off switch.
     node_tt: ?bool = null,
     /// Override the spawn-probability cut the mode's phase row would use (`null` = the row's cutoff).
-    /// A measurement needs e.g. `.deep3` at 1e-3 instead of 1e-2 without a second mode (#263/#256).
+    /// A measurement needs e.g. `.deep3` at 1e-3 instead of 1e-2 without a second mode.
     cutoff: ?f64 = null,
-    /// Candidate (#320): at most this many spawn branches per chance node, drawn by weighted sampling
-    /// without replacement from the node's 0.9/0.1 spawn probabilities. `null` (the default) keeps
-    /// every branch, bit for bit as before; with a finite budget a 4-ply tree then fits a 3-ply cost.
-    /// The draw is deterministic in the node's board, its depth and `sample_seed`, and never consumes
-    /// the game's spawn RNG or the value cache (a leaf is the net's exact V whatever the sample size).
+    /// At most this many spawn branches per chance node, drawn by weighted sampling without replacement
+    /// from the node's 0.9/0.1 probabilities. `null` keeps every branch; with a finite budget a 4-ply
+    /// tree then fits a 3-ply cost. The draw is deterministic in the node's board, its depth and
+    /// `sample_seed`, and never consumes the game's spawn RNG or the value cache.
     sample: ?usize = null,
-    /// Candidate (#320): seed of that sampler, so the same board and seed sample the same spawns.
+    /// Seed of that sampler, so the same board and seed sample the same spawns.
     sample_seed: u64 = default_sample_seed,
-    /// Candidate (#320): shallowest chance node to sample (`1` = every spawn layer). At `2` the spawn
-    /// layer above the leaves keeps every branch, which keeps the last move's death risk exact.
+    /// Shallowest chance node to sample (`1` = every spawn layer). At `2` the spawn layer above the
+    /// leaves keeps every branch, which keeps the last move's death risk exact.
     sample_min_depth: u8 = 1,
-    /// Candidate (#183): leaf-evaluation budget of an iterative deepening search, `null` = off. When
-    /// set, `bestMoveWithCacheValueOpts` searches depth 2, 3, ... and keeps the best move of the last
+    /// Leaf-evaluation budget of an iterative deepening search, `null` = off. When set,
+    /// `bestMoveWithCacheValueOpts` searches depth 2, 3, ... and keeps the best move of the last
     /// iteration that finished inside the budget (`mode` only sets the first depth and the spawn cut).
-    /// The budget is what makes the search's cost predictable: wall clock is not used, so the same
-    /// board and budget always pick the same move.
+    /// The budget is what makes cost predictable: no wall clock, so the same board and budget always
+    /// pick the same move.
     id_budget: ?usize = null,
-    /// Candidate (#188): with `id_budget`, deepen only while the start depth's best move beats its
-    /// runner-up by at most this NN-value gap (score deltas over `reward_scale`, so 0.05 = 50 points of
-    /// one-move score). A root move that is already clearly better stops the deepening after its first
-    /// iteration, which is where most of the budget saving comes from. `null` = always deepen.
+    /// With `id_budget`, deepen only while the start depth's best move beats its runner-up by at most
+    /// this NN-value gap (score deltas over `reward_scale`, so 0.05 = 50 points of one-move score). A
+    /// root move that is already clearly better stops after its first iteration, which is where most of
+    /// the saving comes from. `null` = always deepen.
     id_margin: ?f64 = null,
-    /// Candidate (#189): heterogeneous rerank of the 2-ply search's top two moves by a cheap foreign
-    /// evaluator when the net's own gap is within `Rerank.margin`; null = the plain argmax.
+    /// Heterogeneous rerank of the 2-ply search's top two moves by a cheap foreign evaluator when the
+    /// net's own gap is within `Rerank.margin`; null = the plain argmax.
     rerank: ?Rerank = null,
-    /// Candidate (#187): how far every chance node's score moves from its mean toward its CVaR, so a
+    /// Candidate: how far every chance node's score moves from its mean toward its CVaR, so a
     /// move that is usually good but sometimes losing ranks below one that is always equally good.
     /// `0` (the default) is the plain expectation, bit for bit as before; `1` is the CVaR alone. A
     /// phase row with a nonzero `Phase.risk_weight` overrides it for that row.
     risk_weight: f64 = 0,
-    /// Candidate (#175) `dist`: teacher pairs from `computeTeachers`. Every self-play step also takes one
+    /// Candidate `dist`: teacher pairs from `computeTeachers`. Every self-play step also takes one
     /// regression step on a uniformly drawn pair, so 1/2 of the updates are distillation.
     distill: ?*Teachers = null,
-    /// Candidate (#206) how many self-play steps run between two teacher regressions (`1` = every step,
-    /// the historical `#175` behavior; `8` puts 1 teacher update in 9). The decay that `#175` showed is
+    /// Candidate how many self-play steps run between two teacher regressions (`1` = every step,
+    /// the historical behavior; `8` puts 1 teacher update in 9). The decay that showed is
     /// caused by the teacher signal drowning the shallow game, so the mix is the knob to sweep.
     distill_every: u32 = 1,
-    /// Candidate (#206) learning rate of the teacher regression alone; `0` uses the TD rate. A teacher
+    /// Candidate learning rate of the teacher regression alone; `0` uses the TD rate. A teacher
     /// update that is 10x smaller cannot drag the shared parameters away as fast.
     distill_lr: f64 = 0,
-    /// Candidate (#175) `dson`: the teacher regression only, with the self-play TD update switched off.
+    /// Candidate `dson`: the teacher regression only, with the self-play TD update switched off.
     /// The 50/50 mix is not for value quality: it exists so the shallow half of the game (which the deep
     /// buffer never covers) keeps being trained. `dson` answers the other half of that question — whether
     /// the teacher regression alone is stable, given that the parameters are shared with the early game.
     distill_only: bool = false,
 };
 
-/// (#277) Shape is implemented only by the per-move `td1` + `greedy1` TD(0) update. The variants
+/// Shape is implemented only by the per-move `td1` + `greedy1` TD(0) update. The variants
 /// below re-train afterstates after the game, use another target, or own a different update path, so
 /// they would silently ignore the shaped reward. Refuse them explicitly instead of falling back to
 /// the raw reward. `shape_c == 0` is always allowed and takes the untouched historical path.
-/// (#289) PopArt is also restricted to the plain serial TD(0) path: its EMA lives at `trainStep`, so
+/// PopArt is also restricted to the plain serial TD(0) path: its EMA lives at `trainStep`, so
 /// any other field would change the update, the target or the game against statistics that no longer
 /// describe what is being trained.
 pub const OptionsError = error{ ShapeRequiresPlainTd1, PopArtRequiresPlainTd1 };
 
-/// (#289) Everything but the PopArt pointer itself must stay at its default; `move_cap` is a safety
+/// Everything but the PopArt pointer itself must stay at its default; `move_cap` is a safety
 /// bound on one game, not an update, so it is carried over.
 fn popartIsPlainTd1(opts: Options) bool {
     return std.meta.eql(opts, Options{ .popart = opts.popart, .move_cap = opts.move_cap });
@@ -2296,7 +2270,7 @@ pub fn validateOptions(opts: Options) OptionsError!void {
         return error.ShapeRequiresPlainTd1;
 }
 
-/// Prioritized replay (issue #34): ring buffer of recent TD updates. After each game, `m` extra updates
+/// Prioritized replay: ring buffer of recent TD updates. After each game, `m` extra updates
 /// are drawn from the buffer: with probability `uniform_share` uniformly, otherwise with probability
 /// proportional to (|TD error| + err_floor)^alpha. The drawn entry's error is refreshed after its update.
 pub const Priority = struct {
@@ -2331,7 +2305,7 @@ pub const Priority = struct {
         return self.len - 1;
     }
 
-    /// `m` extra updates, midgame variant (#59): uniform over entries with 4..7 empty cells,
+    /// `m` extra updates, midgame variant: uniform over entries with 4..7 empty cells,
     /// whole buffer when none exist.
     pub fn sampleMidgame(self: *const Priority, rng: std.Random) usize {
         var eligible: usize = 0;
@@ -2348,7 +2322,7 @@ pub const Priority = struct {
         unreachable;
     }
 
-    /// Midgame branch of the midmix variant (#63): entries with 4..7 empty cells, by priority weight.
+    /// Midgame branch of the midmix variant: entries with 4..7 empty cells, by priority weight.
     /// Whole buffer (uniform) when that bucket is empty.
     pub fn sampleMidmix(self: *const Priority, rng: std.Random) usize {
         if (rng.float(f64) < self.uniform_share) return rng.uintLessThan(usize, self.len);
@@ -2380,10 +2354,10 @@ pub const Priority = struct {
     }
 };
 
-/// One extra update on a drawn deep afterstate for `ft2` (#159): the target is the same `deep3` teacher
-/// sample that `tch` writes offline (#207).
+/// One extra update on a drawn deep afterstate for `ft2`: the target is the same `deep3` teacher
+/// sample that `tch` writes offline.
 ///
-/// The #159 code used `pickMove(...).value` — the net's own 1-ply search value — as the target. On the
+/// The code used `pickMove(...).value` — the net's own 1-ply search value — as the target. On the
 /// deep domain that is a max over moves of `r + V(spawn)`, so every step pushes `V` up to the best
 /// branch's bootstrap: with stale deep boards and `replay_k` on top the net diverged to NaN within a few
 /// thousand games at every rate tried (`|w|` 4e275, eval stuck at 11,478). A bounded teacher label
@@ -2396,14 +2370,14 @@ fn deepStep(net: *Net, rng: std.Random, buffer: *Dump, lr: f64, cache: *Cache, m
 }
 
 /// The label of one deep afterstate: one spawn from `rng`, then the value of `mode`'s search on it. `tch`
-/// (offline) and `ft2` (online) both call this, so the two teacher paths cannot drift apart (#207).
+/// (offline) and `ft2` (online) both call this, so the two teacher paths cannot drift apart.
 fn deepSampleTarget(net: *const Net, board: Board, rng: std.Random, mode: Mode) f64 {
     var state = GameState{ .board = board, .score = 0 };
     _ = state.spawnRandomTile(rng);
     return teacherValue(.{ .single = net }, state, mode, false);
 }
 
-/// Deep-position dump (issue #159): fixed-capacity buffer of afterstates whose max tile reached
+/// Deep-position dump: fixed-capacity buffer of afterstates whose max tile reached
 /// `dump_min_tile`. The score does not enter the TD target (reward = score_delta / `reward_scale`),
 /// so training from these positions means the same thing as training from them mid-game.
 ///
@@ -2468,7 +2442,7 @@ pub const Dump = struct {
     }
 
     /// Uniform draw of one stored afterstate, counted so the 50/50 mix of `ft2` is observable.
-    /// Uniform on purpose: #33/#34/#56 lost with |TD error| and midgame resampling of existing data.
+    /// Uniform on purpose: lost with |TD error| and midgame resampling of existing data.
     pub fn draw(self: *Dump, rng: std.Random) Board {
         std.debug.assert(self.len > 0);
         self.draws += 1;
@@ -2509,10 +2483,10 @@ pub const Dump = struct {
     }
 };
 
-/// Offline teacher pass (issue #175): the deep-search value of the stored deep positions, computed once.
+/// Offline teacher pass: the deep-search value of the stored deep positions, computed once.
 ///
-/// Online distillation (`#167`, variant `d3`) prices every training move with a 3-ply tree, which costs
-/// 30-46 ms/move and puts 100k games at ~35-40 h per seed. The stored deep positions (`#159`) only need
+/// Online distillation (variant `d3`) prices every training move with a 3-ply tree, which costs
+/// 30-46 ms/move and puts 100k games at ~35-40 h per seed. The stored deep positions  only need
 /// that tree once each: 65,536 x ~20 ms is ~22 min, and the regression that follows runs at the ordinary
 /// 0.5 ms/move speed. This is the cheap path to a better `V`, which is what the 8192 rate is limited by
 /// (depth alone did not move it: see `docs/solver-history.md` 「深さ別の比較」).
@@ -2522,7 +2496,7 @@ pub const Dump = struct {
 /// The board is post-spawn because `V` is defined on post-spawn boards (that is what `forward` sees).
 pub const teacher_magic = "2048-TCH";
 /// One `tch` pass is one dump (`dump_cap` = 65,536 samples); the cap is 32x that so several passes can be
-/// merged into one teacher file (`tchadd`, #207). The struct is ~40 MB, so it lives on the heap
+/// merged into one teacher file (`tchadd`). The struct is ~40 MB, so it lives on the heap
 /// (`nn_main.zig` allocates it), not on the stack.
 pub const teacher_cap: usize = 32 * dump_cap;
 pub const teacher_header_len = dump_header_len;
@@ -2542,7 +2516,7 @@ pub const Teachers = struct {
         self.len += 1;
     }
 
-    /// Appends every entry of `other` (a second `tch` pass, #207), stopping at `teacher_cap`.
+    /// Appends every entry of `other` (a second `tch` pass), stopping at `teacher_cap`.
     /// Returns the number of samples that did not fit.
     pub fn appendBuffer(self: *Teachers, other: *const Teachers) usize {
         const room = teacher_cap - self.len;
@@ -2603,7 +2577,7 @@ pub const Teachers = struct {
     }
 };
 
-/// One teacher pass over `dump` (#175): each stored afterstate is completed with one uniformly drawn
+/// One teacher pass over `dump`: each stored afterstate is completed with one uniformly drawn
 /// spawn and priced with `teacherValue` at `mode` (the caller uses `.deep3`). One spawn per position on
 /// purpose: the stored target is then a one-sample estimate of the spawn expectation, which is all a
 /// single regression step on a single board can express anyway. The spawns come from `rng`, so the pass
@@ -2618,12 +2592,12 @@ pub const Teachers = struct {
 pub fn computeTeachers(net: *const Net, buffer: *Teachers, dump: *const Dump, rng: std.Random, mode: Mode) void {
     buffer.len = 0;
     for (0..dump.len) |i| {
-        // the input is the stored afterstate, exactly what every V consumer evaluates (#177 P1)
+        // the input is the stored afterstate, exactly what every V consumer evaluates
         buffer.append(dump.boardAt(i), deepSampleTarget(net, dump.boardAt(i), rng, mode));
     }
 }
 
-/// One regression step on a drawn teacher pair (`dist`, #175). Same gradient path as a TD step; the
+/// One regression step on a drawn teacher pair (`dist`). Same gradient path as a TD step; the
 /// target comes from the cached teacher file instead of a bootstrap. 1/2 of the steps are these, so the
 /// self-play half keeps the early game (which the deep buffer never covers) from drifting.
 fn distStep(net: *Net, rng: std.Random, buffer: *Teachers, lr: f64, cache: *Cache) void {
@@ -2729,7 +2703,7 @@ pub fn trainGame(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag) u32 {
 pub const GameResult = struct { score: u32, moves: u32, capped: bool = false };
 
 /// `trainGame` with options. `diag` is only recorded on the default path (`opts` all off).
-/// (#277) Returns `error.ShapeRequiresPlainTd1` rather than silently dropping a shaped reward on a
+/// Returns `error.ShapeRequiresPlainTd1` rather than silently dropping a shaped reward on a
 /// path that does not implement it.
 pub fn trainGameOpts(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) OptionsError!GameResult {
     try validateOptions(opts);
@@ -2746,11 +2720,11 @@ fn trainGameOptsUnchecked(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opt
     var cache: Cache = .{};
     var pending: ?Pick = null;
     while (true) {
-        // (#242) Stop before the pick: a capped game is pathological, and its unfinished tail must not
+        // Stop before the pick: a capped game is pathological, and its unfinished tail must not
         // enter any target. The check reads no rng, so every normal game is unchanged.
         if (opts.move_cap > 0 and n >= @as(usize, opts.move_cap)) return .{ .score = state.score, .moves = @intCast(n), .capped = true };
         const pick = pickMove(net, state, opts.death) orelse break;
-        // (#262) With replay_k > 0 this path, not `tdBootstrap`, is the online TD update. Keep the
+        // With replay_k > 0 this path, not `tdBootstrap`, is the online TD update. Keep the
         // live `pick.value` unless a frozen target was asked for, so the default stays bit-identical.
         const next_value = if (opts.target_net != null) bootstrapValue(net, opts, pick.after) else pick.value;
         if (pending) |p| if (!opts.backward and !opts.death) trainAfter(net, &cache, p.after, p.reward + next_value, lr);
@@ -2772,7 +2746,7 @@ fn trainGameOptsUnchecked(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opt
     }
     if (opts.replay_k > 0) {
         const lr_replay = lr * opts.replay_lr_scale;
-        // (#300) One trace for the whole sweep: the TD(lambda) of the replayed tail. Unused (all zeros,
+        // One trace for the whole sweep: the TD(lambda) of the replayed tail. Unused (all zeros,
         // never read) when `sweep_lambda == 0`, which keeps the TD(0) sweep bit for bit.
         var sweep_trace: Net = std.mem.zeroes(Net);
         var i = n -| @min(opts.replay_k, step_cap);
@@ -2798,18 +2772,18 @@ fn valueOf(net: *const Net, after: Board) f64 {
     return forward(net, after, &cache);
 }
 
-/// V of the afterstate that closes a TD target (#262). A frozen target net answers the bootstrap;
+/// V of the afterstate that closes a TD target. A frozen target net answers the bootstrap;
 /// without one this is exactly the old `valueOf(net, after)`.
 fn bootstrapValue(net: *const Net, opts: Options, after: Board) f64 {
     return valueOf(opts.target_net orelse net, after);
 }
 
-/// Global L2 norm the averaged symmetry gradient is clipped to (#98). Measured averaged-gradient norms are
+/// Global L2 norm the averaged symmetry gradient is clipped to. Measured averaged-gradient norms are
 /// 0.04..0.26 on a fresh net but 4..300 late in training, so a unit-norm step is a no-op early and, with lr,
 /// caps a late-game update at lr = 0.003 against a mean |w| of 0.44.
 pub const sym_batch_clip: f64 = 1.0;
 
-/// Batch symmetry (#98): 8 gradients from one snapshot, averaged elementwise, one SGD step.
+/// Batch symmetry: 8 gradients from one snapshot, averaged elementwise, one SGD step.
 fn trainSymBatch(net: *Net, after: Board, target: f64, lr: f64) void {
     var grad = std.mem.zeroes(Net);
     var cache: Cache = .{};
@@ -2826,14 +2800,14 @@ fn trainSymBatch(net: *Net, after: Board, target: f64, lr: f64) void {
     for (flat(net), flat(&grad)) |*w, x| w.* -= lr * scale * x;
 }
 
-/// (#234) Bound the TD target at `Options.clamp` (0 = untouched), so a diverging value cannot bootstrap
+/// Bound the TD target at `Options.clamp` (0 = untouched), so a diverging value cannot bootstrap
 /// itself into `inf`.
 fn clampTarget(target: f64, opts: Options) f64 {
     if (!(opts.clamp > 0)) return target;
     return std.math.clamp(target, -opts.clamp, opts.clamp);
 }
 
-/// (#232) The step size of one per-move TD sample: `lr` itself, or up to `lr * (1 + tail_alpha)` when the
+/// The step size of one per-move TD sample: `lr` itself, or up to `lr * (1 + tail_alpha)` when the
 /// board the target bootstrapped from is nearly full. Exact SGD loss weighting, see `Options.tail_alpha`.
 fn tailWeight(opts: Options, board: Board, lr: f64) f64 {
     if (opts.tail_alpha <= 0) return lr;
@@ -2841,21 +2815,21 @@ fn tailWeight(opts: Options, board: Board, lr: f64) f64 {
     return lr * (1 + opts.tail_alpha * (15 - empty) / 15);
 }
 
-/// (#277) Empty-cell potential `Phi(board) = shape_c * countEmpty(board) / 15`: 0 on a full board,
+/// Empty-cell potential `Phi(board) = shape_c * countEmpty(board) / 15`: 0 on a full board,
 /// `shape_c` on the empty board. It is dimensionless per empty cell, so `shape_c` sets the reward scale.
 fn shapePotential(board: Board, shape_c: f64) f64 {
     const empty: f64 = @floatFromInt(core.countEmpty(board));
     return shape_c * empty / 15;
 }
 
-/// (#277) Shaped reward of one non-terminal TD transition. The `shape_c == 0` branch returns the raw
+/// Shaped reward of one non-terminal TD transition. The `shape_c == 0` branch returns the raw
 /// reward itself (not `raw + 0.0`), keeping `base`/`par` bit-identical.
 fn shapedReward(p: Pick, next: Pick, opts: Options) f64 {
     if (opts.shape_c == 0) return p.reward;
     return p.reward + shapePotential(next.after, opts.shape_c) - shapePotential(p.after, opts.shape_c);
 }
 
-/// (#277) Shaped reward of the last transition: the terminal afterstate has no empty cell, so its
+/// Shaped reward of the last transition: the terminal afterstate has no empty cell, so its
 /// potential is 0 and only `-Phi(p.after)` remains.
 fn shapedTerminalReward(p: Pick, opts: Options) f64 {
     if (opts.shape_c == 0) return p.reward;
@@ -2898,7 +2872,7 @@ fn trainStep(net: *Net, cache: *Cache, after: Board, target: f64, lr: f64, opts:
     }
 }
 
-/// Start of a #159 `restart` game: a stored deep afterstate plus exactly one fresh spawn re-rolled from
+/// Start of a `restart` game: a stored deep afterstate plus exactly one fresh spawn re-rolled from
 /// `rng` (so the games from one dump differ, and one rng draw per game keeps them reproducible). Score 0:
 /// only score deltas enter the target, and the stored board carries no score.
 fn restartState(rng: std.Random, buffer: *Dump) GameState {
@@ -2907,9 +2881,9 @@ fn restartState(rng: std.Random, buffer: *Dump) GameState {
     return state;
 }
 
-/// (#273) The dihedral transform drawn for one per-move TD update. `rtgt` draws once and gives the same
+/// The dihedral transform drawn for one per-move TD update. `rtgt` draws once and gives the same
 /// `k` to the input afterstate and to the target's next board, so the update is the TD update of the
-/// rotated transition. `rsym` (#271) keeps the target canonical and rotates only the input.
+/// rotated transition. `rsym` keeps the target canonical and rotates only the input.
 const UpdateSym = struct {
     /// Transform of the stored afterstate (the trained input), or null for none.
     after: ?usize = null,
@@ -2936,7 +2910,7 @@ fn symState(state: GameState, k: ?usize) GameState {
     return if (k) |index| .{ .board = transformBoard(index, state.board), .score = state.score } else state;
 }
 
-/// One non-terminal per-move TD update (#158, #273): draw the update's symmetry once, build the target
+/// One non-terminal per-move TD update: draw the update's symmetry once, build the target
 /// from the next board rotated by the same `k`, and train the rotated afterstate. Returns the target for
 /// the diagnostics and the priority buffer. `spawned` is the post-spawn board the pending step led into
 /// (this move has not been applied yet), the board the `search2` and `teacher` targets evaluate.
@@ -2948,7 +2922,7 @@ fn tdUpdate(net: *Net, cache: *Cache, p: Pick, next: Pick, spawned: GameState, l
     return target;
 }
 
-/// The last update of a game (#273, #277): a terminal transition has no next board, so its target is
+/// The last update of a game: a terminal transition has no next board, so its target is
 /// the (possibly shaped) reward alone and is never rotated; the input afterstate still gets the
 /// update's one draw.
 fn tdTerminalUpdate(net: *Net, cache: *Cache, p: Pick, spawned: GameState, lr: f64, rng: std.Random, opts: Options, trace: *Net) f64 {
@@ -2968,20 +2942,20 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
     var moves: u32 = 0;
     var trace: Net = std.mem.zeroes(Net);
     while (true) {
-        // (#242) See `Options.move_cap`: stop before the search, and before the pending step's update.
+        // See `Options.move_cap`: stop before the search, and before the pending step's update.
         if (opts.move_cap > 0 and moves >= opts.move_cap) {
             if (diag) |d| d.finish();
             return .{ .score = state.score, .moves = moves, .capped = true };
         }
         var pick = selfplayPick(vfn, state, opts.death, opts.selfplay, opts.teacher, opts.sym_leaf) orelse break;
-        // `#224`: with probability `explore` play a uniformly random legal move, so the self-play walks
+        //: with probability `explore` play a uniformly random legal move, so the self-play walks
         // through boards the greedy policy would never visit. `0` (the default) draws nothing from the
         // rng, so every older seed still spawns the same tiles. Trained targets then include the random
         // step, which is why the variant loses badly: see `warm_open` for the target-free opening.
         if (opts.explore > 0 and rng.float(f64) < opts.explore) {
             if (randomPick(vfn, state, rng, opts.death)) |p| pick = p;
         }
-        // `#224` opening diversity: the first `warm_open` moves are random and produce NO training
+        // opening diversity: the first `warm_open` moves are random and produce NO training
         // sample, so the games start from boards the greedy policy never reaches while every stored
         // target still comes from greedy play (random-move targets poisoned the value, see `explore`).
         if (moves < opts.warm_open) {
@@ -3008,7 +2982,7 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
             const every = @max(opts.deep_every, 1);
             if (moves % every == 0) deepStep(net, rng, buffer, lr, &cache, opts.deep_mode);
         };
-        // `#206`: the teacher regression only every `distill_every` steps and at its own rate, so the
+        //: the teacher regression only every `distill_every` steps and at its own rate, so the
         // shallow half of the game keeps the parameters it learned.
         if (opts.distill) |buffer| if (buffer.len > 0) {
             dist_tick += 1;
@@ -3043,7 +3017,7 @@ fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Opt
     return .{ .score = state.score, .moves = moves };
 }
 
-/// One self-play move of the per-move trainer (#158, #167). `greedy1` is the historical 1-ply argmax;
+/// One self-play move of the per-move trainer. `greedy1` is the historical 1-ply argmax;
 /// `deep2` plays the eval's 2-ply search; a `teacher` mode plays that mode's search (see
 /// `pickTeacherValue`). None of them draws from the rng (the search enumerates spawns), so all policies
 /// spawn the same tiles in the same order for the same seed and differ only in the move they pick.
@@ -3055,14 +3029,14 @@ fn selfplayPick(vfn: Value, state: GameState, death: bool, selfplay: SelfPlay, t
     };
 }
 
-/// Value of a post-spawn board under a teacher mode (#167): `Search.value(state, ply, 1)` at the mode's
+/// Value of a post-spawn board under a teacher mode: `Search.value(state, ply, 1)` at the mode's
 /// phase row, i.e. `ply` own moves with the eval's `V` at the leaf. For `.deep` (ply 2, full width)
 /// that is the tree `search2Value` bootstraps (`t2`); for `.deep3` (ply 3, its `deep3_cutoff`) it is
 /// the tree `Mode.deep` ranks its moves with, so the target is what the 2-ply play side already
 /// believes the position is worth, one own move deeper than `t2` and cheap enough to train on.
 fn teacherValue(vfn: Value, state: GameState, mode: Mode, sym_leaf: bool) f64 {
     // a fresh table per label: the previous one was filled with the weights as they stood a few steps
-    // ago, and `getValue` cannot tell (#207)
+    // ago, and `getValue` cannot tell
     sharedValueCache().clear();
     const depth = phaseDepth(mode, state.board);
     var search: Search = .{
@@ -3076,13 +3050,13 @@ fn teacherValue(vfn: Value, state: GameState, mode: Mode, sym_leaf: bool) f64 {
     return search.value(state, depth.ply, 1);
 }
 
-/// Bootstrap of one per-move TD target (#158): the value of what follows the step's reward.
+/// Bootstrap of one per-move TD target: the value of what follows the step's reward.
 /// `td1` keeps the historical V of the afterstate the next move reached; `search2` bootstraps
 /// `spawned`, the post-spawn board the step led into, with `search2_ply - 1` searched rewards and V of
 /// the afterstate one move past the last of them (see `search2Value`). With a `deep2` policy `next.value`
-/// is already a search value, so `td1` reads V of the afterstate directly then. A teacher (#167)
+/// is already a search value, so `td1` reads V of the afterstate directly then. A teacher
 /// replaces the bootstrap entirely: its own search value of `spawned`, and `target` is ignored.
-/// `next_sym` is the `rtgt` (#273) transform of the board being valued: `next.after` for `td1`, the
+/// `next_sym` is the `rtgt` transform of the board being valued: `next.after` for `td1`, the
 /// post-spawn `spawned` for `search2` and a teacher. When set, `td1` prices the rotated board directly
 /// (a frozen `target_net` included) instead of reusing `next.value`, which is canonical.
 fn tdBootstrap(net: *const Net, next: Pick, spawned: GameState, opts: Options, next_sym: ?usize) f64 {
@@ -3102,7 +3076,7 @@ fn tdBootstrap(net: *const Net, next: Pick, spawned: GameState, opts: Options, n
     };
 }
 
-/// Online n-step TD (issue #84) on the same 1-ply self-play policy as `trainGamePerMove`: each step enters
+/// Online n-step TD on the same 1-ply self-play policy as `trainGamePerMove`: each step enters
 /// the window with V of its afterstate, and the step leaving the window is trained on its n rewards plus
 /// that value. The last min(n, game length) steps are flushed at game over with the rewards alone.
 fn trainGameNStep(net: *Net, rng: std.Random, lr: f64, n: usize, move_cap: u32) GameResult {
@@ -3111,7 +3085,7 @@ fn trainGameNStep(net: *Net, rng: std.Random, lr: f64, n: usize, move_cap: u32) 
     var cache: Cache = .{};
     var moves: u32 = 0;
     while (true) {
-        // (#242) A capped game is not terminal, so its window is not flushed as one either.
+        // A capped game is not terminal, so its window is not flushed as one either.
         if (move_cap > 0 and moves >= move_cap) return .{ .score = state.score, .moves = moves, .capped = true };
         const pick = pickMove(net, state, false) orelse break;
         moves += 1;
@@ -3123,7 +3097,7 @@ fn trainGameNStep(net: *Net, rng: std.Random, lr: f64, n: usize, move_cap: u32) 
     return .{ .score = state.score, .moves = moves };
 }
 
-/// MS-TD (#107) self-play game over the staged value: the same 1-ply policy as `trainGamePerMove`,
+/// MS-TD self-play game over the staged value: the same 1-ply policy as `trainGamePerMove`,
 /// one TD(0) step per move (gamma = 1), and each step trains only the net of the afterstate it reached.
 pub fn trainGameStaged(staged: *Staged, rng: std.Random, lr: f64) GameResult {
     const value: Value = .{ .staged = staged };
@@ -3131,7 +3105,7 @@ pub fn trainGameStaged(staged: *Staged, rng: std.Random, lr: f64) GameResult {
     var pending: ?Pick = null;
     var moves: u32 = 0;
     while (true) {
-        // (#242) Same cap on the MS-TD path; the staged weights are also finite-safe (#234).
+        // Same cap on the MS-TD path; the staged weights are also finite-safe.
         if (moves >= default_move_cap) return .{ .score = state.score, .moves = moves, .capped = true };
         const pick = pickMoveValue(value, state, false) orelse break;
         moves += 1;
@@ -3177,12 +3151,12 @@ fn runBatchGame(ctx: BatchGameCtx, i: usize) BatchGame {
 
 /// What a batch reports back to the CLI: the score of the last game (the historical return of
 /// `trainBatch`/`trainBatchOpts`) plus the moves the whole batch played. The moves are what the serial
-/// loop adds to `total_moves`; without them the `par` path printed `0 moves` (#208), which read as
+/// loop adds to `total_moves`; without them the `par` path printed `0 moves`, which read as
 /// "par trains nothing".
 pub const BatchOutcome = struct {
     score: u32,
     moves: u64,
-    /// (#242) Index (within this batch) and move count of the first game that hit `Options.move_cap`;
+    /// Index (within this batch) and move count of the first game that hit `Options.move_cap`;
     /// null when every game ended normally. One pathological game stalls the whole batch, so the CLI
     /// must stop on this instead of waiting for the other games.
     capped_game: ?usize = null,
@@ -3215,7 +3189,7 @@ fn validateBatchOptions(opts: Options) OptionsError!void {
 
 /// `trainBatch` with options: every game trains with `trainGameOpts(.., opts)`, so any stateless
 /// variant (`backward`, `replay`, `sym`, `symlam`, `nstep`) batches the same way `base` does.
-/// (#277) Refuses a shaped run that the per-move path cannot implement. (#289) Refuses PopArt because
+/// Refuses a shaped run that the per-move path cannot implement. Refuses PopArt because
 /// its EMA state is serial-only.
 pub fn trainBatchOpts(net: *Net, seed: u64, first_game: usize, games: usize, lr: f64, diag: ?*Diag, opts: Options) OptionsError!BatchOutcome {
     try validateBatchOptions(opts);
@@ -3226,7 +3200,7 @@ pub fn trainBatchOpts(net: *Net, seed: u64, first_game: usize, games: usize, lr:
     // the per-game nets train with plain SGD; Adam acts once on the merged gradient below
     var thread_opts = opts;
     thread_opts.adam = null;
-    // (#246) a batch applies one step: the per-game nets accumulate the gradient, and the merge below
+    // a batch applies one step: the per-game nets accumulate the gradient, and the merge below
     // caps that single step. Capping inside the games would cap 8 sub-steps instead of one.
     thread_opts.step_clip = 0;
     parallel.map(BatchGame, units[0..games], BatchGameCtx{
@@ -3251,7 +3225,7 @@ pub fn trainBatchOpts(net: *Net, seed: u64, first_game: usize, games: usize, lr:
     for (out_w, start_w) |*o, s| o.* = s + o.* * scale;
     if (opts.adam) |state| {
         // The merge above is `-lr * (summed batch gradient)`, so dividing by `lr` gives Adam the gradient;
-        // `start` is the net the games played with, and the optimizer step is applied to it (#231).
+        // `start` is the net the games played with, and the optimizer step is applied to it.
         var grad: Net = undefined;
         const inv = -1 / lr;
         for (flat(&grad), flatConst(net), start_w) |*g, merged, s| g.* = (merged - s) * inv;
@@ -3274,7 +3248,7 @@ pub fn trainBatchOpts(net: *Net, seed: u64, first_game: usize, games: usize, lr:
     return .{ .score = units[games - 1].score, .moves = moves, .capped_game = capped_game, .capped_moves = capped_moves };
 }
 
-/// (#246) Bound the single step `trainBatchOpts` applies: `grad_clip` scales the whole delta down to
+/// Bound the single step `trainBatchOpts` applies: `grad_clip` scales the whole delta down to
 /// that L2 norm (source and target of the step, so the comparison is on `dw` alone), then `step_clip`
 /// caps every element. Both 0 (the default) leaves the merged delta untouched, bit for bit.
 fn clipMergedDelta(merged: []f64, start: []const f64, opts: Options) void {
@@ -3297,7 +3271,7 @@ const endian_marker: u32 = 0x01020304;
 const header_len = 16;
 
 /// The caller's own error names for the three header words, so `error.BadWeightMagic` and
-/// `error.BadQuantMagic` stay distinct while the check itself is written once (#141).
+/// `error.BadQuantMagic` stay distinct while the check itself is written once.
 const HeaderErrors = struct { magic: anyerror, version: anyerror, endian: anyerror };
 
 /// `bytes` starts with the 8-byte `magic` or else `err` — all `Dump` and `Teachers` need.
@@ -3315,7 +3289,7 @@ fn checkVersionedHeader(bytes: []const u8, magic: []const u8, version: u32, errs
 
 pub const file_len = header_len + @sizeOf(Net);
 
-/// Staged weight file (#107): the same header with its own 8-byte magic and `stage_count` weight blocks.
+/// Staged weight file: the same header with its own 8-byte magic and `stage_count` weight blocks.
 pub const staged_file_magic = "2048-MS\x00";
 pub const staged_file_len = header_len + @sizeOf(Net) * stage_count;
 
@@ -3339,7 +3313,7 @@ pub fn encode(net: *const Net) [file_len]u8 {
     return out;
 }
 
-/// Diagnostic: how many times `parse` ran on this thread (issue #87 tests assert weights are
+/// Diagnostic: how many times `parse` ran on this thread (87 tests assert weights are
 /// parsed once per thread, not once per move).
 pub threadlocal var parse_count: usize = 0;
 
@@ -3375,7 +3349,7 @@ fn flatConst(net: *const Net) []const f64 {
 }
 
 /// TD with function approximation can diverge: on the 128/32 net the weights reached 1e86 (and 6,334 NaN)
-/// somewhere between 100,000 and 300,000 games on training seed 2 (#234). A half-day `par` run that ends in
+/// somewhere between 100,000 and 300,000 games on training seed 2. A half-day `par` run that ends in
 /// a NaN net wastes the whole run and, worse, overwrites the last good checkpoint, so training checks this
 /// every few games and stops instead of saving (`main` reports `diverged at N games`).
 pub fn weightsFinite(net: *const Net) bool {
@@ -3385,7 +3359,7 @@ pub fn weightsFinite(net: *const Net) bool {
     return true;
 }
 
-// ---- quantized weights (#170) ----
+// ---- quantized weights ----
 //
 // A second file format next to the f32 one, for shipping: the same 18,561 weights as int16 with one
 // step per block (`w ≈ q * step`), 148,504 B -> 37,170 B. The f32 format is untouched and stays the
@@ -3430,11 +3404,11 @@ pub const QPayload = extern struct {
     b2: [h2_size]i16,
     w3: [h2_size]i16,
     b3: i16,
-    /// (#226) zero-length unless the build sets `-Dfeat`, so the shipped layout is unchanged.
+    /// zero-length unless the build sets `-Dfeat`, so the shipped layout is unchanged.
     wf: [feature_count][h1_size]i16,
 };
 
-/// int16 weights plus the steps that turn them back into values (#170): `w ≈ q * steps[block]`,
+/// int16 weights plus the steps that turn them back into values: `w ≈ q * steps[block]`,
 /// `activation ≈ q * a_steps[layer]`.
 pub const Quantized = struct {
     q: QPayload = std.mem.zeroes(QPayload),
@@ -3489,7 +3463,7 @@ fn activationBound1(net: *const Net) f64 {
 
 /// Worst-case activation of hidden layer 2: `b2[j]` plus every positive `w2[j][i]` at the layer-1 bound.
 /// Loose by construction (all 64 hidden units cannot peak at once), but ~1e-2 absolute on the value —
-/// see `docs/solver-history.md` (#170).
+/// see `docs/solver-history.md`.
 fn activationBound2(net: *const Net, a1_bound: f64) f64 {
     var bound: f64 = 0;
     for (0..h2_size) |j| {
@@ -3500,7 +3474,7 @@ fn activationBound2(net: *const Net, a1_bound: f64) f64 {
     return bound;
 }
 
-/// `Net` -> `Quantized` (#170): every block gets `step = max|w| / 32767` and `q = round(w / step)`; the
+/// `Net` -> `Quantized`: every block gets `step = max|w| / 32767` and `q = round(w / step)`; the
 /// hidden activations get the worst-case bound of the layer that produces them as their step, so they
 /// fit i16 without clamping a reachable value.
 pub fn quantize(net: *const Net) Quantized {
@@ -3530,7 +3504,7 @@ pub fn dequantize(q: *const Quantized, net: *Net) void {
     }
 }
 
-/// File layout (all little endian, `#170`): 8-byte magic `2048-NQ1`, u32 version, u32 endianness
+/// File layout (all little endian): 8-byte magic `2048-NQ1`, u32 version, u32 endianness
 /// marker, one f32 step per block (`w1 b1 w2 b2 w3 b3`), one f32 step per activation (`a1 a2`), then
 /// the 18,561 i16 weights in `Net` field order.
 pub fn encodeQuantized(q: *const Quantized) [quant_file_len]u8 {
@@ -3575,7 +3549,7 @@ fn quantizeActivation(z: f64, step: f64) i16 {
     return @intFromFloat(@min(@round(z / step), 32767));
 }
 
-/// Afterstate value from the quantized net (#170). Same arithmetic as `forward`, with int16 weights:
+/// Afterstate value from the quantized net. Same arithmetic as `forward`, with int16 weights:
 /// each hidden layer multiplies i16 x i16 into i32 and sums in i64 — the steps are ~1e-4, so the
 /// accumulated integers reach 1e9 and an i32 sum would overflow — then the layer's step is applied
 /// once, at the activation, and the activation is re-quantized with its own step for the next layer.
@@ -4146,7 +4120,7 @@ test "node cache keeps the chosen move along a game (#263/#266)" {
         var default_stats: Stats = .{};
         const plain = bestMoveWithCacheValueOpts(vfn, state, mode, &plain_stats, &plain_leaf, .{ .node_tt = false });
         const cached = bestMoveWithCacheValueOpts(vfn, state, mode, &cached_stats, &cached_leaf, .{ .node_tt = true });
-        // #266: the default is the same search as explicit on for 3-ply and as explicit off for 2-ply
+        // : the default is the same search as explicit on for 3-ply and as explicit off for 2-ply
         const default = bestMoveWithCacheValueOpts(vfn, state, mode, &default_stats, &default_leaf, .{});
         try std.testing.expectEqual(plain, cached);
         try std.testing.expectEqual(plain, default);
@@ -4334,7 +4308,7 @@ test "mass cutoff 0.5 drops the low-probability tail of one chance node (#182)" 
     try std.testing.expect(off.chance(late_board, 1, 1) != cut.chance(late_board, 1, 1));
 }
 
-/// Modes that pick their own depth from the phase table (#157).
+/// Modes that pick their own depth from the phase table.
 const phase_modes = [_]Mode{ .phase_h1, .phase_h2, .phase_h3 };
 
 test "risk weight 0 is the plain expectation, bit for bit (#187)" {
@@ -4725,7 +4699,7 @@ test "greedy and chance moves are unchanged by the deep mode" {
     var prng = std.Random.DefaultPrng.init(6);
     const net = Net.init(prng.random());
     // recorded on the pre-#69 code: both modes still route to pickMove / chanceMove
-    // re-recorded at #233: the width change (64 -> 128) moves the random init, and with it the
+    // re-recorded at : the width change (64 -> 128) moves the random init, and with it the
     // directions this pin recorded on `mid_board` (was `.left` for both at 64/32).
     try std.testing.expectEqual(@as(?Direction, .up), bestMove(&net, mid_board, .greedy));
     try std.testing.expectEqual(@as(?Direction, .down), bestMove(&net, mid_board, .chance));
@@ -4754,7 +4728,7 @@ test "deep2 self-play picks the eval's 2-ply move, legally and deterministically
     var moved = mid_board;
     try std.testing.expect(moved.slide(first.dir).changed);
     try std.testing.expectEqual(first.after, moved.board);
-    // the self-play policy and the eval policy must look at the same tree, otherwise #158 compares apples to oranges
+    // the self-play policy and the eval policy must look at the same tree, otherwise compares apples to oranges
     try std.testing.expectEqual(@as(?Direction, first.dir), bestMove(&net, mid_board, .deep));
 }
 
@@ -4905,7 +4879,7 @@ test "search2 target and deep2 pick price with the current weights, not the shar
     new_net.b3 = 0.5;
     const state: GameState = .{ .board = mid_board.board };
 
-    // `t2`: both calls share one table on purpose. Before #228 the second one answered from the leaves
+    // `t2`: both calls share one table on purpose. Before the second one answered from the leaves
     // `old_net` had priced, so `after - before` was 0 instead of the bias delta.
     var cache: ValueCache = .{};
     const before = search2Value(.{ .single = &old_net }, state, &cache, false);
@@ -4926,7 +4900,7 @@ test "search2 target and deep2 pick price with the current weights, not the shar
 }
 
 test "teacher target equals the mode's search value (#167)" {
-    // (#228) `teacherValue` clears the thread-local cache at entry, so a leaf another test left in it
+    // `teacherValue` clears the thread-local cache at entry, so a leaf another test left in it
     // cannot answer for this test's net; the reset below is belt and braces.
     sharedValueCache().* = .{};
     const weights = try parse(@embedFile("nn_weights.bin"));
@@ -4950,7 +4924,7 @@ test "teacher target equals the mode's search value (#167)" {
     try std.testing.expect(std.math.isFinite(want_deep3) and want_deep3 != want_deep);
 
     // the teacher owns the bootstrap: `target` is not consulted any more (a policy/target mismatch is
-    // exactly the #135 failure this cell exists to avoid)
+    // exactly the failure this cell exists to avoid)
     try std.testing.expectEqual(want_deep, tdBootstrap(&weights, next, state, .{ .teacher = .deep, .target = .search2 }, null));
     try std.testing.expectEqual(want_deep3, tdBootstrap(&weights, next, state, .{ .teacher = .deep3, .target = .td1 }, null));
 
@@ -5118,7 +5092,7 @@ test "death training drives values toward minus moves to game over (#101)" {
     var init_rng = std.Random.DefaultPrng.init(11);
     var net = Net.init(init_rng.random());
     var train_rng = std.Random.DefaultPrng.init(12);
-    // 200 games at the 128/32 default (#233): at 64 games the values had barely moved off 0
+    // 200 games at the 128/32 default: at 64 games the values had barely moved off 0
     for (0..200) |_| _ = try trainGameOpts(&net, train_rng.random(), 0.02, null, .{ .death = true });
 
     var play_rng = std.Random.DefaultPrng.init(13);
@@ -5139,11 +5113,11 @@ test "death training drives values toward minus moves to game over (#101)" {
 }
 
 /// Mean and standard error live in `stats.zig` so the n-tuple runner and the shared eval row use
-/// the same arithmetic (#304).
+/// the same arithmetic.
 pub const MeanErr = eval_stats.MeanErr;
 pub const meanStderr = eval_stats.meanStderr;
 
-/// Linear correlation of two equal-length samples (issue #101 probe); 0 when either is constant.
+/// Linear correlation of two equal-length samples; 0 when either is constant.
 pub fn pearson(xs: []const f64, ys: []const f64) f64 {
     std.debug.assert(xs.len == ys.len);
     if (xs.len < 2) return 0;
@@ -5222,7 +5196,7 @@ test "embedded weights file parses" {
 }
 
 test "quantized file is 48 B of header plus 2 B per weight (#170)" {
-    // 37,057 = 256*128 + 128 + 32*128 + 32 + 32 + 1: the 128/32 shipped net of #233 (18,561 at 64/32)
+    // 37,057 = 256*128 + 128 + 32*128 + 32 + 32 + 1: the 128/32 shipped net of (18,561 at 64/32)
     try std.testing.expectEqual(@as(usize, 37_057), weight_count);
     try std.testing.expectEqual(weight_count * @sizeOf(i16), @sizeOf(QPayload));
     try std.testing.expectEqual(@as(usize, 48), quant_header_len);
@@ -5278,8 +5252,8 @@ test "quantized round trip keeps every weight within its block step (#170)" {
         for (block.offset..block.offset + block.len) |i| {
             const delta = @abs(before[i] - after[i]);
             try std.testing.expect(delta <= step); // max|w| / 32767: the contract of the format
-            // what round() actually costs. The step is taken from the f32 weights, so the observed
-            // ratio reaches 0.5003 x step; the slack is f32 round-off, not a broken contract (#233).
+            // what round actually costs. The step is taken from the f32 weights, so the observed
+            // ratio reaches 0.5003 x step; the slack is f32 round-off, not a broken contract.
             try std.testing.expect(delta <= step / 2 + step * 1e-3);
         }
     }
@@ -5919,7 +5893,7 @@ test "replay tail changes the weights and K=0 is off" {
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&base), std.mem.asBytes(&off));
 }
 
-// (#262) A frozen target must be the only source of the bootstrap value; otherwise the regression
+// A frozen target must be the only source of the bootstrap value; otherwise the regression
 // target still moves with the live weights and the variant measures nothing.
 test "bootstrapValue reads the frozen target net while the live net is the default" {
     var init_rng = std.Random.DefaultPrng.init(11);
@@ -5936,7 +5910,7 @@ test "bootstrapValue reads the frozen target net while the live net is the defau
     try std.testing.expectEqual(valueOf(&live, pick.after), bootstrapValue(&live, .{}, pick.after));
 }
 
-// (#262) lr = 0 makes every update a no-op, so the live net never moves. Any use of the frozen
+// lr = 0 makes every update a no-op, so the live net never moves. Any use of the frozen
 // target for move selection would change the game; keeping score and moves equal proves the policy
 // and the spawn tape still come from the live net.
 test "frozen target leaves the live policy and spawn tape unchanged" {
@@ -5957,7 +5931,7 @@ test "frozen target leaves the live policy and spawn tape unchanged" {
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&target_before), std.mem.asBytes(&target));
 }
 
-// (#262) The per-move path, the online half of the replay path (`replay_lr_scale = 0` leaves only
+// The per-move path, the online half of the replay path (`replay_lr_scale = 0` leaves only
 // the online updates at a nonzero rate) and the replay path itself all have to see the target. The
 // same test asserts the target snapshot is never written during a game.
 test "frozen target changes the online and replay updates without being mutated" {
@@ -6135,7 +6109,7 @@ test "parallel training batch matches a serial run of the same game seeds" {
     var par = base;
     const par_out = trainBatch(&par, 77, 0, games, 0.001, null);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&serial), std.mem.asBytes(&par));
-    // #208: the batch reports the moves it played, so the `par` CLI line never prints `0 moves`.
+    // : the batch reports the moves it played, so the `par` CLI line never prints `0 moves`.
     var serial_moves: u64 = 0;
     for (0..games) |i| {
         var rng = std.Random.DefaultPrng.init(77 + i);
@@ -6658,7 +6632,7 @@ test "sym_leaf of a dihedrally symmetric board equals one forward (#178)" {
     try std.testing.expectApproxEqAbs(forward(&net, symmetric, &scratch), search.leaf(symmetric), 1e-12);
 }
 
-/// #183: one short game under an `id_budget`, with its move sequence and its leaf count. The value
+/// one short game under an `id_budget`, with its move sequence and its leaf count. The value
 /// cache lives for the whole game, exactly as in `playWithOptsValue`.
 const IdGame = struct {
     moves: [64]Direction = undefined,
@@ -6963,8 +6937,8 @@ test "stageOfEmpties maps empty-cell counts to the 7 stages" {
     try std.testing.expectEqual(@as(usize, 6), stageOfEmpties(17));
 }
 
-/// `Staged` is `stage_count` (7) nets — ~2 MB at the 128/32 default of #233 — so it has to live on the
-/// heap: the test runner and `main` stacks overflowed once the shipped width doubled (#233).
+/// `Staged` is `stage_count` (7) nets — ~2 MB at the 128/32 default of — so it has to live on the
+/// heap: the test runner and `main` stacks overflowed once the shipped width doubled.
 fn heapStaged(allocator: std.mem.Allocator, rng: std.Random) !*Staged {
     const self = try allocator.create(Staged);
     self.* = Staged.init(rng);
@@ -7085,7 +7059,7 @@ test "bestMove and play accept the staged value" {
     try std.testing.expect(result.moves > 0);
 }
 
-/// One recorded game's tape: 8192 spawns × 8 bytes per `Spawn` = 64 KiB since #237.
+/// One recorded game's tape: 8192 spawns × 8 bytes per `Spawn` = 64 KiB since .
 const tape_capacity = 8192;
 
 test "spawn tape records and replays the same game" {
@@ -7093,7 +7067,7 @@ test "spawn tape records and replays the same game" {
     const net = Net.init(prng.random());
     const value: Value = .{ .single = &net };
 
-    // recording draws a uniform number per spawn (#237) instead of an index out of the hole count, so it
+    // recording draws a uniform number per spawn instead of an index out of the hole count, so it
     // no longer reproduces `playValue`'s game byte for byte; what has to hold is that the tape *is* the
     // game, i.e. a replay of it is identical whatever rng the replay starts from.
     var buf: [tape_capacity]Spawn = undefined;
@@ -7116,7 +7090,7 @@ test "spawn tape records and replays the same game" {
 
 test "tape replay takes the recorded slot among the empty cells (#235, #237)" {
     // A board whose first empty cell in row-major order is (0,2): the old code placed the replayed tile
-    // there whenever the recorded cell was taken, which is the bias #235/#237 remove.
+    // there whenever the recorded cell was taken, which is the bias remove.
     var state = core.GameState.initEmpty();
     state.board[0][0] = 2;
     state.board[0][1] = 2;
@@ -7346,7 +7320,7 @@ test "Teachers encodes the fixed boards and targets to the same bytes as before 
     try std.testing.expectEqualSlices(u8, &golden, &bytes);
 }
 
-/// `Teachers` is ~40 MB (32 dumps, #207), so tests heap allocate it, like `nn_main` does.
+/// `Teachers` is ~40 MB (32 dumps), so tests heap allocate it, like `nn_main` does.
 fn testTeachers() !*Teachers {
     const t = try std.testing.allocator.create(Teachers);
     t.* = .{};
@@ -7472,13 +7446,13 @@ test "distill_every thins the teacher mix and distill_lr does not change the TD 
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
 }
 
-/// #189 test scorers: +1 for an afterstate that kept a tile in the top-left cell (the `left` move of
+/// test scorers: +1 for an afterstate that kept a tile in the top-left cell (the `left` move of
 /// `post_spawn_board`), 0 otherwise.
 fn rerankPrefersLeft(board: Board) f64 {
     return if (board[0][0] != 0) 1 else 0;
 }
 
-/// #189 test scorer: +1 for an afterstate whose top-left cell is empty (the `right` move).
+/// test scorer: +1 for an afterstate whose top-left cell is empty (the `right` move).
 fn rerankPrefersRight(board: Board) f64 {
     return if (board[0][0] == 0) 1 else 0;
 }
@@ -7670,7 +7644,7 @@ test "shaped non-terminal and terminal targets follow the potential formula (#27
     const next: Pick = .{ .dir = .right, .after = boardWithEmpties(5), .reward = 0.5, .value = 3.5 };
     const spawned: GameState = .{ .board = boardWithEmpties(6) };
 
-    // #277: reward + Phi(next.after) - Phi(p.after) + V(next.after), with V = next.value on td1/greedy1.
+    // : reward + Phi(next.after) - Phi(p.after) + V(next.after), with V = next.value on td1/greedy1.
     const want_nonterminal = p.reward + shapePotential(next.after, c) - shapePotential(p.after, c) + next.value;
     const got_nonterminal = tdUpdate(&net, &cache, p, next, spawned, 0, rng.random(), .{ .shape_c = c }, &trace);
     try std.testing.expectApproxEqAbs(want_nonterminal, got_nonterminal, 1e-12);
@@ -7759,7 +7733,7 @@ test "PopArt refuses mixed training variants and stays opt-in (#289)" {
     try std.testing.expectError(error.PopArtRequiresPlainTd1, validateOptions(.{ .popart = &state, .lambda = 0.7 }));
     try std.testing.expectError(error.PopArtRequiresPlainTd1, validateOptions(.{ .popart = &state, .step_clip = 1 }));
     try std.testing.expectError(error.PopArtRequiresPlainTd1, validateOptions(.{ .popart = &state, .adam = adam }));
-    // a search-only field (the #320 spawn sampler) is inert on this path, so it is refused, not ignored
+    // a search-only field (the spawn sampler) is inert on this path, so it is refused, not ignored
     try std.testing.expectError(error.PopArtRequiresPlainTd1, validateOptions(.{ .popart = &state, .sample = 2 }));
     // the per-game safety bound is not an update and stays allowed
     try validateOptions(.{ .popart = &state, .move_cap = 500 });
