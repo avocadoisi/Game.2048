@@ -87,3 +87,21 @@ python3 scripts/label-issues.py --apply    # ラベル作成 + 付与。冪等�
 gh issue edit <n> --add-label train:more
 gh issue list -l train:more --state open
 ```
+
+## 進行タグ `train:wait`
+
+**ラン待ち**（学習・計測・profile の実行中、または CPU の順番待ち）を示す進行タグ。
+学習も計測も 1 本ずつしか回せないので、issue は「コードは入ったが、数値を取るランがまだ終わっていない」
+間このタグを持つ。待ちの理由（実行中 / 順番待ち / 4 時間上限で打ち切り）は issue のコメントに書く。
+
+- ランの依頼を積んだ時点で付ける。
+- ランが終わって採否と数値を issue に記録したら、**close のときに必ず外す**。
+  `gh issue close` はラベルを外さないので、`gh issue edit` で先に外す。
+- `train:more` は「4 時間では決着せず、追加学習で伸びる見込み」の意味。`train:wait` は
+  「いまラン待ち」の意味で、採否が決まったら close と同時に消える。両方付いてもよい。
+
+```bash
+gh issue edit <n> --add-label train:wait
+gh issue edit <n> --remove-label train:wait && gh issue close <n>
+gh issue list -l train:wait --state open
+```
