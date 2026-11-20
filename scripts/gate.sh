@@ -3,9 +3,11 @@
 #
 #   scripts/gate.sh format [--write]  # zig fmt, shfmt, ruff format
 #   scripts/gate.sh lint              # shellcheck, ruff check, node --check
-#   scripts/gate.sh test              # zig build test
+#   scripts/gate.sh test              # zig build test (full, CI)
+#   scripts/gate.sh test-fast         # zig build test -Dslow-tests=false (skip slow regression tests)
 #   scripts/gate.sh fast              # format + lint (pre-commit)
-#   scripts/gate.sh all               # format + lint + test (pre-push, CI)
+#   scripts/gate.sh push              # format + lint + test-fast (pre-push)
+#   scripts/gate.sh all               # format + lint + test (CI)
 #   scripts/gate.sh install           # enable .githooks (core.hooksPath)
 #
 # The gate is deliberately portable: it needs only the tools below, and every
@@ -18,7 +20,7 @@ cd "$root"
 ZIG_WANT=0.17.1
 
 usage() {
-  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 need() {
@@ -76,11 +78,17 @@ test_gate() {
   zig build test
 }
 
+# The slow full-game/training regression tests are skipped here; CI runs them via `all`.
+test_fast_gate() {
+  check_zig
+  zig build test -Dslow-tests=false
+}
+
 install_hooks() {
   need git
   git config core.hooksPath .githooks
   chmod +x scripts/gate.sh .githooks/pre-commit .githooks/pre-push
-  echo "gate: core.hooksPath=.githooks (pre-commit: fast, pre-push: all)"
+  echo "gate: core.hooksPath=.githooks (pre-commit: fast, pre-push: push)"
 }
 
 case "${1:-}" in
@@ -93,9 +101,17 @@ case "${1:-}" in
   test)
     test_gate
     ;;
+  test-fast)
+    test_fast_gate
+    ;;
   fast)
     format check
     lint
+    ;;
+  push)
+    format check
+    lint
+    test_fast_gate
     ;;
   all)
     format check

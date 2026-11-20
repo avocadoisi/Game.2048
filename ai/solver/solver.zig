@@ -8,6 +8,10 @@ const nn = @import("nn");
 const ntuple = @import("ntuple");
 const builtin = @import("builtin");
 
+/// Re-export of the gate tier flag so targets that import `solver` (e.g. bench) can skip their
+/// slow regression tests under `-Dslow-tests=false` without importing `nn` themselves.
+pub const slow_tests = nn.slow_tests;
+
 /// Returned for a board where the player has no legal move.
 const lost_score: f64 = -1e9;
 /// shortcut: fixed width keeps branching cheap; tune against deeper searches if needed.
@@ -1232,6 +1236,7 @@ test "nnbeam evaluates the afterstate before spawn at the final ply" {
 }
 
 test "expectimax TT depth 3 matches bestMove on random-play boards" {
+    if (!nn.slow_tests) return error.SkipZigTest;
     var rng_state = std.Random.DefaultPrng.init(100);
     const rng = rng_state.random();
     var state = GameState.gameStart(rng);
@@ -1247,6 +1252,7 @@ test "expectimax TT depth 3 matches bestMove on random-play boards" {
 }
 
 test "reused TT returns the same moves as a fresh table across games (#88)" {
+    if (!nn.slow_tests) return error.SkipZigTest;
     const warm = ttWorkspace();
     try std.testing.expectEqual(warm, ttWorkspace()); // one workspace per thread, reused
     for ([_]u64{ 100, 200 }) |seed| {
@@ -1430,6 +1436,7 @@ test "expectimax full and pruned searches pin their fixed-board moves and values
 }
 
 test "weighted search pins fixed-board moves and values (#312)" {
+    if (!nn.slow_tests) return error.SkipZigTest;
     const boards = [_]Board{
         .{ .{ 2, 4, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 } },
         .{ .{ 2, 2, 4, 8 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 } },
@@ -1559,6 +1566,9 @@ test "iterative deepening returns a legal move on random boards" {
 }
 
 test "iterative deepening with a zero budget returns the depth 2 move" {
+    // id_depth_reached is a running max across calls; reset it so this test does not inherit a
+    // deeper depth from an earlier timed search (which reaches further in a faster build).
+    id_depth_reached = 0;
     var prng = std.Random.DefaultPrng.init(11);
     const rng = prng.random();
     var state = GameState.gameStart(rng);
@@ -2026,6 +2036,7 @@ fn goldenPlay(policy: Policy, seed: u64, depth: u8) Golden {
 }
 
 test "nn policy reproduces the same move sequence and score on a fixed seed" {
+    if (!nn.slow_tests) return error.SkipZigTest;
     const g = goldenPlay(.nn, 20240601, 0);
     // re-recorded at with the 128/32 shipped net (was 32,380 / 2048 / 1,669 moves)
     try std.testing.expectEqual(@as(u32, 81104), g.score);
@@ -2035,6 +2046,7 @@ test "nn policy reproduces the same move sequence and score on a fixed seed" {
 }
 
 test "nn2 policy reproduces the same move sequence and score on a fixed seed" {
+    if (!nn.slow_tests) return error.SkipZigTest;
     const g = goldenPlay(.nn2, 20240601, 0);
     // re-recorded at with the 128/32 shipped net (was 77,164 / 4096 / 3,542 moves)
     try std.testing.expectEqual(@as(u32, 132164), g.score);
@@ -2044,6 +2056,7 @@ test "nn2 policy reproduces the same move sequence and score on a fixed seed" {
 }
 
 test "nn policy parses the weights once per thread, not once per move" {
+    if (!nn.slow_tests) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(7);
     const rng = prng.random();
     var state = GameState.gameStart(rng);

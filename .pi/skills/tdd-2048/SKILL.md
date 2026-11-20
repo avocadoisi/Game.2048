@@ -10,7 +10,8 @@ Cycle and test discipline: `dev-philosophy`. Order of a change: `dev-workflow`.
 
 ## Commands
 
-- `zig build test` — unit tests of 15 targets: core, exe, solver, bench, ranking, parallel, evalab, probe, nn, nn_main, ntuple, ntuple_main, ga-rl, tune, cmaes
+- `zig build test` — full suite, 15 targets: core, exe, solver, bench, ranking, parallel, evalab, probe, nn, nn_main, ntuple, ntuple_main, ga-rl, tune, cmaes. This is what CI runs (`gate.sh all`)
+- `zig build test -Dslow-tests=false` — fast tier: skips the slow full-game/training regression tests (each returns `error.SkipZigTest`). This is what pre-push runs (`gate.sh push`). Same binary, every cheap unit test still runs
 - `zig build run` — play · `zig build run -- serve 8080` — HTTP server
 - Zig **0.17.1** (`build.zig` uses `addPassthruArgs`; `std.Io`). `zig version` before building
 - `nix develop` when zig is not on PATH
@@ -36,7 +37,9 @@ Cycle and test discipline: `dev-philosophy`. Order of a change: `dev-workflow`.
 - inject RNG; core never calls a global random source
 - core does not depend on CLI, IO, or allocator-heavy code
 - randomness in tests: `SequenceRng` (scripted) or a fixed-seed `DefaultPrng`
-- `zig build test -Doptimize=ReleaseFast` does not finish: the `nn` test binary alone compiles for 20+ min. Debug is the full-test setting
+- `zig build test -Doptimize=ReleaseFast` does not finish: the `nn` test binary alone compiles for 20+ min. Debug is the full-test setting. ReleaseSafe is not a drop-in either: it compiles slower and the faster search trips speed-sensitive tests (e.g. iterative deepening reaches a deeper depth in the same 1 ms budget)
+- gate tiers: pre-commit = `gate.sh fast` (format+lint); pre-push = `gate.sh push` (format+lint+fast tests); CI = `gate.sh all` (format+lint+full tests). A new slow regression test (full game, deep search, or training) must start with `if (!<flag>) return error.SkipZigTest;` so it stays out of the push path: `<flag>` is `width.slow_tests` in nn.zig, `nn.slow_tests` in solver.zig, `solver.slow_tests` in anything that imports solver (the flag is re-exported down that chain)
+- test runs are cached when nothing changed, so a no-op `zig build test` is ~1 s; the cost is per-change recompile + re-run, dominated by the `nn` binary (~7 min Debug). Copying `.zig-cache` between worktrees does NOT hit (absolute paths are baked into the manifest); the global cache is already shared — keep worktrees long-lived instead
 - measure a policy with `zig build solve`; `zig build ranking` runs every policy (nnmcts etc.) and takes 10+ min per game
 - `dump` / `dumpp2` train while they play, so `lr 0.003` from the shipped net breaks the policy mid-dump and records almost nothing (`dump_min_tile = 4096`, `ai/solver/nn.zig:1767`). Pass `lr 0` and give `weights_path` a copy in `/tmp`: the variant saves back to that path
 
