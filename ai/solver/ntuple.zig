@@ -184,14 +184,78 @@ pub const TupleNet = struct {
         return self.value(indices(board));
     }
 
+    /// Apply a precomputed TD error equally across each active tuple's touched weight.
+    fn applyDelta(self: *TupleNet, idx: Indices, delta: f64, lr: f64) void {
+        const step: f32 = @floatCast(lr * delta / @as(f64, @floatFromInt(self.count)));
+        for (0..self.count) |p| self.storage[offsets[p] + idx[p]] += step;
+    }
+
     /// TD step: move every touched entry by `lr * (target - V) / n_tuples`; returns the TD error.
     pub fn train(self: *TupleNet, idx: Indices, target: f64, lr: f64) f64 {
         const delta = target - self.value(idx);
-        const step: f32 = @floatCast(lr * delta / @as(f64, @floatFromInt(self.count)));
-        for (0..self.count) |p| self.storage[offsets[p] + idx[p]] += step;
+        self.applyDelta(idx, delta, lr);
         return delta;
     }
 };
+
+/// Paper defaults for the opt-in delayed TD(lambda) learner (#290).
+pub const delayed_td_horizon: usize = 3;
+pub const delayed_td_lambda: f64 = 0.5;
+
+/// Buffer up to h+1 afterstates and their TD errors, then apply one aggregated update per state.
+/// This is the delayed TD(lambda) algorithm: the default TD(0) training path remains separate.
+pub const DelayedTDLambda = struct {
+    net: *TupleNet,
+    lr: f64,
+    states: [delayed_td_horizon + 1]Indices = undefined,
+    deltas: [delayed_td_horizon + 1]f64 = undefined,
+    len: usize = 0,
+
+    pub fn init(net: *TupleNet, lr: f64) DelayedTDLambda {
+        return .{ .net = net, .lr = lr };
+    }
+
+    /// Add one afterstate's TD error; once h future errors are available, update it and discard it.
+    pub fn observe(self: *DelayedTDLambda, idx: Indices, delta: f64) void {
+        self.states[self.len] = idx;
+        self.deltas[self.len] = delta;
+        self.len += 1;
+        if (self.len == delayed_td_horizon + 1) {
+            self.applyOldest();
+            self.dropOldest();
+        }
+    }
+
+    /// Apply the remaining truncated traces at episode end, oldest state first.
+    pub fn finish(self: *DelayedTDLambda) void {
+        while (self.len > 0) {
+            self.applyOldest();
+            self.dropOldest();
+        }
+    }
+
+    fn applyOldest(self: *DelayedTDLambda) void {
+        var delta_sum: f64 = 0;
+        var decay: f64 = 1;
+        for (self.deltas[0..self.len]) |delta| {
+            delta_sum += delta * decay;
+            decay *= delayed_td_lambda;
+        }
+        self.net.applyDelta(self.states[0], delta_sum, self.lr);
+    }
+
+    fn dropOldest(self: *DelayedTDLambda) void {
+        for (1..self.len) |i| {
+            self.states[i - 1] = self.states[i];
+            self.deltas[i - 1] = self.deltas[i];
+        }
+        self.len -= 1;
+    }
+};
+
+pub fn delayedTDLambdaExtraMemoryBytes() usize {
+    return @sizeOf(DelayedTDLambda);
+}
 
 /// int16 view of a table: one scale per pattern, so the 4-tuples can use a coarser step than the
 /// 6-tuples. `q * scale` reproduces the f32 value to within half a step (129 MiB -> 64.6 MiB, #129).
@@ -417,10 +481,14 @@ pub const Mode = enum {
 /// afterstate on the post-spawn board (`r + max_a V(after(s', a))`, the two-stage #131 target).
 pub const Target = enum { on_policy, max_backup };
 
-/// Runner variant: policy mode, table set, TD target, and whether to load `table_path` first.
+/// Training algorithm selected by the runner; TD(0) stays the default (#290).
+pub const Learner = enum { td_zero, delayed_td_lambda };
+
+/// Runner variant: policy mode, table set, learner, TD target, and whether to load `table_path` first.
 pub const Variant = struct {
     mode: Mode = .greedy,
     set: Set = .full,
+    learner: Learner = .td_zero,
     target: Target = .on_policy,
     resume_from_file: bool = false,
 };
@@ -434,6 +502,7 @@ pub fn parseVariant(name: []const u8) ?Variant {
     if (std.mem.eql(u8, name, "resume")) return .{ .resume_from_file = true };
     if (std.mem.eql(u8, name, "lightresume")) return .{ .resume_from_file = true, .set = .light };
     if (std.mem.eql(u8, name, "wide")) return .{ .set = .wide };
+    if (std.mem.eql(u8, name, "widedelay")) return .{ .set = .wide, .learner = .delayed_td_lambda };
     if (std.mem.eql(u8, name, "maxb")) return .{ .set = .wide, .target = .max_backup };
     if (std.mem.eql(u8, name, "maxbchance")) return .{ .set = .wide, .mode = .chance, .target = .max_backup };
     if (std.mem.eql(u8, name, "maxbdeep")) return .{ .set = .wide, .mode = .deep, .target = .max_backup };
@@ -671,6 +740,28 @@ pub fn trainGameWith(net: *TupleNet, rng: std.Random, lr: f64, mode: Mode, targe
         _ = state.move(pick.dir, rng);
     }
     if (pending) |p| _ = net.train(p.idx, p.reward, lr);
+    return .{ .score = state.score, .moves = moves };
+}
+
+/// Opt-in delayed TD(lambda) self-play, with the on-policy afterstate target only (#290).
+pub fn trainGameDelayedTDLambda(net: *TupleNet, rng: std.Random, lr: f64, mode: Mode) GameResult {
+    var state = core.GameState.gameStart(rng);
+    var learner = DelayedTDLambda.init(net, lr);
+    var pending: ?Pick = null;
+    var moves: u32 = 0;
+    var stats: Stats = .{};
+    while (chooseMove(net, state, mode, &stats)) |pick| {
+        moves += 1;
+        if (pending) |p| {
+            // Re-evaluate the pending afterstate: older delayed updates may have touched its weights.
+            const delta = p.reward + pick.value - net.value(p.idx);
+            learner.observe(p.idx, delta);
+        }
+        pending = pick;
+        _ = state.move(pick.dir, rng);
+    }
+    if (pending) |p| learner.observe(p.idx, p.reward - net.value(p.idx));
+    learner.finish();
     return .{ .score = state.score, .moves = moves };
 }
 
@@ -918,6 +1009,10 @@ test "variant names select the mode, the table set and resume" {
     try std.testing.expect(lightresume.resume_from_file);
     try std.testing.expectEqual(Set.light, lightresume.set);
     try std.testing.expectEqual(Set.wide, parseVariant("wide").?.set);
+    const widedelay = parseVariant("widedelay").?;
+    try std.testing.expectEqual(Set.wide, widedelay.set);
+    try std.testing.expectEqual(Learner.delayed_td_lambda, widedelay.learner);
+    try std.testing.expectEqual(Target.on_policy, widedelay.target);
     try std.testing.expectEqual(Mode.deep, parseVariant("widedeep").?.mode);
     try std.testing.expectEqual(Set.wide, parseVariant("widedeep").?.set);
     try std.testing.expectEqual(@as(?Variant, null), parseVariant("lightresumex"));
@@ -982,6 +1077,55 @@ test "quantized eval reproduces the float table it came from (#129)" {
     // one table only: the value is that table's entry, so the tolerance is a single quantization step
     try std.testing.expect(@abs(net.value(idx) - q.value(idx)) < 0.02);
     try std.testing.expect(@abs(net.eval(sample_board) - q.eval(sample_board)) < 0.02);
+}
+
+test "delayed TD(lambda) matches the naive bounded trace including the episode tail (#290)" {
+    const gpa = std.testing.allocator;
+    var reference = try TupleNet.initWith(gpa, .light);
+    defer reference.deinit(gpa);
+    var delayed = try TupleNet.initWith(gpa, .light);
+    defer delayed.deinit(gpa);
+
+    var second = sample_board;
+    second[0][0] = 0;
+    second[3][3] = 4;
+    var third = sample_board;
+    third[1][1] = 0;
+    third[2][2] = 16;
+    const states = [_]Indices{
+        indices(sample_board),
+        indices(second),
+        indices(third),
+        indices(sample_board),
+        indices(second),
+        indices(third),
+    };
+    const deltas = [_]f64{ 1.25, -0.5, 2.0, -3.0, 0.25, 4.0 };
+    const lr = 0.05;
+
+    trainTdLambdaReference(&reference, &states, &deltas, lr, delayed_td_lambda, delayed_td_horizon);
+    var learner = DelayedTDLambda.init(&delayed, lr);
+    for (states, deltas) |idx, delta| learner.observe(idx, delta);
+    learner.finish();
+
+    for (reference.storage, delayed.storage) |want, got| {
+        try std.testing.expectApproxEqAbs(want, got, 0.00001);
+    }
+}
+
+/// Straightforward per-error implementation used only as a test oracle for the delayed update.
+fn trainTdLambdaReference(net: *TupleNet, states: []const Indices, deltas: []const f64, lr: f64, lambda: f64, horizon: usize) void {
+    std.debug.assert(states.len == deltas.len);
+    for (deltas, 0..) |delta, t| {
+        const first = if (t > horizon) t - horizon else 0;
+        var k = t + 1;
+        while (k > first) {
+            k -= 1;
+            var decay: f64 = 1;
+            for (0..t - k) |_| decay *= lambda;
+            net.applyDelta(states[k], delta * decay, lr);
+        }
+    }
 }
 
 test "trainGame keeps the on-policy target and max backup differs from it (#131)" {
