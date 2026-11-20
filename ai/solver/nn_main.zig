@@ -62,6 +62,8 @@ const usage =
     \\              oi / oi16 (#107: multiply the initial weights by 4 / 16 = optimistic initialization,
     \\                       then train exactly like base; only the init differs, so `par` works)
     \\              resume  (#66: load weights_path and train train_games more games from those weights, plain per-move path)
+    \\              popart  (#289: plain TD(0) with adaptive target normalization; raw weights plus <weights_path>.popart stats sidecar)
+    \\              popartresume (#289: resume PopArt weights and stats sidecar; no parallel training)
     \\              mstd    (#107 MS-TD: one MLP per empty-cell stage (0..2, 3..4, 5..6, 7..8, 9..10,
     \\                       11..12, 13..16 empties); each TD step trains only the stage of the afterstate
     \\                       it reached. Weights go to a staged file (its own magic), so eval needs the same file)
@@ -129,6 +131,27 @@ const usage =
 
 const default_weights_path = "ai/solver/nn_weights.bin";
 
+fn popartModeAllowed(is_popart: bool, is_resume: bool, train_games: u32) bool {
+    return !is_popart or is_resume or train_games > 0;
+}
+
+fn popartTrainingPathAllowed(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    is_popart: bool,
+    train_games: u32,
+    weights_path: []const u8,
+) !bool {
+    if (!is_popart or train_games == 0) return true;
+    const output_path = try std.fs.path.resolveAlloc(allocator, &.{ cwd, weights_path });
+    defer allocator.free(output_path);
+    // Also block shipped basenames outside this worktree (e.g. an absolute path into the main checkout).
+    if (std.ascii.eqlIgnoreCase(std.fs.path.basename(output_path), std.fs.path.basename(default_weights_path))) return false;
+    const shipped_path = try std.fs.path.resolveAlloc(allocator, &.{ cwd, default_weights_path });
+    defer allocator.free(shipped_path);
+    return !std.mem.eql(u8, output_path, shipped_path);
+}
+
 // Positional defaults, one named constant each (`usage` above is the compatibility surface).
 const default_train_games: u32 = 2000;
 const default_eval_games: u32 = 100;
@@ -190,6 +213,8 @@ const Variant = enum {
     par,
     lam,
     rlam,
+    popart,
+    popartresume,
     /// Not in `variant_specs`: the placeholder for a name no entry matched. It carries every default
     /// fact and no builder, so `main` prints the usage where the old chain's final `else` did - the
     /// same place, and after the same parses, as before the table existed (the old code parsed later
@@ -202,13 +227,16 @@ const Variant = enum {
 const MaxArgs = enum { clip, value, rows, ft2_tch, dump, pairw_pairleaf, pairrow };
 
 /// Everything a variant's `nn.Options` builder reads. The buffers the options point at (`adam`,
-/// `priority`, `dump`, `teachers`, the `tnet` snapshot) belong to `main`, so they are borrowed here;
-/// `args` is the raw command line, read only through the `parse*` helpers.
+/// `popart`, `priority`, `dump`, `teachers`, the `tnet` snapshot) belong to `main`, so they are borrowed
+/// here; `args` is the raw command line, read only through the `parse*` helpers.
 const BuildCtx = struct {
     args: []const []const u8,
     replay_k: usize,
     learning_rate: f64,
     adam: *nn.Adam,
+    /// (#289) the target moments `popart`/`popartresume` point at; `main` owns it because the sidecar
+    /// load and save happen around the game loop, outside the options.
+    popart: *nn.PopArtState,
     priority: *nn.Priority,
     dump: *nn.Dump,
     teachers: *nn.Teachers,
@@ -289,6 +317,8 @@ const variant_specs = [_]VariantSpec{
     .{ .variant = .par, .build = &buildPlain },
     .{ .variant = .lam, .build = &buildSweepReplay, .max_args = .value },
     .{ .variant = .rlam, .build = &buildSweepReplay, .load_weights = true, .max_args = .value },
+    .{ .variant = .popart, .build = &buildPopart },
+    .{ .variant = .popartresume, .build = &buildPopartResume, .load_weights = true },
 };
 
 // One builder per options family: the arms of the options if-chain #315 moved out of `main`, each
@@ -488,6 +518,20 @@ fn buildDson(ctx: *const BuildCtx) anyerror!nn.Options {
     var opts = try buildDist(ctx);
     opts.distill_only = true;
     return opts;
+}
+
+/// (#289) `popart`: plain TD(0) whose target is normalized by the running moments in `PopArtState`. The
+/// builder only borrows the state; the rescale of `w3`/`b3` and of the target happens inside
+/// `nn.trainStep`, and `main` refuses `par` because the moments are cross-move state.
+fn buildPopart(ctx: *const BuildCtx) anyerror!nn.Options {
+    return .{ .popart = ctx.popart };
+}
+
+/// (#289) `popartresume`: the same options as `popart`. The difference is the spec row's
+/// `load_weights`, which makes `main` load `weights_path` and then the `<weights_path>.popart` sidecar
+/// into the same borrowed state before training or an eval-only run.
+fn buildPopartResume(ctx: *const BuildCtx) anyerror!nn.Options {
+    return buildPopart(ctx);
 }
 
 /// Resolve a command-line variant name exactly once. This is the only variant-name comparison left.
@@ -981,6 +1025,10 @@ pub fn main(init: std.process.Init) !void {
     const is_dump = spec.variant == .dump or spec.variant == .dumpp2;
     const is_ft2 = spec.variant == .ft2;
     const is_restart = spec.variant == .restart;
+    // (#289) PopArt: adaptive target normalization on the plain serial TD(0) path. `popartresume`
+    // reloads the raw weights plus the `<weights_path>.popart` statistics sidecar.
+    const is_popart = spec.variant == .popart or spec.variant == .popartresume;
+    const is_popart_resume = spec.variant == .popartresume;
     // Paired comparison (#168): two policies play the same spawn tape.
     const is_pair = spec.variant == .pair;
     // Paired comparison of two weight files (#210): A = weights_path, B = the file at index 12, both with
@@ -1015,6 +1063,7 @@ pub fn main(init: std.process.Init) !void {
     const uses_dump = spec.dump;
     const replay_k: usize = try cli.argOr(usize, args, 7, default_replay_k);
     const weights_path: []const u8 = try cli.argOr([]const u8, args, 8, default_weights_path);
+    const popart_path: ?[]const u8 = if (is_popart) try std.fmt.allocPrint(init.arena.allocator(), "{s}.popart", .{weights_path}) else null;
     const train_seed: u64 = try cli.argOr(u64, args, 9, default_train_seed);
     // Deep-position buffer (#159). Index 10 must say "par" or "-" (see `parseParFlag`); index 11 is the
     // dump path.
@@ -1022,6 +1071,7 @@ pub fn main(init: std.process.Init) !void {
     var dump: nn.Dump = .{};
     var priority: nn.Priority = .{};
     var adam: nn.Adam = .{};
+    var popart_state: nn.PopArtState = .{};
     // (#262) Declared before `opts`, which points at its `net`; initialised from the live net after
     // `startNet` and refreshed between batches only.
     var target_sync: TargetSync = undefined;
@@ -1044,6 +1094,7 @@ pub fn main(init: std.process.Init) !void {
         .replay_k = replay_k,
         .learning_rate = learning_rate,
         .adam = &adam,
+        .popart = &popart_state,
         .priority = &priority,
         .dump = &dump,
         .teachers = teachers,
@@ -1054,6 +1105,12 @@ pub fn main(init: std.process.Init) !void {
     // (#137) the merge multiplier applies to every variant that reached a batched path; the builders never
     // set it, so it is assigned once here for all of them.
     opts.batch_scale = batch_scale;
+    // (#289) PopArt's EMA is cross-move state, so a merged `par` batch would race on it. Checked before
+    // `validateOptions`, whose PopArt arm rejects a non-unit `batch_scale` with the generic usage.
+    if (is_popart and use_par) {
+        std.debug.print("PopArt is serial-only\n{s}", .{usage});
+        return;
+    }
     // (#277) Refuse a shaped run mixed with a variant that retrains afterstates later or replaces the
     // TD target: those paths do not implement the shaped reward, and silently training on the raw
     // reward would hide the mistake.
@@ -1061,6 +1118,18 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}", .{usage});
         return;
     };
+    if (!popartModeAllowed(is_popart, is_popart_resume, train_games)) {
+        std.debug.print("popart requires training; use popartresume to evaluate saved PopArt weights\n{s}", .{usage});
+        return;
+    }
+    if (is_popart and train_games > 0) {
+        const cwd = try std.process.currentPathAlloc(init.io, init.gpa);
+        defer init.gpa.free(cwd);
+        if (!try popartTrainingPathAllowed(init.gpa, cwd, is_popart, train_games, weights_path)) {
+            std.debug.print("PopArt training requires a candidate weights_path with a distinct filename\n{s}", .{usage});
+            return;
+        }
+    }
     // `dump` is the shared layout plus one slot: index 11 carries the dump path.
     // `par` runs may carry the #137 batch_scale at index 12, after the `-` dump slot.
     // (#203) index 13 narrows the eval table to the rows a measurement needs (`0,2`). The variants that
@@ -1112,6 +1181,19 @@ pub fn main(init: std.process.Init) !void {
     else
         try startNet(&net, init.io, init.gpa, train_games, use_resume, train_seed, weights_path);
     if (loaded) std.debug.print("loaded {s}\n", .{weights_path});
+    if (is_popart_resume) {
+        try popart_state.load(init.io, init.gpa, popart_path.?);
+        std.debug.print("loaded PopArt EMA: target μ={d:.3}, var={d:.3}, σ={d:.3} (n={d}); value μ={d:.3}, var={d:.3}, σ={d:.3} (n={d})\n", .{
+            popart_state.mu,
+            popart_state.variance(),
+            popart_state.sigma(),
+            popart_state.updates,
+            popart_state.value_mu,
+            popart_state.valueVariance(),
+            popart_state.valueSigma(),
+            popart_state.value_updates,
+        });
+    }
     // (#262) The initial snapshot is the starting net; the first batch trains against it.
     if (is_tnet) target_sync = TargetSync.init(&net, target_every);
     // Optimistic initialization (#107) only rescales the random init, so it stays out of `nn.Options`.
@@ -1192,6 +1274,7 @@ pub fn main(init: std.process.Init) !void {
                 if ((g + 1) % 5000 == 0) {
                     std.debug.print("train {d}/{d} last game score {d}\n", .{ g + 1, train_games, last_score });
                     try nn.save(&net, init.io, weights_path); // checkpoint
+                    if (is_popart) try popart_state.save(init.io, popart_path.?);
                 }
             }
         }
@@ -1209,6 +1292,16 @@ pub fn main(init: std.process.Init) !void {
             train_seed,
             variant_label,
         });
+        if (is_popart) std.debug.print("PopArt EMA: target μ={d:.3}, var={d:.3}, σ={d:.3} (n={d}); value μ={d:.3}, var={d:.3}, σ={d:.3} (n={d})\n", .{
+            popart_state.mu,
+            popart_state.variance(),
+            popart_state.sigma(),
+            popart_state.updates,
+            popart_state.value_mu,
+            popart_state.valueVariance(),
+            popart_state.valueSigma(),
+            popart_state.value_updates,
+        });
         if (want_diag and !is_mstd) printDiag(&diag);
         if (is_dist or is_dson) std.debug.print("distill: {d} teacher samples, {d} regression steps\n", .{ teachers.len, teachers.draws });
         if (is_dump) {
@@ -1216,7 +1309,12 @@ pub fn main(init: std.process.Init) !void {
             try dump.save(init.io, init.gpa, path);
             std.debug.print("dump: {d} deep afterstates ({d} dropped) -> {s}\n", .{ dump.len, dump.dropped, path });
         }
-        if (is_mstd) try staged.saveFile(init.io, init.gpa, weights_path) else try nn.save(&net, init.io, weights_path);
+        if (is_mstd) {
+            try staged.saveFile(init.io, init.gpa, weights_path);
+        } else {
+            try nn.save(&net, init.io, weights_path);
+            if (is_popart) try popart_state.save(init.io, popart_path.?);
+        }
     }
 
     // `eval_games = 0` is "train only": the table below plays every row on every eval game, and one
@@ -1579,6 +1677,32 @@ test "usage text lists the resume variant" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "resume  (#66") != null);
 }
 
+test "usage text lists both PopArt variants and the raw-weight sidecar (#289)" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "popart  (#289") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "popartresume (#289") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "<weights_path>.popart") != null);
+}
+
+test "fresh PopArt mode requires training while resume mode can evaluate (#289)" {
+    try std.testing.expect(!popartModeAllowed(true, false, 0));
+    try std.testing.expect(popartModeAllowed(true, false, 1));
+    try std.testing.expect(popartModeAllowed(true, true, 0));
+    try std.testing.expect(popartModeAllowed(false, false, 0));
+}
+
+test "PopArt training cannot overwrite shipped weights (#289)" {
+    const cwd = "/repo";
+    try std.testing.expect(!(try popartTrainingPathAllowed(std.testing.allocator, cwd, true, 1, default_weights_path)));
+    try std.testing.expect(!(try popartTrainingPathAllowed(std.testing.allocator, cwd, true, 1, "./ai/solver/nn_weights.bin")));
+    try std.testing.expect(!(try popartTrainingPathAllowed(std.testing.allocator, cwd, true, 1, "ai/solver/../solver/nn_weights.bin")));
+    try std.testing.expect(!(try popartTrainingPathAllowed(std.testing.allocator, cwd, true, 1, "/repo/ai/solver/nn_weights.bin")));
+    try std.testing.expect(!(try popartTrainingPathAllowed(std.testing.allocator, cwd, true, 1, "/other/repo/ai/solver/nn_weights.bin")));
+    try std.testing.expect(!(try popartTrainingPathAllowed(std.testing.allocator, cwd, true, 1, "/tmp/NN_WEIGHTS.BIN")));
+    try std.testing.expect(try popartTrainingPathAllowed(std.testing.allocator, cwd, true, 0, default_weights_path));
+    try std.testing.expect(try popartTrainingPathAllowed(std.testing.allocator, cwd, true, 1, "candidate.bin"));
+    try std.testing.expect(try popartTrainingPathAllowed(std.testing.allocator, cwd, false, 1, default_weights_path));
+}
+
 test "usage text lists the nstep variant" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "nstep   (#84") != null);
 }
@@ -1859,12 +1983,13 @@ test "usage text lists the shape variant and its coefficient slot (#277)" {
 
 test "variant table lists every accepted variant name once (#314)" {
     const names = [_][]const u8{
-        "base",   "backward", "replay",  "tnet", "priority", "midgame",   "midmix", "sym",
-        "symlam", "symbatch", "rsym",    "rtgt", "explore",  "explore20", "open8",  "open16",
-        "nstep",  "death",    "t2",      "p2",   "tp2",      "d2",        "d3",     "dumpp2",
-        "tch",    "tchadd",   "dist",    "dson", "oi",       "oi16",      "resume", "mstd",
-        "dump",   "ft2",      "restart", "adam", "tailw",    "clamp",     "shape",  "clip",
-        "pairw",  "pairleaf", "pairrow", "leaf", "pair",     "par",       "lam",    "rlam",
+        "base",   "backward",     "replay",  "tnet", "priority", "midgame",   "midmix", "sym",
+        "symlam", "symbatch",     "rsym",    "rtgt", "explore",  "explore20", "open8",  "open16",
+        "nstep",  "death",        "t2",      "p2",   "tp2",      "d2",        "d3",     "dumpp2",
+        "tch",    "tchadd",       "dist",    "dson", "oi",       "oi16",      "resume", "mstd",
+        "dump",   "ft2",          "restart", "adam", "tailw",    "clamp",     "shape",  "clip",
+        "pairw",  "pairleaf",     "pairrow", "leaf", "pair",     "par",       "lam",    "rlam",
+        "popart", "popartresume",
     };
     try std.testing.expectEqual(names.len, variant_specs.len);
     for (variant_specs, 0..) |spec, i| {
@@ -1879,7 +2004,8 @@ test "variant table lists every accepted variant name once (#314)" {
 
 test "variant table resume and dump sets match the old hand lists (#314)" {
     const resumes = [_][]const u8{
-        "resume", "dump", "dumpp2", "ft2", "restart", "dist", "dson", "tch", "tchadd", "t2", "p2", "tp2", "rlam",
+        "resume",       "dump", "dumpp2", "ft2", "restart", "dist", "dson", "tch", "tchadd", "t2", "p2", "tp2", "rlam",
+        "popartresume",
     };
     const dumps = [_][]const u8{
         "dump", "dumpp2", "ft2", "restart", "tch", "tchadd", "dist", "dson",
@@ -1971,6 +2097,8 @@ test "variant table max_args matches the old if-chain (#314)" {
         .{ .name = "par", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
         .{ .name = "lam", .no_rows = 14, .no_rows_par = 14, .rows = 14 },
         .{ .name = "rlam", .no_rows = 14, .no_rows_par = 14, .rows = 14 },
+        .{ .name = "popart", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "popartresume", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
     };
     try std.testing.expectEqual(variant_specs.len, expected.len);
     for (expected) |e| {
@@ -2014,6 +2142,8 @@ test "an unknown variant keeps the old parse order and usage path (#314)" {
 /// them against a literal.
 const BuildFixture = struct {
     adam: nn.Adam = .{},
+    /// (#289) the state `popart`/`popartresume` point at; all defaults, like a fresh `main`.
+    popart: nn.PopArtState = .{},
     priority: nn.Priority = .{},
     dump: nn.Dump = .{},
     teachers: *nn.Teachers,
@@ -2043,6 +2173,7 @@ const BuildFixture = struct {
             .replay_k = self.replay_k,
             .learning_rate = self.learning_rate,
             .adam = &self.adam,
+            .popart = &self.popart,
             .priority = &self.priority,
             .dump = &self.dump,
             .teachers = self.teachers,
@@ -2112,6 +2243,8 @@ test "each variant builds the options of its own branch family (#315)" {
         .{ .name = "par", .opts = .{} },
         .{ .name = "lam", .opts = .{ .replay_k = default_replay_k, .sweep_lambda = default_sweep_lambda } },
         .{ .name = "rlam", .opts = .{ .replay_k = default_replay_k, .sweep_lambda = default_sweep_lambda } },
+        .{ .name = "popart", .opts = .{ .popart = &fixture.popart } },
+        .{ .name = "popartresume", .opts = .{ .popart = &fixture.popart } },
     };
     try std.testing.expectEqual(variant_specs.len, expected.len);
     for (expected) |e| {
