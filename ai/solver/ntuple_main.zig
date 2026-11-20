@@ -6,6 +6,7 @@ const parallel = @import("parallel");
 const cli = @import("args.zig");
 const bench = @import("bench.zig");
 const stats = @import("stats");
+const game_limit = @import("game_limit");
 
 const usage =
     \\usage: ntuple [train_games] [eval_games] [eval_seed] [learning_rate] [variant] [table_path] [train_seed]
@@ -26,6 +27,9 @@ const usage =
     \\                a path ending in .q16.bin reads/writes the int16 quantized format (#129)
     \\  train_seed    seed for self-play games (default 1)
     \\
+    \\  Time caps     60 s/game for training, 30 min/game for evaluation. Append +xtime to variant
+    \\                for the single extended retry: 300 s / 120 min. Unfinished games are neither
+    \\                saved nor included in a completed evaluation row.
     \\The table is written to `table_path` only when train_games > 0.
     \\
 ;
@@ -72,6 +76,27 @@ const Eval = struct {
     elapsed_ns: i96 = 0,
 };
 
+const ExperimentVariant = struct { variant: ntuple.Variant, extended: bool };
+
+/// `variant+xtime` is an explicit single retry, not another training iteration (#336).
+fn parseExperimentVariant(name: []const u8) ?ExperimentVariant {
+    if (ntuple.parseVariant(name)) |variant| return .{ .variant = variant, .extended = false };
+    if (std.mem.endsWith(u8, name, "+xtime")) {
+        const variant = ntuple.parseVariant(name[0 .. name.len - "+xtime".len]) orelse return null;
+        return .{ .variant = variant, .extended = true };
+    }
+    return null;
+}
+
+fn timeLimit(result: anytype, phase: game_limit.RunPhase, extended: bool) noreturn {
+    const extend = game_limit.promising(result.score, result.max_tile, extended);
+    const disposition = if (extended) "inconclusive-close" else if (extend) "extend-once" else "no-go-close";
+    std.debug.print("{s} game hit the {d:.1}s time cap at {d} moves (partial score={d}, max_tile={d}), {s}; not saving or aggregating it\n", .{
+        @tagName(phase), @as(f64, @floatFromInt(game_limit.limitNs(phase, extended))) / std.time.ns_per_s, result.moves, result.score, result.max_tile, disposition,
+    });
+    std.process.exit(1);
+}
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const train_games: u32 = try cli.argOr(u32, args, 1, default_train_games);
@@ -79,10 +104,12 @@ pub fn main(init: std.process.Init) !void {
     const eval_seed: u64 = try cli.argOr(u64, args, 3, default_eval_seed);
     const learning_rate: f64 = try cli.argOr(f64, args, 4, default_learning_rate);
     const variant_name: []const u8 = try cli.argOr([]const u8, args, 5, "base");
-    const variant = ntuple.parseVariant(variant_name) orelse {
+    const parsed = parseExperimentVariant(variant_name) orelse {
         std.debug.print("{s}", .{usage});
         return;
     };
+    const variant = parsed.variant;
+    const game_options: ntuple.GameOptions = .{ .game_time_limit_ns = game_limit.limitNs(if (train_games > 0) .train else .evaluate, parsed.extended) };
     const mode = variant.mode;
     const table_path: []const u8 = try cli.argOr([]const u8, args, 6, default_table_path);
     const train_seed: u64 = try cli.argOr(u64, args, 7, default_train_seed);
@@ -144,13 +171,14 @@ pub fn main(init: std.process.Init) !void {
             const frac = @as(f64, @floatFromInt(g)) / @as(f64, @floatFromInt(train_games));
             const lr = learning_rate * (1 - 0.9 * frac);
             const game = switch (variant.learner) {
-                .td_zero => ntuple.trainGameWith(&net, rng.random(), lr, mode, variant.target),
-                .delayed_td_lambda => ntuple.trainGameDelayedTDLambda(&net, rng.random(), lr, mode),
+                .td_zero => ntuple.trainGameWithOpts(&net, rng.random(), lr, mode, variant.target, game_options),
+                .delayed_td_lambda => ntuple.trainGameDelayedTDLambdaOpts(&net, rng.random(), lr, mode, game_options),
                 .temporal_coherence => if (tc_state) |*tc|
-                    ntuple.trainGameTemporalCoherence(tc, rng.random(), lr, mode)
+                    ntuple.trainGameTemporalCoherenceOpts(tc, rng.random(), lr, mode, game_options)
                 else
                     unreachable,
             };
+            if (game.timed_out) timeLimit(game, .train, parsed.extended);
             last_score = game.score;
             total_moves += game.moves;
             if ((g + 1) % 5000 == 0) {
@@ -186,17 +214,18 @@ pub fn main(init: std.process.Init) !void {
     };
     const seed_ranges: u32 = 1;
     const games = eval_games * seed_ranges;
-    const EvalCtx = struct { net: *const ntuple.TupleNet, policy: usize, eval_seed: u64 };
+    const EvalCtx = struct { net: *const ntuple.TupleNet, policy: usize, eval_seed: u64, options: ntuple.GameOptions };
     const playGame = struct {
         fn f(c: EvalCtx, i: usize) ntuple.PlayResult {
             var prng = std.Random.DefaultPrng.init(c.eval_seed + i);
+            var game_stats: ntuple.Stats = .{};
             return switch (c.policy) {
-                0 => ntuple.play(c.net, prng.random(), .greedy),
-                1 => ntuple.play(c.net, prng.random(), .chance),
-                2 => ntuple.play(c.net, prng.random(), .deep),
+                0 => ntuple.playWithStatsOpts(c.net, prng.random(), .greedy, &game_stats, c.options),
+                1 => ntuple.playWithStatsOpts(c.net, prng.random(), .chance, &game_stats, c.options),
+                2 => ntuple.playWithStatsOpts(c.net, prng.random(), .deep, &game_stats, c.options),
                 else => blk: {
-                    const b = solver.playPolicy(prng.random(), .expectimax, 2);
-                    break :blk ntuple.PlayResult{ .score = b.score, .max_tile = b.max_tile, .moves = b.moves };
+                    const b = solver.playPolicyOpts(prng.random(), .expectimax, 2, c.options);
+                    break :blk ntuple.PlayResult{ .score = b.score, .max_tile = b.max_tile, .moves = b.moves, .timed_out = b.timed_out };
                 },
             };
         }
@@ -205,7 +234,10 @@ pub fn main(init: std.process.Init) !void {
         r.range_scores = try init.arena.allocator().alloc(f64, seed_ranges);
         const res_all = try init.arena.allocator().alloc(ntuple.PlayResult, games);
         const start = std.Io.Clock.awake.now(init.io);
-        parallel.map(ntuple.PlayResult, res_all, EvalCtx{ .net = &net, .policy = idx, .eval_seed = eval_seed }, playGame);
+        parallel.map(ntuple.PlayResult, res_all, EvalCtx{ .net = &net, .policy = idx, .eval_seed = eval_seed, .options = game_options }, playGame);
+        for (res_all) |result| {
+            if (result.timed_out) timeLimit(result, .evaluate, parsed.extended);
+        }
         stats.rangeTotals(ntuple.PlayResult, Eval, r, res_all, eval_games);
         // `seed_ranges` is 1, so the between-range stderr above is always zero; a single-range row is
         // only judgeable with the per-game standard error.
@@ -234,6 +266,19 @@ pub fn main(init: std.process.Init) !void {
             100 * @as(f64, @floatFromInt(r.reach_8192)) / @as(f64, @floatFromInt(games)),
         });
     }
+}
+
+test "experiment variants and time budgets agree with NN (#336)" {
+    const base = parseExperimentVariant("base").?;
+    try std.testing.expect(!base.extended);
+    try std.testing.expect(parseExperimentVariant("base+xtime").?.extended);
+    try std.testing.expect(parseExperimentVariant("base+xtime+xtime") == null);
+    try std.testing.expectEqual(@as(u64, 60 * std.time.ns_per_s), game_limit.limitNs(.train, false));
+    try std.testing.expectEqual(@as(u64, 300 * std.time.ns_per_s), game_limit.limitNs(.train, true));
+    try std.testing.expectEqual(@as(u64, 30 * std.time.ns_per_min), game_limit.limitNs(.evaluate, false));
+    try std.testing.expectEqual(@as(u64, 120 * std.time.ns_per_min), game_limit.limitNs(.evaluate, true));
+    try std.testing.expect(game_limit.promising(100_000, 0, false));
+    try std.testing.expect(!game_limit.promising(100_000, 0, true));
 }
 
 test "train seed argument (position 7) is optional and defaults to 1" {

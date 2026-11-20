@@ -72,11 +72,38 @@ python3 scripts/label-issues.py --apply    # ラベル作成 + 付与。冪等�
 `train:more` の条件は [docs/measurement.md](measurement.md) の「学習の時間予算」。付いていない issue には追加学習を回さない。
 学習も計測も 1 本ずつしか回せないので、`train:wait` はランの依頼を積んだ時点で付け、待ちの理由（実行中 / 順番待ち /
 4 時間上限で打ち切り）を issue のコメントに書く。`gh issue close` はラベルを外さないので `gh issue edit` で先に外す。
-両方付いてもよい（= いまラン待ちで、終わったら追加学習の判断）。
+両方付いてもよい（= いまラン待ちで、終わったら追加学習の判断）。新しい候補の回数上限は下記 close 上限を参照する。
 
 ```bash
 gh issue edit <n> --add-label train:more
 gh issue list -l train:more --state open
+```
+
+## 進行タグ `train:wait`
+
+**ラン待ち**（学習・計測・profile の実行中、または CPU の順番待ち）を示す進行タグ。
+学習も計測も 1 本ずつしか回せないので、issue は「コードは入ったが、数値を取るランがまだ終わっていない」
+間このタグを持つ。待ちの理由（実行中 / 順番待ち / 4 時間上限で打ち切り）は issue のコメントに書く。
+
+- ランの依頼を積んだ時点で付ける。
+- ランが終わって採否と数値を issue に記録したら、**close のときに必ず外す**。
+  `gh issue close` はラベルを外さないので、`gh issue edit` で先に外す。
+- `train:more` は「4 時間では決着せず、追加学習で伸びる見込み」の意味。`train:wait` は
+  「いまラン待ち」の意味で、採否が決まったら close と同時に消える。両方付いてもよい。
+
+### 候補1件のclose上限（#336）
+
+新しい学習候補の予算は、[docs/concept.md](concept.md) と [docs/measurement.md](measurement.md) で固定する。
+**候補1件につき学習2回・最終評価1セット**を使っても採用条件を満たさない場合、両方の進行タグを外して close する。
+
+- 1局の時間超過は、部分 score ≥100,000 または 8192 tile のときだけ、延長1回を検討できる。
+  未定の再挑戦・別seedでの繰り返しを `train:more` という理由で積まない。
+- 明らかに発散・失敗・許容できない減速のときは、枠を使い切る前に no-go で閉じてよい。
+  一方で完了しない時間超過を負け・進歩として記録せず、`no-go` か `inconclusive` と書く。
+- issue の本文・コメントに、実行コマンド、各1局の使用上限、`+xtime` の有無、完走した学習/評価の数、採否を残す。
+- close はbotによる自動処理ではなく、上記の記録を書いてから行う。
+
+```bash
 gh issue edit <n> --add-label train:wait
 gh issue edit <n> --remove-label train:wait && gh issue close <n>
 ```

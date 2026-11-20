@@ -10,7 +10,7 @@
 
 1. **`pairw`（A = 同梱 net、B = 候補、20 局、seed 9000）で `mean diff - 2*stderr > 0`。**
    20 局の stderr は 6,000〜10,000 点なので採用線は約 **+15,000 点**（+2σ）。
-   σ はゲーム数でしか縮まない（`--games 40` と seed 追加）。
+   σ はゲーム数でしか縮まない。ゲーム数は評価前に決め、結果を見て増やさない（#336）。
    出現（spawn）は盤面に依存しない **32-bit 共通乱数値**で A から B へ渡し（#237）、各盤面でその乱数値を
    自分の空きマス集合へ写像する（#235 の index+clamp を置き換え）。
    **#237 より前の pairw 数値は旧テープの歴史値**なので、新しい測定と直接比べず、
@@ -19,6 +19,22 @@
    `avg_score` と `reach8192` の両方を見る（ペアは spawn を揃えるので裾を見ていない）。
    ペアと非ペアが食い違ったら **ペアを採る**（非ペアは spawn 運で ±10,000 点動く）。
 3. **ms/move が悪化しない。** 評価のコストは候補ごとに記録する（学習側の改善 #204 と混ぜない）。
+
+## 1候補の予算と打ち切り（#336）
+
+[docs/concept.md](concept.md) に従い、**候補1件につき学習2回、最終評価1セットまで**とする。同時に実行する仕事は1つだけ。
+
+| 工程 | 既定の1局の上限 | 1回だけ認める延長 |
+| --- | ---: | ---: |
+| NN / n-tuple 学習 | **60秒** | **300秒** |
+| 採否評価（paired / 非ペア / expectimax） | **30分** | **120分** |
+
+- 延長は、部分 score ≥100,000 または最大 tile ≥8,192 の未完局があるときだけ、variant の `+xtime` で明示する。二重指定は拒否する。
+- 初回の条件外超過は no-go close、延長後の超過は inconclusive close。未完局を有効な学習・評価の証拠には使わない。
+- 対局開始から monotonic clock で測り、**次の手の探索を始める前**に判定する。開始済みの1手は止めない soft deadline である。
+- 未完tail・未完の並列 batch は学習に使わず、その候補の table / checkpoint を上書き保存せず、非0で終了する。
+- 評価は1局でも未完なら、その表を採否に使わず非0で終了する。ペアの片側だけも使わない。
+- 上記の学習2回・評価1セットで採用条件を満たせない候補は、`train:wait` / `train:more` を外して issue を close する。
 
 ## 学習の時間予算（4 時間）と打ち切り
 
@@ -36,7 +52,7 @@
 | 追加学習 | **4 時間で打ち切った未完走の run** で、明確には負けていない（`mean + 2σ ≥ 0`）かつ `8192` 到達が同梱 − 1 局以上、学習ログか checkpoint が上向き | `train:more` を付け、issue は開いたまま。「止めたゲーム数・checkpoint のパス・`pairw` の数値・次の 4 時間で回すこと」を書く |
 | 見送り | 上記以外（`mean + 2σ < 0`、`8192` が崩れた、曲線が平坦・下降、checkpoint が無い） | 数値を issue に残して close。追加の学習はしない |
 
-- **4 時間は 1 試行の上限で、issue の寿命ではない。** `train:more` が付いた issue だけ次の試行を回せる。
+- **4 時間は1試行の上限だが、学習2回の候補予算を延長する理由にはしない。** `train:more` が付いた issue だけ次の試行を回せる。
 - **完走して ADOPT に届かなかった run は追加学習の対象にしない**（そのゲーム数では効果が無い）。
 - checkpoint は 5,000 ゲームごと（`zig build nn` の既定）。kill するときも最後の checkpoint のパスを issue に書く。
   無い／読めない trial は「見送り」。
@@ -46,7 +62,8 @@
 
 ```sh
 scripts/eval-net.sh /tmp/cand.bin                 # 20 局 seed 9000、同梱 net と比較
-scripts/eval-net.sh /tmp/cand.bin --games 40      # σ を縮めたいとき
+scripts/eval-net.sh /tmp/cand.bin --games 40      # 計測前に40局を選ぶ場合
+scripts/eval-net.sh /tmp/cand.bin --xtime         # 有望な未完の1回だけの延長（120分/局）
 scripts/eval-net.sh /tmp/cand.bin --shipped /tmp/base.bin
 scripts/eval-net.sh /tmp/cand.bin --h1 96         # 幅の違う net は build 側も合わせる（既定 128/32）
 ```

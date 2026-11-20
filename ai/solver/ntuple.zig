@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("core");
 const blob = @import("blob");
+const game_limit = @import("game_limit");
 
 const Board = core.Board;
 
@@ -566,8 +567,26 @@ pub const PlayResult = struct {
     moves: u32,
     /// `net.eval` leaf calls summed over the game (0 for modes that do not search).
     leaves: u64 = 0,
+    /// (#336) The game hit its time cap before game over; it is not a completed evaluation row.
+    timed_out: bool = false,
 };
-pub const GameResult = struct { score: u32, moves: u32 };
+pub const GameResult = struct {
+    score: u32,
+    moves: u32,
+    max_tile: core.Tile = 0,
+    capped: bool = false,
+    timed_out: bool = false,
+};
+/// Null preserves the library API's unlimited default; the experiment runner supplies a cap.
+pub const GameOptions = struct { game_time_limit_ns: ?u64 = null };
+
+fn timeLimitReached(start: std.Io.Timestamp, limit_ns: ?u64) bool {
+    return game_limit.reached(start, limit_ns);
+}
+
+fn gameResult(state: core.GameState, moves: u32, timed_out: bool) GameResult {
+    return .{ .score = state.score, .moves = moves, .max_tile = core.maxTile(state.board), .timed_out = timed_out, .capped = timed_out };
+}
 
 /// Afterstate chosen by a policy, with its scaled reward, cached indices and value estimate.
 const Pick = struct {
@@ -751,10 +770,18 @@ pub fn play(net: *const TupleNet, rng: std.Random, mode: Mode) PlayResult {
 }
 
 pub fn playWithStats(net: *const TupleNet, rng: std.Random, mode: Mode, stats: *Stats) PlayResult {
+    return playWithStatsOpts(net, rng, mode, stats, .{});
+}
+
+pub const gameStartTime = game_limit.start;
+
+pub fn playWithStatsOpts(net: *const TupleNet, rng: std.Random, mode: Mode, stats: *Stats, opts: GameOptions) PlayResult {
+    const start = gameStartTime(opts.game_time_limit_ns);
     var state = core.GameState.gameStart(rng);
     var moves: u32 = 0;
     var move_stats: Stats = .{};
     while (true) {
+        if (timeLimitReached(start, opts.game_time_limit_ns)) return .{ .score = state.score, .max_tile = core.maxTile(state.board), .moves = moves, .leaves = stats.leaves, .timed_out = true };
         move_stats = .{};
         const pick = chooseMove(net, state, mode, &move_stats) orelse break;
         stats.leaves += move_stats.leaves;
@@ -773,11 +800,18 @@ pub fn trainGame(net: *TupleNet, rng: std.Random, lr: f64, mode: Mode) GameResul
 /// game actually played with the max over the four moves available on the post-spawn board, so the
 /// table learns the afterstate value of the *best* continuation rather than of the sampled one.
 pub fn trainGameWith(net: *TupleNet, rng: std.Random, lr: f64, mode: Mode, target: Target) GameResult {
+    return trainGameWithOpts(net, rng, lr, mode, target, .{});
+}
+
+pub fn trainGameWithOpts(net: *TupleNet, rng: std.Random, lr: f64, mode: Mode, target: Target, opts: GameOptions) GameResult {
+    const start = gameStartTime(opts.game_time_limit_ns);
     var state = core.GameState.gameStart(rng);
     var pending: ?Pick = null;
     var moves: u32 = 0;
     var stats: Stats = .{};
-    while (chooseMove(net, state, mode, &stats)) |pick| {
+    while (true) {
+        if (timeLimitReached(start, opts.game_time_limit_ns)) return gameResult(state, moves, true);
+        const pick = chooseMove(net, state, mode, &stats) orelse break;
         moves += 1;
         if (pending) |p| {
             const next_value = switch (target) {
@@ -790,17 +824,24 @@ pub fn trainGameWith(net: *TupleNet, rng: std.Random, lr: f64, mode: Mode, targe
         _ = state.move(pick.dir, rng);
     }
     if (pending) |p| _ = net.train(p.idx, p.reward, lr);
-    return .{ .score = state.score, .moves = moves };
+    return gameResult(state, moves, false);
 }
 
 /// Opt-in delayed TD(lambda) self-play, with the on-policy afterstate target only.
 pub fn trainGameDelayedTDLambda(net: *TupleNet, rng: std.Random, lr: f64, mode: Mode) GameResult {
+    return trainGameDelayedTDLambdaOpts(net, rng, lr, mode, .{});
+}
+
+pub fn trainGameDelayedTDLambdaOpts(net: *TupleNet, rng: std.Random, lr: f64, mode: Mode, opts: GameOptions) GameResult {
+    const start = gameStartTime(opts.game_time_limit_ns);
     var state = core.GameState.gameStart(rng);
     var learner = DelayedTDLambda.init(net, lr);
     var pending: ?Pick = null;
     var moves: u32 = 0;
     var stats: Stats = .{};
-    while (chooseMove(net, state, mode, &stats)) |pick| {
+    while (true) {
+        if (timeLimitReached(start, opts.game_time_limit_ns)) return gameResult(state, moves, true);
+        const pick = chooseMove(net, state, mode, &stats) orelse break;
         moves += 1;
         if (pending) |p| {
             // Re-evaluate the pending afterstate: older delayed updates may have touched its weights.
@@ -812,18 +853,25 @@ pub fn trainGameDelayedTDLambda(net: *TupleNet, rng: std.Random, lr: f64, mode: 
     }
     if (pending) |p| learner.observe(p.idx, p.reward - net.value(p.idx));
     learner.finish();
-    return .{ .score = state.score, .moves = moves };
+    return gameResult(state, moves, false);
 }
 
 /// Opt-in on-policy TD(λ) with per-weight Temporal Coherence; the TD(0) path is unchanged.
 pub fn trainGameTemporalCoherence(tc: *TemporalCoherence, rng: std.Random, beta: f64, mode: Mode) GameResult {
+    return trainGameTemporalCoherenceOpts(tc, rng, beta, mode, .{});
+}
+
+pub fn trainGameTemporalCoherenceOpts(tc: *TemporalCoherence, rng: std.Random, beta: f64, mode: Mode, opts: GameOptions) GameResult {
+    const start = gameStartTime(opts.game_time_limit_ns);
     const net = tc.net;
     tc.beginEpisode();
     var state = core.GameState.gameStart(rng);
     var pending: ?Pick = null;
     var moves: u32 = 0;
     var stats: Stats = .{};
-    while (chooseMove(net, state, mode, &stats)) |pick| {
+    while (true) {
+        if (timeLimitReached(start, opts.game_time_limit_ns)) return gameResult(state, moves, true);
+        const pick = chooseMove(net, state, mode, &stats) orelse break;
         moves += 1;
         if (pending) |p| {
             // Re-evaluate the pending afterstate because its weights may have changed through the trace.
@@ -834,7 +882,7 @@ pub fn trainGameTemporalCoherence(tc: *TemporalCoherence, rng: std.Random, beta:
         _ = state.move(pick.dir, rng);
     }
     if (pending) |p| tc.observe(p.idx, p.reward - net.value(p.idx), beta);
-    return .{ .score = state.score, .moves = moves };
+    return gameResult(state, moves, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -1357,6 +1405,33 @@ test "temporal coherence trace stops propagating beyond the configured horizon (
     try std.testing.expectApproxEqAbs(@as(f32, 1.875), net.storage[1], 0.00001);
     try std.testing.expectApproxEqAbs(@as(f32, 1.875), net.storage[2], 0.00001);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), net.storage[5], 0.00001);
+}
+
+test "time limits reject unfinished n-tuple games before the next move (#336)" {
+    var rng = std.Random.DefaultPrng.init(336);
+    var net = try TupleNet.initWith(std.testing.allocator, .light);
+    defer net.deinit(std.testing.allocator);
+    const before = try std.testing.allocator.dupe(f32, net.storage);
+    defer std.testing.allocator.free(before);
+    const options: GameOptions = .{ .game_time_limit_ns = 0 };
+    const trained = trainGameWithOpts(&net, rng.random(), 0.001, .greedy, .on_policy, options);
+    try std.testing.expect(trained.timed_out);
+    try std.testing.expect(trained.capped);
+    try std.testing.expectEqual(@as(u32, 0), trained.moves);
+    try std.testing.expect(trained.max_tile <= 4);
+    try std.testing.expectEqualSlices(f32, before, net.storage);
+    const delayed = trainGameDelayedTDLambdaOpts(&net, rng.random(), 0.001, .greedy, options);
+    try std.testing.expect(delayed.timed_out);
+    var stats: Stats = .{};
+    const played = playWithStatsOpts(&net, rng.random(), .greedy, &stats, options);
+    try std.testing.expect(played.timed_out);
+    try std.testing.expectEqual(@as(u32, 0), played.moves);
+    var tc = try TemporalCoherence.init(std.testing.allocator, &net);
+    defer tc.deinit(std.testing.allocator);
+    const coherent = trainGameTemporalCoherenceOpts(&tc, rng.random(), 0.001, .greedy, options);
+    try std.testing.expect(coherent.timed_out);
+    try std.testing.expectEqual(@as(u32, 0), coherent.moves);
+    try std.testing.expectEqualSlices(f32, before, net.storage);
 }
 
 test "trainGame keeps the on-policy target and max backup differs from it (#131)" {
