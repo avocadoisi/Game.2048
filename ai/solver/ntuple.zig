@@ -66,7 +66,8 @@ pub fn transformBoard(board: Board, t: usize) Board {
 }
 
 /// One `(accumulator, shift)` pair: cell level `<< shift` goes into accumulator `acc`.
-/// There is one accumulator per (base pattern, symmetry transform); the table index is their minimum.
+/// There is one accumulator per (base pattern, symmetry transform); the canonical read-out takes
+/// their minimum, the opt-in summed read-out (#322) uses all of them.
 pub const Slot = struct { acc: u8, shift: u5 };
 
 const max_slots = 32;
@@ -93,7 +94,25 @@ pub const slot_table = blk: {
 /// One canonical table index per base pattern (shared by all 8 transforms of that pattern).
 pub const Indices = [pattern_count]u32;
 
-pub fn indices(board: Board) Indices {
+/// The 8 transform indices of every base pattern, in transform order.
+pub const TransformIndices = [pattern_count][8]u32;
+
+/// How the 8 dihedral transforms of a base pattern are read out of the shared table.
+pub const Symmetry = enum {
+    /// The smallest of the 8 transform indices, one entry per pattern (default; all shipped tables).
+    canonical,
+    /// All 8 transform indices, values summed; a duplicated index counts once per transform (#322).
+    summed,
+};
+
+/// Both read-outs of one board, derived from the same 16-cell scan so a runner can pick one at
+/// start-up without recomputing indices per move. Values come from `TupleNet.symmetry`.
+pub const Entries = struct {
+    canonical: Indices,
+    summed: TransformIndices,
+};
+
+fn transformIndices(board: Board) TransformIndices {
     var acc: [pattern_count * 8]u32 = @splat(0);
     for (0..core.BoardCellCount) |cell| {
         const level: u32 = @intCast(levelOf(board[cell / core.BoardSize][cell % core.BoardSize]));
@@ -101,13 +120,24 @@ pub fn indices(board: Board) Indices {
             acc[slot.acc] |= level << slot.shift;
         }
     }
-    var out: Indices = undefined;
-    for (0..pattern_count) |p| {
-        var best: u32 = std.math.maxInt(u32);
-        for (0..8) |o| best = @min(best, acc[p * 8 + o]);
-        out[p] = best;
-    }
+    var out: TransformIndices = undefined;
+    for (0..pattern_count) |p| out[p] = acc[p * 8 ..][0..8].*;
     return out;
+}
+
+pub fn entriesFor(board: Board) Entries {
+    const summed = transformIndices(board);
+    var canonical: Indices = undefined;
+    for (0..pattern_count) |p| {
+        var best = summed[p][0];
+        for (summed[p][1..]) |idx| best = @min(best, idx);
+        canonical[p] = best;
+    }
+    return .{ .canonical = canonical, .summed = summed };
+}
+
+pub fn indices(board: Board) Indices {
+    return entriesFor(board).canonical;
 }
 
 pub fn tableLen(p: usize) usize {
@@ -161,6 +191,8 @@ pub const TupleNet = struct {
     storage: []f32,
     /// Number of active patterns (a prefix of `patterns`); `.light` stops before the 6-tuple.
     count: usize,
+    /// Read-out of the 8 dihedral transforms; `.canonical` is the shipped default (#322 opt-in).
+    symmetry: Symmetry = .canonical,
 
     pub fn init(gpa: std.mem.Allocator) !TupleNet {
         return initWith(gpa, .full);
@@ -190,8 +222,25 @@ pub const TupleNet = struct {
         return v;
     }
 
+    /// Summed read-out: every transform index of every active pattern, duplicates summed each time.
+    pub fn valueSummed(self: *const TupleNet, all: TransformIndices) f64 {
+        var v: f64 = 0;
+        for (0..self.count) |p| {
+            for (all[p]) |idx| v += self.storage[offsets[p] + idx];
+        }
+        return v;
+    }
+
+    /// Value of `entries` under this net's read-out (`symmetry`).
+    pub fn valueOf(self: *const TupleNet, e: Entries) f64 {
+        return switch (self.symmetry) {
+            .canonical => self.value(e.canonical),
+            .summed => self.valueSummed(e.summed),
+        };
+    }
+
     pub fn eval(self: *const TupleNet, board: Board) f64 {
-        return self.value(indices(board));
+        return self.valueOf(entriesFor(board));
     }
 
     /// Apply a precomputed TD error equally across each active tuple's touched weight.
@@ -200,10 +249,32 @@ pub const TupleNet = struct {
         for (0..self.count) |p| self.storage[offsets[p] + idx[p]] += step;
     }
 
+    /// Summed-read-out TD step: a gradient step on `valueSummed` with alpha = lr / (8 * n_tuples).
+    /// Each of the 8 transform indices of a pattern moves by `lr * delta / (8 * n_tuples)`, so an
+    /// index duplicated k times moves k times as far -- the multiplicity of the forward sum. A
+    /// pattern moves by `lr * delta / n_tuples` in total (the canonical per-pattern rate) and the
+    /// value by `lr * delta` per pattern when its 8 indices are distinct, so `lr` is not rescaled.
+    fn applySummedDelta(self: *TupleNet, all: TransformIndices, delta: f64, lr: f64) void {
+        const step: f32 = @floatCast(lr * delta / (@as(f64, @floatFromInt(self.count)) * 8));
+        for (0..self.count) |p| {
+            for (all[p]) |idx| self.storage[offsets[p] + idx] += step;
+        }
+    }
+
     /// TD step: move every touched entry by `lr * (target - V) / n_tuples`; returns the TD error.
     pub fn train(self: *TupleNet, idx: Indices, target: f64, lr: f64) f64 {
         const delta = target - self.value(idx);
         self.applyDelta(idx, delta, lr);
+        return delta;
+    }
+
+    /// `train` on `entries`, with the update that matches this net's read-out.
+    pub fn trainEntries(self: *TupleNet, e: Entries, target: f64, lr: f64) f64 {
+        const delta = target - self.valueOf(e);
+        switch (self.symmetry) {
+            .canonical => self.applyDelta(e.canonical, delta, lr),
+            .summed => self.applySummedDelta(e.summed, delta, lr),
+        }
         return delta;
     }
 };
@@ -541,12 +612,15 @@ pub const Target = enum { on_policy, max_backup };
 /// Learning algorithm selected by the runner; TD(0) stays the default.
 pub const Learner = enum { td_zero, delayed_td_lambda, temporal_coherence };
 
-/// Runner variant: policy mode, table set, learner, TD target, and whether to load `table_path` first.
+/// Runner variant: policy mode, table set, learner, read-out, TD target, and whether to load
+/// `table_path` first.
 pub const Variant = struct {
     mode: Mode = .greedy,
     set: Set = .full,
     learner: Learner = .td_zero,
     target: Target = .on_policy,
+    /// `.summed` is the #322 opt-in; every shipped table and the default remain `.canonical`.
+    symmetry: Symmetry = .canonical,
     resume_from_file: bool = false,
 };
 
@@ -559,6 +633,8 @@ pub fn parseVariant(name: []const u8) ?Variant {
     if (std.mem.eql(u8, name, "resume")) return .{ .resume_from_file = true };
     if (std.mem.eql(u8, name, "lightresume")) return .{ .resume_from_file = true, .set = .light };
     if (std.mem.eql(u8, name, "wide")) return .{ .set = .wide };
+    if (std.mem.eql(u8, name, "summed")) return .{ .symmetry = .summed };
+    if (std.mem.eql(u8, name, "widesum")) return .{ .set = .wide, .symmetry = .summed };
     if (std.mem.eql(u8, name, "widedelay")) return .{ .set = .wide, .learner = .delayed_td_lambda };
     if (std.mem.eql(u8, name, "widetc")) return .{ .set = .wide, .learner = .temporal_coherence };
     if (std.mem.eql(u8, name, "widedeep_tc")) return .{ .mode = .deep, .set = .wide, .learner = .temporal_coherence };
@@ -598,10 +674,10 @@ fn gameResult(state: core.GameState, moves: u32, timed_out: bool) GameResult {
     return .{ .score = state.score, .moves = moves, .max_tile = core.maxTile(state.board), .timed_out = timed_out, .capped = timed_out };
 }
 
-/// Afterstate chosen by a policy, with its scaled reward, cached indices and value estimate.
+/// Afterstate chosen by a policy, with its scaled reward, cached table entries and value estimate.
 const Pick = struct {
     dir: core.Direction,
-    idx: Indices,
+    entries: Entries,
     reward: f64,
     value: f64,
 };
@@ -613,12 +689,12 @@ fn pickMove(net: *const TupleNet, state: core.GameState) ?Pick {
         var next = state;
         const moved = next.slide(d);
         if (!moved.changed) continue;
-        const idx = indices(next.board);
+        const entries = entriesFor(next.board);
         const pick: Pick = .{
             .dir = d,
-            .idx = idx,
+            .entries = entries,
             .reward = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale,
-            .value = net.value(idx),
+            .value = net.valueOf(entries),
         };
         if (best == null or pick.reward + pick.value > best.?.reward + best.?.value) best = pick;
     }
@@ -655,12 +731,12 @@ fn chanceMove(net: *const TupleNet, state: core.GameState) ?Pick {
         const chance = if (empties == 0) bestAfterValue(net, moved) else total / empties;
         const value = @as(f64, @floatFromInt(result.score_delta)) / reward_scale + chance;
         if (best == null or value > best_value) {
-            const idx = indices(moved.board);
+            const entries = entriesFor(moved.board);
             best = .{
                 .dir = d,
-                .idx = idx,
+                .entries = entries,
                 .reward = @as(f64, @floatFromInt(result.score_delta)) / reward_scale,
-                .value = net.value(idx),
+                .value = net.valueOf(entries),
             };
             best_value = value;
         }
@@ -724,12 +800,12 @@ fn deepMove(net: *const TupleNet, state: core.GameState, stats: *Stats) ?Pick {
         if (!moved.changed) continue;
         const v = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale + search.chance(next, 2);
         if (best == null or v > best_value) {
-            const idx = indices(next.board);
+            const entries = entriesFor(next.board);
             best = .{
                 .dir = d,
-                .idx = idx,
+                .entries = entries,
                 .reward = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale,
-                .value = net.value(idx),
+                .value = net.valueOf(entries),
             };
             best_value = v;
         }
@@ -828,12 +904,12 @@ pub fn trainGameWithOpts(net: *TupleNet, rng: std.Random, lr: f64, mode: Mode, t
                 .on_policy => pick.value,
                 .max_backup => bestAfterValue(net, state),
             };
-            _ = net.train(p.idx, p.reward + next_value, lr);
+            _ = net.trainEntries(p.entries, p.reward + next_value, lr);
         }
         pending = pick;
         _ = state.move(pick.dir, rng);
     }
-    if (pending) |p| _ = net.train(p.idx, p.reward, lr);
+    if (pending) |p| _ = net.trainEntries(p.entries, p.reward, lr);
     return gameResult(state, moves, false);
 }
 
@@ -843,6 +919,8 @@ pub fn trainGameDelayedTDLambda(net: *TupleNet, rng: std.Random, lr: f64, mode: 
 }
 
 pub fn trainGameDelayedTDLambdaOpts(net: *TupleNet, rng: std.Random, lr: f64, mode: Mode, opts: GameOptions) GameResult {
+    // #322's summed read-out is TD(0)-only; #290 keeps the canonical index path (do not mix).
+    std.debug.assert(net.symmetry == .canonical);
     const start = gameStartTime(opts.game_time_limit_ns);
     var state = core.GameState.gameStart(rng);
     var learner = DelayedTDLambda.init(net, lr);
@@ -855,13 +933,13 @@ pub fn trainGameDelayedTDLambdaOpts(net: *TupleNet, rng: std.Random, lr: f64, mo
         moves += 1;
         if (pending) |p| {
             // Re-evaluate the pending afterstate: older delayed updates may have touched its weights.
-            const delta = p.reward + pick.value - net.value(p.idx);
-            learner.observe(p.idx, delta);
+            const delta = p.reward + pick.value - net.value(p.entries.canonical);
+            learner.observe(p.entries.canonical, delta);
         }
         pending = pick;
         _ = state.move(pick.dir, rng);
     }
-    if (pending) |p| learner.observe(p.idx, p.reward - net.value(p.idx));
+    if (pending) |p| learner.observe(p.entries.canonical, p.reward - net.value(p.entries.canonical));
     learner.finish();
     return gameResult(state, moves, false);
 }
@@ -872,8 +950,10 @@ pub fn trainGameTemporalCoherence(tc: *TemporalCoherence, rng: std.Random, beta:
 }
 
 pub fn trainGameTemporalCoherenceOpts(tc: *TemporalCoherence, rng: std.Random, beta: f64, mode: Mode, opts: GameOptions) GameResult {
-    const start = gameStartTime(opts.game_time_limit_ns);
     const net = tc.net;
+    // #322's summed read-out is TD(0)-only; #288 keeps the canonical index path (do not mix).
+    std.debug.assert(net.symmetry == .canonical);
+    const start = gameStartTime(opts.game_time_limit_ns);
     tc.beginEpisode();
     var state = core.GameState.gameStart(rng);
     var pending: ?Pick = null;
@@ -885,13 +965,13 @@ pub fn trainGameTemporalCoherenceOpts(tc: *TemporalCoherence, rng: std.Random, b
         moves += 1;
         if (pending) |p| {
             // Re-evaluate the pending afterstate because its weights may have changed through the trace.
-            const delta = p.reward + pick.value - net.value(p.idx);
-            tc.observe(p.idx, delta, beta);
+            const delta = p.reward + pick.value - net.value(p.entries.canonical);
+            tc.observe(p.entries.canonical, delta, beta);
         }
         pending = pick;
         _ = state.move(pick.dir, rng);
     }
-    if (pending) |p| tc.observe(p.idx, p.reward - net.value(p.idx), beta);
+    if (pending) |p| tc.observe(p.entries.canonical, p.reward - net.value(p.entries.canonical), beta);
     return gameResult(state, moves, false);
 }
 

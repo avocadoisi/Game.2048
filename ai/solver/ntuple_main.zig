@@ -18,6 +18,11 @@ const usage =
     \\  variant       base (greedy 1-ply) or chance (1 spawn lookahead); deep (2-ply) adds a
     \\                second own move. light / lightdeep use only the 5 base 4-tuples.
     \\                wide / widedeep add the second 2x3 6-tuple (both 2x3 orbits, #106).
+    \\                summed / widesum opt into the #322 read-out that sums all 8 dihedral
+    \\                transforms of each pattern (duplicate indices count each time) instead of the
+    \\                canonical minimum; widesum is summed on the wide set. Each transform copy
+    \\                steps lr*delta/(8*n_tuples), the canonical per-pattern rate spread over the 8
+    \\                transforms: keep the same learning_rate and train a fresh table.
     \\                widedelay opts into delayed TD(lambda) on wide tables (lambda=0.5, horizon=3, #290).
     \\                widetc / widedeep_tc opt into TC(lambda) on wide tables (lambda=0.5, horizon=3, #288).
     \\                maxb / maxbchance / maxbdeep are wide with the max-backup TD target (#131).
@@ -37,14 +42,16 @@ const usage =
 
 const default_table_path = "ai/solver/ntuple_weights.bin";
 
-fn learnerTrainingPathAllowed(
+fn trainingPathAllowed(
     allocator: std.mem.Allocator,
     cwd: []const u8,
-    learner: ntuple.Learner,
+    variant: ntuple.Variant,
     train_games: u32,
     table_path: []const u8,
 ) !bool {
-    if (train_games == 0 or learner == .td_zero) return true;
+    // The summed read-out (#322) changes what the weights mean, so it needs a fresh candidate too.
+    const experimental = variant.learner != .td_zero or variant.symmetry != .canonical;
+    if (train_games == 0 or !experimental) return true;
     const output_path = try std.fs.path.resolveAlloc(allocator, &.{ cwd, table_path });
     defer allocator.free(output_path);
     // Also block shipped basenames outside this worktree (e.g. an absolute path into the main checkout).
@@ -118,17 +125,18 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}", .{usage});
         return;
     }
-    if (train_games > 0 and variant.learner != .td_zero) {
+    if (train_games > 0) {
         const cwd = try std.process.currentPathAlloc(init.io, init.gpa);
         defer init.gpa.free(cwd);
-        if (!try learnerTrainingPathAllowed(init.gpa, cwd, variant.learner, train_games, table_path)) {
-            std.debug.print("Experimental learner training needs a candidate table_path with a distinct filename\n{s}", .{usage});
+        if (!try trainingPathAllowed(init.gpa, cwd, variant, train_games, table_path)) {
+            std.debug.print("Experimental learner or read-out training needs a candidate table_path with a distinct filename\n{s}", .{usage});
             return;
         }
     }
 
     var net = try ntuple.TupleNet.initWith(init.gpa, variant.set);
     defer net.deinit(init.gpa);
+    net.symmetry = variant.symmetry;
     std.debug.print("table: variant={s} patterns={d} entries={d} raw={d:.1} MiB\n", .{
         variant_name,
         net.count,
@@ -291,10 +299,15 @@ test "train seed argument (position 7) is optional and defaults to 1" {
     try std.testing.expectEqual(@as(u64, 3), try cli.argOr(u64, &with_seed, 7, default_train_seed));
 }
 
-test "experimental n-tuple learners cannot overwrite the shipped table" {
+test "experimental n-tuple learners and summed read-out cannot overwrite the shipped table" {
     const gpa = std.testing.allocator;
     const cwd = "/repo";
-    const experimental = [_]ntuple.Learner{ .delayed_td_lambda, .temporal_coherence };
+    const experimental = [_]ntuple.Variant{
+        .{ .learner = .delayed_td_lambda },
+        .{ .learner = .temporal_coherence },
+        .{ .symmetry = .summed },
+        .{ .set = .wide, .symmetry = .summed },
+    };
     const refused = [_][]const u8{
         default_table_path,
         "./ai/solver/ntuple_weights.bin",
@@ -305,15 +318,15 @@ test "experimental n-tuple learners cannot overwrite the shipped table" {
         "/tmp/ntuple_wide_q16.bin",
         "/tmp/NTUPLE_WEIGHTS.BIN",
     };
-    for (experimental) |learner| {
+    for (experimental) |variant| {
         for (refused) |path| {
-            try std.testing.expect(!(try learnerTrainingPathAllowed(gpa, cwd, learner, 1, path)));
+            try std.testing.expect(!(try trainingPathAllowed(gpa, cwd, variant, 1, path)));
         }
         // Loading never writes, and a distinct candidate filename is the intended output.
-        try std.testing.expect(try learnerTrainingPathAllowed(gpa, cwd, learner, 0, default_table_path));
-        try std.testing.expect(try learnerTrainingPathAllowed(gpa, cwd, learner, 1, "candidate.bin"));
+        try std.testing.expect(try trainingPathAllowed(gpa, cwd, variant, 0, default_table_path));
+        try std.testing.expect(try trainingPathAllowed(gpa, cwd, variant, 1, "candidate.bin"));
     }
-    try std.testing.expect(try learnerTrainingPathAllowed(gpa, cwd, .td_zero, 1, default_table_path));
+    try std.testing.expect(try trainingPathAllowed(gpa, cwd, .{}, 1, default_table_path));
 }
 
 test "usage text lists both variants" {
@@ -325,6 +338,8 @@ test "usage text lists both variants" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "widetc") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "widedeep_tc") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "lshaperesume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "summed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "widesum") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "separate path with a distinct filename") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "resume") != null);
 }
