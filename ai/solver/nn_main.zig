@@ -65,6 +65,9 @@ const usage =
     \\              resume  (#66: load weights_path and train train_games more games from those weights, plain per-move path)
     \\              popart  (#289: plain TD(0) with adaptive target normalization; raw weights plus <weights_path>.popart stats sidecar)
     \\              popartresume (#289: resume PopArt weights and stats sidecar; no parallel training)
+    \\              expspawn (#321: TD(0) whose target averages over every spawn outcome of the pending
+    \\                       afterstate (each empty cell x 2:0.9 / 4:0.1) instead of the one tile the game
+    \\                       drew; the same greedy 1-ply reply, no spawn drawn, `par` compatible)
     \\              mstd    (#107 MS-TD: one MLP per empty-cell stage (0..2, 3..4, 5..6, 7..8, 9..10,
     \\                       11..12, 13..16 empties); each TD step trains only the stage of the afterstate
     \\                       it reached. Weights go to a staged file (its own magic), so eval needs the same file)
@@ -236,6 +239,7 @@ const Variant = enum {
     rlam,
     popart,
     popartresume,
+    expspawn,
     /// Not in `variant_specs`: the placeholder for a name no entry matched. It carries every default
     /// fact and no builder, so `main` prints the usage where the old chain's final `else` did - the
     /// same place, and after the same parses, as before the table existed (the old code parsed later
@@ -340,6 +344,7 @@ const variant_specs = [_]VariantSpec{
     .{ .variant = .rlam, .build = &buildSweepReplay, .load_weights = true, .max_args = .value },
     .{ .variant = .popart, .build = &buildPopart },
     .{ .variant = .popartresume, .build = &buildPopartResume, .load_weights = true },
+    .{ .variant = .expspawn, .build = &buildExpectedSpawn },
 };
 
 // One builder per options family: the arms of the options if-chain moved out of `main`, each
@@ -546,6 +551,13 @@ fn buildDson(ctx: *const BuildCtx) anyerror!nn.Options {
 /// `nn.trainStep`, and `main` refuses `par` because the moments are cross-move state.
 fn buildPopart(ctx: *const BuildCtx) anyerror!nn.Options {
     return .{ .popart = ctx.popart };
+}
+
+/// `expspawn`: the opt-in expected-spawn TD(0) of #321. Its target replaces the sampled bootstrap, so
+/// `nn.validateOptions` refuses every option that would change the update, the target or the policy;
+/// the command line only picks the variant.
+fn buildExpectedSpawn(_: *const BuildCtx) anyerror!nn.Options {
+    return .{ .expected_spawn = true };
 }
 
 /// `popartresume`: the same options as `popart`. The difference is the spec row's
@@ -1991,6 +2003,8 @@ test "par is refused for the priority buffer, the staged net and the teacher var
     try std.testing.expect(!parSupported(.{ .teacher = .deep3 }, false));
     // `dist` is read-only, but batched it loses ~30,000 points over 20,000 games.
     try std.testing.expect(!parSupported(.{ .distill = teachers, .distill_every = 8 }, false));
+    // : the expected-spawn target is stateless per game, so `expspawn` batches like base
+    try std.testing.expect(parSupported(.{ .expected_spawn = true }, false));
 }
 
 test "mstd starts from the staged weights file on eval and from 7 random nets otherwise" {
@@ -2050,6 +2064,10 @@ test "usage text lists the tchadd variant (#207)" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "tchadd  (#207") != null);
 }
 
+test "usage text lists the expected-spawn variant (#321)" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "expspawn (#321") != null);
+}
+
 test "shape variant reads its coefficient from the row-spec slot (#277)" {
     const omitted = [_][]const u8{ "nn", "2000", "0", "2000", "0.003", "-", "shape", "30", "x.bin", "3", "par" };
     try std.testing.expectEqual(@as(f64, 1), try parseShapeC(&omitted));
@@ -2095,13 +2113,13 @@ test "only a promising first timeout may use the extension (#336)" {
 
 test "variant table lists every accepted variant name once (#314)" {
     const names = [_][]const u8{
-        "base",   "backward",     "replay",  "tnet", "priority", "midgame",   "midmix", "sym",
-        "symlam", "symbatch",     "rsym",    "rtgt", "explore",  "explore20", "open8",  "open16",
-        "nstep",  "death",        "t2",      "p2",   "tp2",      "d2",        "d3",     "dumpp2",
-        "tch",    "tchadd",       "dist",    "dson", "oi",       "oi16",      "resume", "mstd",
-        "dump",   "ft2",          "restart", "adam", "tailw",    "clamp",     "shape",  "clip",
-        "pairw",  "pairleaf",     "pairrow", "leaf", "pair",     "par",       "lam",    "rlam",
-        "popart", "popartresume",
+        "base",   "backward",     "replay",   "tnet", "priority", "midgame",   "midmix", "sym",
+        "symlam", "symbatch",     "rsym",     "rtgt", "explore",  "explore20", "open8",  "open16",
+        "nstep",  "death",        "t2",       "p2",   "tp2",      "d2",        "d3",     "dumpp2",
+        "tch",    "tchadd",       "dist",     "dson", "oi",       "oi16",      "resume", "mstd",
+        "dump",   "ft2",          "restart",  "adam", "tailw",    "clamp",     "shape",  "clip",
+        "pairw",  "pairleaf",     "pairrow",  "leaf", "pair",     "par",       "lam",    "rlam",
+        "popart", "popartresume", "expspawn",
     };
     try std.testing.expectEqual(names.len, variant_specs.len);
     for (variant_specs, 0..) |spec, i| {
@@ -2211,6 +2229,7 @@ test "variant table max_args matches the old if-chain (#314)" {
         .{ .name = "rlam", .no_rows = 14, .no_rows_par = 14, .rows = 14 },
         .{ .name = "popart", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
         .{ .name = "popartresume", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
+        .{ .name = "expspawn", .no_rows = 11, .no_rows_par = 13, .rows = 14 },
     };
     try std.testing.expectEqual(variant_specs.len, expected.len);
     for (expected) |e| {
@@ -2357,6 +2376,7 @@ test "each variant builds the options of its own branch family (#315)" {
         .{ .name = "rlam", .opts = .{ .replay_k = default_replay_k, .sweep_lambda = default_sweep_lambda } },
         .{ .name = "popart", .opts = .{ .popart = &fixture.popart } },
         .{ .name = "popartresume", .opts = .{ .popart = &fixture.popart } },
+        .{ .name = "expspawn", .opts = .{ .expected_spawn = true } },
     };
     try std.testing.expectEqual(variant_specs.len, expected.len);
     for (expected) |e| {
