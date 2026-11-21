@@ -2209,3 +2209,22 @@ min depth 2）は 4 ペアで **0 勝 4 敗、−100,932 点**（sd 85,815）。
 
 **判定: 不採用**（row 21–26 は opt-in で残す）。次に試すなら K を増やすのではなく「4 タイル branch を必ず 1 本残す層化サンプル」か
 「root の各手で同じサンプル集合を共有する common random numbers」で、比較ノイズと tail の欠落を分けて潰す。
+
+## 探索の盤面を packed u64 にしても上限は 5%（#316）
+
+`sample`（1 ms 間隔、macOS）で `nn.bestMoveWithCache` の top-of-stack を数えた。同梱 128/32 net、
+`-Doptimize=ReleaseFast`、固定 4 局面（終盤セットは 16384 / 32768 を含む 4 局面）。
+
+| 探索 | 局面 | samples | `nn.forward` | `core.GameState.slide` | `_platform_memset` | `_platform_memmove` | その他 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2-ply | 序中盤 4 | 6,022 | 5,569 (92.4%) | 227 (3.8%) | 62 (1.0%) | 33 (0.5%) | 131 |
+| 2-ply | 終盤 4 | 6,005 | 5,567 (92.7%) | 178 (3.0%) | 87 (1.4%) | 42 (0.7%) | 131 |
+| deep3 | 序中盤 4 | 577 | 542 (93.9%) | 18 (3.1%) | 5 (0.9%) | 0 | 12 |
+
+盤面のコピー・行変換・move は `slide` + `memset` + `memmove` で 5% 前後で、TT key の hash は上位に
+現れない。探索を u64 の 4-bit 盤面にしても、葉の net は 16 マス配列を one-hot にするので pack/unpack の
+変換は `forward` と同じ支配経路に残る。wasm も同じ Zig コードで、SIMD が無いぶん `forward` の比率は
+上がる方向にしか動かないため、wasm の profile は判定を変えないと判断して省いた。
+
+**判定: 不採用（試作しない）**。上限 5% のために探索・TT key・合法手・65536 以上の fallback を二重化する
+代償に見合わない。node key を速くするなら、まず `Search` の key 計算そのものを測るのが先。
