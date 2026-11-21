@@ -65,13 +65,14 @@ wasm に含まれるため、他の外部アセットは要らない。実測（
 
 | 方針 | 平均スコア | 1 手（V8） | ページに出る文 |
 | --- | ---: | ---: | --- |
-| `nn2` | 82,772 | 9〜14 ms | `nn2: 平均 82,772 点 / 1 手 9〜14 ms` |
-| `nn3` | 116,205 | 4〜400 ms | `nn3: 平均 116,205 点 / 1 手 4〜400 ms` |
+| `nn2` | 121,569 | 9〜14 ms | `nn2: 平均 121,569 点 / 1 手 9〜14 ms` |
+| `nn3` | 137,342 | 4〜400 ms | `nn3: 平均 137,342 点 / 1 手 4〜400 ms` |
 
-（スコアは native の ranking と同条件の実測。`nn3` は既定の ranking に入れていない重い方針なので
-`#152` の計測値。1 手の ms はブラウザ（V8 on wasm）の実測で、native の `zig build ranking` の
-ms/move とは別物（wasm は 3〜8 倍遅い）。測っていない方針は `speed` が空で、ページはスコアだけを
-出す。実装の説明は `policy_info.description` にあり、CLI と README はそちらを使う。）
+（スコアは同梱 128/32 net を固定した 40 局（seed 9000–9019 / 9100–9119、各 20 局、非ペア）の実測。
+`nn2` は `deep`（eval row 2）、`nn3` は `deep3` + node TT（eval row 15）で、どちらも同じ net。
+1 手の ms はブラウザ（V8 on wasm）の実測で、native の `zig build ranking` の ms/move とは別物
+（wasm は 3〜8 倍遅い）。測っていない方針は `speed` が空で、ページはスコアだけを出す。実装の説明は
+`policy_info.description` にあり、CLI と README はそちらを使う。）
 
 `nn3` は序盤ほど高い（3 手探索の枝が多い）。盤面が詰まると `nn2` と変わらない速さになるので、
 自動再生の既定は `nn3`、速度は遅延なしにしてある。
@@ -113,7 +114,7 @@ zig build ranking -Doptimize=ReleaseFast -- 5 20 1000                 # 全ポ�
 zig build ranking -Doptimize=ReleaseFast -- 5 20 1000 nn,nn2          # 末尾引数でポリシーを絞る
 ```
 
-現状のおおよその強さ（ReleaseFast、評価 seed 9000、100 ゲーム。行ごとに条件が違うので数字は目安）:
+2026-10-31 時点の ranking スナップショット（ReleaseFast、評価 seed 9000、100 ゲーム。行ごとに条件が違うので数字は目安）:
 
 `localhost:8080` のUIに出す比較表は `zig build ranking` の JSON をそのまま読む。
 表を更新するときは、生成して `src/web/ranking.json` に置き直し、ビルドし直す
@@ -124,7 +125,9 @@ zig build ranking -Doptimize=ReleaseFast -- 5 20 1000 > src/web/ranking.json
 ```
 
 表は avg score と一緒に速度（games/s と 1 手あたり ms）も出す。速度は同じ実行・同じマシン
-の相対値なので、他の負荷が載っていると絶対値は動く（順位は動きにくい）。
+の相対値なので、他の負荷が載っていると絶対値は動く（順位は動きにくい）。この表は旧 64/32 net の
+スナップショットで、`nn2` / `nn` の行は現在の同梱 net とは違う。現在の `nn2` / `nn3` は上の
+「同梱する方針」表を見る。
 
 | 手法 | avg score | 到達 | 速度 (games/s) |
 |---|---:|---:|---:|
