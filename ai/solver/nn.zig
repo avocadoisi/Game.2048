@@ -2093,6 +2093,14 @@ pub const Options = struct {
     popart: ?*PopArtState = null,
     /// (#336) One game's wall-clock budget; null leaves library calls unlimited. The CLI sets it.
     game_time_limit_ns: ?u64 = null,
+    /// Candidate (#321): TD(0) whose target is the expectation over every spawn outcome of the pending
+    /// afterstate instead of the one tile the game actually drew. Each empty cell is equally likely and
+    /// the tile is 2 with p = 0.9 and 4 with p = 0.1, so the weights sum to 1; every branch is priced
+    /// with the same greedy 1-ply `reward + V` the sampled target bootstraps from, with the weights
+    /// frozen. The enumeration reads the net only, so it draws nothing from the game's spawn rng and
+    /// the spawns, and the moves every seed plays, stay those of the sampled run. Plain per-move TD(0)
+    /// with the `greedy1` policy only, see `expectedSpawnIsPlainTd1`.
+    expected_spawn: bool = false,
     /// Candidate A: no per-move update during the game; afterwards train every stored afterstate from last to first.
     backward: bool = false,
     /// After the game, re-train the last `replay_k` afterstates once more (0 = off), oldest first.
@@ -2279,7 +2287,7 @@ pub const Options = struct {
 /// PopArt is also restricted to the plain serial TD(0) path: its EMA lives at `trainStep`, so
 /// any other field would change the update, the target or the game against statistics that no longer
 /// describe what is being trained.
-pub const OptionsError = error{ ShapeRequiresPlainTd1, PopArtRequiresPlainTd1 };
+pub const OptionsError = error{ ShapeRequiresPlainTd1, PopArtRequiresPlainTd1, ExpectedSpawnRequiresPlainTd1 };
 
 /// Everything but the PopArt pointer itself must stay at its default; `move_cap` is a safety
 /// bound on one game, not an update, so it is carried over.
@@ -2287,8 +2295,16 @@ fn popartIsPlainTd1(opts: Options) bool {
     return std.meta.eql(opts, Options{ .popart = opts.popart, .move_cap = opts.move_cap, .game_time_limit_ns = opts.game_time_limit_ns });
 }
 
+/// Same shape as `popartIsPlainTd1`: the expected-spawn target replaces the sampled bootstrap, so a
+/// variant that changes the update, the target or the policy would be silently ignored. `move_cap` and
+/// the game time limit bound one game instead of changing an update, so they are carried over.
+fn expectedSpawnIsPlainTd1(opts: Options) bool {
+    return std.meta.eql(opts, Options{ .expected_spawn = opts.expected_spawn, .move_cap = opts.move_cap, .game_time_limit_ns = opts.game_time_limit_ns });
+}
+
 pub fn validateOptions(opts: Options) OptionsError!void {
     if (opts.popart != null and !popartIsPlainTd1(opts)) return error.PopArtRequiresPlainTd1;
+    if (opts.expected_spawn and !expectedSpawnIsPlainTd1(opts)) return error.ExpectedSpawnRequiresPlainTd1;
     if (opts.shape_c == 0) return;
     if (opts.nstep > 0 or opts.backward or opts.replay_k != 0 or opts.priority != null or
         opts.target_net != null or opts.death or opts.teacher != null or
@@ -2948,6 +2964,28 @@ fn symState(state: GameState, k: ?usize) GameState {
     return if (k) |index| .{ .board = transformBoard(index, state.board), .score = state.score } else state;
 }
 
+/// The expected-spawn bootstrap (#321): `bestAfterValue` of the pending afterstate averaged over every
+/// spawn outcome the game could produce there, i.e. `V` of the greedy 1-ply reply to each. Cells are
+/// uniform and the tile is 0.9/0.1, so the weights sum to 1 and a board with no empty cell has no spawn
+/// left to average (0, the value of a finished game). Read-only: no spawn is drawn and no weight moves.
+fn expectedSpawnValue(net: *const Net, after: Board) f64 {
+    const empties = core.countEmpty(after);
+    if (empties == 0) return 0;
+    const vfn: Value = .{ .single = net };
+    var total: f64 = 0;
+    for (0..core.BoardSize) |r| {
+        for (0..core.BoardSize) |c| {
+            if (after[r][c] != 0) continue;
+            for ([_]struct { value: core.Tile, p: f64 }{ .{ .value = 2, .p = 0.9 }, .{ .value = 4, .p = 0.1 } }) |spawn| {
+                var child: GameState = .{ .board = after };
+                child.board[r][c] = spawn.value;
+                total += spawn.p * bestAfterValue(vfn, child);
+            }
+        }
+    }
+    return total / @as(f64, @floatFromInt(empties));
+}
+
 /// One non-terminal per-move TD update: draw the update's symmetry once, build the target
 /// from the next board rotated by the same `k`, and train the rotated afterstate. Returns the target for
 /// the diagnostics and the priority buffer. `spawned` is the post-spawn board the pending step led into
@@ -2955,19 +2993,23 @@ fn symState(state: GameState, k: ?usize) GameState {
 fn tdUpdate(net: *Net, cache: *Cache, p: Pick, next: Pick, spawned: GameState, lr: f64, rng: std.Random, opts: Options, trace: *Net) f64 {
     const sym = updateSym(rng, opts);
     const reward = shapedReward(p, next, opts);
-    const target = clampTarget(reward + tdBootstrap(net, next, spawned, opts, sym.next), opts);
+    const bootstrap = if (opts.expected_spawn) expectedSpawnValue(net, p.after) else tdBootstrap(net, next, spawned, opts, sym.next);
+    const target = clampTarget(reward + bootstrap, opts);
     trainStep(net, cache, symBoard(p.after, sym.after), target, tailWeight(opts, spawned.board, lr), opts, trace);
     return target;
 }
 
 /// The last update of a game: a terminal transition has no next board, so its target is
 /// the (possibly shaped) reward alone and is never rotated; the input afterstate still gets the
-/// update's one draw.
+/// update's one draw. With `expected_spawn` the target also prices the spawns that would have followed
+/// `p.after` (#321), where the sampled run saw the one tile that ended the game: the drawn tile always
+/// kills the board, but the spawns the expectation averages over are not all dead.
 fn tdTerminalUpdate(net: *Net, cache: *Cache, p: Pick, spawned: GameState, lr: f64, rng: std.Random, opts: Options, trace: *Net) f64 {
     const sym = updateSym(rng, opts);
     const reward = shapedTerminalReward(p, opts);
-    trainStep(net, cache, symBoard(p.after, sym.after), reward, tailWeight(opts, spawned.board, lr), opts, trace);
-    return reward;
+    const target = if (opts.expected_spawn) reward + expectedSpawnValue(net, p.after) else reward;
+    trainStep(net, cache, symBoard(p.after, sym.after), target, tailWeight(opts, spawned.board, lr), opts, trace);
+    return target;
 }
 
 fn trainGamePerMove(net: *Net, rng: std.Random, lr: f64, diag: ?*Diag, opts: Options) GameResult {
@@ -7963,4 +8005,170 @@ test "shape refuses variants that would drop the shaped reward (#277)" {
     var net = Net.init(init_rng.random());
     var rng = std.Random.DefaultPrng.init(280);
     try std.testing.expectError(error.ShapeRequiresPlainTd1, trainGameOpts(&net, rng.random(), 0.001, null, .{ .shape_c = 1, .replay_k = 30 }));
+}
+
+/// `V(board)` = number of empty cells: one hidden unit sums the level-0 input rows and the output reads
+/// that unit alone, so the expected-spawn values below are hand-computable integers.
+fn emptyCountNet() Net {
+    var net = std.mem.zeroes(Net);
+    for (0..core.BoardCellCount) |cell| net.w1[cell * levels][0] = 1;
+    net.w2[0][0] = 1;
+    net.w3[0] = 1;
+    return net;
+}
+
+test "expected spawn prices both tiles of the greedy 1-ply reply (#321)" {
+    const net = emptyCountNet();
+    // One empty cell at (0,0), where a 2 spawn merges with (1,0) (up or down, 4 points) and a 4 spawn
+    // merges with (0,1) (left or right, 8 points). No other pair merges, and V counts empty cells, so
+    // the greedy reply is `4/1000 + 1` and `8/1000 + 1` and the cell is certain.
+    const after = Board{
+        .{ 0, 4, 8, 16 },
+        .{ 2, 32, 64, 128 },
+        .{ 8, 64, 128, 256 },
+        .{ 16, 128, 256, 512 },
+    };
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9 * (0.004 + 1) + 0.1 * (0.008 + 1)), expectedSpawnValue(&net, after), 1e-12);
+
+    // The pending reward is added once, on top of the expectation, and the sampled continuation is
+    // ignored: `next` is a board no move of `after` reaches.
+    var trainable = net;
+    var cache: Cache = .{};
+    var trace = std.mem.zeroes(Net);
+    const p: Pick = .{ .dir = .left, .after = after, .reward = 0.25, .value = 0 };
+    const next: Pick = .{ .dir = .up, .after = boardWithEmpties(0), .reward = 9, .value = 9 };
+    var rng = std.Random.DefaultPrng.init(321);
+    const target = tdUpdate(&trainable, &cache, p, next, .{ .board = boardWithEmpties(9) }, 0, rng.random(), .{ .expected_spawn = true }, &trace);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25 + 1.0044), target, 1e-12);
+}
+
+test "expected spawn prices the alive spawns a terminal move still had (#321)" {
+    const net = emptyCountNet();
+    // The game died on the 2 spawn: the board below with a 2 at (3,3) is full and has no pair, so the
+    // sampled terminal target is the reward alone. The 4 spawn merges with (3,2) for 8 points and leaves
+    // one empty cell behind (V = 1), so its 0.1 share is `0.008 + 1`.
+    const after = Board{
+        .{ 8, 16, 32, 64 },
+        .{ 128, 256, 512, 1024 },
+        .{ 8, 16, 32, 64 },
+        .{ 128, 256, 4, 0 },
+    };
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9 * 0 + 0.1 * (0.008 + 1)), expectedSpawnValue(&net, after), 1e-12);
+
+    var cache: Cache = .{};
+    var trace = std.mem.zeroes(Net);
+    const p: Pick = .{ .dir = .up, .after = after, .reward = 0.016, .value = 0 };
+    var rng = std.Random.DefaultPrng.init(321);
+    var trainable = net;
+    const expected = tdTerminalUpdate(&trainable, &cache, p, .{ .board = after }, 0, rng.random(), .{ .expected_spawn = true }, &trace);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.016 + 0.1008), expected, 1e-12);
+    // the sampled path is unchanged: the reward alone
+    var plain = net;
+    try std.testing.expectEqual(@as(f64, 0.016), tdTerminalUpdate(&plain, &cache, p, .{ .board = after }, 0, rng.random(), .{}, &trace));
+}
+
+test "expected spawn ignores the sampled continuation and draws no tile (#321)" {
+    const net = emptyCountNet();
+    const after = Board{
+        .{ 0, 4, 8, 16 },
+        .{ 2, 32, 64, 128 },
+        .{ 8, 64, 128, 256 },
+        .{ 16, 128, 256, 512 },
+    };
+    const p: Pick = .{ .dir = .left, .after = after, .reward = 0.004, .value = 0 };
+    var cache: Cache = .{};
+    var trace = std.mem.zeroes(Net);
+    var used = std.Random.DefaultPrng.init(11);
+    var fresh = std.Random.DefaultPrng.init(11);
+    var a = net;
+    var b = net;
+    // Two targets of the same step: only the sampled continuation and its board differ.
+    const left: Pick = .{ .dir = .left, .after = boardWithEmpties(4), .reward = 0.5, .value = 2 };
+    const right: Pick = .{ .dir = .right, .after = boardWithEmpties(6), .reward = -1, .value = -3 };
+    const first = tdUpdate(&a, &cache, p, left, .{ .board = boardWithEmpties(4) }, 0, used.random(), .{ .expected_spawn = true }, &trace);
+    const second = tdUpdate(&b, &cache, p, right, .{ .board = boardWithEmpties(6) }, 0, used.random(), .{ .expected_spawn = true }, &trace);
+    try std.testing.expectEqual(first, second);
+    // The enumeration read the net only, so the game's spawn rng is exactly where the seed left it.
+    try std.testing.expectEqual(fresh.random().int(u64), used.random().int(u64));
+}
+
+/// The greedy 1-ply reply of a post-spawn board, re-derived from the policy the sampled target uses.
+fn greedyReplyValue(net: *const Net, state: GameState) f64 {
+    const pick = pickMove(net, state, false) orelse return 0;
+    return pick.reward + pick.value;
+}
+
+test "expected spawn averages every spawn outcome with weights that sum to one (#321)" {
+    var init_rng = std.Random.DefaultPrng.init(321);
+    const net = Net.init(init_rng.random());
+    const board = Board{
+        .{ 2, 4, 8, 0 },
+        .{ 16, 32, 64, 0 },
+        .{ 128, 256, 512, 1024 },
+        .{ 4, 8, 16, 32 },
+    };
+    // Reference: two cells at 1/2 each, the tile at 0.9/0.1, the greedy reply as the branch value.
+    // Any weight that does not normalise to 1 (a missing 1/empties, a doubled cell) moves the sum.
+    var total: f64 = 0;
+    var empties: f64 = 0;
+    for (0..core.BoardSize) |r| {
+        for (0..core.BoardSize) |c| {
+            if (board[r][c] != 0) continue;
+            empties += 1;
+            var child = GameState{ .board = board };
+            child.board[r][c] = 2;
+            total += 0.9 * greedyReplyValue(&net, child);
+            child.board[r][c] = 4;
+            total += 0.1 * greedyReplyValue(&net, child);
+        }
+    }
+    try std.testing.expect(empties == 2);
+    try std.testing.expectApproxEqRel(total / empties, expectedSpawnValue(&net, board), 1e-12);
+}
+
+test "expected spawn target equals the sampled target when the tile cannot matter (#321)" {
+    const net = emptyCountNet();
+    // One empty cell at (2,0) and no 2 or 4 anywhere, so the drawn tile can only fill that cell and no
+    // move can tell the two tiles apart: both branches score the same 8+8 merge in row 0, 0.016 + 1.
+    const after = Board{
+        .{ 8, 8, 16, 32 },
+        .{ 64, 128, 256, 512 },
+        .{ 0, 8, 16, 32 },
+        .{ 128, 256, 512, 1024 },
+    };
+    try std.testing.expectApproxEqAbs(@as(f64, 0.016 + 1), expectedSpawnValue(&net, after), 1e-12);
+
+    // The sampled path: the game draws the tile, plays the best reply, and bootstraps reward + V.
+    var spawned = GameState{ .board = after };
+    var rng = std.Random.DefaultPrng.init(321);
+    try std.testing.expect(spawned.spawnRandomTile(rng.random()));
+    const next = pickMove(&net, spawned, false).?;
+    const p: Pick = .{ .dir = .up, .after = after, .reward = 0.004, .value = 0 };
+    var trainable = net;
+    var cache: Cache = .{};
+    var trace = std.mem.zeroes(Net);
+    const expected = tdUpdate(&trainable, &cache, p, next, spawned, 0, rng.random(), .{ .expected_spawn = true }, &trace);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.004) + next.reward + next.value, expected, 1e-12);
+}
+
+test "expected spawn is opt-in and refuses variants it would silently ignore (#321)" {
+    var pr: Priority = .{};
+    var target_net = emptyCountNet();
+    try validateOptions(.{});
+    // a search-only field (the spawn sampler) is inert on this path, so it is refused, not ignored
+    try validateOptions(.{ .expected_spawn = true });
+    try std.testing.expectError(error.ExpectedSpawnRequiresPlainTd1, validateOptions(.{ .expected_spawn = true, .sample = 2 }));
+    try std.testing.expectError(error.ExpectedSpawnRequiresPlainTd1, validateOptions(.{ .expected_spawn = true, .backward = true }));
+    try std.testing.expectError(error.ExpectedSpawnRequiresPlainTd1, validateOptions(.{ .expected_spawn = true, .replay_k = 30 }));
+    try std.testing.expectError(error.ExpectedSpawnRequiresPlainTd1, validateOptions(.{ .expected_spawn = true, .priority = &pr }));
+    try std.testing.expectError(error.ExpectedSpawnRequiresPlainTd1, validateOptions(.{ .expected_spawn = true, .target_net = &target_net }));
+    try std.testing.expectError(error.ExpectedSpawnRequiresPlainTd1, validateOptions(.{ .expected_spawn = true, .nstep = 4 }));
+    try std.testing.expectError(error.ExpectedSpawnRequiresPlainTd1, validateOptions(.{ .expected_spawn = true, .target = .search2 }));
+    try std.testing.expectError(error.ExpectedSpawnRequiresPlainTd1, validateOptions(.{ .expected_spawn = true, .selfplay = .deep2 }));
+    try std.testing.expectError(error.ExpectedSpawnRequiresPlainTd1, validateOptions(.{ .expected_spawn = true, .death = true }));
+    try std.testing.expectError(error.ExpectedSpawnRequiresPlainTd1, validateOptions(.{ .expected_spawn = true, .lambda = 0.7 }));
+    // Per-game safety bounds do not alter an update, and the target is stateless per game, so `par`
+    // batches it like `base`.
+    try validateOptions(.{ .expected_spawn = true, .move_cap = 500, .game_time_limit_ns = 0 });
+    try validateBatchOptions(.{ .expected_spawn = true });
 }
