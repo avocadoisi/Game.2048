@@ -21,6 +21,7 @@ const usage =
     \\                widedelay opts into delayed TD(lambda) on wide tables (lambda=0.5, horizon=3, #290).
     \\                widetc / widedeep_tc opt into TC(lambda) on wide tables (lambda=0.5, horizon=3, #288).
     \\                maxb / maxbchance / maxbdeep are wide with the max-backup TD target (#131).
+    \\                lshape / lshaperesume add one non-rectangular 6-cell L tuple, +64 MiB f32 (#323).
     \\                resume loads table_path first, then trains train_games more games.
     \\  table_path    file to load (train_games 0) or write (default ai/solver/ntuple_weights.bin);
     \\                experimental learners require a separate path with a distinct filename
@@ -323,6 +324,7 @@ test "usage text lists both variants" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "widedelay") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "widetc") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "widedeep_tc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "lshaperesume") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "separate path with a distinct filename") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "resume") != null);
 }

@@ -32,6 +32,10 @@ pub const patterns = [_]Pattern{
     // (8 positions around the edge, 4 positions through the middle). The first 6-tuple above is the
     // `min` index of orbit 0 for every board, so orbit 1 needs exactly this one more table.
     .{ .len = 6, .cells = .{ 4, 5, 6, 8, 9, 10 } }, // 2x3 middle-left (orbit 1)
+    // (#323) One non-rectangular 6-tuple: an L with arms 3 and 4 on a corner, top row cols 0-2 plus
+    // left column rows 0-3. Its 8 transforms are the 4 corners x 2 arm orientations, an orbit no
+    // rectangular tuple shares, so it is one more table reachable only through `Set.lshape`.
+    .{ .len = 6, .cells = .{ 0, 1, 2, 4, 8, 12 } }, // L, arms 3x4 on the top-left corner
 };
 pub const pattern_count = patterns.len;
 
@@ -125,17 +129,21 @@ pub const offsets = blk: {
 };
 
 /// Table set: `.light` keeps only the five 4-tuples, `.full` adds the first 2x3 6-tuple (the
-/// committed `ntuple_weights.bin` and every existing policy), `.wide` adds both 2x3 orbits.
-pub const Set = enum { light, full, wide };
+/// committed `ntuple_weights.bin` and every existing policy), `.wide` adds both 2x3 orbits, and
+/// `.lshape` adds the single L-shaped 6-tuple on top of `.wide` (#323).
+pub const Set = enum { light, full, wide, lshape };
 
 pub const light_count = 5;
 pub const full_count = 6;
+/// Both 2x3 orbits (#106). The L shape is appended after them so `.wide` tables keep their layout.
+pub const wide_count = 7;
 
 pub fn countOf(set: Set) usize {
     return switch (set) {
         .light => light_count,
         .full => full_count,
-        .wide => pattern_count,
+        .wide => wide_count,
+        .lshape => pattern_count,
     };
 }
 
@@ -465,7 +473,7 @@ pub fn loadQuantized(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !Quan
 pub const file_magic = "2048-NT\x00";
 pub const file_version: u32 = 1;
 const header_len: usize = 8 + 4 + 4 + 4;
-/// File length for `n` tables; `.wide` is `fileLen(pattern_count)`.
+/// File length for `n` tables; `.wide` is `fileLen(wide_count)`, `.lshape` is `fileLen(pattern_count)`.
 pub fn fileLen(n: usize) usize {
     return header_len + n * 4 + entriesOf(n) * 4;
 }
@@ -558,6 +566,8 @@ pub fn parseVariant(name: []const u8) ?Variant {
     if (std.mem.eql(u8, name, "maxbchance")) return .{ .set = .wide, .mode = .chance, .target = .max_backup };
     if (std.mem.eql(u8, name, "maxbdeep")) return .{ .set = .wide, .mode = .deep, .target = .max_backup };
     if (std.mem.eql(u8, name, "widedeep")) return .{ .mode = .deep, .set = .wide };
+    if (std.mem.eql(u8, name, "lshape")) return .{ .set = .lshape };
+    if (std.mem.eql(u8, name, "lshaperesume")) return .{ .resume_from_file = true, .set = .lshape };
     return null;
 }
 
@@ -913,6 +923,27 @@ fn canonicalIndex(board: Board, p: usize) u32 {
     return best;
 }
 
+/// True when the unordered cell set `cells` is one of the 8 dihedral transforms of `base`,
+/// i.e. both patterns would index the same table.
+fn sameOrbit(base: []const u8, cells: []const u8) bool {
+    if (base.len != cells.len) return false;
+    var want: [6]u8 = undefined;
+    @memcpy(want[0..cells.len], cells);
+    std.mem.sort(u8, want[0..cells.len], {}, std.sort.asc(u8));
+    for (0..8) |t| {
+        var transformed: [6]u8 = undefined;
+        for (base, 0..) |cell, j| transformed[j] = @intCast(transformCell(t, cell));
+        std.mem.sort(u8, transformed[0..base.len], {}, std.sort.asc(u8));
+        if (std.mem.eql(u8, transformed[0..base.len], want[0..cells.len])) return true;
+    }
+    return false;
+}
+
+/// A distinct weight per table, so a round-trip can tell the tables apart.
+fn tableProbe(p: usize) f32 {
+    return @floatCast(@as(f64, @floatFromInt(p)) + 0.75);
+}
+
 test "levelOf maps tiles to log2 levels and clamps large tiles" {
     try std.testing.expectEqual(@as(usize, 0), levelOf(0));
     try std.testing.expectEqual(@as(usize, 1), levelOf(2));
@@ -1022,15 +1053,14 @@ test "deep is deterministic and counts leaf evaluations" {
 test "the wide set adds the second 2x3 orbit and keeps light/full unchanged (#106)" {
     try std.testing.expectEqual(@as(usize, 5), light_count);
     try std.testing.expectEqual(@as(usize, 6), full_count);
-    try std.testing.expectEqual(@as(usize, 7), pattern_count);
+    try std.testing.expectEqual(@as(usize, 7), wide_count);
     try std.testing.expectEqual(@as(usize, 5 * 65536), entryCount(.light));
     try std.testing.expectEqual(@as(usize, 5 * 65536 + 16777216), entryCount(.full));
-    try std.testing.expectEqual(total_entries, entryCount(.wide));
     try std.testing.expectEqual(entryCount(.full) + 16777216, entryCount(.wide));
 
     var wide = try TupleNet.initWith(std.testing.allocator, .wide);
     defer wide.deinit(std.testing.allocator);
-    try std.testing.expectEqual(pattern_count, wide.count);
+    try std.testing.expectEqual(wide_count, wide.count);
     try std.testing.expectEqual(entryCount(.wide), wide.storage.len);
 }
 
@@ -1049,10 +1079,74 @@ test "the second 6-tuple is not a transform of the first (#106)" {
     try std.testing.expectEqual(@as(u8, 6), patterns[6].len);
 }
 
+test "the L-shaped 6-tuple is one D4 orbit that no existing pattern shares (#323)" {
+    const lshape = patterns[pattern_count - 1];
+    try std.testing.expectEqual(@as(u8, 6), lshape.len);
+    // The table is built from these cells: top row cols 0-2 plus left column rows 0-3.
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 2, 4, 8, 12 }, lshape.cells[0..6]);
+
+    // Arms 3 and 4 are unequal, so no transform fixes the set: the orbit is exactly 8 placements
+    // (4 corners x 2 arm orientations) and needs one table.
+    var orbit: [8][6]u8 = undefined;
+    var orbit_len: usize = 0;
+    for (0..8) |t| {
+        var cells: [6]u8 = undefined;
+        for (lshape.cells[0..6], 0..) |cell, j| cells[j] = @intCast(transformCell(t, cell));
+        std.mem.sort(u8, &cells, {}, std.sort.asc(u8));
+        var seen = false;
+        for (orbit[0..orbit_len]) |placed| seen = seen or std.mem.eql(u8, &placed, &cells);
+        if (!seen) {
+            orbit[orbit_len] = cells;
+            orbit_len += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 8), orbit_len);
+
+    // Distinct from every existing pattern orbit, in particular both 2x3 rectangles and every
+    // 4-tuple: the addition cannot reuse a table the `min` index already covers.
+    for (patterns[0 .. pattern_count - 1]) |pat| {
+        try std.testing.expect(!sameOrbit(pat.cells[0..pat.len], lshape.cells[0..6]));
+    }
+    try std.testing.expect(sameOrbit(lshape.cells[0..6], &[_]u8{ 3, 7, 11, 13, 14, 15 }));
+}
+
+test "the lshape set adds exactly one 6-tuple table over wide (#323)" {
+    try std.testing.expectEqual(@as(usize, wide_count + 1), pattern_count);
+    try std.testing.expectEqual(total_entries, entryCount(.lshape));
+    try std.testing.expectEqual(entryCount(.wide) + 16777216, entryCount(.lshape));
+    // `.wide` keeps the #106 layout, so tables written for it stay loadable.
+    try std.testing.expectEqual(@as(usize, 33_882_112), entryCount(.wide));
+    try std.testing.expectEqual(@as(usize, 135_528_496), fileLen(wide_count));
+
+    var lshape = try TupleNet.initWith(std.testing.allocator, .lshape);
+    defer lshape.deinit(std.testing.allocator);
+    try std.testing.expectEqual(pattern_count, lshape.count);
+    try std.testing.expectEqual(entryCount(.lshape), lshape.storage.len);
+    // The new table is appended after the seven existing ones.
+    try std.testing.expectEqual(entryCount(.wide), offsets[wide_count]);
+    try std.testing.expectEqual(tableLen(wide_count), lshape.table(wide_count).len);
+}
+
+test "the L-shape table stays inside the 200 MiB f32 ceiling (#323)" {
+    const mib = 1024 * 1024;
+    // 16^6 f32 entries: 64 MiB for the one new table, and nothing else grows.
+    try std.testing.expectEqual(@as(usize, 64 * mib), tableLen(pattern_count - 1) * @sizeOf(f32));
+    try std.testing.expectEqual(@as(usize, 32 * mib), tableLen(pattern_count - 1) * @sizeOf(i16));
+    try std.testing.expectEqual(@as(usize, 64 * mib), (entryCount(.lshape) - entryCount(.wide)) * @sizeOf(f32));
+
+    // The whole opt-in set: 193.25 MiB f32 (129.25 MiB for `.wide`), under the prototype ceiling.
+    try std.testing.expectEqual(@as(usize, 202_637_312), entryCount(.lshape) * @sizeOf(f32));
+    try std.testing.expect(entryCount(.lshape) * @sizeOf(f32) <= 200 * mib);
+    try std.testing.expectEqual(@as(usize, 202_637_364), fileLen(pattern_count));
+    // The int16 form a checkpoint or eval table would ship: ~96.6 MiB.
+    try std.testing.expectEqual(@as(usize, 101_318_772), quantizedFileLen(pattern_count));
+    try std.testing.expect(quantizedFileLen(pattern_count) <= 100 * mib);
+}
+
 test "light tables keep the five base tuples and drop the 6-tuple" {
     try std.testing.expectEqual(@as(usize, 5), light_count);
     try std.testing.expectEqual(@as(usize, 5 * 65536), entryCount(.light));
-    try std.testing.expectEqual(entryCount(.wide), total_entries);
+    try std.testing.expectEqual(entryCount(.lshape), total_entries);
     try std.testing.expect(fileLen(light_count) * 17 <= fileLen(pattern_count) * 1);
 
     var light = try TupleNet.initWith(std.testing.allocator, .light);
@@ -1082,6 +1176,84 @@ test "light table file round-trips with its own pattern count" {
     defer back.deinit(std.testing.allocator);
     try std.testing.expectEqual(light_count, back.count);
     try std.testing.expectEqualSlices(f32, light.storage, back.storage);
+}
+
+test "the lshape table round-trips through the f32 blob format (#323)" {
+    const gpa = std.testing.allocator;
+    const idx = indices(sample_board);
+    var net = try TupleNet.initWith(gpa, .lshape);
+    const count = net.count;
+    for (0..count) |p| net.storage[offsets[p] + idx[p]] = tableProbe(p);
+    const bytes = encode(gpa, &net) catch |err| {
+        net.deinit(gpa);
+        return err;
+    };
+    // Free the 193.25 MiB source before the parser allocates its own copy.
+    net.deinit(gpa);
+    defer gpa.free(bytes);
+
+    // Same magic and version as a `.wide` file; only the pattern count and payload grow.
+    try std.testing.expectEqual(fileLen(pattern_count), bytes.len);
+    try std.testing.expectEqual(file_version, std.mem.readInt(u32, bytes[8..12], .little));
+    try std.testing.expectEqual(@as(u32, @intCast(count)), std.mem.readInt(u32, bytes[16..20], .little));
+
+    var back = try parse(gpa, bytes);
+    defer back.deinit(gpa);
+    try std.testing.expectEqual(count, back.count);
+    try std.testing.expectEqualSlices(u8, bytes[header_len + count * 4 ..], std.mem.sliceAsBytes(back.storage));
+    for (0..count) |p| try std.testing.expectEqual(tableProbe(p), back.storage[offsets[p] + idx[p]]);
+    // Every table, the new one included, contributes to the value: sum(0.75 + p) for p in 0..8.
+    try std.testing.expectEqual(@as(f64, 34), back.eval(sample_board));
+}
+
+test "the lshape quantized table round-trips inside the int16 ceiling (#323)" {
+    const gpa = std.testing.allocator;
+    var q = try Quantized.initWith(gpa, .lshape);
+    const count = q.count;
+    for (0..count) |p| q.scales[p] = tableProbe(p);
+    const scales = q.scales;
+    q.storage[offsets[pattern_count - 1] + 3] = 1234;
+
+    const bytes = try encodeQuantized(gpa, &q);
+    q.deinit(gpa);
+    defer gpa.free(bytes);
+
+    try std.testing.expectEqual(quantizedFileLen(pattern_count), bytes.len);
+    try std.testing.expect(bytes.len <= 100 * 1024 * 1024);
+    var back = try parseQuantized(gpa, bytes);
+    defer back.deinit(gpa);
+    try std.testing.expectEqual(count, back.count);
+    try std.testing.expectEqualSlices(f64, scales[0..count], back.scales[0..count]);
+    try std.testing.expectEqual(@as(i16, 1234), back.storage[offsets[pattern_count - 1] + 3]);
+}
+
+test "a 7-table wide file written before the L-shape still loads (#323)" {
+    const gpa = std.testing.allocator;
+    const idx = indices(sample_board);
+    var wide = try TupleNet.initWith(gpa, .wide);
+    const count = wide.count;
+    for (0..count) |p| wide.storage[offsets[p] + idx[p]] = tableProbe(p);
+    const bytes = encode(gpa, &wide) catch |err| {
+        wide.deinit(gpa);
+        return err;
+    };
+    wide.deinit(gpa);
+    defer gpa.free(bytes);
+
+    // The pre-#323 header is unchanged: version 1, count 7, the same first table length.
+    try std.testing.expectEqual(fileLen(wide_count), bytes.len);
+    try std.testing.expectEqual(file_version, std.mem.readInt(u32, bytes[8..12], .little));
+    try std.testing.expectEqual(@as(u32, wide_count), std.mem.readInt(u32, bytes[16..20], .little));
+    try std.testing.expectEqual(@as(u32, @intCast(tableLen(0))), std.mem.readInt(u32, bytes[20..24], .little));
+
+    var back = try parse(gpa, bytes);
+    defer back.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, wide_count), back.count);
+    // The seven tables of the old file are read back and the L table is not part of the sum:
+    // sum(0.75 + p) for p in 0..7.
+    try std.testing.expectEqual(@as(f64, 26.25), back.eval(sample_board));
+    // The L shape is opt-in: its file is longer, so `load` refuses to mix the two sets.
+    try std.testing.expect(fileLen(wide_count) < fileLen(pattern_count));
 }
 
 test "encode writes the f32 table layout byte for byte (#302)" {
@@ -1250,6 +1422,14 @@ test "variant names select the mode, the table set and resume" {
     try std.testing.expectEqual(Learner.temporal_coherence, widedeep_tc.learner);
     try std.testing.expectEqual(Mode.deep, parseVariant("widedeep").?.mode);
     try std.testing.expectEqual(Set.wide, parseVariant("widedeep").?.set);
+    const lshape = parseVariant("lshape").?;
+    try std.testing.expectEqual(Set.lshape, lshape.set);
+    try std.testing.expectEqual(Mode.greedy, lshape.mode);
+    try std.testing.expectEqual(Learner.td_zero, lshape.learner);
+    try std.testing.expect(!lshape.resume_from_file);
+    const lshaperesume = parseVariant("lshaperesume").?;
+    try std.testing.expect(lshaperesume.resume_from_file);
+    try std.testing.expectEqual(Set.lshape, lshaperesume.set);
     try std.testing.expectEqual(@as(?Variant, null), parseVariant("lightresumex"));
 }
 
