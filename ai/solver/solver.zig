@@ -191,6 +191,25 @@ pub fn shippedNet() *const nn.Net {
     return nnNet();
 }
 
+/// The f32 net, narrowed once per thread exactly like `cached_net`. Deriving it from the f64 weights
+/// keeps the wasm module free of a second copy of the net (the f32 file is 148 KB): the conversion
+/// costs microseconds and rounds each weight the same way `encodeF32` would (#348).
+threadlocal var cached_net_f32: ?nn.Net32 = null;
+
+fn nnNetF32() *const nn.Net32 {
+    if (cached_net_f32 == null) cached_net_f32 = nn.toF32(nnNet());
+    return &cached_net_f32.?;
+}
+
+/// The shipped net as the search's `Value`: f32 weights under `-Dnn-f32` (#348), f64 otherwise.
+pub fn nnValue() nn.Value {
+    if (comptime nn.f32_weights) {
+        return .{ .f32 = nnNetF32() };
+    } else {
+        return .{ .single = nnNet() };
+    }
+}
+
 /// Net value of one position, the leaf `nn2` uses at the end of its plies.
 pub fn netLeaf(net: *const nn.Net, board: Board) f64 {
     var cache: nn.Cache = .{};
@@ -204,7 +223,7 @@ pub fn scoreRootMove(policy: Policy, state: GameState, dir: Direction) ?f64 {
         .nn3 => .deep3,
         else => return null,
     };
-    return nn.scoreRootMove(nnNet(), state, mode, dir, nn.sharedValueCache());
+    return nn.scoreRootMoveValue(nnValue(), state, mode, dir, nn.sharedValueCache());
 }
 
 /// Quantized n-tuple table used by `algo=ntuple`; 64.6 MiB, so it is loaded once per thread and
@@ -284,11 +303,11 @@ pub fn chooseOne(comptime policy: Policy, state: GameState, rng: std.Random, dep
         .nn, .nn2, .nn3, .nnmcts, .nnbeam => {
             const net = nnNet();
             return switch (policy) {
-                .nn => nn.bestMove(net, state, .chance),
+                .nn => nn.bestMoveValue(nnValue(), state, .chance),
                 // the 2-ply search itself dominates the cost.
-                .nn2 => nn.bestMove(net, state, .deep),
+                .nn2 => nn.bestMoveValue(nnValue(), state, .deep),
                 // 3-ply with the spawn cut: a few times nn2's cost, so ranking leaves it out.
-                .nn3 => nn.bestMove(net, state, .deep3),
+                .nn3 => nn.bestMoveValue(nnValue(), state, .deep3),
                 .nnmcts => nnmctsMove(net, state, rng),
                 // the sampled beam stays below nn2's leaf count.
                 .nnbeam => if (nnBeamBest(net, state, rng)) |best| best.first_move else null,
@@ -2102,6 +2121,18 @@ test "nn policy parses the weights once per thread, not once per move" {
     try std.testing.expectEqual(@as(usize, 32), moves);
     // the ~148 KB net is parsed at most once for the whole game, then reused by reference
     try std.testing.expect(nn.parse_count - before <= 1);
+}
+
+test "the committed f32 net file is the shipped net narrowed (#348)" {
+    // The file is the format's reference artefact: a stale copy would mislead anyone loading it.
+    const net = nn.parse(@embedFile("nn_weights.bin")) catch unreachable;
+    const want = nn.toF32(&net);
+    const got = nn.decodeF32(@embedFile("nn_weights.f32.bin")) catch unreachable;
+    try std.testing.expectEqualSlices(
+        f32,
+        std.mem.bytesAsSlice(f32, std.mem.asBytes(&want)),
+        std.mem.bytesAsSlice(f32, std.mem.asBytes(&got)),
+    );
 }
 
 test "ntuple policy plays a legal move from the quantized table (#129)" {

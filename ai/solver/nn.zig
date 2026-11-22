@@ -31,6 +31,9 @@ pub const feature_count: u32 = width.feat;
 pub const feature_all = 6;
 /// Score deltas are divided by this before they enter the value target, so values stay near unit scale.
 pub const reward_scale: f64 = 1000;
+/// `-Dnn-f32`: the shipped net is evaluated from `nn_weights.f32.bin` (#348). Off by default, so the
+/// shipped policy code and the f64 weight file stay the reference.
+pub const f32_weights: bool = width.f32_weights;
 
 /// Plain f64 weights. `extern` keeps the layout fixed, so the file is the raw struct bytes.
 pub const Net = extern struct {
@@ -405,17 +408,20 @@ pub fn stageOfEmpties(empties: usize) usize {
 }
 
 /// Value function used by the search: one net for every board, or one net per empty-cell stage.
-/// `.quantized` is the opt-in int16 path: same policy code, weights from the quantized file. Nothing selects
-/// it on its own; `nn.forward` over the f32 net stays the default.
-pub const Value = union(enum) { single: *const Net, staged: *const Staged, quantized: *const Quantized };
+/// `.quantized` is the opt-in int16 path: same policy code, weights from the quantized file. `.f32`
+/// (#348) is the same net stored and evaluated as f32: half the bytes to read per leaf and an
+/// f32x4 first layer under `-Dnn-simd`. Nothing selects either on its own; the f64 net stays the
+/// default.
+pub const Value = union(enum) { single: *const Net, staged: *const Staged, quantized: *const Quantized, f32: *const Net32 };
 
-/// `forward` for a `Value`; `cache` belongs to the net being evaluated and is unused for staged and
-/// quantized values.
+/// `forward` for a `Value`; `cache` belongs to the net being evaluated and is unused for staged,
+/// quantized and f32 values.
 pub fn valueAt(value: Value, board: Board, cache: *Cache) f64 {
     return switch (value) {
         .single => |net| forward(net, board, cache),
         .staged => |staged| staged.forward(board),
         .quantized => |q| forwardQuantized(q, board),
+        .f32 => |net| forwardF32(net, board),
     };
 }
 
@@ -1649,6 +1655,11 @@ fn searchDepth(mode: Mode, board: Board, omit_leaf_reward: bool) Depth {
 
 /// Score one root branch using the same fixed horizon and cutoff as the serial deep search.
 pub fn scoreRootMove(net: *const Net, state: GameState, mode: Mode, dir: Direction, cache: *ValueCache) ?f64 {
+    return scoreRootMoveValue(.{ .single = net }, state, mode, dir, cache);
+}
+
+/// `scoreRootMove` for any `Value`, so the f32 build scores root branches with the f32 net (#348).
+pub fn scoreRootMoveValue(vfn: Value, state: GameState, mode: Mode, dir: Direction, cache: *ValueCache) ?f64 {
     if (mode != .deep and mode != .deep3) return null;
     const depth = searchDepth(mode, state.board, false);
     const nodes: ?*NodeCache = if (depth.ply >= 3) blk: {
@@ -1656,7 +1667,7 @@ pub fn scoreRootMove(net: *const Net, state: GameState, mode: Mode, dir: Directi
         table.clear();
         break :blk table;
     } else null;
-    var search = newSearch(.{ .single = net }, cache, nodes, depth, false, 0);
+    var search = newSearch(vfn, cache, nodes, depth, false, 0);
     return rootMoveScore(&search, state, dir);
 }
 
@@ -3704,6 +3715,144 @@ pub fn forwardQuantized(q: *const Quantized, board: Board) f64 {
         @as(f64, @floatFromInt(q.q.b3)) * s[5];
 }
 
+/// f32 copy of the same weights (#348). The point is traffic: one leaf reads ~24 KiB instead of
+/// ~48 KiB, and wasm gets an f32x4 first-layer accumulate. Training stays f64 (`Net`); this is a
+/// shipping artefact, written by `zig build nn-f32`.
+pub const Net32 = extern struct {
+    w1: [input_count][h1_size]f32,
+    b1: [h1_size]f32,
+    w2: [h2_size][h1_size]f32,
+    b2: [h2_size]f32,
+    w3: [h2_size]f32,
+    b3: f32,
+    wf: [feature_count][h1_size]f32,
+};
+
+/// Narrow the trained f64 weights once, at conversion time.
+pub fn toF32(net: *const Net) Net32 {
+    var out: Net32 = std.mem.zeroes(Net32);
+    for (0..input_count) |r| for (0..h1_size) |i| {
+        out.w1[r][i] = @floatCast(net.w1[r][i]);
+    };
+    for (0..h1_size) |i| out.b1[i] = @floatCast(net.b1[i]);
+    for (0..h2_size) |j| {
+        for (0..h1_size) |i| out.w2[j][i] = @floatCast(net.w2[j][i]);
+        out.b2[j] = @floatCast(net.b2[j]);
+        out.w3[j] = @floatCast(net.w3[j]);
+    }
+    out.b3 = @floatCast(net.b3);
+    for (0..feature_count) |k| for (0..h1_size) |i| {
+        out.wf[k][i] = @floatCast(net.wf[k][i]);
+    };
+    return out;
+}
+
+/// Each lane adds its own row slice, so the four f32 lanes stay independent (no reassociation
+/// across lanes, and the tail is scalar).
+fn accumulateRowsSimdF32(dst: []f32, src: []const f32) void {
+    const V = @Vector(4, f32);
+    var i: usize = 0;
+    while (i + 4 <= dst.len) : (i += 4) {
+        const a: V = dst[i..][0..4].*;
+        const b: V = src[i..][0..4].*;
+        dst[i..][0..4].* = a + b;
+    }
+    while (i < dst.len) : (i += 1) dst[i] += src[i];
+}
+
+/// f32x4 dot product: the vector lanes keep their own partial sums, the tail is scalar.
+fn dotSimdF32(a: []const f32, b: []const f32) f32 {
+    const V = @Vector(4, f32);
+    var acc: V = @splat(0);
+    var i: usize = 0;
+    while (i + 4 <= a.len) : (i += 4) {
+        const x: V = a[i..][0..4].*;
+        const y: V = b[i..][0..4].*;
+        acc += x * y;
+    }
+    var sum: f32 = @reduce(.Add, acc);
+    while (i < a.len) : (i += 1) sum += a[i] * b[i];
+    return sum;
+}
+
+/// Afterstate value from the f32 net: the same arithmetic as `forward`, in f32. `-Dnn-simd` picks
+/// the f32x4 accumulate for the first layer and the f32x4 dot for the second.
+pub fn forwardF32(net: *const Net32, board: Board) f64 {
+    return forwardF32Impl(net, board, width.simd);
+}
+
+fn forwardF32Impl(net: *const Net32, board: Board, comptime simd: bool) f64 {
+    var z1: [h1_size]f32 = net.b1;
+    for (0..core.BoardCellCount) |cell| {
+        const row = cell * levels + levelOf(board[cell / core.BoardSize][cell % core.BoardSize]);
+        if (comptime simd) {
+            accumulateRowsSimdF32(&z1, &net.w1[row]);
+        } else {
+            for (0..h1_size) |i| z1[i] += net.w1[row][i];
+        }
+    }
+    if (comptime feature_count > 0) {
+        const feat = features(board);
+        for (feat, 0..) |f, k| {
+            if (f == 0) continue;
+            const fk: f32 = @floatCast(f);
+            for (0..h1_size) |i| z1[i] += net.wf[k][i] * fk;
+        }
+    }
+    var a1: [h1_size]f32 = undefined;
+    for (0..h1_size) |i| a1[i] = @max(z1[i], 0);
+
+    var out: f32 = net.b3;
+    for (0..h2_size) |j| {
+        var z: f32 = net.b2[j];
+        if (comptime simd) {
+            z += dotSimdF32(&net.w2[j], &a1);
+        } else {
+            for (0..h1_size) |i| z += net.w2[j][i] * a1[i];
+        }
+        out += net.w3[j] * @max(z, 0);
+    }
+    return out;
+}
+
+/// f32 weight file (#348): the same 16-byte header with its own magic, then `Net32`'s bytes.
+pub const f32_file_magic = "2048-NF\x00";
+pub const f32_file_len = header_len + @sizeOf(Net32);
+
+pub fn encodeF32(net: *const Net32) [f32_file_len]u8 {
+    var out: [f32_file_len]u8 = undefined;
+    @memcpy(out[0..8], f32_file_magic);
+    std.mem.writeInt(u32, out[8..12], file_version, .little);
+    std.mem.writeInt(u32, out[12..16], endian_marker, .little);
+    var w = blob.Writer.init(out[header_len..]);
+    for (std.mem.bytesAsSlice(f32, std.mem.asBytes(net))) |weight| w.writeF32(weight);
+    return out;
+}
+
+pub fn decodeF32(bytes: []const u8) !Net32 {
+    if (bytes.len != f32_file_len) return error.WrongWeightFileSize;
+    try checkVersionedHeader(bytes, f32_file_magic, file_version, .{
+        .magic = error.BadWeightMagic,
+        .version = error.UnsupportedWeightVersion,
+        .endian = error.WrongWeightEndianness,
+    });
+    var net: Net32 = undefined;
+    var r = blob.Reader.init(bytes[header_len..]);
+    for (std.mem.bytesAsSlice(f32, std.mem.asBytes(&net))) |*weight| weight.* = try r.readF32();
+    return net;
+}
+
+pub fn saveF32(net: *const Net32, io: std.Io, path: []const u8) !void {
+    const bytes = encodeF32(net);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = &bytes });
+}
+
+pub fn loadF32(net: *Net32, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(f32_file_len + 1));
+    defer gpa.free(bytes);
+    net.* = try decodeF32(bytes);
+}
+
 fn lossOf(net: *const Net, board: Board, target: f64) f64 {
     var cache: Cache = .{};
     const d = forward(net, board, &cache) - target;
@@ -5374,6 +5523,62 @@ test "encodeQuantized writes the int16 weight layout byte for byte (#302)" {
     std.crypto.hash.sha2.Sha256.hash(&bytes, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
     try std.testing.expectEqualStrings("a6660a0c97dd859eeab2500cf2008903f118e64d8e63e14e72653f1bb332e8b2", &hex);
+}
+
+test "the f32 file is half the f64 block and round-trips every weight (#348)" {
+    // 37,057 weights at 4 B instead of 8 B, plus the same 16 B header.
+    try std.testing.expectEqual(@as(usize, 37_057 * @sizeOf(f32) + 16), f32_file_len);
+    // same header, half the payload: 16 + 4 B/weight here, 16 + 8 B/weight in `Net`.
+    try std.testing.expectEqual(header_len + @sizeOf(Net), file_len);
+    try std.testing.expectEqual(header_len + @sizeOf(Net32), f32_file_len);
+    // 8 B per weight in `Net` become 4 B in `Net32`, so the payload halves exactly.
+    try std.testing.expectEqual(header_len + @sizeOf(Net), 2 * (header_len + @sizeOf(Net32)) - header_len);
+
+    const net = try parse(@embedFile("nn_weights.bin"));
+    const narrowed = toF32(&net);
+    const back = try decodeF32(&encodeF32(&narrowed));
+    try std.testing.expectEqualSlices(
+        f32,
+        std.mem.bytesAsSlice(f32, std.mem.asBytes(&narrowed)),
+        std.mem.bytesAsSlice(f32, std.mem.asBytes(&back)),
+    );
+
+    // Narrowing is the only loss: every weight is the f64 one rounded to f32.
+    const wide_values = flatConst(&net);
+    const narrow_values = std.mem.bytesAsSlice(f32, std.mem.asBytes(&back));
+    try std.testing.expectEqual(wide_values.len, narrow_values.len);
+    for (wide_values, narrow_values) |w, n| {
+        try std.testing.expectEqual(@as(f32, @floatCast(w)), n);
+    }
+}
+
+test "forwardF32 agrees with forward on every board of a game (#348)" {
+    const net = try parse(@embedFile("nn_weights.bin"));
+    const net32 = toF32(&net);
+    var prng = std.Random.DefaultPrng.init(9000);
+    const rng = prng.random();
+    var cache: Cache = .{};
+    var worst: f64 = 0;
+    var boards: usize = 0;
+    for (0..2) |_| {
+        var state = core.GameState.gameStart(rng);
+        while (!state.isGameOver()) {
+            const want = forward(&net, state.board, &cache);
+            const got = forwardF32(&net32, state.board);
+            // f32 sums 256 row additions and a 128-term dot; 1e-3 is 1e-4 of a typical value.
+            worst = @max(worst, @abs(got - want));
+            if (comptime width.simd) {
+                // The f32x4 lanes keep separate partial sums, so the vector and scalar f32 paths
+                // differ by rounding only.
+                worst = @max(worst, @abs(forwardF32Impl(&net32, state.board, false) - got));
+            }
+            const dir = bestMoveValue(.{ .single = &net }, state, .greedy) orelse break;
+            _ = state.move(dir, rng);
+            boards += 1;
+        }
+    }
+    try std.testing.expect(boards > 100);
+    try std.testing.expect(worst < 1e-3);
 }
 
 test "quantized round trip keeps every weight within its block step (#170)" {

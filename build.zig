@@ -19,18 +19,39 @@ pub fn build(b: *std.Build) void {
 
     // Width of the value MLP: the hidden layers are compile-time sized, so a capacity sweep is a
     // build option instead of three edited copies (`zig build nn -Dh1=32 -Dh2=16`).
-    const width_opts = b.addOptions();
-    width_opts.addOption(u32, "h1", b.option(u32, "h1", "hidden layer 1 width (default 128, #233)") orelse 128);
-    width_opts.addOption(u32, "h2", b.option(u32, "h2", "hidden layer 2 width (default 32, #233)") orelse 32);
+    const h1_width = b.option(u32, "h1", "hidden layer 1 width (default 128, #233)") orelse 128;
+    const h2_width = b.option(u32, "h2", "hidden layer 2 width (default 32, #233)") orelse 32;
     // Hand-engineered global features on top of the one-hot board: 0 (default) keeps today's
     // 256-input net and file format, 1..6 adds that many of `nn.featureNames` to the input layer.
-    width_opts.addOption(u32, "feat", b.option(u32, "feat", "global board features 0..6 (default 0)") orelse 0);
-    width_opts.addOption(bool, "simd", b.option(bool, "nn-simd", "experiment with SIMD first-layer accumulation (#317)") orelse false);
+    const feat_count = b.option(u32, "feat", "global board features 0..6 (default 0)") orelse 0;
+    const nn_simd = b.option(bool, "nn-simd", "experiment with SIMD first-layer accumulation (#317)") orelse false;
+    // Evaluate the net from f32 weights instead of f64 (#348). The search is unchanged: only the
+    // leaf arithmetic and the bytes it reads differ.
+    const nn_f32 = b.option(bool, "nn-f32", "evaluate the net from f32 weights (#348)") orelse false;
     // The full-game / training regression tests are the slow part of `zig build test`. The
     // pre-push gate passes -Dslow-tests=false to skip them; CI keeps the default (true) and runs
     // everything. A skipped test returns error.SkipZigTest, so the fast tier still compiles the
     // same binary and runs every cheap unit test.
-    width_opts.addOption(bool, "slow_tests", b.option(bool, "slow-tests", "run the slow full-game/training regression tests (default true; pre-push passes false)") orelse true);
+    const slow_tests = b.option(bool, "slow-tests", "run the slow full-game/training regression tests (default true; pre-push passes false)") orelse true;
+
+    const width_opts = b.addOptions();
+    width_opts.addOption(u32, "h1", h1_width);
+    width_opts.addOption(u32, "h2", h2_width);
+    width_opts.addOption(u32, "feat", feat_count);
+    width_opts.addOption(bool, "simd", nn_simd);
+    width_opts.addOption(bool, "f32_weights", nn_f32);
+    width_opts.addOption(bool, "slow_tests", slow_tests);
+
+    // The browser module always ships the f32 leaf with f32x4 lanes (#348): on V8 that is 1.4x fewer
+    // ms/move than f64 with the same moves and 1.2 KB fewer bytes, and f64 SIMD gains nothing. Native
+    // builds keep the flags, so `-Dnn-f32 -Dnn-simd` still reproduce the measurement.
+    const wasm_width_opts = b.addOptions();
+    wasm_width_opts.addOption(u32, "h1", h1_width);
+    wasm_width_opts.addOption(u32, "h2", h2_width);
+    wasm_width_opts.addOption(u32, "feat", feat_count);
+    wasm_width_opts.addOption(bool, "simd", true);
+    wasm_width_opts.addOption(bool, "f32_weights", true);
+    wasm_width_opts.addOption(bool, "slow_tests", slow_tests);
 
     const parallel_mod = b.addModule("parallel", .{
         .root_source_file = b.path("ai/solver/parallel.zig"),
@@ -352,6 +373,24 @@ pub fn build(b: *std.Build) void {
     const nn_quant_step = b.step("nn-quant", "Quantize the value net to int16 and measure the error (#170)");
     nn_quant_step.dependOn(&nn_quant_cmd.step);
 
+    // The f32 file is the #348 experiment: same weights, half the bytes, `Value.f32` instead of `Value.single`.
+    const nn_f32_exe = b.addExecutable(.{
+        .name = "nn-f32",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("ai/solver/nn_f32.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "nn", .module = nn_mod },
+            },
+        }),
+    });
+    const nn_f32_cmd = b.addRunArtifact(nn_f32_exe);
+    nn_f32_cmd.addPassthruArgs();
+    const nn_f32_step = b.step("nn-f32", "Write the f32 value net and measure its speed and accuracy (#348)");
+    nn_f32_step.dependOn(&nn_f32_cmd.step);
+
     const ntuple_tests = b.addTest(.{ .filters = test_filters, .root_module = ntuple_mod });
     const run_ntuple_tests = b.addRunArtifact(ntuple_tests);
 
@@ -467,7 +506,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "game_limit", .module = wasm_game_limit_mod },
             .{ .name = "parallel", .module = wasm_parallel_mod },
             .{ .name = "blob", .module = wasm_blob_mod },
-            .{ .name = "nn_width", .module = width_opts.createModule() },
+            .{ .name = "nn_width", .module = wasm_width_opts.createModule() },
         },
     });
     const wasm_ntuple_mod = b.addModule("ntuple-wasm", .{

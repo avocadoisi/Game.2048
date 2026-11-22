@@ -27,11 +27,16 @@ const usage =
     \\                widetc / widedeep_tc opt into TC(lambda) on wide tables (lambda=0.5, horizon=3, #288).
     \\                maxb / maxbchance / maxbdeep are wide with the max-backup TD target (#131).
     \\                lshape / lshaperesume add one non-rectangular 6-cell L tuple, +64 MiB f32 (#323).
+    \\                four6 / four6stage are the #346 shape: only four six-cell tuples (67.1M
+    \\                entries, 268 MiB f32), not a prefix of the wide set. four6stage also decays lr
+    \\                in stages: 100% to 50% of the games at learning_rate, 50-75% at x0.1, then x0.01.
     \\                resume loads table_path first, then trains train_games more games.
     \\  table_path    file to load (train_games 0) or write (default ai/solver/ntuple_weights.bin);
     \\                experimental learners require a separate path with a distinct filename
     \\                a path ending in .q16.bin reads/writes the int16 quantized format (#129)
     \\  train_seed    seed for self-play games (default 1)
+    \\  checkpoint_every  write `table_path` every N training games to `<path>.<games>[.q16].bin`
+    \\                so a long staged run leaves intermediate tables (default 0, off; #346)
     \\
     \\  Time caps     60 s/game for training, 30 min/game for evaluation. Append +xtime to variant
     \\                for the single extended retry: 300 s / 120 min. Unfinished games are neither
@@ -50,7 +55,8 @@ fn trainingPathAllowed(
     table_path: []const u8,
 ) !bool {
     // The summed read-out (#322) changes what the weights mean, so it needs a fresh candidate too.
-    const experimental = variant.learner != .td_zero or variant.symmetry != .canonical;
+    // `four6` (#346) is a different pattern set with a different table layout: never the shipped file.
+    const experimental = variant.learner != .td_zero or variant.symmetry != .canonical or variant.set == .four6;
     if (train_games == 0 or !experimental) return true;
     const output_path = try std.fs.path.resolveAlloc(allocator, &.{ cwd, table_path });
     defer allocator.free(output_path);
@@ -71,6 +77,8 @@ const default_eval_seed: u64 = 1000;
 const default_learning_rate: f64 = 0.01;
 /// Positional arg 7, after `table_path`, appended so existing command lines keep their meaning.
 const default_train_seed: u64 = 1;
+/// Positional arg 8, after `train_seed`: checkpoint interval in games (0 disables, #346).
+const default_checkpoint_every: u32 = 0;
 
 const Eval = struct {
     name: []const u8,
@@ -105,6 +113,16 @@ fn timeLimit(result: anytype, phase: game_limit.RunPhase, extended: bool) noretu
     std.process.exit(1);
 }
 
+/// Checkpoint path for a long staged run: strip a trailing `.bin` and append `.<games>` so the
+/// quantized suffix (`.q16.bin`) survives and the loader still picks the right format (#346).
+fn checkpointPath(buf: []u8, table_path: []const u8, games: u32, quantized: bool) ![]const u8 {
+    const base = if (std.mem.endsWith(u8, table_path, ".bin")) table_path[0 .. table_path.len - ".bin".len] else table_path;
+    return if (quantized)
+        std.fmt.bufPrint(buf, "{s}.{d}.q16.bin", .{ base, games })
+    else
+        std.fmt.bufPrint(buf, "{s}.{d}.bin", .{ base, games });
+}
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const train_games: u32 = try cli.argOr(u32, args, 1, default_train_games);
@@ -121,7 +139,8 @@ pub fn main(init: std.process.Init) !void {
     const mode = variant.mode;
     const table_path: []const u8 = try cli.argOr([]const u8, args, 6, default_table_path);
     const train_seed: u64 = try cli.argOr(u64, args, 7, default_train_seed);
-    if (args.len > 8 or eval_games == 0) {
+    const checkpoint_every: u32 = try cli.argOr(u32, args, 8, default_checkpoint_every);
+    if (args.len > 9 or eval_games == 0) {
         std.debug.print("{s}", .{usage});
         return;
     }
@@ -175,10 +194,14 @@ pub fn main(init: std.process.Init) !void {
         const start = std.Io.Clock.awake.now(init.io);
         var total_moves: u64 = 0;
         var last_score: u32 = 0;
+        if (variant.lr_schedule == .staged) std.debug.print("lr schedule: staged (base {d}, x0.1 after 50%, x0.01 after 75%)\n", .{learning_rate});
         for (0..train_games) |g| {
-            // linear decay to 10% of the start rate, same schedule as nn_main
+            // `linear` decays to 10% of the start rate, same schedule as nn_main (#346 adds `staged`)
             const frac = @as(f64, @floatFromInt(g)) / @as(f64, @floatFromInt(train_games));
-            const lr = learning_rate * (1 - 0.9 * frac);
+            const lr = switch (variant.lr_schedule) {
+                .linear => learning_rate * (1 - 0.9 * frac),
+                .staged => if (frac < 0.5) learning_rate else if (frac < 0.75) learning_rate * 0.1 else learning_rate * 0.01,
+            };
             const game = switch (variant.learner) {
                 .td_zero => ntuple.trainGameWithOpts(&net, rng.random(), lr, mode, variant.target, game_options),
                 .delayed_td_lambda => ntuple.trainGameDelayedTDLambdaOpts(&net, rng.random(), lr, mode, game_options),
@@ -192,6 +215,17 @@ pub fn main(init: std.process.Init) !void {
             total_moves += game.moves;
             if ((g + 1) % 5000 == 0) {
                 std.debug.print("train {d}/{d} last game score {d}\n", .{ g + 1, train_games, last_score });
+            }
+            // Intermediate tables for a long staged run: `<path>.<games>[.q16].bin` (#346).
+            if (checkpoint_every > 0 and (g + 1) % checkpoint_every == 0 and g + 1 != train_games) {
+                var path_buf: [1024]u8 = undefined;
+                const ckpt = try checkpointPath(&path_buf, table_path, @intCast(g + 1), quantized_path);
+                if (quantized_path) {
+                    var q = try ntuple.quantize(init.gpa, &net);
+                    defer q.deinit(init.gpa);
+                    try ntuple.saveQuantized(&q, init.io, init.gpa, ckpt);
+                } else try ntuple.save(&net, init.io, init.gpa, ckpt);
+                std.debug.print("checkpoint {s}\n", .{ckpt});
             }
         }
         const elapsed = start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
