@@ -38,6 +38,24 @@ pub const patterns = [_]Pattern{
     .{ .len = 6, .cells = .{ 0, 1, 2, 4, 8, 12 } }, // L, arms 3x4 on the top-left corner
 };
 pub const pattern_count = patterns.len;
+/// The `.lshape` set is `patterns[0..lshape_count]`; `.light`/`.full`/`.wide` are shorter prefixes.
+pub const lshape_count = pattern_count;
+
+/// `four6` (#346): the whole net is four six-cell tuples, the shape Guei et al. (arXiv 2111.11090)
+/// reach 251,920 with over 100M episodes. None of these is congruent, under the 8 dihedral
+/// transforms, to the 2x3 rectangles (patterns 5 and 6), the L (pattern 7), or each other;
+/// `test "four6 is four new six-cell orbits"` fixes that.
+pub const four6_patterns = [_]Pattern{
+    // 4+2 chord: a full top row plus the two left cells of the row below.
+    .{ .len = 6, .cells = .{ 0, 1, 2, 3, 4, 5 } },
+    // 3+3 zigzag: top row cols 0-2, next row cols 1-3.
+    .{ .len = 6, .cells = .{ 0, 1, 2, 5, 6, 7 } },
+    // 2+2+2 band: cols 0-1, 1-2 and 2-3 on rows 0, 1 and 2.
+    .{ .len = 6, .cells = .{ 0, 1, 5, 6, 10, 11 } },
+    // 3+2+1 wedge: top row cols 0-2, next row cols 0-1, then the cell below col 1.
+    .{ .len = 6, .cells = .{ 0, 1, 2, 4, 5, 9 } },
+};
+pub const four6_count = four6_patterns.len;
 
 /// The 8 dihedral transforms of a cell index: rotations and mirrors of the 4x4 board.
 pub fn transformCell(t: usize, cell: usize) usize {
@@ -77,19 +95,25 @@ const SlotTable = struct {
     counts: [core.BoardCellCount]u8,
 };
 
-/// cell -> (tuple, shift) lookup, built once at compile time so a board needs one 16-cell scan.
-pub const slot_table = blk: {
+/// cell -> (tuple, shift) lookup for `list`, built at compile time so a board needs one 16-cell
+/// scan. Each active pattern set gets its own table (`patterns` and `four6_patterns`).
+fn buildSlotTable(comptime list: []const Pattern) SlotTable {
     @setEvalBranchQuota(200_000);
     var t: SlotTable = undefined;
     for (&t.counts) |*c| c.* = 0;
-    for (patterns, 0..) |pat, p| for (0..8) |o| for (0..pat.len) |j| {
+    for (list, 0..) |pat, p| for (0..8) |o| for (0..pat.len) |j| {
         const cell = transformCell(o, pat.cells[j]);
         if (t.counts[cell] >= max_slots) @compileError("ntuple slot table overflow");
         t.items[cell][t.counts[cell]] = .{ .acc = @intCast(p * 8 + o), .shift = @intCast(4 * j) };
         t.counts[cell] += 1;
     };
-    break :blk t;
-};
+    return t;
+}
+
+/// The default (8-pattern prefix) lookup, shared by every shipped table.
+pub const slot_table = buildSlotTable(&patterns);
+/// The `four6` lookup: four six-cell tuples only (#346).
+const four6_slot_table = buildSlotTable(&four6_patterns);
 
 /// One canonical table index per base pattern (shared by all 8 transforms of that pattern).
 pub const Indices = [pattern_count]u32;
@@ -112,36 +136,51 @@ pub const Entries = struct {
     summed: TransformIndices,
 };
 
-fn transformIndices(board: Board) TransformIndices {
-    var acc: [pattern_count * 8]u32 = @splat(0);
+fn transformIndicesWith(comptime slots: SlotTable, comptime n: usize, board: Board) [n][8]u32 {
+    var acc: [n * 8]u32 = @splat(0);
     for (0..core.BoardCellCount) |cell| {
         const level: u32 = @intCast(levelOf(board[cell / core.BoardSize][cell % core.BoardSize]));
-        for (slot_table.items[cell][0..slot_table.counts[cell]]) |slot| {
+        for (slots.items[cell][0..slots.counts[cell]]) |slot| {
             acc[slot.acc] |= level << slot.shift;
         }
     }
-    var out: TransformIndices = undefined;
-    for (0..pattern_count) |p| out[p] = acc[p * 8 ..][0..8].*;
+    var out: [n][8]u32 = undefined;
+    for (0..n) |p| out[p] = acc[p * 8 ..][0..8].*;
     return out;
 }
 
-pub fn entriesFor(board: Board) Entries {
-    const summed = transformIndices(board);
-    var canonical: Indices = undefined;
-    for (0..pattern_count) |p| {
+/// Both read-outs for the first `n` patterns of `slots`; entries of inactive patterns stay zero so
+/// a `four6` net can share the fixed-size `Entries` arrays.
+pub fn entriesOn(comptime slots: SlotTable, comptime n: usize, board: Board) Entries {
+    const summed = transformIndicesWith(slots, n, board);
+    var e: Entries = std.mem.zeroes(Entries);
+    for (0..n) |p| {
         var best = summed[p][0];
         for (summed[p][1..]) |idx| best = @min(best, idx);
-        canonical[p] = best;
+        e.canonical[p] = best;
     }
-    return .{ .canonical = canonical, .summed = summed };
+    for (0..n) |p| e.summed[p] = summed[p];
+    return e;
+}
+
+fn transformIndices(board: Board) TransformIndices {
+    return transformIndicesWith(slot_table, pattern_count, board);
+}
+
+pub fn entriesFor(board: Board) Entries {
+    return entriesOn(slot_table, pattern_count, board);
 }
 
 pub fn indices(board: Board) Indices {
     return entriesFor(board).canonical;
 }
 
+pub fn tableLenOf(pat: Pattern) usize {
+    return @as(usize, 1) << @intCast(4 * pat.len);
+}
+
 pub fn tableLen(p: usize) usize {
-    return @as(usize, 1) << @intCast(4 * patterns[p].len);
+    return tableLenOf(patterns[p]);
 }
 
 pub const total_entries = blk: {
@@ -161,7 +200,7 @@ pub const offsets = blk: {
 /// Table set: `.light` keeps only the five 4-tuples, `.full` adds the first 2x3 6-tuple (the
 /// committed `ntuple_weights.bin` and every existing policy), `.wide` adds both 2x3 orbits, and
 /// `.lshape` adds the single L-shaped 6-tuple on top of `.wide` (#323).
-pub const Set = enum { light, full, wide, lshape };
+pub const Set = enum { light, full, wide, lshape, four6 };
 
 pub const light_count = 5;
 pub const full_count = 6;
@@ -169,28 +208,49 @@ pub const full_count = 6;
 pub const wide_count = 7;
 
 pub fn countOf(set: Set) usize {
+    return activePatterns(set).len;
+}
+
+/// The base patterns of `set`, in table order. `.four6` is not a prefix of `patterns` (#346).
+pub fn activePatterns(set: Set) []const Pattern {
     return switch (set) {
-        .light => light_count,
-        .full => full_count,
-        .wide => wide_count,
-        .lshape => pattern_count,
+        .light => patterns[0..light_count],
+        .full => patterns[0..full_count],
+        .wide => patterns[0..wide_count],
+        .lshape => patterns[0..lshape_count],
+        .four6 => &four6_patterns,
     };
 }
 
-fn entriesOf(n: usize) usize {
+/// Byte offsets of each table in flat storage for `active`; only the first `active.len` are set.
+pub fn offsetsOf(active: []const Pattern) [pattern_count]usize {
+    var off: [pattern_count]usize = @splat(0);
+    for (active, 0..) |_, p| {
+        if (p > 0) off[p] = off[p - 1] + tableLenOf(active[p - 1]);
+    }
+    return off;
+}
+
+fn entriesOf(active: []const Pattern) usize {
     var entries: usize = 0;
-    for (0..n) |p| entries += tableLen(p);
+    for (active) |pat| entries += tableLenOf(pat);
     return entries;
 }
 
 pub fn entryCount(set: Set) usize {
-    return entriesOf(countOf(set));
+    return entriesOf(activePatterns(set));
 }
 
 pub const TupleNet = struct {
     storage: []f32,
-    /// Number of active patterns (a prefix of `patterns`); `.light` stops before the 6-tuple.
+    /// Number of active patterns (a prefix of `patterns`, or all of `four6_patterns`).
     count: usize,
+    /// The active base patterns, in table order (#346 decouples this from the `patterns` prefix).
+    active: []const Pattern = patterns[0..full_count],
+    /// Offsets of each active table inside `storage`; only the first `count` are meaningful.
+    off: [pattern_count]usize = offsets,
+    /// True when `active` is `four6_patterns`, which needs its own slot table.
+    four6: bool = false,
     /// Read-out of the 8 dihedral transforms; `.canonical` is the shipped default (#322 opt-in).
     symmetry: Symmetry = .canonical,
 
@@ -199,26 +259,40 @@ pub const TupleNet = struct {
     }
 
     pub fn initWith(gpa: std.mem.Allocator, set: Set) !TupleNet {
-        return initCount(gpa, countOf(set));
+        return initPatterns(gpa, activePatterns(set));
     }
 
-    fn initCount(gpa: std.mem.Allocator, n: usize) !TupleNet {
-        const storage = try gpa.alloc(f32, entriesOf(n));
+    fn initPatterns(gpa: std.mem.Allocator, active: []const Pattern) !TupleNet {
+        const storage = try gpa.alloc(f32, entriesOf(active));
         @memset(storage, 0);
-        return .{ .storage = storage, .count = n };
+        return .{
+            .storage = storage,
+            .count = active.len,
+            .active = active,
+            .off = offsetsOf(active),
+            .four6 = active.ptr == @as([*]const Pattern, &four6_patterns),
+        };
     }
 
     pub fn deinit(self: *TupleNet, gpa: std.mem.Allocator) void {
         gpa.free(self.storage);
     }
 
+    /// Both read-outs of `board` for this net's pattern set (`four6` uses its own slot table).
+    pub fn entries(self: *const TupleNet, board: Board) Entries {
+        return if (self.four6)
+            entriesOn(four6_slot_table, four6_count, board)
+        else
+            entriesFor(board);
+    }
+
     pub fn table(self: *TupleNet, p: usize) []f32 {
-        return self.storage[offsets[p]..][0..tableLen(p)];
+        return self.storage[self.off[p]..][0..tableLenOf(self.active[p])];
     }
 
     pub fn value(self: *const TupleNet, idx: Indices) f64 {
         var v: f64 = 0;
-        for (0..self.count) |p| v += self.storage[offsets[p] + idx[p]];
+        for (0..self.count) |p| v += self.storage[self.off[p] + idx[p]];
         return v;
     }
 
@@ -226,7 +300,7 @@ pub const TupleNet = struct {
     pub fn valueSummed(self: *const TupleNet, all: TransformIndices) f64 {
         var v: f64 = 0;
         for (0..self.count) |p| {
-            for (all[p]) |idx| v += self.storage[offsets[p] + idx];
+            for (all[p]) |idx| v += self.storage[self.off[p] + idx];
         }
         return v;
     }
@@ -240,13 +314,13 @@ pub const TupleNet = struct {
     }
 
     pub fn eval(self: *const TupleNet, board: Board) f64 {
-        return self.valueOf(entriesFor(board));
+        return self.valueOf(self.entries(board));
     }
 
     /// Apply a precomputed TD error equally across each active tuple's touched weight.
     fn applyDelta(self: *TupleNet, idx: Indices, delta: f64, lr: f64) void {
         const step: f32 = @floatCast(lr * delta / @as(f64, @floatFromInt(self.count)));
-        for (0..self.count) |p| self.storage[offsets[p] + idx[p]] += step;
+        for (0..self.count) |p| self.storage[self.off[p] + idx[p]] += step;
     }
 
     /// Summed-read-out TD step: a gradient step on `valueSummed` with alpha = lr / (8 * n_tuples).
@@ -257,7 +331,7 @@ pub const TupleNet = struct {
     fn applySummedDelta(self: *TupleNet, all: TransformIndices, delta: f64, lr: f64) void {
         const step: f32 = @floatCast(lr * delta / (@as(f64, @floatFromInt(self.count)) * 8));
         for (0..self.count) |p| {
-            for (all[p]) |idx| self.storage[offsets[p] + idx] += step;
+            for (all[p]) |idx| self.storage[self.off[p] + idx] += step;
         }
     }
 
@@ -419,15 +493,18 @@ pub const Quantized = struct {
     /// Value = `storage[i] * scales[p]` for pattern `p`; 0 for an all-zero table.
     scales: [pattern_count]f64 = @splat(0),
     count: usize,
+    /// Active patterns and their table offsets; mirrors the f32 net it came from (#346).
+    active: []const Pattern = patterns[0..full_count],
+    off: [pattern_count]usize = offsets,
 
     pub fn initWith(gpa: std.mem.Allocator, set: Set) !Quantized {
-        return initCount(gpa, countOf(set));
+        return initPatterns(gpa, activePatterns(set));
     }
 
-    fn initCount(gpa: std.mem.Allocator, n: usize) !Quantized {
-        const storage = try gpa.alloc(i16, entriesOf(n));
+    fn initPatterns(gpa: std.mem.Allocator, active: []const Pattern) !Quantized {
+        const storage = try gpa.alloc(i16, entriesOf(active));
         @memset(storage, 0);
-        return .{ .storage = storage, .count = n };
+        return .{ .storage = storage, .count = active.len, .active = active, .off = offsetsOf(active) };
     }
 
     pub fn deinit(self: *Quantized, gpa: std.mem.Allocator) void {
@@ -436,7 +513,7 @@ pub const Quantized = struct {
 
     pub fn value(self: *const Quantized, idx: Indices) f64 {
         var v: f64 = 0;
-        for (0..self.count) |p| v += @as(f64, @floatFromInt(self.storage[offsets[p] + idx[p]])) * self.scales[p];
+        for (0..self.count) |p| v += @as(f64, @floatFromInt(self.storage[self.off[p] + idx[p]])) * self.scales[p];
         return v;
     }
 
@@ -450,7 +527,7 @@ fn tableScales(net: *const TupleNet) [pattern_count]f64 {
     var scales: [pattern_count]f64 = @splat(0);
     for (0..net.count) |p| {
         var max: f32 = 0;
-        for (net.storage[offsets[p]..][0..tableLen(p)]) |w| max = @max(max, @abs(w));
+        for (net.storage[net.off[p]..][0..tableLenOf(net.active[p])]) |w| max = @max(max, @abs(w));
         scales[p] = if (max == 0) 0 else @as(f64, max) / 32767;
     }
     return scales;
@@ -467,11 +544,12 @@ fn quantizeValues(values: []const f32, scale: f64, out: []i16) void {
 
 /// Quantize every active table into a fresh int16 buffer.
 pub fn quantize(gpa: std.mem.Allocator, net: *const TupleNet) !Quantized {
-    var q = try Quantized.initCount(gpa, net.count);
+    var q = try Quantized.initPatterns(gpa, net.active);
     errdefer q.deinit(gpa);
     q.scales = tableScales(net);
     for (0..net.count) |p| {
-        quantizeValues(net.storage[offsets[p]..][0..tableLen(p)], q.scales[p], q.storage[offsets[p]..][0..tableLen(p)]);
+        const len = tableLenOf(net.active[p]);
+        quantizeValues(net.storage[net.off[p]..][0..len], q.scales[p], q.storage[q.off[p]..][0..len]);
     }
     return q;
 }
@@ -481,8 +559,9 @@ pub fn quantize(gpa: std.mem.Allocator, net: *const TupleNet) !Quantized {
 pub fn dequantizeInto(q: *const Quantized, net: *TupleNet) void {
     std.debug.assert(q.count == net.count);
     for (0..q.count) |p| {
+        const len = tableLenOf(net.active[p]);
         const scale: f32 = @floatCast(q.scales[p]);
-        for (q.storage[offsets[p]..][0..tableLen(p)], net.storage[offsets[p]..][0..tableLen(p)]) |v, *w| {
+        for (q.storage[q.off[p]..][0..len], net.storage[net.off[p]..][0..len]) |v, *w| {
             w.* = @as(f32, @floatFromInt(v)) * scale;
         }
     }
@@ -490,19 +569,54 @@ pub fn dequantizeInto(q: *const Quantized, net: *TupleNet) void {
 
 pub const quantized_magic = "2048-NQ\x00";
 
-/// File length for `n` quantized tables.
+/// File length for the `active` tables.
+pub fn quantizedFileLenOf(active: []const Pattern) usize {
+    return header_len + active.len * 4 + active.len * 8 + entriesOf(active) * 2;
+}
+
+/// File length for `n` quantized prefix tables.
 pub fn quantizedFileLen(n: usize) usize {
-    return header_len + n * 4 + n * 8 + entriesOf(n) * 2;
+    return quantizedFileLenOf(patterns[0..n]);
+}
+
+/// Pattern set whose table lengths match a file header, so a `four6` table loads back as `four6`
+/// instead of being mistaken for a prefix of `patterns` (#346). Any shorter prefix of `patterns`
+/// is accepted too, so single-table test files and pre-existing partial dumps still load.
+fn patternsFromLens(lens: []const u32) ?[]const Pattern {
+    const all = [_]Set{ .light, .full, .wide, .lshape, .four6 };
+    for (all) |s| {
+        const active = activePatterns(s);
+        if (lensMatch(active, lens)) return active;
+    }
+    if (lens.len <= pattern_count and lensMatch(patterns[0..lens.len], lens)) return patterns[0..lens.len];
+    return null;
+}
+
+fn lensMatch(active: []const Pattern, lens: []const u32) bool {
+    if (active.len != lens.len) return false;
+    for (active, lens) |pat, n| {
+        if (tableLenOf(pat) != n) return false;
+    }
+    return true;
+}
+
+/// Largest table file any supported set can produce, for `readFileAlloc` limits.
+pub fn maxFileLen() usize {
+    return @max(fileLen(pattern_count), fileLenOf(&four6_patterns));
+}
+
+pub fn maxQuantizedFileLen() usize {
+    return @max(quantizedFileLen(pattern_count), quantizedFileLenOf(&four6_patterns));
 }
 
 /// File: magic, version, endianness marker, pattern count, per-table lengths (u32 LE), per-table
 /// scales (f64 LE), then the i16 LE payload.
 pub fn encodeQuantized(gpa: std.mem.Allocator, q: *const Quantized) ![]u8 {
-    const bytes = try gpa.alloc(u8, quantizedFileLen(q.count));
+    const bytes = try gpa.alloc(u8, quantizedFileLenOf(q.active));
     var w = blob.Writer.init(bytes);
     blob.writeHeader(&w, quantized_magic, file_version);
     w.writeU32(@intCast(q.count));
-    for (0..q.count) |p| w.writeU32(@intCast(tableLen(p)));
+    for (0..q.count) |p| w.writeU32(@intCast(tableLenOf(q.active[p])));
     for (0..q.count) |p| w.writeF64(q.scales[p]);
     for (q.storage) |value| w.writeI16(value);
     return bytes;
@@ -518,11 +632,14 @@ pub fn parseQuantized(gpa: std.mem.Allocator, bytes: []const u8) !Quantized {
     });
     const n: usize = try r.readU32();
     if (n == 0 or n > pattern_count) return error.WrongPatternCount;
-    if (bytes.len != quantizedFileLen(n)) return error.WrongTableFileSize;
+    var lens: [pattern_count]u32 = @splat(0);
     for (0..n) |p| {
-        if (try r.readU32() != tableLen(p)) return error.WrongTableLength;
+        lens[p] = try r.readU32();
+        if (lens[p] == 0) return error.WrongTableLength;
     }
-    var q = try Quantized.initCount(gpa, n);
+    const active = patternsFromLens(lens[0..n]) orelse return error.WrongTableLength;
+    if (bytes.len != quantizedFileLenOf(active)) return error.WrongTableFileSize;
+    var q = try Quantized.initPatterns(gpa, active);
     errdefer q.deinit(gpa);
     for (0..n) |p| q.scales[p] = try r.readF64();
     for (q.storage) |*value| value.* = try r.readI16();
@@ -536,7 +653,7 @@ pub fn saveQuantized(q: *const Quantized, io: std.Io, gpa: std.mem.Allocator, pa
 }
 
 pub fn loadQuantized(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !Quantized {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(quantizedFileLen(pattern_count) + 1));
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(maxQuantizedFileLen() + 1));
     defer gpa.free(bytes);
     return parseQuantized(gpa, bytes);
 }
@@ -544,18 +661,24 @@ pub fn loadQuantized(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !Quan
 pub const file_magic = "2048-NT\x00";
 pub const file_version: u32 = 1;
 const header_len: usize = 8 + 4 + 4 + 4;
-/// File length for `n` tables; `.wide` is `fileLen(wide_count)`, `.lshape` is `fileLen(pattern_count)`.
+/// File length for `active` tables; `.wide` is `fileLen(wide_count)`, `.four6` is
+/// `fileLenOf(&four6_patterns)` (#346).
+pub fn fileLenOf(active: []const Pattern) usize {
+    return header_len + active.len * 4 + entriesOf(active) * 4;
+}
+
+/// File length for `n` prefix tables.
 pub fn fileLen(n: usize) usize {
-    return header_len + n * 4 + entriesOf(n) * 4;
+    return fileLenOf(patterns[0..n]);
 }
 
 /// File: magic, version, endianness marker, pattern count, per-table lengths (u32 LE), then f32 LE payload.
 pub fn encode(gpa: std.mem.Allocator, net: *const TupleNet) ![]u8 {
-    const bytes = try gpa.alloc(u8, fileLen(net.count));
+    const bytes = try gpa.alloc(u8, fileLenOf(net.active));
     var w = blob.Writer.init(bytes);
     blob.writeHeader(&w, file_magic, file_version);
     w.writeU32(@intCast(net.count));
-    for (0..net.count) |p| w.writeU32(@intCast(tableLen(p)));
+    for (0..net.count) |p| w.writeU32(@intCast(tableLenOf(net.active[p])));
     for (net.storage) |value| w.writeF32(value);
     return bytes;
 }
@@ -570,11 +693,14 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !TupleNet {
     });
     const n: usize = try r.readU32();
     if (n == 0 or n > pattern_count) return error.WrongPatternCount;
-    if (bytes.len != fileLen(n)) return error.WrongTableFileSize;
+    var lens: [pattern_count]u32 = @splat(0);
     for (0..n) |p| {
-        if (try r.readU32() != tableLen(p)) return error.WrongTableLength;
+        lens[p] = try r.readU32();
+        if (lens[p] == 0) return error.WrongTableLength;
     }
-    var net = try TupleNet.initCount(gpa, n);
+    const active = patternsFromLens(lens[0..n]) orelse return error.WrongTableLength;
+    if (bytes.len != fileLenOf(active)) return error.WrongTableFileSize;
+    var net = try TupleNet.initPatterns(gpa, active);
     errdefer net.deinit(gpa);
     for (net.storage) |*value| value.* = try r.readF32();
     return net;
@@ -587,10 +713,10 @@ pub fn save(net: *const TupleNet, io: std.Io, gpa: std.mem.Allocator, path: []co
 }
 
 pub fn load(net: *TupleNet, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(fileLen(pattern_count) + 1));
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(maxFileLen() + 1));
     defer gpa.free(bytes);
-    // A table from the other `Set` has a different length; refuse it instead of overrunning.
-    if (bytes.len != fileLen(net.count)) return error.TableSizeMismatch;
+    // A table from another `Set` has a different length; refuse it instead of overrunning.
+    if (bytes.len != fileLenOf(net.active)) return error.TableSizeMismatch;
     var parsed = try parse(gpa, bytes);
     defer parsed.deinit(gpa);
     @memcpy(net.storage, parsed.storage);
@@ -609,6 +735,11 @@ pub const Mode = enum {
 /// afterstate on the post-spawn board (`r + max_a V(after(s', a))`, the two-stage target).
 pub const Target = enum { on_policy, max_backup };
 
+/// How the runner decays the learning rate over the training games. `linear` is the shipped
+/// 1 -> 0.1 schedule; `staged` is the #346 schedule for very long runs (full rate for the first
+/// half, x0.1 in the third quarter, x0.01 for the last quarter).
+pub const LrSchedule = enum { linear, staged };
+
 /// Learning algorithm selected by the runner; TD(0) stays the default.
 pub const Learner = enum { td_zero, delayed_td_lambda, temporal_coherence };
 
@@ -621,6 +752,7 @@ pub const Variant = struct {
     target: Target = .on_policy,
     /// `.summed` is the #322 opt-in; every shipped table and the default remain `.canonical`.
     symmetry: Symmetry = .canonical,
+    lr_schedule: LrSchedule = .linear,
     resume_from_file: bool = false,
 };
 
@@ -644,6 +776,8 @@ pub fn parseVariant(name: []const u8) ?Variant {
     if (std.mem.eql(u8, name, "widedeep")) return .{ .mode = .deep, .set = .wide };
     if (std.mem.eql(u8, name, "lshape")) return .{ .set = .lshape };
     if (std.mem.eql(u8, name, "lshaperesume")) return .{ .resume_from_file = true, .set = .lshape };
+    if (std.mem.eql(u8, name, "four6")) return .{ .set = .four6 };
+    if (std.mem.eql(u8, name, "four6stage")) return .{ .set = .four6, .lr_schedule = .staged };
     return null;
 }
 
@@ -689,7 +823,7 @@ fn pickMove(net: *const TupleNet, state: core.GameState) ?Pick {
         var next = state;
         const moved = next.slide(d);
         if (!moved.changed) continue;
-        const entries = entriesFor(next.board);
+        const entries = net.entries(next.board);
         const pick: Pick = .{
             .dir = d,
             .entries = entries,
@@ -731,7 +865,7 @@ fn chanceMove(net: *const TupleNet, state: core.GameState) ?Pick {
         const chance = if (empties == 0) bestAfterValue(net, moved) else total / empties;
         const value = @as(f64, @floatFromInt(result.score_delta)) / reward_scale + chance;
         if (best == null or value > best_value) {
-            const entries = entriesFor(moved.board);
+            const entries = net.entries(moved.board);
             best = .{
                 .dir = d,
                 .entries = entries,
@@ -800,7 +934,7 @@ fn deepMove(net: *const TupleNet, state: core.GameState, stats: *Stats) ?Pick {
         if (!moved.changed) continue;
         const v = @as(f64, @floatFromInt(moved.score_delta)) / reward_scale + search.chance(next, 2);
         if (best == null or v > best_value) {
-            const entries = entriesFor(next.board);
+            const entries = net.entries(next.board);
             best = .{
                 .dir = d,
                 .entries = entries,
@@ -1338,7 +1472,7 @@ test "a 7-table wide file written before the L-shape still loads (#323)" {
 
 test "encode writes the f32 table layout byte for byte (#302)" {
     const gpa = std.testing.allocator;
-    var net = try TupleNet.initCount(gpa, 1);
+    var net = try TupleNet.initPatterns(gpa, patterns[0..1]);
     defer net.deinit(gpa);
     for (net.storage, 0..) |*value, i| value.* = @floatFromInt(@as(i32, @intCast(i % 11)) - 5);
 
@@ -1360,7 +1494,7 @@ test "encode writes the f32 table layout byte for byte (#302)" {
 
 test "encodeQuantized writes the int16 table layout byte for byte (#302)" {
     const gpa = std.testing.allocator;
-    var q = try Quantized.initCount(gpa, 1);
+    var q = try Quantized.initPatterns(gpa, patterns[0..1]);
     defer q.deinit(gpa);
     q.scales[0] = 1.0;
     for (q.storage, 0..) |*value, i| value.* = @intCast(@as(i32, @intCast(i % 3001)) - 1500);
@@ -1384,7 +1518,7 @@ test "encodeQuantized writes the int16 table layout byte for byte (#302)" {
 
 test "parse rejects a foreign magic, another version, a wrong length and a wrong size (#302)" {
     const gpa = std.testing.allocator;
-    var net = try TupleNet.initCount(gpa, 1);
+    var net = try TupleNet.initPatterns(gpa, patterns[0..1]);
     defer net.deinit(gpa);
     const full = try encode(gpa, &net);
     defer gpa.free(full);
@@ -1419,7 +1553,7 @@ test "parse rejects a foreign magic, another version, a wrong length and a wrong
 
 test "parseQuantized rejects the same broken headers as parse (#302)" {
     const gpa = std.testing.allocator;
-    var q = try Quantized.initCount(gpa, 1);
+    var q = try Quantized.initPatterns(gpa, patterns[0..1]);
     defer q.deinit(gpa);
     q.scales[0] = 1.0;
     const full = try encodeQuantized(gpa, &q);
@@ -1560,7 +1694,7 @@ test "parseQuantized rejects short buffers and the float format (#129)" {
 
 test "quantized eval reproduces the float table it came from (#129)" {
     const gpa = std.testing.allocator;
-    var net = try TupleNet.initCount(gpa, 1);
+    var net = try TupleNet.initPatterns(gpa, patterns[0..1]);
     defer net.deinit(gpa);
     for (net.storage, 0..) |*w, i| w.* = @as(f32, @floatFromInt(i % 977)) - 300;
 
@@ -1625,7 +1759,7 @@ fn trainTdLambdaReference(net: *TupleNet, states: []const Indices, deltas: []con
 
 test "temporal coherence scales updates by accumulated signed versus absolute error (#288)" {
     const gpa = std.testing.allocator;
-    var net = try TupleNet.initCount(gpa, 1);
+    var net = try TupleNet.initPatterns(gpa, patterns[0..1]);
     defer net.deinit(gpa);
     var tc = try TemporalCoherence.init(gpa, &net);
     defer tc.deinit(gpa);
@@ -1651,7 +1785,7 @@ test "temporal coherence scales updates by accumulated signed versus absolute er
 
 test "temporal coherence trace stops propagating beyond the configured horizon (#288)" {
     const gpa = std.testing.allocator;
-    var net = try TupleNet.initCount(gpa, 1);
+    var net = try TupleNet.initPatterns(gpa, patterns[0..1]);
     defer net.deinit(gpa);
     var tc = try TemporalCoherence.init(gpa, &net);
     defer tc.deinit(gpa);
@@ -1712,4 +1846,96 @@ test "trainGame keeps the on-policy target and max backup differs from it (#131)
 
     try std.testing.expectEqualSlices(f32, a.storage, b.storage);
     try std.testing.expect(!std.mem.eql(f32, a.storage, c.storage));
+}
+
+test "four6 is four new six-cell orbits (#346)" {
+    // Orbit size 8: every dihedral transform of each pattern indexes a different tuple.
+    for (four6_patterns) |pat| try std.testing.expectEqual(@as(u8, 6), pat.len);
+    for (four6_patterns) |pat| {
+        var sets: [8][6]u8 = undefined;
+        for (0..8) |t| {
+            for (pat.cells[0..6], 0..) |cell, j| sets[t][j] = @intCast(transformCell(t, cell));
+            std.mem.sort(u8, sets[t][0..6], {}, std.sort.asc(u8));
+        }
+        var distinct: usize = 0;
+        for (0..8) |a| {
+            var dup = false;
+            for (0..a) |b| {
+                if (std.mem.eql(u8, sets[a][0..6], sets[b][0..6])) dup = true;
+            }
+            if (!dup) distinct += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 8), distinct);
+    }
+    // No four6 pattern shares an orbit with the 2x3 rectangles, the L, or another four6 pattern:
+    // if it did, both would index the same table and the set would be smaller than four tables.
+    const existing = [_]usize{ 5, 6, pattern_count - 1 };
+    for (four6_patterns, 0..) |pat, p| {
+        for (existing) |e| try std.testing.expect(!sameOrbit(patterns[e].cells[0..6], pat.cells[0..6]));
+        for (four6_patterns[0..p]) |earlier| try std.testing.expect(!sameOrbit(earlier.cells[0..6], pat.cells[0..6]));
+    }
+}
+
+test "the four6 set is four 16^6 tables and a self-describing file (#346)" {
+    try std.testing.expectEqual(@as(usize, 4 * 16_777_216), entryCount(.four6));
+    try std.testing.expectEqual(@as(usize, four6_count), countOf(.four6));
+    // f32 268.4 MiB, int16 134.2 MiB: native-only, the distillation in #347 is what ships.
+    try std.testing.expectEqual(@as(usize, 268_435_492), fileLenOf(&four6_patterns));
+    try std.testing.expectEqual(@as(usize, 134_217_796), quantizedFileLenOf(&four6_patterns));
+    const off = offsetsOf(&four6_patterns);
+    try std.testing.expectEqual(@as(usize, 0), off[0]);
+    try std.testing.expectEqual(@as(usize, 16_777_216), off[1]);
+    try std.testing.expectEqual(@as(usize, 3 * 16_777_216), off[3]);
+    // The header lens alone tell a four6 file apart from a prefix of `patterns`.
+    const lens = [_]u32{ 16_777_216, 16_777_216, 16_777_216, 16_777_216 };
+    try std.testing.expectEqual(@as(?[]const Pattern, &four6_patterns), patternsFromLens(&lens));
+    try std.testing.expectEqual(@as(?[]const Pattern, patterns[0..1]), patternsFromLens(&.{65_536}));
+}
+
+test "four6 slot table matches the direct index (#346)" {
+    const e = entriesOn(four6_slot_table, four6_count, sample_board);
+    for (four6_patterns, 0..) |pat, p| {
+        var best: u32 = std.math.maxInt(u32);
+        for (0..8) |t| {
+            var idx: u32 = 0;
+            for (pat.cells[0..6], 0..) |cell, j| {
+                const c = transformCell(t, cell);
+                const level: u32 = @intCast(levelOf(sample_board[c / core.BoardSize][c % core.BoardSize]));
+                idx |= level << @intCast(4 * j);
+            }
+            best = @min(best, idx);
+        }
+        try std.testing.expectEqual(best, e.canonical[p]);
+    }
+    // Inactive patterns stay zero so a four6 net can share the fixed-size `Entries` arrays.
+    try std.testing.expectEqual(@as(u32, 0), e.canonical[four6_count]);
+    try std.testing.expectEqual(@as([8]u32, std.mem.zeroes([8]u32)), e.summed[four6_count]);
+}
+
+test "the four6 table round-trips through the f32 blob format (#346)" {
+    const gpa = std.testing.allocator;
+    var net = try TupleNet.initWith(gpa, .four6);
+    defer net.deinit(gpa);
+    try std.testing.expect(net.four6);
+    try std.testing.expectEqual(@as(usize, four6_count), net.count);
+    for (0..net.count) |p| {
+        net.storage[net.off[p] + @as(usize, @intCast(p))] = @floatFromInt(p + 1);
+        try std.testing.expectEqual(tableLenOf(four6_patterns[p]), net.table(p).len);
+    }
+    const bytes = try encode(gpa, &net);
+    defer gpa.free(bytes);
+    try std.testing.expectEqual(fileLenOf(&four6_patterns), bytes.len);
+    var parsed = try parse(gpa, bytes);
+    defer parsed.deinit(gpa);
+    try std.testing.expect(parsed.four6);
+    try std.testing.expectEqualSlices(f32, net.storage, parsed.storage);
+
+    var q = try quantize(gpa, &net);
+    defer q.deinit(gpa);
+    const qbytes = try encodeQuantized(gpa, &q);
+    defer gpa.free(qbytes);
+    var qparsed = try parseQuantized(gpa, qbytes);
+    defer qparsed.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, four6_count), qparsed.count);
+    try std.testing.expectEqual(@as(?[]const Pattern, &four6_patterns), @as(?[]const Pattern, qparsed.active));
 }
