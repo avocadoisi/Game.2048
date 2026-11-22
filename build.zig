@@ -183,6 +183,38 @@ pub fn build(b: *std.Build) void {
     const solve_step = b.step("solve", "Run the solver and report game statistics");
     solve_step.dependOn(&solve_cmd.step);
 
+    // Tests live in bitboard.zig, so it is a module (and its own test root) rather than a file
+    // imported by bb_main: `zig test` only runs the tests of the root file.
+    const bitboard_mod = b.addModule("bitboard", .{
+        .root_source_file = b.path("ai/solver/bitboard.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core", .module = core_mod },
+            .{ .name = "solver", .module = solver_mod },
+        },
+    });
+
+    const bb_exe = b.addExecutable(.{
+        .name = "bb",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("ai/solver/bb_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "solver", .module = solver_mod },
+                .{ .name = "bitboard", .module = bitboard_mod },
+                .{ .name = "parallel", .module = parallel_mod },
+            },
+        }),
+    });
+    const bb_cmd = b.addRunArtifact(bb_exe);
+    bb_cmd.addPassthruArgs();
+
+    const bb_step = b.step("bb", "Run the packed bitboard expectimax (#349)");
+    bb_step.dependOn(&bb_cmd.step);
+
     const ranking_exe = b.addExecutable(.{
         .name = "ranking",
         .root_module = b.createModule(.{
@@ -504,6 +536,9 @@ pub fn build(b: *std.Build) void {
     b.step("test-solver", "Run the solver unit tests only").dependOn(&run_solver_tests.step);
     b.step("test-bench", "Run the bench unit tests only").dependOn(&run_bench_tests.step);
     b.step("test-ranking", "Run the ranking unit tests only").dependOn(&run_ranking_tests.step);
+    const bb_tests = b.addTest(.{ .filters = test_filters, .root_module = bitboard_mod });
+    const run_bb_tests = b.addRunArtifact(bb_tests);
+    b.step("test-bb", "Run the packed-bitboard unit tests only").dependOn(&run_bb_tests.step);
 
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_core_tests.step);
@@ -523,4 +558,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_ranking_tests.step);
     test_step.dependOn(&run_evalab_tests.step);
     test_step.dependOn(&run_probe_tests.step);
+    test_step.dependOn(&run_bb_tests.step);
 }
