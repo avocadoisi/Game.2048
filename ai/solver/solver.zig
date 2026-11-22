@@ -183,6 +183,20 @@ fn nnNet() *const nn.Net {
     return &cached_net.?;
 }
 
+/// The shipped net's type, so other modules can hold a reference without importing `nn.zig`.
+pub const Net = nn.Net;
+
+/// The shipped 128/32 net; `bitboard.zig` scores its leaves with it.
+pub fn shippedNet() *const nn.Net {
+    return nnNet();
+}
+
+/// Net value of one position, the leaf `nn2` uses at the end of its plies.
+pub fn netLeaf(net: *const nn.Net, board: Board) f64 {
+    var cache: nn.Cache = .{};
+    return nn.forward(net, board, &cache);
+}
+
 /// Score one NN root branch for a worker; unsupported policies return null.
 pub fn scoreRootMove(policy: Policy, state: GameState, dir: Direction) ?f64 {
     const mode: nn.Mode = switch (policy) {
