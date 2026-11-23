@@ -335,6 +335,24 @@ pub fn build(b: *std.Build) void {
     const nn_cmd = b.addRunArtifact(nn_exe);
     nn_cmd.addPassthruArgs();
 
+    const nn_diag_exe = b.addExecutable(.{
+        .name = "nn-diag",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("ai/solver/nn_diag.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "solver", .module = solver_mod },
+                .{ .name = "nn", .module = nn_mod },
+            },
+        }),
+    });
+    const nn_diag_cmd = b.addRunArtifact(nn_diag_exe);
+    nn_diag_cmd.addPassthruArgs();
+    const nn_diag_step = b.step("nn-diag", "Diagnose whether deeper search values predict realised scores (#356)");
+    nn_diag_step.dependOn(&nn_diag_cmd.step);
+
     const nn_main_tests = b.addTest(.{ .filters = test_filters, .root_module = nn_exe.root_module });
     const run_nn_main_tests = b.addRunArtifact(nn_main_tests);
 
