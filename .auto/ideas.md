@@ -25,8 +25,14 @@
   distillation from deep3 failed at #350, so only worth it with a much larger sample.
 - 20-game evals on one seed have a noise floor of ~+/-10k; confirm any search change on 3 seeds
   or with pairrow before believing a +10k win.
-- After expspawn 300k: fine-tune it with the *plain* TD(0) recipe for 50k at lr 0.0005
-  (target mix: expected-spawn bootstrap -> sampled) to recover any 2-ply sharpness lost to
-  the Rao-Blackwellized target; only if expspawn alone is close to 134.9k.
-- Compare expspawn's 1-ply (greedy) score too: if it is much higher than 60.9k but 2-ply is
-  not, the target is smoothing V in a way 2-ply punishes (same signature as low-lr fine-tune).
+- expspawn 300k at lr 0.001 is ~5 h on this machine (60k games in 22 min, games ~500 moves),
+  and the mid-run 50k checkpoint (lr 0.00085) scores only 44,141.8 (1-ply 15,133.6): the
+  slowly-annealed target is smoothed. Killed at 60k. Retry with a *short* schedule instead
+  (40k games, 0.001->0.0001) — matches the documented 20k point (61.6k) and anneals fully.
+
+## Open after session 2
+- Make the 3-ply tree cheaper before retesting h6: 4-way set-associative node TT and a
+  leaf-only smaller net (h1 96) could cut leaves 30-50%; h6 needs ~4x -> ~2x to be arguable.
+- Risk/tile-conditioned phase rows (`min_max_tile`) so only 4096+ boards pay for 3-ply.
+- `pairw` the shipped net against a 300k retrain under a *changed* target is now cheap and
+  deterministic; any target change can be A/B'd exactly.

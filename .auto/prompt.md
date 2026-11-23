@@ -54,3 +54,16 @@ Training (expspawn, 128/32, lr 0.001, par, batch_scale 1 because the variant gua
 - expspawn is affordable after all: `expspawn` + `par` + `batch_scale 1.0` is accepted
   (the guard rejects only non-1 batch_scale). 300k games ≈ 1.5-2 h on 8 cores.
   Run in flight: `/tmp/expspawn300k.bin`, lr 0.001, seed 1.
+
+## Update 2026-11-24 (session 2, final state)
+- REPRODUCIBILITY: the shipped recipe is deterministic. `base`, 128/32, 300k games, lr 0.003,
+  seed 1, `par`, `batch_scale 2.8284271247461903` rebuilds ai/solver/nn_weights.bin bit-for-bit
+  (sha256 c98ea27c...). Eval on seed 9200 is exactly 134,867.2 / 1-ply 60,864.6 / 15-20 8192.
+- TRAP: `-` in the batch_scale slot means 1.0, not sqrt(batch) (`parseBatchScale` returns 1.0 for
+  `-`). Every earlier "variance" and SWA conclusion came from 8x undertrained bs1 runs.
+- SEARCH: endgame 3-ply (`phase_h6`) is a wash at 4x cost:
+  9200 +12,575.6 (unpaired), 9300 +10,801.8 +/- 10,050.1, 9400 +747.6, 9000 +2,708.0 +/- 8,531.5
+  (paired A=141,548.0, B=144,256.0, 10W/10L). Reverted. Do not retry without a cheaper tree.
+- EXPSPAWN: closed. par+bs1 is 8x undertrained; par+sqrt(8) reaches 92,377 at 190k (behind base
+  at the same budget); serial is ~1.7 h per 40k games.
+- NO measured lever above 134,867.2 exists in this repo today.
