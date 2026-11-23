@@ -1,0 +1,1 @@
+{"type":"config","name":"Raise 2048 solver avg score (expspawn retrain, no eval-seed overfit)","metricName":"avg2ply","metricUnit":"","bestDirection":"higher"}
