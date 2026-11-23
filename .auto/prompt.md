@@ -67,3 +67,7 @@ Training (expspawn, 128/32, lr 0.001, par, batch_scale 1 because the variant gua
 - EXPSPAWN: closed. par+bs1 is 8x undertrained; par+sqrt(8) reaches 92,377 at 190k (behind base
   at the same budget); serial is ~1.7 h per 40k games.
 - NO measured lever above 134,867.2 exists in this repo today.
+- EFFICIENCY: native node-TT 4096 -> 16384 entries (ai/solver/nn.zig:759): 3-ply score identical
+  (146,470.7) but leaves/move 10,251 -> 9,581 (-6.5%) and 17.42 -> 16.57 ms/move (-4.9%),
+  hit rate 17.8%. 2-ply untouched (134,867.2, 1.00 ms/move). Hit rate is now collision-bound;
+  4-way associativity is the next step if 3-ply ever ships.

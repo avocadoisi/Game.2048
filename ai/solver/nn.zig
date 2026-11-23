@@ -756,7 +756,7 @@ pub fn sharedValueCache() *ValueCache {
 pub const NodeCache = struct {
     /// The table lives in thread-local storage like `ValueCache`; wasm gets the smaller one because
     /// the 8K-entry leaf cache already overflowed that stack.
-    pub const capacity = if (builtin.target.cpu.arch.isWasm()) 1 << 9 else 1 << 12;
+    pub const capacity = if (builtin.target.cpu.arch.isWasm()) 1 << 9 else 1 << 14;
     /// `0xff` marks an unused slot; a real cell stores the tile's exponent plus one (1..32, 0 empty),
     /// so no board the game can produce collides with the sentinel.
     const unused_cell = 0xff;
