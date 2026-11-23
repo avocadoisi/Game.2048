@@ -44,3 +44,13 @@ Training (expspawn, 128/32, lr 0.001, par, batch_scale 1 because the variant gua
 ## Session Notes
 - Machine: 8 physical cores; expspawn measured at ~20.6k moves/s wall (10k games, 145 s).
 - Eval cost: 10 games 2-ply ≈ 64 s; shipped net seed 9200 10 games = 131,709.6, 8192 7/10.
+
+## Update 2026-11-24 (session 2)
+- Baseline avg2ply (seed 9200, 20 games): 134,867.2 for the shipped net.
+- lr 0.002 / 250k, seed-2 divergence, fresh 300k rerun (116.9k), SWA 4/8/16/32: all discarded.
+- Endgame 3-ply rows h5/h6/h7/h9: h6 looked +12.6k on 9200 but did not replicate
+  (9300 +10.8k ± 10.1k, 9400 +0.7k) at 4x ms/move. Discarded (log #6). 20-game seed
+  noise is ~±10k; a single-seed +10k is not evidence.
+- expspawn is affordable after all: `expspawn` + `par` + `batch_scale 1.0` is accepted
+  (the guard rejects only non-1 batch_scale). 300k games ≈ 1.5-2 h on 8 cores.
+  Run in flight: `/tmp/expspawn300k.bin`, lr 0.001, seed 1.
