@@ -108,3 +108,6 @@ Training (expspawn, 128/32, lr 0.001, par, batch_scale 1 because the variant gua
   (four-seed sums). 90k trades seeds (9000 +5,135, 9300 +1,525, 9200 -3,347, 9400 -9,707).
   Do not extend the constant-lr polish further; a lower-lr anneal tail (1e-4) is a different,
   untested mechanism.
+- ANNEAL TAIL REJECTED (#24): 10k games at lr 1e-4 after the 60k polish gives aggregate +6,504 but
+  9200 -8,287 (-5.5%) and 9300 -3,598 (-2.5%); 2 of 4 seeds non-worse. Seed-trading, outside the 3%
+  band. Lesson: a positive four-seed SUM can hide a benchmark regression - check the per-seed band.

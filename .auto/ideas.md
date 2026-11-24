@@ -44,3 +44,6 @@
 - Polish-length sweep: TRIED (#21). 15k beat 30k on 9000/9300 (+10,989/+1,140) and lost on
   9200/9400 (-9,482/-13,404); four-seed aggregate favors 30k. 20 games per seed cannot rank nets -
   any future length point needs 4 seeds x 40 games (~1.5 h each). Do not repeat at 20 games.
+- STRUCTURAL ONLY from here: the polish/anneal family is closed (0/30/60/90k + 1e-4 tail all measured).
+  Every remaining option (V architecture change, new target, search width) needs a full retrain and
+  multi-seed gating, and none has a prior above noise in docs/solver-history.md.
