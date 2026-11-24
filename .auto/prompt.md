@@ -100,3 +100,7 @@ Training (expspawn, 128/32, lr 0.001, par, batch_scale 1 because the variant gua
 - NOISE LESSON (#21): a 20-game per-seed comparison flips sign between seeds. The 15k polish won
   by +12k on the two selection seeds and lost by -9k and -13k on the two held-out ones. Rank nets on
   >=4 seeds (or 40 games/seed, ~9 min each) and never on 9200 alone.
+- POLISH SERIES (current shipped = 60k, commit 996140a): 0k 113.7/134.9/125.3/133.7 (9000/9200/9300
+  /9400), 30k 136.1/144.4/129.9/134.8 (agg 545,257), 60k 135.4/150.7/144.8/153.7 (agg 584,697).
+  Each pass = `resume` 30k at constant lr 0.0003, seed 1, par sqrt (~570 s). Rule for the next pass:
+  keep only if the four-seed aggregate beats 584,697.0 with >=3 of 4 seeds non-worse.
