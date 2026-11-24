@@ -81,3 +81,7 @@ Training (expspawn, 128/32, lr 0.001, par, batch_scale 1 because the variant gua
 - LR SWEEP: 0.002 (250k) 101,526.4; 0.0028 (300k, clean) 113,191.8; 0.003 (300k, shipped)
   134,867.2. 0.003 is the measured peak of the recipe; downward is strictly worse and upward
   diverges on seed 2. No free parameter remains.
+- SEED SPREAD AT 300k (lr 0.003, par sqrt, all deterministic): seed 1 = 134,867.2 (shipped),
+  seed 2 = divergence at 50,440 games, seed 3 = collapse to 1,160 moves/game and 23,119.2
+  (0/20 4096). The recipe is a lottery (~1/3 success); the shipped net is a high draw.
+  Any retrain must budget 3-4 seeds and gate on moves/game + 4096 reach, never on benchmark score.

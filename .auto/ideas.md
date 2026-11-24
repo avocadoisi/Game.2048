@@ -36,3 +36,8 @@
 - Risk/tile-conditioned phase rows (`min_max_tile`) so only 4096+ boards pay for 3-ply.
 - `pairw` the shipped net against a 300k retrain under a *changed* target is now cheap and
   deterministic; any target change can be A/B'd exactly.
+- 2-net value ensemble (#180, backlog says "reserved for compute"): train a second 300k net with a
+  different train seed and average V at the leaf. Mechanism: halves the random part of V error, so
+  near-tie moves get sharper; docs' V error is 0.07 early / 0.30 late. Cost: 2x leaves (ms/move
+  ~2.4), needs a `Value.pair` variant plus a two-path CLI. Only worth it if the score gain clears
+  the noise at 2x latency.
