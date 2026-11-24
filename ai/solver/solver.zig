@@ -2082,11 +2082,11 @@ fn goldenPlay(policy: Policy, seed: u64, depth: u8) Golden {
 test "nn policy reproduces the same move sequence and score on a fixed seed" {
     if (!nn.slow_tests) return error.SkipZigTest;
     const g = goldenPlay(.nn, 20240601, 0);
-    // re-recorded at with the 128/32 shipped net (was 32,380 / 2048 / 1,669 moves)
-    try std.testing.expectEqual(@as(u32, 81104), g.score);
-    try std.testing.expectEqual(@as(core.Tile, 4096), g.max_tile);
-    try std.testing.expectEqual(@as(u32, 3744), g.moves);
-    try std.testing.expectEqual(@as(u64, 6496592461525624355), g.checksum);
+    // re-recorded at with the 30k-polished 128/32 net (was 81,104 / 4096 / 3,744 moves)
+    try std.testing.expectEqual(@as(u32, 112940), g.score);
+    try std.testing.expectEqual(@as(core.Tile, 8192), g.max_tile);
+    try std.testing.expectEqual(@as(u32, 4662), g.moves);
+    try std.testing.expectEqual(@as(u64, 1766340016371405916), g.checksum);
 }
 
 test "expectimax evaluation can reject an unfinished game (#336)" {
@@ -2100,11 +2100,11 @@ test "expectimax evaluation can reject an unfinished game (#336)" {
 test "nn2 policy reproduces the same move sequence and score on a fixed seed" {
     if (!nn.slow_tests) return error.SkipZigTest;
     const g = goldenPlay(.nn2, 20240601, 0);
-    // re-recorded at with the 128/32 shipped net (was 77,164 / 4096 / 3,542 moves)
-    try std.testing.expectEqual(@as(u32, 132164), g.score);
-    try std.testing.expectEqual(@as(core.Tile, 8192), g.max_tile);
-    try std.testing.expectEqual(@as(u32, 5520), g.moves);
-    try std.testing.expectEqual(@as(u64, 10726614709475710891), g.checksum);
+    // re-recorded at with the 30k-polished 128/32 net (was 132,164 / 8192 / 5,520 moves)
+    try std.testing.expectEqual(@as(u32, 80248), g.score);
+    try std.testing.expectEqual(@as(core.Tile, 4096), g.max_tile);
+    try std.testing.expectEqual(@as(u32, 3704), g.moves);
+    try std.testing.expectEqual(@as(u64, 7403473882996351152), g.checksum);
 }
 
 test "nn policy parses the weights once per thread, not once per move" {
