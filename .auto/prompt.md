@@ -111,3 +111,6 @@ Training (expspawn, 128/32, lr 0.001, par, batch_scale 1 because the variant gua
 - ANNEAL TAIL REJECTED (#24): 10k games at lr 1e-4 after the 60k polish gives aggregate +6,504 but
   9200 -8,287 (-5.5%) and 9300 -3,598 (-2.5%); 2 of 4 seeds non-worse. Seed-trading, outside the 3%
   band. Lesson: a positive four-seed SUM can hide a benchmark regression - check the per-seed band.
+- OUT-OF-SAMPLE CONFIRMATION (#25): on seeds 9500/9600 (never used in any decision) the 60k net
+  scores 155,944.2 / 151,678.0 vs 118,945.0 / 122,604.4 for the pre-polish 300k net (+31%/+24%,
+  8192 19/20 both). Six-seed mean 124.9k -> 148.7k. The polish gain generalizes.
