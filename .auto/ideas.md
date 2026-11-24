@@ -41,5 +41,6 @@
   near-tie moves get sharper; docs' V error is 0.07 early / 0.30 late. Cost: 2x leaves (ms/move
   ~2.4), needs a `Value.pair` variant plus a two-path CLI. Only worth it if the score gain clears
   the noise at 2x latency.
-- Polish-length sweep: 15k vs 30k vs 60k at lr 3e-4 from the shipped net, deciding on seeds 9000 +
-  9300, not 9200. Cheap (each 5-10 min) and the only knob that has moved the metric in 20 runs.
+- Polish-length sweep: TRIED (#21). 15k beat 30k on 9000/9300 (+10,989/+1,140) and lost on
+  9200/9400 (-9,482/-13,404); four-seed aggregate favors 30k. 20 games per seed cannot rank nets -
+  any future length point needs 4 seeds x 40 games (~1.5 h each). Do not repeat at 20 games.

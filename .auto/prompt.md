@@ -97,3 +97,6 @@ Training (expspawn, 128/32, lr 0.001, par, batch_scale 1 because the variant gua
 - Next candidates: polish-length sweep (15k/60k), a second sequential polish, and confirming the
   polish on another base net. Judge on seeds 9000/9300 (9200 is the benchmark and must not be the
   only selector).
+- NOISE LESSON (#21): a 20-game per-seed comparison flips sign between seeds. The 15k polish won
+  by +12k on the two selection seeds and lost by -9k and -13k on the two held-out ones. Rank nets on
+  >=4 seeds (or 40 games/seed, ~9 min each) and never on 9200 alone.
