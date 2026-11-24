@@ -47,3 +47,6 @@
 - STRUCTURAL ONLY from here: the polish/anneal family is closed (0/30/60/90k + 1e-4 tail all measured).
   Every remaining option (V architecture change, new target, search width) needs a full retrain and
   multi-seed gating, and none has a prior above noise in docs/solver-history.md.
+- CANDIDATE (not shipped): /tmp/polish60k.bin, the 60k polish via train seed 2. Strongest 2-ply net
+  measured (four-seed 609,407 vs 584,697; benchmark 155,704.2) but 1-ply 54,694 with 2/20 games dead
+  below 2048. Revisit only if the product confirms 1-ply is never user-visible.
