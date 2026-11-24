@@ -78,3 +78,6 @@ Training (expspawn, 128/32, lr 0.001, par, batch_scale 1 because the variant gua
 - SCHEDULE STRETCH (400k, lr 0.003 -> 0.0003 linear): 85,445.2 on 9200 (3/20 8192,
   1-ply 49,102.8) vs 134,867.2 for the 300k recipe. The anneal must be the last ~10% in absolute
   games; stretching it proportionally leaves the net hot. Same failure as the 1M run and #204 C.
+- LR SWEEP: 0.002 (250k) 101,526.4; 0.0028 (300k, clean) 113,191.8; 0.003 (300k, shipped)
+  134,867.2. 0.003 is the measured peak of the recipe; downward is strictly worse and upward
+  diverges on seed 2. No free parameter remains.
