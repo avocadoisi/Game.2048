@@ -89,3 +89,11 @@ Training (expspawn, 128/32, lr 0.001, par, batch_scale 1 because the variant gua
   `{}`); replay_k=0 vs 30 yields byte-identical weights. Active inputs are only (games, lr, train
   seed, par batch_scale), all pinned: lr 0.003 peak (0.0028=113k, 0.002=101k), 300k the end of the
   anneal (400k=85k), sqrt(8) the par rule, seed 1 the only non-collapsing seed at 300k.
+## Current state (2026-11-24)
+- Baseline is now the 30k-polished net: 9200 144,437.4 (18/20), 9000 136,147.2, 9300 129,883.8,
+  40 games 9000 135,032.0; 1.07-1.10 ms/move. Shipped in 017da7f (goldens + f32 regenerated).
+- Its recipe: `resume` 30k games from the previous weights at constant lr 0.0003, seed 1, par sqrt.
+  Seed-4 control of the same polish was neutral (-809), so the gain belongs to this trajectory.
+- Next candidates: polish-length sweep (15k/60k), a second sequential polish, and confirming the
+  polish on another base net. Judge on seeds 9000/9300 (9200 is the benchmark and must not be the
+  only selector).
