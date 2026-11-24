@@ -104,3 +104,7 @@ Training (expspawn, 128/32, lr 0.001, par, batch_scale 1 because the variant gua
   /9400), 30k 136.1/144.4/129.9/134.8 (agg 545,257), 60k 135.4/150.7/144.8/153.7 (agg 584,697).
   Each pass = `resume` 30k at constant lr 0.0003, seed 1, par sqrt (~570 s). Rule for the next pass:
   keep only if the four-seed aggregate beats 584,697.0 with >=3 of 4 seeds non-worse.
+- POLISH SERIES CLOSED at 60k (#23): 0k ~500,790 / 30k 545,257 / 60k 584,697 / 90k 578,303
+  (four-seed sums). 90k trades seeds (9000 +5,135, 9300 +1,525, 9200 -3,347, 9400 -9,707).
+  Do not extend the constant-lr polish further; a lower-lr anneal tail (1e-4) is a different,
+  untested mechanism.
