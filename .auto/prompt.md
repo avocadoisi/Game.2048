@@ -75,3 +75,6 @@ Training (expspawn, 128/32, lr 0.001, par, batch_scale 1 because the variant gua
   3.22 ms/move) on 9200 - worse than 2-ply and than ungated h6. Do not gate depth on progress.
 - 4-WAY TT: 4-way set association at 16k entries is 0.6% slower than direct-mapped with a lower
   hit rate (16.6% vs 17.8%); direct-mapped 16384 is the best TT. 3-ply cost is tree-bound.
+- SCHEDULE STRETCH (400k, lr 0.003 -> 0.0003 linear): 85,445.2 on 9200 (3/20 8192,
+  1-ply 49,102.8) vs 134,867.2 for the 300k recipe. The anneal must be the last ~10% in absolute
+  games; stretching it proportionally leaves the net hot. Same failure as the 1M run and #204 C.
