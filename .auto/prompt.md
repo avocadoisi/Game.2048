@@ -85,3 +85,7 @@ Training (expspawn, 128/32, lr 0.001, par, batch_scale 1 because the variant gua
   seed 2 = divergence at 50,440 games, seed 3 = collapse to 1,160 moves/game and 23,119.2
   (0/20 4096). The recipe is a lottery (~1/3 success); the shipped net is a high draw.
   Any retrain must budget 3-4 seeds and gate on moves/game + 4096 reach, never on benchmark score.
+- RECIPE KNOBS ARE EXHAUSTED: variant `base` ignores the CLI replay_k slot (`buildBase` returns
+  `{}`); replay_k=0 vs 30 yields byte-identical weights. Active inputs are only (games, lr, train
+  seed, par batch_scale), all pinned: lr 0.003 peak (0.0028=113k, 0.002=101k), 300k the end of the
+  anneal (400k=85k), sqrt(8) the par rule, seed 1 the only non-collapsing seed at 300k.
