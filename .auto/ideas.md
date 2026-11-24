@@ -50,3 +50,10 @@
 - CANDIDATE (not shipped): /tmp/polish60k.bin, the 60k polish via train seed 2. Strongest 2-ply net
   measured (four-seed 609,407 vs 584,697; benchmark 155,704.2) but 1-ply 54,694 with 2/20 games dead
   below 2048. Revisit only if the product confirms 1-ply is never user-visible.
+- PRODUCT OPTION (measured, not shipped): endgame-only 4-ply (phase_h10 = deep above 3 empties,
+  4-ply at <=2). 12/12 games converted to 8192 vs 18/20 for h6, 152,498.7 on 12 games @9200, but
+  10.03 ms/move native (~9x). The implementation was reverted; recreate it as `Mode.phase_h10` with
+  phases {min_empty=3, ply=2, full_width_cutoff} then {min_empty=0, ply=4, deep3_cutoff} plus an
+  all_rows entry. Revisit only if the app gains a per-move time budget.
+- The depth line is fully measured: 2-ply 1.10 ms / 150.7k; endgame 3-ply 4.1 ms / coin flip;
+  endgame 4-ply 10.0 ms / +1.2%; 3-ply everywhere 12.7x / +8%; 4-ply everywhere 21.9x / +2.5%.
