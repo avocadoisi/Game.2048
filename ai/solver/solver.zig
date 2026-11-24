@@ -2082,11 +2082,11 @@ fn goldenPlay(policy: Policy, seed: u64, depth: u8) Golden {
 test "nn policy reproduces the same move sequence and score on a fixed seed" {
     if (!nn.slow_tests) return error.SkipZigTest;
     const g = goldenPlay(.nn, 20240601, 0);
-    // re-recorded at with the 30k-polished 128/32 net (was 81,104 / 4096 / 3,744 moves)
-    try std.testing.expectEqual(@as(u32, 112940), g.score);
+    // re-recorded at with the 60k-polished 128/32 net (was 112,940 / 8192 / 4,662 moves)
+    try std.testing.expectEqual(@as(u32, 130092), g.score);
     try std.testing.expectEqual(@as(core.Tile, 8192), g.max_tile);
-    try std.testing.expectEqual(@as(u32, 4662), g.moves);
-    try std.testing.expectEqual(@as(u64, 1766340016371405916), g.checksum);
+    try std.testing.expectEqual(@as(u32, 5378), g.moves);
+    try std.testing.expectEqual(@as(u64, 1839493775265053749), g.checksum);
 }
 
 test "expectimax evaluation can reject an unfinished game (#336)" {
@@ -2100,11 +2100,11 @@ test "expectimax evaluation can reject an unfinished game (#336)" {
 test "nn2 policy reproduces the same move sequence and score on a fixed seed" {
     if (!nn.slow_tests) return error.SkipZigTest;
     const g = goldenPlay(.nn2, 20240601, 0);
-    // re-recorded at with the 30k-polished 128/32 net (was 132,164 / 8192 / 5,520 moves)
-    try std.testing.expectEqual(@as(u32, 80248), g.score);
-    try std.testing.expectEqual(@as(core.Tile, 4096), g.max_tile);
-    try std.testing.expectEqual(@as(u32, 3704), g.moves);
-    try std.testing.expectEqual(@as(u64, 7403473882996351152), g.checksum);
+    // re-recorded at with the 60k-polished 128/32 net (was 80,248 / 4096 / 3,704 moves)
+    try std.testing.expectEqual(@as(u32, 122868), g.score);
+    try std.testing.expectEqual(@as(core.Tile, 8192), g.max_tile);
+    try std.testing.expectEqual(@as(u32, 5034), g.moves);
+    try std.testing.expectEqual(@as(u64, 10383812049443369385), g.checksum);
 }
 
 test "nn policy parses the weights once per thread, not once per move" {
