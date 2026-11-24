@@ -4275,7 +4275,7 @@ test "node cache collision is a miss, never another board's value (#263)" {
 test "node cache slot is 48 bytes and the table size follows the capacity (#263)" {
     try std.testing.expectEqual(@as(usize, 48), @sizeOf(NodeCache.Entry));
     try std.testing.expectEqual(@as(usize, NodeCache.capacity) * 48, @sizeOf(NodeCache));
-    const expected = if (builtin.target.cpu.arch.isWasm()) 512 else 4096;
+    const expected = if (builtin.target.cpu.arch.isWasm()) 512 else 16384;
     try std.testing.expectEqual(@as(usize, expected), NodeCache.capacity);
 }
 
