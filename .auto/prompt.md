@@ -71,3 +71,7 @@ Training (expspawn, 128/32, lr 0.001, par, batch_scale 1 because the variant gua
   (146,470.7) but leaves/move 10,251 -> 9,581 (-6.5%) and 17.42 -> 16.57 ms/move (-4.9%),
   hit rate 17.8%. 2-ply untouched (134,867.2, 1.00 ms/move). Hit rate is now collision-bound;
   4-way associativity is the next step if 3-ply ever ships.
+- TILE-GATED DEPTH (h5): 3-ply only on 4096+ boards at <=3 empties scores 119,494.6 (12/20 8192,
+  3.22 ms/move) on 9200 - worse than 2-ply and than ungated h6. Do not gate depth on progress.
+- 4-WAY TT: 4-way set association at 16k entries is 0.6% slower than direct-mapped with a lower
+  hit rate (16.6% vs 17.8%); direct-mapped 16384 is the best TT. 3-ply cost is tree-bound.
