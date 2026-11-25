@@ -565,10 +565,15 @@ pub fn build(b: *std.Build) void {
 
     const install_wasm = b.addInstallFileWithDir(wasm_exe.getEmittedBin(), .{ .custom = "web" }, "game2048.wasm");
     const install_static_html = b.addInstallFileWithDir(b.path("src/web/index.static.html"), .{ .custom = "web" }, "index.html");
+    // The measured scores of every ranked policy: the static page draws the same numbers the server
+    // page does, instead of a second copy of them per policy in the module (`python3 -m http.server`
+    // serves it, `scripts/deploy-pages.sh` publishes it).
+    const install_ranking = b.addInstallFileWithDir(b.path("src/web/ranking.json"), .{ .custom = "web" }, "ranking.json");
 
     const wasm_step = b.step("wasm", "Build the WebAssembly module and static site into zig-out/web");
     wasm_step.dependOn(&install_wasm.step);
     wasm_step.dependOn(&install_static_html.step);
+    wasm_step.dependOn(&install_ranking.step);
     wasm_step.dependOn(&b.addInstallFileWithDir(b.path("src/web/search-workers.mjs"), .{ .custom = "web" }, "search-workers.mjs").step);
     wasm_step.dependOn(&b.addInstallFileWithDir(b.path("src/web/solver-worker.mjs"), .{ .custom = "web" }, "solver-worker.mjs").step);
 

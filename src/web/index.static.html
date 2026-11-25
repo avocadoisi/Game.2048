@@ -24,10 +24,13 @@
   button:disabled { opacity: .45; }
   #msg { min-height: 1.5em; font-weight: bold; }
   #policy-desc { font-size: 12px; line-height: 1.4; color: #8f857d; max-width: 34em; margin: 0 auto; }
-  #reach { margin: 6px auto; border-collapse: collapse; font-size: 12px; color: #8f857d; }
-  #reach td { padding: 1px 6px; }
-  #reach .bar { width: min(150px, 40vw); background: #d9cec3; height: 9px; border-radius: 3px; }
-  #reach .bar div { background: #8f7a66; height: 9px; border-radius: 3px; }
+  #detail { margin: 6px auto; font-size: 12px; color: #8f857d; }
+  #detail table { margin: 6px auto; border-collapse: collapse; }
+  #detail td, #detail th { padding: 1px 6px; }
+  #detail caption { caption-side: top; padding-bottom: 2px; }
+  #detail .bar { width: min(120px, 30vw); background: #d9cec3; height: 9px; border-radius: 3px; }
+  #detail .bar div { background: #8f7a66; height: 9px; border-radius: 3px; }
+  #detail .dist { font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body class="animations-enabled">
@@ -52,7 +55,7 @@
   </select></label>
 </p>
 <p id="policy-desc"></p>
-<table id="reach"></table>
+<div id="detail"></div>
 <script type="module">
 import { RootWorkerPool } from "./search-workers.mjs";
 // Static build: everything runs in WebAssembly, there is no server.
@@ -218,15 +221,47 @@ async function autoLoop(now) {
   if (running && epoch === autoEpoch) autoFrame = requestAnimationFrame(autoLoop);
 }
 
-// Reach ladder under the policy picker: how far the measured games of this policy got. The pairs
-// come from `algo_reach` / `solver.policy_info.reach` ("2048=95,4096=88,…", share of the games that
-// reached at least the tile), so the page never invents a curve (issue #369).
+// Score detail of the selected policy: the spread of its measured games, the tiles those games
+// reached and the score bands they ended in. The numbers come from `ranking.json`, the file the server
+// page draws too (`zig build ranking` writes it, `zig build wasm` installs it next to this page); when
+// the file or the policy is missing, the ladder the module carries (`algo_reach`) is shown instead, so
+// the page never invents a curve (issues #369, #371).
+const REACH_TILES = [256, 512, 1024, 2048, 4096, 8192, 16384];
+let stats = null;
+const pctOf = (n, d) => (d ? Math.round((100 * n) / d) : 0);
+const num = (v) => (typeof v === "number" ? Math.round(v).toLocaleString() : "-");
+const bar = (pct) => `<td class="bar"><div style="width:${pct}%"></div></td><td>${pct}%</td>`;
+
+function showDetail(p) {
+  const box = document.getElementById("detail");
+  const e = (stats?.entries || []).find((x) => x.policy === p.name);
+  if (!e || !e.games) return showReach(p.reach);
+  const games = e.games;
+  const dist = `<div class="dist">${e.policy} — ${games} games: avg ${num(e.avg_score)} / median ${num(e.median_score)} / min ${num(e.min_score)} / max ${num(e.max_score)} / sd ${num(e.stddev_score)}</div>`;
+  // reach at a tile and the average score of the games that got there are suffix sums of the same
+  // per-final-tile bins (`max_tiles`), so neither can drift from the other
+  const tiles = REACH_TILES.map((tile) => {
+    const bins = (e.max_tiles || []).filter((b) => b.tile >= tile);
+    const reached = bins.reduce((n, b) => n + b.games, 0);
+    const avg = reached ? bins.reduce((n, b) => n + b.avg_score * b.games, 0) / reached : 0;
+    return `<tr><td>${tile}</td>${bar(pctOf(reached, games))}<td>${reached ? num(avg) : "-"}</td></tr>`;
+  }).join("");
+  const bands = (e.score_bands || []).map((b) => `<tr><td>${b.from / 1000}k–${b.to / 1000}k</td>${bar(pctOf(b.games, games))}</tr>`).join("");
+  box.innerHTML =
+    `${dist}
+    <table><caption>reached at least — share of its games</caption>
+      <tr><th>tile</th><th></th><th></th><th>avg score</th></tr>${tiles}</table>
+    ${bands ? `<table><caption>score bands — where its games ended</caption>${bands}</table>` : ""}`;
+}
+
+// Fallback ladder from the module: `solver.policy_info.reach` ("2048=95,4096=88,…", share of the games
+// that reached at least the tile).
 function showReach(spec) {
-  const table = document.getElementById("reach");
+  const box = document.getElementById("detail");
   const pairs = (spec || "").split(",").filter(Boolean).map((pair) => pair.split("=").map(Number));
-  if (pairs.length === 0) { table.innerHTML = ""; return; }
-  const rows = pairs.map(([tile, pct]) => `<tr><td>${tile}</td><td class="bar"><div style="width:${pct}%"></div></td><td>${pct}%</td></tr>`).join("");
-  table.innerHTML = `<caption>reached at least — share of the measured games</caption>${rows}`;
+  if (pairs.length === 0) { box.innerHTML = ""; return; }
+  const rows = pairs.map(([tile, pct]) => `<tr><td>${tile}</td>${bar(pct)}</tr>`).join("");
+  box.innerHTML = `<table><caption>reached at least — share of the measured games</caption>${rows}</table>`;
 }
 
 (async () => {
@@ -259,6 +294,9 @@ function showReach(spec) {
     option.title = p.speed ? `${p.score} / 1 手 ${p.speed}` : p.score;
     picker.appendChild(option);
   }
+  // Every ranked policy's measured scores, written by `zig build ranking` and installed next to this
+  // page; a page copied elsewhere just falls back to the module's ladder.
+  stats = await fetch("ranking.json").then((r) => (r.ok ? r.json() : null)).catch(() => null);
   const preferred = policies.findIndex((p) => p.name === DEFAULT_POLICY);
   picker.value = String(preferred >= 0 ? preferred : policies.length - 1);
   const showPolicy = () => {
@@ -267,7 +305,7 @@ function showReach(spec) {
     // Score first (how strong), then the measured cost per move (how slow) — nothing else.
     const speed = p.speed ? ` / 1 手 ${p.speed}` : "";
     document.getElementById("policy-desc").textContent = `${p.name}: ${p.score}${speed}`;
-    showReach(p.reach);
+    showDetail(p);
   };
   picker.addEventListener("change", () => { revision++; showPolicy(); });
   showPolicy();

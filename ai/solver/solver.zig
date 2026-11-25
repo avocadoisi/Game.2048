@@ -112,7 +112,8 @@ pub const PolicyInfo = struct {
     depth: u8,
     /// One line shown next to the ranking row and in the HTTP UI. Japanese, like the UI.
     description: []const u8,
-    /// Average score of a `zig build ranking` run (5 run x 20 games, seed 1000) — the number
+    /// Average score of a `zig build ranking` run (8 run x 5 games, seed 1000; the batch
+    /// `src/web/ranking.json` ships) — the number
     /// the browser page shows under the policy picker, so a player sees the strength without the
     /// implementation notes. `nn3`, `expectimax_id` and `ntuple` are not in the default ranking, so
     /// their numbers come from the sections that measured them.
@@ -137,19 +138,19 @@ pub const PolicyInfo = struct {
 
 /// The single source of truth for the per-policy metadata, in `Policy` order.
 pub const policy_info = [_]PolicyInfo{
-    .{ .policy = .random, .depth = 0, .description = "合法手からランダムに1手選ぶ（比較の基準）", .score = "平均 1,062 点" },
-    .{ .policy = .greedy, .depth = 0, .description = "1手先だけ見る。滑らせた盤面の評価が最も高い手を選ぶ（出現や探索はしない）", .score = "平均 7,789 点" },
-    .{ .policy = .expectimax, .depth = 2, .description = "2手先まで探索し、ランダムな出現（2か4）を平均して評価する。評価は蛇行順と合体ペアの手作り関数", .score = "平均 33,218 点" },
-    .{ .policy = .mcts, .depth = 0, .description = "UCTで候補手を選び、ランダムな対局を繰り返して評価する", .score = "平均 29,722 点" },
-    .{ .policy = .beam, .depth = 0, .description = "幅32で3手先まで探索し、各空きマスに2が出現すると仮定して評価する", .score = "平均 20,440 点" },
-    .{ .policy = .expectimax_tt, .depth = 0, .description = "depth 3の期待値探索を置換表で高速化したもの（同じ手を選ぶ）", .score = "平均 55,636 点" },
-    .{ .policy = .ga, .depth = 2, .description = "GAで評価の重みを進化させた期待値探索（depth 2）。GA内のholdout(seed 500〜)では+4%だが、ranking seed 1000では素の expectimax より低い", .score = "平均 24,046 点" },
-    .{ .policy = .nn, .depth = 0, .description = "TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）", .score = "平均 71,742 点" },
-    .{ .policy = .nn2, .depth = 2, .description = "TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）", .score = "平均 141,885 点", .speed = "9〜14 ms", .reach = "256=100,512=100,1024=100,2048=100,4096=98,8192=87,16384=0" },
-    .{ .policy = .nnmcts, .depth = 0, .description = "UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）", .score = "平均 17,037 点" },
-    .{ .policy = .nnbeam, .depth = 0, .description = "NNの盤面価値を葉にしたビーム探索。幅8・3手先で、ply間のspawnを2回サンプリングする（固定seedで再現）", .score = "平均 21,048 点" },
+    .{ .policy = .random, .depth = 0, .description = "合法手からランダムに1手選ぶ（比較の基準）", .score = "平均 1,089 点" },
+    .{ .policy = .greedy, .depth = 0, .description = "1手先だけ見る。滑らせた盤面の評価が最も高い手を選ぶ（出現や探索はしない）", .score = "平均 7,913 点" },
+    .{ .policy = .expectimax, .depth = 2, .description = "2手先まで探索し、ランダムな出現（2か4）を平均して評価する。評価は蛇行順と合体ペアの手作り関数", .score = "平均 35,072 点" },
+    .{ .policy = .mcts, .depth = 0, .description = "UCTで候補手を選び、ランダムな対局を繰り返して評価する", .score = "平均 24,820 点" },
+    .{ .policy = .beam, .depth = 0, .description = "幅32で3手先まで探索し、各空きマスに2が出現すると仮定して評価する", .score = "平均 21,005 点" },
+    .{ .policy = .expectimax_tt, .depth = 0, .description = "depth 3の期待値探索を置換表で高速化したもの（同じ手を選ぶ）", .score = "平均 59,008 点" },
+    .{ .policy = .ga, .depth = 2, .description = "GAで評価の重みを進化させた期待値探索（depth 2）。GA内のholdout(seed 500〜)では+4%だが、ranking seed 1000では素の expectimax より低い", .score = "平均 23,357 点" },
+    .{ .policy = .nn, .depth = 0, .description = "TD学習の小さなMLP価値関数。各手の後に1回出現を見込んで選ぶ（1-ply + 出現1回の先読み）", .score = "平均 124,215 点" },
+    .{ .policy = .nn2, .depth = 2, .description = "TD学習のMLP価値関数で2手先まで探索する（自分の手→出現→自分の手→出現の期待値、置換表で高速化）", .score = "平均 142,295 点", .speed = "9〜14 ms", .reach = "256=100,512=100,1024=100,2048=100,4096=95,8192=85,16384=3" },
+    .{ .policy = .nnmcts, .depth = 0, .description = "UCTの各候補手から8手だけランダムに進め、打ち切った盤面をNN価値で評価する（終局は将来価値0として同じスケールで揃える）", .score = "平均 10,870 点" },
+    .{ .policy = .nnbeam, .depth = 0, .description = "NNの盤面価値を葉にしたビーム探索。幅8・3手先で、ply間のspawnを2回サンプリングする（固定seedで再現）", .score = "平均 24,413 点" },
     .{ .policy = .expectimax_id, .depth = 0, .ranked = false, .description = "時間予算付きの反復深化 + 確率枝刈り（#104）。depth 2から1ずつ深くし、予算内に終わった最後の深さの手を選ぶ。予算はdepth引数（ms、0なら既定値）", .score = "平均 75,202 点" },
-    .{ .policy = .nn3, .depth = 0, .ranked = false, .description = "TD学習のMLP価値関数で3手先まで探索する（深い層の出現確率が1e-2未満の枝を落として再正規化）。既定のランキングには入れていない（重い）", .score = "平均 152,463 点", .speed = "4〜400 ms", .reach = "256=100,512=100,1024=100,2048=100,4096=100,8192=88,16384=0" },
+    .{ .policy = .nn3, .depth = 0, .ranked = false, .description = "TD学習のMLP価値関数で3手先まで探索する（深い層の出現確率が1e-2未満の枝を落として再正規化）。既定のランキングには入れていない（重い）", .score = "平均 147,279 点", .speed = "4〜400 ms", .reach = "256=100,512=100,1024=100,2048=100,4096=100,8192=88,16384=0" },
     .{ .policy = .ntuple, .depth = 0, .ranked = false, .needs_table = true, .description = "n-tuple 表（量子化した int16、7 パターン）の1手先読み。表は 64 MiB あるので API と CLI 専用", .score = "平均 20,014 点" },
 };
 
