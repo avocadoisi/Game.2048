@@ -114,3 +114,28 @@ Training (expspawn, 128/32, lr 0.001, par, batch_scale 1 because the variant gua
 - OUT-OF-SAMPLE CONFIRMATION (#25): on seeds 9500/9600 (never used in any decision) the 60k net
   scores 155,944.2 / 151,678.0 vs 118,945.0 / 122,604.4 for the pre-polish 300k net (+31%/+24%,
   8192 19/20 both). Six-seed mean 124.9k -> 148.7k. The polish gain generalizes.
+
+## Update 2026-11-25 (session 2, converged at 40+ experiments)
+
+Shipped net: 128/32, base 300k (lr 3e-3, seed 1, par sqrt(8)) + polish 60k (lr 3e-4, seed 1).
+Benchmark 150,747.2 (9200, 20 games); four-seed sum 584,697.0 (135,419/150,747/144,828/153,702);
+nine-seed mean 148,528.9; 9500/9600 out-of-sample 155,944.2/151,678.0. Commits: 996140a (60k),
+017da7f (30k), 964c533 (9 seeds), 3721966, c404e0f (selection-effect rule), 3f5d5cd, fff9902,
+9449206 (leaky knob).
+- DETERMINISM: base 300k reproduces bit-identically (sha256 c98ea27c…, 553,202,634 moves) three
+  times; training variance is exactly zero, all spread is train-seed choice.
+- BATCH_SCALE TRAP: `-` means 1.0, not sqrt(8). Every early `par - -` run was 8x undertrained.
+- SELECTION EFFECT (#32): the seed-2 polish (four-seed 609,407, benchmark 155,704.2) lost on both
+  fresh seeds (152,174.6/147,647.6 vs 155,944.2/151,678.0). Rule now mandatory: four-seed screen,
+  then two fresh seeds both >= shipped. Three polish samples: 584,697/609,407/550,843, sd 29,300.
+- CLOSED WITH NUMBERS: 3-ply at <=3 empties (4 seeds, mean +3,220, every estimate <1.1 sigma at
+  3.2–3.6x); endgame 4-ply (9x, +1.2%); tile-gated depth (119,494.6, horizon switch destroys the
+  policy); node-TT 4-way (16.67 vs 16.57 ms); 400k straight decay (85,445.2); lr 2.8e-3 (113,191.8)
+  and 4e-4 polish (143,142.4); third train seed (23,119.2) and seed-2 divergence at 50,440; weight
+  merge (569,744.8); freeze/head-only (102,012.0); h1=160 (361,618, -38%); replay_k inert;
+  leaky-ReLU 0.01 (376,386, -36%); p2 2-ply self-play fine-tune cost-closed (~3.6 s/game).
+- ADOPTION EVIDENCE: 40-game pairw on seed 9000 gives mean diff -22,510.5 +- 9,470.6 (2.38 sigma),
+  27:13, at 91448cd. Product f32 path: 154,007.4, 19/20 8192; f32 artifact byte-identical to a
+  regeneration; wasm advertises 141,885 (nn2) / 152,463 (nn3).
+- WHAT IS LEFT: only a different representation (CNN/residual; weight-format change, full retrain)
+  or a product per-move time budget. Do not re-run recipe variants: every cheap axis is measured.
