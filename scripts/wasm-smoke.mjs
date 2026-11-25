@@ -149,6 +149,7 @@ const html = readFileSync(join(root, "zig-out/web/index.html"), "utf8");
 if (!html.includes("algo_count()")) fail("zig-out/web/index.html does not build its policy list from the module");
 if (!html.includes("algo_score(")) fail("zig-out/web/index.html does not show the module's policy scores");
 if (!html.includes("algo_speed(")) fail("zig-out/web/index.html does not show the module's per-move cost");
+if (!html.includes("ranking.json")) fail("zig-out/web/index.html does not read the measured score detail");
 const preferred = /const DEFAULT_POLICY = "([a-z0-9_]+)"/.exec(html);
 if (!preferred) fail("zig-out/web/index.html has no DEFAULT_POLICY, so its default policy is unknown");
 if (!want.includes(preferred[1])) {
@@ -177,6 +178,22 @@ for (let algo = 0; algo < algoCount; algo++) {
   const solveMs = Number(/ms=([\d.]+)/.exec(child.stdout)?.[1]);
   if (!Number.isFinite(solveMs)) fail(`solve(${algo}) printed no timing: ${JSON.stringify(child.stdout)}`);
   slowest = Math.max(slowest, solveMs);
+}
+
+// The score detail under the picker comes from `ranking.json`, which `zig build wasm` installs next to
+// the page. Its numbers are the ones the page prints, so the file has to describe the same batch the
+// totals claim: one band and one tile bin per game, the median inside the range, the average too.
+const ranking = JSON.parse(readFileSync(join(root, "zig-out/web/ranking.json"), "utf8"));
+if (!Array.isArray(ranking.entries) || ranking.entries.length === 0) fail("zig-out/web/ranking.json lists no entries");
+for (const e of ranking.entries) {
+  if (!(e.games > 0)) fail(`ranking entry ${e.policy} has no games`);
+  if (!(e.min_score <= e.median_score && e.median_score <= e.max_score)) fail(`ranking entry ${e.policy} scores are out of order`);
+  if (!(e.avg_score >= e.min_score && e.avg_score <= e.max_score)) fail(`ranking entry ${e.policy} average is outside its range`);
+  if (!(e.stddev_score >= 0)) fail(`ranking entry ${e.policy} has no spread`);
+  const bands = (e.score_bands || []).reduce((n, b) => n + b.games, 0);
+  if (bands !== e.games) fail(`ranking entry ${e.policy}: bands cover ${bands} of ${e.games} games`);
+  const bins = (e.max_tiles || []).reduce((n, b) => n + b.games, 0);
+  if (bins !== e.games) fail(`ranking entry ${e.policy}: max_tiles cover ${bins} of ${e.games} games`);
 }
 
 console.log(`OK: ${bytes.length} bytes wasm, ${algoCount} policies (${names.join(", ")}), ${applied} applied moves, slowest solve ${Math.round(slowest)} ms`);

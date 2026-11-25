@@ -39,7 +39,7 @@ branch=$(git rev-parse --abbrev-ref HEAD)
 echo "==> zig build wasm -Doptimize=ReleaseFast"
 zig build wasm -Doptimize=ReleaseFast
 
-for file in index.html game2048.wasm search-workers.mjs solver-worker.mjs; do
+for file in index.html game2048.wasm search-workers.mjs solver-worker.mjs ranking.json; do
   test -s "zig-out/web/$file" || {
     echo "missing zig-out/web/$file" >&2
     exit 1

@@ -135,6 +135,18 @@ test "a policy outside the default list can be named, one that needs a table can
     try std.testing.expectError(error.UnknownPolicy, selectPolicies(&buf, "ntuple"));
 }
 
+test "a filter may name more policies than the default list holds" {
+    // `nn3` sits outside the default list but is what the static page ships, so the caller's slots
+    // follow `policy_info`; a default-sized table has to fail loudly instead of overrunning.
+    const names = "random,greedy,expectimax,mcts,beam,expectimax_tt,ga,nn,nn2,nnmcts,nnbeam,nn3";
+    var buf: [solver.policy_info.len]PolicySpec = undefined;
+    const selected = try selectPolicies(&buf, names);
+    try std.testing.expectEqual(policies.len + 1, selected.len);
+    try std.testing.expectEqual(solver.Policy.nn3, selected[selected.len - 1].policy);
+    var small: [policies.len]PolicySpec = undefined;
+    try std.testing.expectError(error.TooManyPolicies, selectPolicies(&small, names));
+}
+
 test "runEntries executes only the filtered policies" {
     var buf: [policies.len]PolicySpec = undefined;
     const selected = try selectPolicies(&buf, "greedy");
@@ -161,13 +173,14 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var table: [policies.len]PolicySpec = undefined;
+    // A filter may name policies outside the default list (`nn3`), so the slots follow `policy_info`.
+    var table: [solver.policy_info.len]PolicySpec = undefined;
     const selected = selectPolicies(&table, filter) catch |err| {
         std.debug.print("filter \"{s}\": {s}\n{s}", .{ filter, @errorName(err), usage });
         return;
     };
 
-    var entries: [policies.len]Entry = undefined;
+    var entries: [solver.policy_info.len]Entry = undefined;
     try runEntries(init.io, init.arena.allocator(), selected, &entries, runs, games_per_run, seed);
     std.mem.sort(Entry, entries[0..selected.len], {}, byScoreDesc);
 
@@ -177,18 +190,29 @@ pub fn main(init: std.process.Init) !void {
     try w.print("{{\"seed\":{d},\"runs\":{d},\"games_per_run\":{d},\"entries\":[", .{ seed, runs, games_per_run });
     for (entries[0..selected.len], 0..) |e, i| {
         if (i > 0) try w.writeAll(",");
-        try w.print("{{\"policy\":\"{s}\",\"depth\":{d},\"games\":{d},\"avg_score\":{d:.1},\"avg_moves\":{d:.1},\"best_tile\":{d},\"reach_4096\":{d},\"reach_8192\":{d},\"reach_16384\":{d},\"dead_below_2048\":{d},\"latency_ms_per_move\":{d:.4},\"games_per_sec\":{d:.2},\"description\":\"{s}\",\"max_tiles\":[", .{
-            @tagName(e.policy), e.depth, e.summary.games, e.summary.avg_score, e.summary.avg_moves, e.summary.best_tile, e.summary.reach_4096, e.summary.reach_8192, e.summary.reach_16384, e.summary.dead_below_2048, e.summary.latencyMsPerMove(), e.summary.gamesPerSec(), describe(e.policy),
+        try w.print("{{\"policy\":\"{s}\",\"depth\":{d},\"games\":{d},\"avg_score\":{d:.1},\"min_score\":{d},\"median_score\":{d},\"max_score\":{d},\"stddev_score\":{d:.1},\"avg_moves\":{d:.1},\"best_tile\":{d},\"reach_4096\":{d},\"reach_8192\":{d},\"reach_16384\":{d},\"dead_below_2048\":{d},\"latency_ms_per_move\":{d:.4},\"games_per_sec\":{d:.2},\"description\":\"{s}\",\"max_tiles\":[", .{
+            @tagName(e.policy), e.depth, e.summary.games, e.summary.avg_score, e.summary.scores.min, e.summary.scores.median, e.summary.scores.max, e.summary.scores.stddev, e.summary.avg_moves, e.summary.best_tile, e.summary.reach_4096, e.summary.reach_8192, e.summary.reach_16384, e.summary.dead_below_2048, e.summary.latencyMsPerMove(), e.summary.gamesPerSec(), describe(e.policy),
         });
-        // How many games finished with each highest tile (`tile` is the final max tile of a game).
-        // Empty bins are left out; reach at any threshold is a suffix sum, so the page can show
-        // tiles this run does not count separately (#369).
+        // How many games finished with each highest tile (`tile` is the final max tile of a game) and
+        // what those games scored. Empty bins are left out; reach at any threshold is a suffix sum, so
+        // the page can show tiles this run does not count separately (#369), and the average of the
+        // games that reached a tile is the same suffix sum over `score` (#371).
         var printed = false;
-        for (e.summary.max_tile_counts, 0..) |count, bin| {
-            if (count == 0) continue;
+        for (e.summary.max_tiles, 0..) |tally, bin| {
+            if (tally.games == 0) continue;
             if (printed) try w.writeAll(",");
-            try w.print("{{\"tile\":{d},\"games\":{d}}}", .{ @as(u32, 1) << @intCast(bin + 1), count });
+            try w.print("{{\"tile\":{d},\"games\":{d},\"avg_score\":{d:.1}}}", .{ @as(u32, 1) << @intCast(bin + 1), tally.games, @as(f64, @floatFromInt(tally.score)) / @as(f64, @floatFromInt(tally.games)) });
             printed = true;
+        }
+        try w.writeAll("],\"score_bands\":[");
+        // Where the games landed score-wise, band by band; empty bands are left out (#371).
+        var band_printed = false;
+        for (e.summary.scores.bands, 0..) |count, band| {
+            if (count == 0) continue;
+            if (band_printed) try w.writeAll(",");
+            const from = band * bench.score_band_width;
+            try w.print("{{\"from\":{d},\"to\":{d},\"games\":{d}}}", .{ from, from + bench.score_band_width, count });
+            band_printed = true;
         }
         try w.writeAll("]}");
     }
