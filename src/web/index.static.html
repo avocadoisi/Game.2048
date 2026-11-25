@@ -111,7 +111,7 @@ function newGame() {
 // Solver preview: ask the wasm solver for the move, then apply it.
 // The policy list comes straight from the module (`wasm.policies`): the page offers exactly what
 // was compiled in, so a policy the module does not ship cannot be selected by mistake (#154).
-// Default is nn3 (native 40-game avg 137,342 vs nn2's 121,569 at seeds 9000+9100) at 4-400 ms
+// Default is nn3 (native 152,463 vs nn2's 141,885 on the README's 20+20 protocol) at 4-400 ms
 // per move in V8; nn2 is 9-14 ms, which is why both exist next to the speed picker (issue #152).
 const DEFAULT_POLICY = "nn3";
 const FRAME_BUDGET_MS = 8;
