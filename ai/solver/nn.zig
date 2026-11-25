@@ -642,6 +642,8 @@ pub const Depth = struct {
     /// directly above the leaves at full width, so the spawn that decides whether the last move survives is
     /// never thinned.
     sample_min_depth: u8 = 1,
+    /// Number of uniformly sampled empty cells, each with both spawn tiles; 0 disables it.
+    stratified_cells: usize = 0,
 };
 
 /// A completed search node: its value and whether that value is a direct leaf. The node table
@@ -983,7 +985,8 @@ fn sampleUniform(seed: u64, board_hash: u64, depth: u8, index: usize) f64 {
 /// marks all but `keep` branches of one chance node as dropped, choosing them by weighted
 /// sampling without replacement (Efraimidis-Spirakis: keep the largest `u^(1/p)`, equivalently the
 /// smallest `-ln(u)/p`). Probabilities are the same `cprob * spawn.p` the full enumeration averages
-/// with, so a kept set still renormalizes over its own mass below and the 2/4 ratio is preserved.
+/// with, but renormalizing over the kept mass does not in general preserve the 2/4 ratio or give an
+/// unbiased estimate. The stratified sampler below separately retains both tiles in sampled cells.
 /// Every key depends only on the node identity and the branch index, so the choice is deterministic
 /// for a seed. `keep` at or above the branch count drops nothing, and branches already dropped by the
 /// mass cut are never brought back.
@@ -1009,6 +1012,27 @@ fn sampleMask(branches: []const ChanceBranch, keep: usize, seed: u64, board_hash
     }
     for (branches, 0..) |_, i| {
         if (!taken[i]) dropped[i] = true;
+    }
+}
+
+/// Uniformly sample cells without replacement, keeping both spawn values for each selected cell.
+/// Branches are generated in cell order, 2 followed by 4. Their original probabilities then give
+/// 0.9 * mean(V2) + 0.1 * mean(V4); fixed child values have an unbiased expectation over seeds.
+fn stratifiedMask(branches: []const ChanceBranch, keep: usize, seed: u64, hash: u64, depth: u8, dropped: *[max_chance_branches]bool) void {
+    const cells = branches.len / 2;
+    if (keep == 0 or keep >= cells) return;
+    var taken: [core.BoardSize * core.BoardSize]bool = @splat(false);
+    for (0..keep) |_| {
+        var best: ?usize = null;
+        for (0..cells) |i| {
+            if (taken[i]) continue;
+            if (best == null or sampleUniform(seed, hash, depth, i) < sampleUniform(seed, hash, depth, best.?)) best = i;
+        }
+        taken[best.?] = true;
+    }
+    for (0..cells) |i| {
+        dropped[2 * i] = !taken[i];
+        dropped[2 * i + 1] = !taken[i];
     }
 }
 
@@ -1044,6 +1068,7 @@ const Search = struct {
     sample_seed: u64 = default_sample_seed,
     /// : chance nodes shallower than this keep every branch (see `Depth.sample_min_depth`).
     sample_min_depth: u8 = 1,
+    stratified_cells: usize = 0,
     /// : `leaf` calls this search may still make (cache hits count too). Unbounded by default, so
     /// every pre-#183 tree is searched exactly as before; the iterative deepening sets it per iteration.
     nodes_left: usize = std.math.maxInt(usize),
@@ -1197,7 +1222,9 @@ const Search = struct {
         // the cut path below, so the kept ones renormalize over their own mass exactly as a cut node
         // does and the value keeps the scale of a full average. Not combined with the recovery:
         // that row evaluates every branch one layer shallower, which sampling would silently undo.
-        if (self.sample > 0 and depth >= self.sample_min_depth and !self.recover_cut_branches) {
+        if (self.stratified_cells > 0) {
+            stratifiedMask(branches[0..count], self.stratified_cells, self.sample_seed, ValueCache.keyOf(state.board), depth, &dropped);
+        } else if (self.sample > 0 and depth >= self.sample_min_depth and !self.recover_cut_branches) {
             sampleMask(branches[0..count], self.sample, self.sample_seed, ValueCache.keyOf(state.board), depth, &dropped);
         }
         // : if the fixed cutoff removes any branch, evaluate every spawn from its real child
@@ -1357,8 +1384,9 @@ fn newSearch(vfn: Value, cache: *ValueCache, nodes: ?*NodeCache, depth: Depth, s
         .vfn = vfn,
         .cache = cache,
         .nodes = nodes,
-        .cutoff = depth.cutoff,
-        .mass_cutoff = depth.mass_cutoff,
+        // A probability cut would drop the 4-tile stratum and bias the intended estimator.
+        .cutoff = if (depth.stratified_cells > 0) 0 else depth.cutoff,
+        .mass_cutoff = if (depth.stratified_cells > 0) 0 else depth.mass_cutoff,
         .ply = depth.ply,
         .omit_leaf_reward = depth.omit_leaf_reward,
         .recover_cut_branches = depth.recover_cut_branches,
@@ -1366,6 +1394,7 @@ fn newSearch(vfn: Value, cache: *ValueCache, nodes: ?*NodeCache, depth: Depth, s
         .sample = depth.sample,
         .sample_seed = depth.sample_seed,
         .sample_min_depth = depth.sample_min_depth,
+        .stratified_cells = depth.stratified_cells,
         // a phase row may carry its own weight; the caller's option is the one every other row uses
         .risk_weight = if (depth.risk_weight != 0) depth.risk_weight else risk_weight,
     };
@@ -1405,7 +1434,7 @@ fn deepMoveId(vfn: Value, state: GameState, stats: *Stats, cache: *ValueCache, n
     var best_ply: u8 = 0;
     var ply: u8 = @max(start.ply, 2);
     while (ply <= max_id_ply) : (ply += 1) {
-        var search = newSearch(vfn, cache, nodes, .{ .ply = ply, .cutoff = start.cutoff, .mass_cutoff = start.mass_cutoff, .omit_leaf_reward = start.omit_leaf_reward, .recover_cut_branches = start.recover_cut_branches, .sample = start.sample, .sample_seed = start.sample_seed, .sample_min_depth = start.sample_min_depth }, sym_leaf, risk_weight);
+        var search = newSearch(vfn, cache, nodes, .{ .ply = ply, .cutoff = start.cutoff, .mass_cutoff = start.mass_cutoff, .omit_leaf_reward = start.omit_leaf_reward, .recover_cut_branches = start.recover_cut_branches, .sample = start.sample, .sample_seed = start.sample_seed, .sample_min_depth = start.sample_min_depth, .stratified_cells = start.stratified_cells }, sym_leaf, risk_weight);
         // what this iteration may still spend: the budget minus every iteration before it
         search.nodes_left = budget -| @as(usize, @intCast(spent));
         const root = rootMove(&search, state, order, rerank);
@@ -1725,6 +1754,7 @@ pub fn bestMoveWithCacheValueOpts(vfn: Value, state: GameState, mode: Mode, stat
             if (opts.sample) |sample| depth.sample = sample;
             depth.sample_seed = opts.sample_seed;
             depth.sample_min_depth = opts.sample_min_depth;
+            depth.stratified_cells = opts.stratified_cells;
             searching = true;
         },
     }
@@ -2264,6 +2294,8 @@ pub const Options = struct {
     sample: ?usize = null,
     /// Seed of that sampler, so the same board and seed sample the same spawns.
     sample_seed: u64 = default_sample_seed,
+    /// Number of uniformly sampled empty cells, with both spawn tiles (0 disables stratification).
+    stratified_cells: usize = 0,
     /// Shallowest chance node to sample (`1` = every spawn layer). At `2` the spawn layer above the
     /// leaves keeps every branch, which keeps the last move's death risk exact.
     sample_min_depth: u8 = 1,
@@ -8366,6 +8398,48 @@ test "expected spawn target equals the sampled target when the tile cannot matte
     var trace = std.mem.zeroes(Net);
     const expected = tdUpdate(&trainable, &cache, p, next, spawned, 0, rng.random(), .{ .expected_spawn = true }, &trace);
     try std.testing.expectApproxEqAbs(@as(f64, 0.004) + next.reward + next.value, expected, 1e-12);
+}
+
+test "stratified spawn samples complete cells and preserves fixed child means (#353)" {
+    var branches: [8]ChanceBranch = undefined;
+    for (0..4) |i| {
+        branches[2 * i] = .{ .r = 0, .c = i, .tile = 2, .p = 0.9 };
+        branches[2 * i + 1] = .{ .r = 0, .c = i, .tile = 4, .p = 0.1 };
+    }
+    var sum: f64 = 0;
+    for (0..4096) |seed| {
+        var mask: [max_chance_branches]bool = @splat(false);
+        stratifiedMask(&branches, 1, @intCast(seed), 123, 2, &mask);
+        var count: usize = 0;
+        for (0..4) |i| {
+            try std.testing.expectEqual(mask[2 * i], mask[2 * i + 1]);
+            if (!mask[2 * i]) {
+                count += 1;
+                const value: f64 = @floatFromInt(i);
+                sum += 0.9 * value + 0.1 * (value + 10);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), count);
+    }
+    try std.testing.expectApproxEqAbs(@as(f64, 2.5), sum / 4096, 0.04);
+    var all: [max_chance_branches]bool = @splat(false);
+    stratifiedMask(&branches, 4, 1, 123, 2, &all);
+    for (all[0..8]) |dropped| try std.testing.expect(!dropped);
+}
+
+test "stratified spawn agrees with full width and is deterministic with a node cache (#353)" {
+    const weights = try parse(@embedFile("nn_weights.bin"));
+    const vfn: Value = .{ .single = &weights };
+    var cache: ValueCache = .{};
+    var plain = newSearch(vfn, &cache, null, .{ .ply = 2 }, false, 0);
+    var all = newSearch(vfn, &cache, null, .{ .ply = 2, .stratified_cells = 16 }, false, 0);
+    try std.testing.expectEqual(plain.chance(mid_board, 1, 1), all.chance(mid_board, 1, 1));
+    var nodes: NodeCache = .{};
+    var first = newSearch(vfn, &cache, &nodes, .{ .ply = 2, .stratified_cells = 1 }, false, 0);
+    const value = first.chance(mid_board, 2, 1);
+    var second = newSearch(vfn, &cache, null, .{ .ply = 2, .stratified_cells = 1 }, false, 0);
+    try std.testing.expectEqual(value, second.chance(mid_board, 2, 1));
+    try std.testing.expect(std.math.isFinite(value));
 }
 
 test "expected spawn is opt-in and refuses variants it would silently ignore (#321)" {

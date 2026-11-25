@@ -910,6 +910,9 @@ const all_rows = [_]EvalRow{
     .{ .name = "nn 4-ply spawn sample 6 + node TT (#320)", .spec = .{ .nn = .{ .mode = .deep4, .opts = .{ .sample = 6 } } } },
     .{ .name = "nn 4-ply spawn sample 2, full last spawn layer (#320)", .spec = .{ .nn = .{ .mode = .deep4, .opts = .{ .sample = 2, .sample_min_depth = 2 } } } },
     .{ .name = "nn 4-ply spawn sample 3, full last spawn layer (#320)", .spec = .{ .nn = .{ .mode = .deep4, .opts = .{ .sample = 3, .sample_min_depth = 2 } } } },
+    // Uniform cells with both tiles, no probability cut, so 2:4 mass stays 0.9:0.1.
+    .{ .name = "nn 4-ply stratified 1 cell (#353)", .spec = .{ .nn = .{ .mode = .deep4, .opts = .{ .stratified_cells = 1 } } } },
+    .{ .name = "nn 4-ply stratified 2 cells (#353)", .spec = .{ .nn = .{ .mode = .deep4, .opts = .{ .stratified_cells = 2 } } } },
 };
 
 const Eval = struct {
@@ -1616,7 +1619,7 @@ test "recovered cut branch row 20 stays the default deep3 path (#261)" {
 }
 
 test "eval row table is the single row source (#310)" {
-    try std.testing.expectEqual(@as(usize, 27), all_rows.len);
+    try std.testing.expectEqual(@as(usize, 29), all_rows.len);
     try std.testing.expectEqualStrings("nn 1-ply", all_rows[0].name);
     try std.testing.expectEqualStrings("nn 3-ply + node TT default (#266)", all_rows[15].name);
     try std.testing.expectEqualStrings("nn 3-ply cut branches recovered 1 ply shallow (#261)", all_rows[20].name);
@@ -1639,6 +1642,14 @@ test "spawn-sample rows 21..26 only change the sample (#320)" {
         try std.testing.expectEqual(nn.Mode.deep4, row.mode);
         try std.testing.expectEqual(@as(?usize, sample), row.opts.sample);
         try std.testing.expectEqual(@as(u8, 2), row.opts.sample_min_depth);
+    }
+}
+
+test "stratified rows select complete spawn cells (#353)" {
+    for ([_]usize{ 1, 2 }, 0..) |cells, i| {
+        const row = all_rows[27 + i].spec.nn;
+        try std.testing.expectEqual(nn.Mode.deep4, row.mode);
+        try std.testing.expectEqual(cells, row.opts.stratified_cells);
     }
 }
 
