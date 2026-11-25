@@ -35,6 +35,18 @@ pub const reward_scale: f64 = 1000;
 /// shipped policy code and the f64 weight file stay the reference.
 pub const f32_weights: bool = width.f32_weights;
 
+/// Leaky-ReLU slope (`-Dleaky`, default 0 = the plain ReLU the shipped net uses). Only the activation
+/// differs, so the weight layout and every file stay the same.
+pub const leaky: f64 = width.leaky;
+
+inline fn act(z: f64) f64 {
+    return if (z > 0) z else leaky * z;
+}
+
+inline fn actGrad(z: f64, g: f64) f64 {
+    return if (z > 0) g else leaky * g;
+}
+
 /// Plain f64 weights. `extern` keeps the layout fixed, so the file is the raw struct bytes.
 pub const Net = extern struct {
     /// First layer, one row per (cell, level) pair. Only 16 rows are active for any board.
@@ -195,14 +207,14 @@ fn forwardImpl(net: *const Net, board: Board, cache: *Cache, comptime simd: bool
             for (0..h1_size) |i| cache.z1[i] += net.wf[k][i] * f;
         }
     }
-    for (0..h1_size) |i| cache.a1[i] = @max(cache.z1[i], 0);
+    for (0..h1_size) |i| cache.a1[i] = act(cache.z1[i]);
 
     var out = net.b3;
     for (0..h2_size) |j| {
         var z = net.b2[j];
         for (0..h1_size) |i| z += net.w2[j][i] * cache.a1[i];
         cache.z2[j] = z;
-        cache.a2[j] = @max(z, 0);
+        cache.a2[j] = act(z);
         out += net.w3[j] * cache.a2[j];
     }
     cache.out = out;
@@ -227,7 +239,7 @@ pub fn trainCapped(net: *Net, cache: *const Cache, target: f64, lr: f64, step_cl
     var dz2: [h2_size]f64 = undefined;
     var da1 = std.mem.zeroes([h1_size]f64);
     for (0..h2_size) |j| {
-        dz2[j] = if (cache.z2[j] > 0) d * net.w3[j] else 0;
+        dz2[j] = actGrad(cache.z2[j], d * net.w3[j]);
         for (0..h1_size) |i| da1[i] += net.w2[j][i] * dz2[j];
     }
 
@@ -239,7 +251,7 @@ pub fn trainCapped(net: *Net, cache: *const Cache, target: f64, lr: f64, step_cl
     }
 
     for (0..h1_size) |i| {
-        const dz1 = if (cache.z1[i] > 0) da1[i] else 0;
+        const dz1 = actGrad(cache.z1[i], da1[i]);
         net.b1[i] -= capStep(lr * dz1, step_clip);
         for (cache.rows) |row| net.w1[row][i] -= capStep(lr * dz1, step_clip);
         if (comptime feature_count > 0) {
@@ -2678,7 +2690,7 @@ fn gradOf(net: *const Net, cache: *const Cache) Net {
     var g = std.mem.zeroes(Net);
     var da1: [h1_size]f64 = @splat(0);
     for (0..h2_size) |j| {
-        const dz2: f64 = if (cache.z2[j] > 0) net.w3[j] else 0;
+        const dz2: f64 = actGrad(cache.z2[j], net.w3[j]);
         g.w3[j] = cache.a2[j];
         g.b2[j] = dz2;
         for (0..h1_size) |i| {
@@ -2688,7 +2700,7 @@ fn gradOf(net: *const Net, cache: *const Cache) Net {
     }
     g.b3 = 1;
     for (0..h1_size) |i| {
-        const dz1 = if (cache.z1[i] > 0) da1[i] else 0;
+        const dz1 = actGrad(cache.z1[i], da1[i]);
         g.b1[i] = dz1;
         for (cache.rows) |row| g.w1[row][i] += dz1;
     }
@@ -3800,7 +3812,7 @@ fn forwardF32Impl(net: *const Net32, board: Board, comptime simd: bool) f64 {
         }
     }
     var a1: [h1_size]f32 = undefined;
-    for (0..h1_size) |i| a1[i] = @max(z1[i], 0);
+    for (0..h1_size) |i| a1[i] = @floatCast(act(z1[i]));
 
     var out: f32 = net.b3;
     for (0..h2_size) |j| {
@@ -3810,7 +3822,7 @@ fn forwardF32Impl(net: *const Net32, board: Board, comptime simd: bool) f64 {
         } else {
             for (0..h1_size) |i| z += net.w2[j][i] * a1[i];
         }
-        out += net.w3[j] * @max(z, 0);
+        out += net.w3[j] * @as(f32, @floatCast(act(z)));
     }
     return out;
 }

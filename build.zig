@@ -25,6 +25,10 @@ pub fn build(b: *std.Build) void {
     // 256-input net and file format, 1..6 adds that many of `nn.featureNames` to the input layer.
     const feat_count = b.option(u32, "feat", "global board features 0..6 (default 0)") orelse 0;
     const nn_simd = b.option(bool, "nn-simd", "experiment with SIMD first-layer accumulation (#317)") orelse false;
+    // Leaky-ReLU slope for the value MLP. 0 (default) is the plain ReLU the shipped net was trained
+    // with, so the default build and the weight files are unchanged; a positive slope keeps the
+    // 32-wide second layer from dying, which is one candidate explanation for its capacity ceiling.
+    const nn_leaky = b.option(f64, "leaky", "leaky-ReLU slope for the value net (default 0 = ReLU)") orelse 0;
     // Evaluate the net from f32 weights instead of f64 (#348). The search is unchanged: only the
     // leaf arithmetic and the bytes it reads differ.
     const nn_f32 = b.option(bool, "nn-f32", "evaluate the net from f32 weights (#348)") orelse false;
@@ -39,6 +43,7 @@ pub fn build(b: *std.Build) void {
     width_opts.addOption(u32, "h2", h2_width);
     width_opts.addOption(u32, "feat", feat_count);
     width_opts.addOption(bool, "simd", nn_simd);
+    width_opts.addOption(f64, "leaky", nn_leaky);
     width_opts.addOption(bool, "f32_weights", nn_f32);
     width_opts.addOption(bool, "slow_tests", slow_tests);
 
@@ -50,6 +55,7 @@ pub fn build(b: *std.Build) void {
     wasm_width_opts.addOption(u32, "h2", h2_width);
     wasm_width_opts.addOption(u32, "feat", feat_count);
     wasm_width_opts.addOption(bool, "simd", true);
+    wasm_width_opts.addOption(f64, "leaky", nn_leaky);
     wasm_width_opts.addOption(bool, "f32_weights", true);
     wasm_width_opts.addOption(bool, "slow_tests", slow_tests);
 
