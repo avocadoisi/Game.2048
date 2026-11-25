@@ -2,6 +2,12 @@ const std = @import("std");
 const solver = @import("solver");
 const parallel = @import("parallel");
 
+/// Bins of the final max-tile histogram: `max_tile_counts[i]` counts the games whose highest tile was
+/// `2 << i` (2, 4, 8 … 131072, the largest tile a 4x4 board can hold). Reach at any threshold is a
+/// suffix sum, so one counter per game serves every tile the page can show instead of a fixed set of
+/// `reach_*` fields (issue #369).
+pub const max_tile_logs = 17;
+
 pub const Summary = struct {
     games: u32 = 0,
     avg_score: f64 = 0,
@@ -20,6 +26,20 @@ pub const Summary = struct {
     reach_16384: u32 = 0,
     /// Games that ended below 2048, i.e. died early.
     dead_below_2048: u32 = 0,
+    /// Final max tile per game, exactly one bin per game (see `max_tile_logs`). The `reach_*` fields
+    /// above are suffix sums of it, so a tile the page wants that has no field (`1024`, say) is still
+    /// available.
+    max_tile_counts: [max_tile_logs]u32 = @splat(0),
+
+    /// Games whose final max tile was at least `tile` (a power of two). 0 when `tile` is out of range.
+    pub fn reached(self: Summary, tile: u32) u32 {
+        var games: u32 = 0;
+        for (self.max_tile_counts, 0..) |count, i| {
+            const bin: u32 = @as(u32, 1) << @intCast(i + 1);
+            if (bin >= tile) games += count;
+        }
+        return games;
+    }
 
     /// Wall-clock seconds of the batch (`elapsed=… s`, `elapsed … s` in every runner's report).
     pub fn elapsedSec(self: Summary) f64 {
@@ -52,10 +72,7 @@ const RunResult = struct {
     best_tile: u32 = 0,
     elapsed_ns: i96 = 0,
     max_depth: u8 = 0,
-    reach_4096: u32 = 0,
-    reach_8192: u32 = 0,
-    reach_16384: u32 = 0,
-    dead_below_2048: u32 = 0,
+    max_tile_counts: [max_tile_logs]u32 = @splat(0),
 };
 
 /// Score per CPU second; 0 when no time elapsed (avoids division by zero).
@@ -109,10 +126,9 @@ fn playRun(c: RunCtx, r: usize) RunResult {
         res.moves += result.moves;
         res.best_tile = @max(res.best_tile, result.max_tile);
         res.max_depth = @max(res.max_depth, solver.id_depth_reached);
-        if (result.max_tile >= 4096) res.reach_4096 += 1;
-        if (result.max_tile >= 8192) res.reach_8192 += 1;
-        if (result.max_tile >= 16384) res.reach_16384 += 1;
-        if (result.max_tile < 2048) res.dead_below_2048 += 1;
+        // One bin per game: 2 -> 0, 4 -> 1, … 131072 -> max_tile_logs - 1.
+        const tile = @max(result.max_tile, 2);
+        res.max_tile_counts[std.math.log2_int(u32, tile) - 1] += 1;
     }
     res.elapsed_ns = start.durationTo(std.Io.Clock.awake.now(c.io)).toNanoseconds();
     return res;
@@ -138,25 +154,19 @@ fn runPlan(io: std.Io, gpa: std.mem.Allocator, plan: Plan, runs: u32, games_per_
     var best_tile: u32 = 0;
     var serial_elapsed: i96 = 0;
     var max_depth: u8 = 0;
-    var reach_4096: u32 = 0;
-    var reach_8192: u32 = 0;
-    var reach_16384: u32 = 0;
-    var dead_below_2048: u32 = 0;
+    var max_tile_counts: [max_tile_logs]u32 = @splat(0);
     for (per_run) |r| {
         total_score += r.score;
         total_moves += r.moves;
         best_tile = @max(best_tile, r.best_tile);
         max_depth = @max(max_depth, r.max_depth);
         serial_elapsed += r.elapsed_ns;
-        reach_4096 += r.reach_4096;
-        reach_8192 += r.reach_8192;
-        reach_16384 += r.reach_16384;
-        dead_below_2048 += r.dead_below_2048;
+        for (r.max_tile_counts, 0..) |count, i| max_tile_counts[i] += count;
     }
     const games: u32 = runs * games_per_run;
     const elapsed = start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
     const n: f64 = @floatFromInt(games);
-    return .{
+    var s: Summary = .{
         .games = games,
         .avg_score = @as(f64, @floatFromInt(total_score)) / n,
         .avg_moves = @as(f64, @floatFromInt(total_moves)) / n,
@@ -165,11 +175,14 @@ fn runPlan(io: std.Io, gpa: std.mem.Allocator, plan: Plan, runs: u32, games_per_
         .serial_elapsed_ns = serial_elapsed,
         .total_moves = total_moves,
         .max_depth = max_depth,
-        .reach_4096 = reach_4096,
-        .reach_8192 = reach_8192,
-        .reach_16384 = reach_16384,
-        .dead_below_2048 = dead_below_2048,
+        .max_tile_counts = max_tile_counts,
     };
+    // The `reach_*` counters are suffix sums of the histogram, so they cannot drift from it.
+    s.reach_4096 = s.reached(4096);
+    s.reach_8192 = s.reached(8192);
+    s.reach_16384 = s.reached(16384);
+    s.dead_below_2048 = games - s.reached(2048);
+    return s;
 }
 
 test "scorePerSecond divides total score by elapsed seconds" {
@@ -179,6 +192,24 @@ test "scorePerSecond divides total score by elapsed seconds" {
 
 test "scorePerSecond of zero elapsed time is zero" {
     try std.testing.expectEqual(@as(f64, 0), scorePerSecond(3000, 0));
+}
+
+test "final max-tile histogram holds every game once and the reach counters are its suffix sums" {
+    const s = try run(std.testing.io, std.testing.allocator, .greedy, 2, 3, 1, 11);
+    var total: u32 = 0;
+    for (s.max_tile_counts) |count| total += count;
+    try std.testing.expectEqual(s.games, total);
+    // one bin per game, each a power of two no larger than the best tile of the batch
+    for (s.max_tile_counts, 0..) |count, bin| {
+        if (count == 0) continue;
+        try std.testing.expect(@as(u32, 1) << @intCast(bin + 1) <= s.best_tile);
+    }
+    try std.testing.expectEqual(s.reach_4096, s.reached(4096));
+    try std.testing.expectEqual(s.reach_8192, s.reached(8192));
+    try std.testing.expectEqual(s.games - s.dead_below_2048, s.reached(2048));
+    // a threshold above the largest bin, and one below the smallest, are still well defined
+    try std.testing.expectEqual(@as(u32, 0), s.reached(1 << 20));
+    try std.testing.expectEqual(s.games, s.reached(1));
 }
 
 test "run with the baseline weights matches the expectimax policy on the same games" {

@@ -7,6 +7,8 @@
 //! - `init(seed_lo, seed_hi)`  start a new game, seed = (hi << 32) | lo
 //! - `move(dir) -> u32`        0 = no change, 1 = moved, 2 = game over
 //!                             dir: 0 up, 1 left, 2 down, 3 right
+//! - `undo() -> u32`           1 = went back one move, 0 = nothing remembered; `undo_count() -> u32`
+//!                             = moves still undoable (the last 20, older ones are dropped)
 //! - `solve(algo, depth) -> i32` direction as above, -1 when no legal move
 //!                             `algo` indexes the module's policy list, in the order
 //!                             `wasm.policies` names them (see `algo_name`); `depth` 0 means
@@ -17,6 +19,7 @@
 //!   `algo_name_len(i) -> u32`, and the same pair for the one-line description the page shows:
 //!   `algo_score(i)`, `algo_score_len(i)`: the policy's measured average score, for the page
 //!   `algo_speed(i)`, `algo_speed_len(i)`: its cost per move in the browser ("" when unmeasured)
+//!   `algo_reach(i)`, `algo_reach_len(i)`: tile reach ladder, `"2048=95,4096=88,…"` ("" when unmeasured)
 
 const std = @import("std");
 const core = @import("core");
@@ -25,6 +28,8 @@ const options = @import("options");
 
 var state: core.GameState = .{};
 var prng: std.Random.DefaultPrng = undefined;
+/// Positions the last `core.History.depth` moves came from, for the page's Undo button (issue #369).
+var history: core.History = .{};
 
 /// Policies this module ships, in `wasm.policies` order. Only these kernels are linked in —
 /// `chooseAt` specialises per policy, so everything else is dead code — and the page builds its
@@ -82,6 +87,13 @@ const speeds: []const []const u8 = blk: {
     break :blk &list;
 };
 
+const reaches: []const []const u8 = blk: {
+    var out: [policies.len][]const u8 = undefined;
+    for (policies, 0..) |policy, i| out[i] = solver.policyInfo(policy).reach;
+    const list = out;
+    break :blk &list;
+};
+
 /// Default horizon per shipped policy: `solve`'s `depth == 0` means "the policy's own horizon",
 /// the same convention `expectimax_id` uses for its time budget. Without it a depth-dependent
 /// policy added to `wasm.policies` (`expectimax`, `ga`) would be searched at depth 0, which wraps
@@ -97,6 +109,7 @@ export fn init(seed_lo: u32, seed_hi: u32) void {
     const seed: u64 = @as(u64, seed_hi) << 32 | seed_lo;
     prng = std.Random.DefaultPrng.init(seed);
     state = core.GameState.gameStart(prng.random());
+    history.clear();
 }
 
 fn indexToDirection(dir: u32) ?core.Direction {
@@ -111,9 +124,25 @@ fn indexToDirection(dir: u32) ?core.Direction {
 
 export fn move(dir: u32) u32 {
     const direction = indexToDirection(dir) orelse return 0;
+    history.push(state);
     const result = state.move(direction, prng.random());
+    // A move that changed nothing is not a position to go back to.
+    if (!result.changed) _ = history.pop();
     if (state.isGameOver()) return 2;
     return if (result.changed) 1 else 0;
+}
+
+/// Step back to the position before the last move: 1 = the board went back, 0 = nothing remembered.
+/// The caller must treat the restored board as live again (game over may no longer hold).
+export fn undo() u32 {
+    const previous = history.pop() orelse return 0;
+    state = previous;
+    return 1;
+}
+
+/// Moves still undoable (`0..=core.History.depth`); the page disables Undo on 0.
+export fn undo_count() u32 {
+    return @intCast(history.count);
 }
 
 /// Each arm calls `solver.chooseOne` with a constant policy, which is what keeps the unshipped
@@ -202,4 +231,17 @@ export fn algo_speed(algo: u32) [*]const u8 {
 export fn algo_speed_len(algo: u32) u32 {
     if (algo >= policies.len) return 0;
     return speeds[algo].len;
+}
+
+/// How far the policy got, as `tile=percent` pairs cumulative over the ranked games, e.g.
+/// `"256=100,512=98,2048=95,4096=88,8192=62,16384=0"` (issue #369). Empty when the policy was never
+/// measured over a batch of games; the page then shows no reach table.
+export fn algo_reach(algo: u32) [*]const u8 {
+    if (algo >= policies.len) return "";
+    return reaches[algo].ptr;
+}
+
+export fn algo_reach_len(algo: u32) u32 {
+    if (algo >= policies.len) return 0;
+    return reaches[algo].len;
 }

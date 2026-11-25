@@ -11,6 +11,8 @@ const ranking_json = @embedFile("web/ranking.json");
 pub const Session = struct {
     state: core.GameState,
     prng: std.Random.DefaultPrng,
+    /// Positions the last `core.History.depth` moves came from, newest last (issue #369).
+    history: core.History = .{},
 
     pub fn init(seed: u64) Session {
         var prng = std.Random.DefaultPrng.init(seed);
@@ -20,10 +22,22 @@ pub const Session = struct {
 
     pub fn newGame(self: *Session) void {
         self.state = core.GameState.gameStart(self.prng.random());
+        self.history.clear();
     }
 
     pub fn move(self: *Session, dir: core.Direction) core.MoveResult {
-        return self.state.move(dir, self.prng.random());
+        self.history.push(self.state);
+        const result = self.state.move(dir, self.prng.random());
+        // A move that changed nothing is not a position to go back to, and the UI never undoes one.
+        if (!result.changed) _ = self.history.pop();
+        return result;
+    }
+
+    /// Step back to the position before the last move. False when nothing is remembered.
+    pub fn undo(self: *Session) bool {
+        const state = self.history.pop() orelse return false;
+        self.state = state;
+        return true;
     }
 };
 
@@ -33,6 +47,8 @@ const StateJson = struct {
     game_over: bool,
     changed: bool,
     spawned: bool,
+    /// Steps the page can still go back (0 when Undo does nothing); it disables the button on 0.
+    undo: usize,
 };
 
 fn stateJson(session: *const Session, changed: bool, spawned: bool) StateJson {
@@ -42,6 +58,7 @@ fn stateJson(session: *const Session, changed: bool, spawned: bool) StateJson {
         .game_over = session.state.isGameOver(),
         .changed = changed,
         .spawned = spawned,
+        .undo = session.history.count,
     };
 }
 
@@ -69,6 +86,10 @@ pub fn route(
     if (method == .POST and std.mem.eql(u8, path, "/api/new")) {
         session.newGame();
         return jsonResponse(gpa, .ok, stateJson(session, false, false));
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/undo")) {
+        const undone = session.undo();
+        return jsonResponse(gpa, .ok, stateJson(session, undone, false));
     }
     if (method == .GET and std.mem.eql(u8, path, "/api/solve")) {
         const policy = policyFromQuery(query) orelse
@@ -241,6 +262,71 @@ fn countTiles(board: core.Board) usize {
         if (v != 0) n += 1;
     };
     return n;
+}
+
+test "route undo restores the position before the last move" {
+    const gpa = std.testing.allocator;
+    var session = Session.init(3);
+    const start = session.state;
+
+    // find a move that changes the board, so the undo has something to restore
+    var moved = false;
+    for ([_]core.Direction{ .up, .left, .down, .right }) |dir| {
+        if (session.move(dir).changed) {
+            moved = true;
+            break;
+        }
+    }
+    try std.testing.expect(moved);
+    try std.testing.expectEqual(@as(usize, 1), session.history.count);
+
+    const res = try route(gpa, &session, .POST, "/api/undo");
+    defer gpa.free(res.body);
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqual(start.board, session.state.board);
+    try std.testing.expectEqual(start.score, session.state.score);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"undo\":0") != null);
+
+    // nothing left: the board stays put and the page is told so
+    const again = try route(gpa, &session, .POST, "/api/undo");
+    defer gpa.free(again.body);
+    try std.testing.expect(std.mem.indexOf(u8, again.body, "\"changed\":false") != null);
+    try std.testing.expectEqual(start.board, session.state.board);
+}
+
+test "a move that changes nothing is not undoable" {
+    var session = Session.init(3);
+    // fill the board so every direction is blocked for one of them
+    session.state = .{ .board = .{
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+        .{ 2, 4, 2, 4 },
+        .{ 4, 2, 4, 2 },
+    } };
+    const blocked = [_]core.Direction{ .left, .right, .up, .down };
+    for (blocked) |dir| {
+        if (session.move(dir).changed) continue;
+        try std.testing.expectEqual(@as(usize, 0), session.history.count);
+        return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "new game drops the undo history" {
+    const gpa = std.testing.allocator;
+    var session = Session.init(5);
+    for (0..3) |_| {
+        for ([_]core.Direction{ .up, .left, .down, .right }) |dir| {
+            if (session.move(dir).changed) break;
+        }
+        if (session.state.isGameOver()) break;
+    }
+    try std.testing.expect(session.history.count > 0);
+
+    const res = try route(gpa, &session, .POST, "/api/new");
+    defer gpa.free(res.body);
+    try std.testing.expectEqual(@as(usize, 0), session.history.count);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, "\"undo\":0") != null);
 }
 
 test "route ranking serves the policy comparison" {
