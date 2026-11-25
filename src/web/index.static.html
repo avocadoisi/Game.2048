@@ -21,8 +21,13 @@
     .animations-enabled .cell.changed { animation: none; }
   }
   button { font-size: 16px; padding: 6px 14px; margin: 4px; }
+  button:disabled { opacity: .45; }
   #msg { min-height: 1.5em; font-weight: bold; }
   #policy-desc { font-size: 12px; line-height: 1.4; color: #8f857d; max-width: 34em; margin: 0 auto; }
+  #reach { margin: 6px auto; border-collapse: collapse; font-size: 12px; color: #8f857d; }
+  #reach td { padding: 1px 6px; }
+  #reach .bar { width: min(150px, 40vw); background: #d9cec3; height: 9px; border-radius: 3px; }
+  #reach .bar div { background: #8f7a66; height: 9px; border-radius: 3px; }
 </style>
 </head>
 <body class="animations-enabled">
@@ -33,6 +38,7 @@
 <div id="msg"></div>
 <p>
   <button id="new">New game</button>
+  <button id="undo" disabled>Undo (Z)</button>
   <button id="step">Solver: 1 step</button>
   <button id="auto">Solver: auto</button>
   <label><input id="animation-toggle" type="checkbox" checked> Tile animation</label>
@@ -46,6 +52,7 @@
   </select></label>
 </p>
 <p id="policy-desc"></p>
+<table id="reach"></table>
 <script type="module">
 import { RootWorkerPool } from "./search-workers.mjs";
 // Static build: everything runs in WebAssembly, there is no server.
@@ -80,6 +87,8 @@ function render() {
   document.getElementById("score").textContent = w.score();
   document.getElementById("best").textContent = w.best_tile();
   document.getElementById("msg").textContent = gameOver ? "Game over — press New game" : "";
+  // The module remembers the last 20 positions; the button is offered only while one is left.
+  document.getElementById("undo").disabled = w.undo_count() === 0;
 }
 
 function move(dir, paint = true) {
@@ -103,6 +112,17 @@ function newGame() {
   // crypto seed when available, fixed mix otherwise
   const seed = crypto.getRandomValues(new Uint32Array(2));
   w.init(seed[0], seed[1]);
+  gameOver = false;
+  previousBoard = null;
+  render();
+}
+
+// Undo: step back through the last 20 positions the module kept (`undo` = 1 when the board moved
+// back). A restored board can be playable again, so gameOver is cleared and nothing stays marked.
+function undoMove() {
+  stopAuto();
+  revision++;
+  if (w.undo() !== 1) return;
   gameOver = false;
   previousBoard = null;
   render();
@@ -198,6 +218,17 @@ async function autoLoop(now) {
   if (running && epoch === autoEpoch) autoFrame = requestAnimationFrame(autoLoop);
 }
 
+// Reach ladder under the policy picker: how far the measured games of this policy got. The pairs
+// come from `algo_reach` / `solver.policy_info.reach` ("2048=95,4096=88,…", share of the games that
+// reached at least the tile), so the page never invents a curve (issue #369).
+function showReach(spec) {
+  const table = document.getElementById("reach");
+  const pairs = (spec || "").split(",").filter(Boolean).map((pair) => pair.split("=").map(Number));
+  if (pairs.length === 0) { table.innerHTML = ""; return; }
+  const rows = pairs.map(([tile, pct]) => `<tr><td>${tile}</td><td class="bar"><div style="width:${pct}%"></div></td><td>${pct}%</td></tr>`).join("");
+  table.innerHTML = `<caption>reached at least — share of the measured games</caption>${rows}`;
+}
+
 (async () => {
   const bytes = await (await fetch("game2048.wasm")).arrayBuffer();
   const module = await WebAssembly.compile(bytes);
@@ -216,6 +247,7 @@ async function autoLoop(now) {
       name: text(w.algo_name(i), w.algo_name_len(i)),
       score: text(w.algo_score(i), w.algo_score_len(i)),
       speed: text(w.algo_speed(i), w.algo_speed_len(i)),
+      reach: text(w.algo_reach(i), w.algo_reach_len(i)),
     });
   }
   const picker = document.getElementById("policy");
@@ -235,6 +267,7 @@ async function autoLoop(now) {
     // Score first (how strong), then the measured cost per move (how slow) — nothing else.
     const speed = p.speed ? ` / 1 手 ${p.speed}` : "";
     document.getElementById("policy-desc").textContent = `${p.name}: ${p.score}${speed}`;
+    showReach(p.reach);
   };
   picker.addEventListener("change", () => { revision++; showPolicy(); });
   showPolicy();
@@ -257,6 +290,7 @@ async function autoLoop(now) {
     if (swipeStart?.pointerId === event.pointerId) swipeStart = null;
   });
   document.getElementById("new").addEventListener("click", newGame);
+  document.getElementById("undo").addEventListener("click", undoMove);
   document.getElementById("step").addEventListener("click", () => { stopAuto(); solveStep(); });
   document.getElementById("auto").addEventListener("click", () => {
     if (running) return stopAuto();
@@ -268,6 +302,7 @@ async function autoLoop(now) {
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     // A focused <select> owns its arrow keys; do not turn them into board moves.
     if (e.target instanceof Element && e.target.closest("select, input, button")) return;
+    if (e.code === "KeyZ") { e.preventDefault(); return undoMove(); }
     const dir = CODES[e.code];
     if (dir !== undefined) { e.preventDefault(); move(dir); }
   });

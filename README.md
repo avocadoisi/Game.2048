@@ -28,12 +28,14 @@ zig build run -- help
 ```
 
 - `play`: `w/a/s/d` または `up/left/down/right` で移動、`n` でリセット、`q` で終了
-- `serve`: 矢印キー/WASD で操作。`GET /api/state`、`POST /api/new`、`POST /api/move?dir=left`、
+- `serve`: 矢印キー/WASD で操作、`Z` または Undo ボタンで直前の局面に戻る（20 手まで）。
+  `GET /api/state`、`POST /api/new`、`POST /api/undo`、`POST /api/move?dir=left`、
   `GET /api/solve?depth=2&algo=nn2`、`GET /api/ranking`。solver の自動再生と速度選択ができる
 - 静的配信: `bash scripts/deploy-pages.sh`（ビルド → スモークテスト → `gh-pages` へ push）。
   手元で見るだけなら `zig build wasm -Doptimize=ReleaseFast` のあと `python3 -m http.server 8000 -d zig-out/web`。
   静的版の方針（既定 `nn3`）と自動再生の速度（既定は最速）は select で選べる。選べる方針は
-  ビルドに同梱したものだけで、その一覧は `wasm.policies` が決める（下記）。
+  ビルドに同梱したものだけで、その一覧は `wasm.policies` が決める（下記）。戻る操作は `Z` か
+  Undo ボタンで、サーバ版と同じく 20 手まで（New game で履歴は消える）。
   実験的な並列探索は `http://127.0.0.1:8000/?workers=1` で有効にする。`nn2` / `nn3` の
   候補手を最大 4 worker で探索し、失敗・非対応時は従来の単一スレッドに戻る。
 
@@ -114,7 +116,7 @@ zig build ranking -Doptimize=ReleaseFast -- 5 20 1000                 # 全ポ�
 zig build ranking -Doptimize=ReleaseFast -- 5 20 1000 nn,nn2          # 末尾引数でポリシーを絞る
 ```
 
-2026-10-31 時点の ranking スナップショット（ReleaseFast、評価 seed 9000、100 ゲーム。行ごとに条件が違うので数字は目安）:
+2026-11-25 時点の ranking スナップショット（ReleaseFast、seed 1000、5 run × 20 ゲーム。行ごとに条件が違うので数字は目安）:
 
 `localhost:8080` のUIに出す比較表は `zig build ranking` の JSON をそのまま読む。
 表を更新するときは、生成して `src/web/ranking.json` に置き直し、ビルドし直す
@@ -125,21 +127,27 @@ zig build ranking -Doptimize=ReleaseFast -- 5 20 1000 > src/web/ranking.json
 ```
 
 表は avg score と一緒に速度（games/s と 1 手あたり ms）も出す。速度は同じ実行・同じマシン
-の相対値なので、他の負荷が載っていると絶対値は動く（順位は動きにくい）。この表は旧 64/32 net の
-スナップショットで、`nn2` / `nn` の行は現在の同梱 net とは違う。現在の `nn2` / `nn3` は上の
-「同梱する方針」表を見る。
+の相対値なので、他の負荷が載っていると絶対値は動く（順位は動きにくい）。同じ実行がゲームごとの
+最終最大タイルを数えているので、選択中のモデルについて「そのタイルまで到達した割合」も表の下に
+出す（閾値は 256 から 16384 まで。到達率はそのタイル以上のゲーム数の和なので、実行が区別して
+数えていないタイルも出せる）。
+
+`nn2` は現在の同梱 net で 100 ゲーム。旧 64/32 net の行より手数が長く、1 手あたりのコストも
+約 2 倍になっている（`nn2` は 6047 手/ゲーム）。
 
 | 手法 | avg score | 到達 | 速度 (games/s) |
 |---|---:|---:|---:|
-| `nn2`（committed weights, 100 ゲーム） | 90,358 | 8192 | 0.42 |
-| `nn`（committed weights, 1-ply + spawn, 100 ゲーム） | 69,717 | 8192 | 4.8 |
+| `nn2`（committed weights, 100 ゲーム） | 144,525 | 8192 | 0.12 |
+| `nn`（committed weights, 1-ply + spawn, 100 ゲーム） | 127,407 | 8192 | 1.2 |
 | `expectimax_id`（2 ms/手, 100 ゲーム） | 75,202 | 8192 | — |
-| `expectimax_tt`（depth 3, 200 ゲーム） | 52,736 | 8192 | 1.1 |
+| `expectimax_tt`（depth 3, 200 ゲーム） | 55,636 | 8192 | 0.72 |
 | `ntuple` 1-ply（wide 表 10M ゲーム） | 20,014 | 2048 | — |
-| `expectimax`（depth 2, 既定, 100 ゲーム） | 34,000 | 4096 | 15 |
+| `expectimax`（depth 2, 既定, 100 ゲーム） | 33,218 | 4096 | 6.8 |
 
 速度は `zig build ranking` の同じ実行から出した 1 秒あたりのゲーム数（スコアの行とは条件が違う）。
-`nn2` は 1 手 3.2 ms で `expectimax` の 17 倍遅いが、スコアは 2.4 倍。
+`nn2` は 1 手 6.7 ms で `expectimax` の 16 倍遅いが、スコアは 4.4 倍。同じ実行の到達率は
+`nn2` が 2048 / 4096 / 8192 = 100 / 98 / 87 %、`nn` が 98 / 95 / 75 %、
+`expectimax` が 77 / 14 / 0 %（ページの表の下に出る数字と同じ）。
 
 `nn` / `ntuple` の数値は手作り評価と違い、学習ゲーム数に強く依存する
 （n-tuple の 2-ply は wide 表 10M で 51,951、TD の `nn` は 100k がピークで 400k まで回すと 73,007 に落ちる）。

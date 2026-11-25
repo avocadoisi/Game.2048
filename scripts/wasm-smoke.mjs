@@ -17,7 +17,7 @@ const bytes = readFileSync(wasmPath);
 const { instance } = await WebAssembly.instantiate(bytes, {});
 const w = instance.exports;
 
-for (const name of ["init", "move", "solve", "board_ptr", "score", "best_tile", "memory"]) {
+for (const name of ["init", "move", "solve", "board_ptr", "score", "best_tile", "memory", "undo", "undo_count"]) {
   if (!(name in w)) fail(`missing export ${name}`);
 }
 
@@ -54,6 +54,29 @@ const best = w.best_tile();
 if (best !== Math.max(...snapshot())) fail(`best_tile() = ${best}, board max = ${Math.max(...snapshot())}`);
 
 const text = (ptr, len) => new TextDecoder().decode(new Uint8Array(w.memory.buffer, ptr, len));
+
+// Undo (#369): the module remembers the last 20 positions. One undo restores the board and the score
+// before the last move, and once the window is full the oldest position is dropped, so 20 undos go
+// back exactly 20 moves and no further.
+w.init(424242, 0);
+if (w.undo_count() !== 0) fail(`a new game has undo_count() = ${w.undo_count()}, expected 0`);
+if (w.undo() !== 0) fail("undo() on a new game must report 0");
+const positions = [{ board: snapshot(), score: w.score() }]; // positions[i] = board after i moves
+for (let step = 0; step < 400 && positions.length <= 25; step++) {
+  if (w.move(DIRS[step % DIRS.length]) === 1) positions.push({ board: snapshot(), score: w.score() });
+}
+const played_moves = positions.length - 1;
+if (played_moves <= 20) fail(`expected more than 20 moves to test the undo cap, got ${played_moves}`);
+if (w.undo_count() !== 20) fail(`undo_count() = ${w.undo_count()}, expected the 20-move cap`);
+if (w.undo() !== 1) fail("undo() must restore the position before the last move");
+if (snapshot().join() !== positions[played_moves - 1].board.join()) fail("undo() did not restore the previous board");
+if (w.score() !== positions[played_moves - 1].score) fail("undo() did not restore the previous score");
+for (let i = 0; i < 19; i++) {
+  if (w.undo() !== 1) fail(`undo ${i + 2} inside the remembered window failed`);
+}
+if (snapshot().join() !== positions[played_moves - 20].board.join()) fail("20 undos did not land 20 moves back");
+if (w.undo() !== 0) fail("undo() must stop at the start of the remembered window");
+if (w.undo_count() !== 0) fail(`undo_count() = ${w.undo_count()} after emptying the window, expected 0`);
 
 // `--solve-one <algo>`: solve a single policy, so the parent can hold a hard deadline over a search
 // that never returns. A JS timer cannot interrupt a blocked wasm call, so the deadline has to come
@@ -105,6 +128,18 @@ for (let i = 0; i < algoCount; i++) {
   if (!score.trim()) fail(`algo ${names[i]} has no score (${JSON.stringify(score)})`);
   const speed = text(w.algo_speed(i), w.algo_speed_len(i));
   if (speed && !/ms/.test(speed)) fail(`algo ${names[i]} has no unit in its speed (${JSON.stringify(speed)})`);
+  // `algo_reach` is the tile ladder under the picker ("2048=95,4096=88,…"): ascending tiles,
+  // non-increasing shares, since a game that reached 4096 also reached 2048. Empty = unmeasured.
+  const reach = text(w.algo_reach(i), w.algo_reach_len(i));
+  if (!reach) continue;
+  const pairs = reach.split(",").map((pair) => pair.split("=").map(Number));
+  for (const [j, [tile, pct]] of pairs.entries()) {
+    if (!Number.isInteger(tile) || tile < 2 || (tile & (tile - 1)) !== 0) fail(`algo ${names[i]} reach has a bad tile (${reach})`);
+    if (!Number.isInteger(pct) || pct < 0 || pct > 100) fail(`algo ${names[i]} reach has a bad share (${reach})`);
+    if (j === 0) continue;
+    if (tile <= pairs[j - 1][0]) fail(`algo ${names[i]} reach tiles are not ascending (${reach})`);
+    if (pct > pairs[j - 1][1]) fail(`algo ${names[i]} reach shares are not non-increasing (${reach})`);
+  }
 }
 
 // The page builds its dropdown and its descriptions from the module, so it cannot list a policy that

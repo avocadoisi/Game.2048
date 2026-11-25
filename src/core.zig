@@ -159,6 +159,43 @@ pub const GameState = struct {
     }
 };
 
+/// Positions remembered for undo, newest last (issue #369). A ring, so remembering a move never
+/// allocates or shifts: once `depth` states are held, the oldest is forgotten, which is exactly the
+/// "20 steps back, older boards may be dropped" contract of the UI.
+pub const History = struct {
+    /// Steps the pages offer. 20 states are 20 * 68 B = 1.4 KB, small enough to keep in wasm memory.
+    pub const depth: usize = 20;
+
+    states: [depth]GameState = undefined,
+    /// Index of the oldest remembered state.
+    first: usize = 0,
+    /// Remembered states, `0..depth`.
+    count: usize = 0,
+
+    pub fn clear(self: *History) void {
+        self.first = 0;
+        self.count = 0;
+    }
+
+    /// Remember `state` as the position that a following `pop` goes back to.
+    pub fn push(self: *History, state: GameState) void {
+        if (self.count < depth) {
+            self.states[(self.first + self.count) % depth] = state;
+            self.count += 1;
+            return;
+        }
+        self.states[self.first] = state;
+        self.first = (self.first + 1) % depth;
+    }
+
+    /// Remove and return the newest remembered state; null when there is nothing left to undo.
+    pub fn pop(self: *History) ?GameState {
+        if (self.count == 0) return null;
+        self.count -= 1;
+        return self.states[(self.first + self.count) % depth];
+    }
+};
+
 pub fn gameStart(rng: anytype) GameState {
     return GameState.gameStart(rng);
 }
@@ -737,4 +774,33 @@ test "canSlide matches slide(...).changed without changing the board" {
         }
         try std.testing.expectEqual(board, state.board);
     }
+}
+
+test "history pops the pushes newest first" {
+    var history: History = .{};
+    try std.testing.expect(history.pop() == null); // nothing to undo yet
+    history.push(.{ .score = 1 });
+    history.push(.{ .score = 2 });
+    try std.testing.expectEqual(@as(u32, 2), history.pop().?.score);
+    try std.testing.expectEqual(@as(u32, 1), history.pop().?.score);
+    try std.testing.expect(history.pop() == null);
+}
+
+test "history forgets the oldest state once it holds depth" {
+    var history: History = .{};
+    for (0..History.depth + 5) |i| history.push(.{ .score = @intCast(i) });
+    try std.testing.expectEqual(History.depth, history.count);
+    // the five oldest are gone, so the last of the `depth` undos lands on score 5
+    var last: u32 = 0;
+    for (0..History.depth) |_| last = history.pop().?.score;
+    try std.testing.expectEqual(@as(u32, 5), last);
+    try std.testing.expectEqual(@as(usize, 0), history.count);
+}
+
+test "history clear drops every remembered state" {
+    var history: History = .{};
+    history.push(.{ .score = 7 });
+    history.clear();
+    try std.testing.expectEqual(@as(usize, 0), history.count);
+    try std.testing.expect(history.pop() == null);
 }

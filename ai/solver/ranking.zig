@@ -37,15 +37,21 @@ const policies = blk: {
     break :blk list;
 };
 
+/// A policy by name, from the whole table rather than the default list: a heavy policy that is
+/// left out of a full ranking run (nn3) still has measurements worth taking on demand, and they
+/// have to come from the same command as the rest (#369). Policies that need a data file cannot
+/// run from this binary at all, so they are unknown here.
 fn policyByName(name: []const u8) ?PolicySpec {
-    for (policies) |p| {
-        if (std.mem.eql(u8, @tagName(p.policy), name)) return p;
+    for (solver.policy_info) |info| {
+        if (!std.mem.eql(u8, @tagName(info.policy), name)) continue;
+        if (info.needs_table) return null;
+        return .{ .policy = info.policy, .depth = info.depth };
     }
     return null;
 }
 
-/// Policies named in `filter` (comma-separated, in the given order); every policy when `filter` is empty.
-/// `out` must hold at least as many slots as `filter` has names.
+/// Policies named in `filter` (comma-separated, in the given order); every ranked policy when
+/// `filter` is empty. `out` must hold at least as many slots as `filter` has names.
 fn selectPolicies(out: []PolicySpec, filter: []const u8) ![]PolicySpec {
     if (filter.len == 0) {
         @memcpy(out[0..policies.len], policies[0..]);
@@ -121,6 +127,14 @@ test "unknown policy name is rejected" {
     try std.testing.expectError(error.UnknownPolicy, selectPolicies(&buf, "nn,nope"));
 }
 
+test "a policy outside the default list can be named, one that needs a table cannot" {
+    var buf: [policies.len]PolicySpec = undefined;
+    const selected = try selectPolicies(&buf, "nn3");
+    try std.testing.expectEqual(@as(usize, 1), selected.len);
+    try std.testing.expectEqual(solver.Policy.nn3, selected[0].policy);
+    try std.testing.expectError(error.UnknownPolicy, selectPolicies(&buf, "ntuple"));
+}
+
 test "runEntries executes only the filtered policies" {
     var buf: [policies.len]PolicySpec = undefined;
     const selected = try selectPolicies(&buf, "greedy");
@@ -163,9 +177,20 @@ pub fn main(init: std.process.Init) !void {
     try w.print("{{\"seed\":{d},\"runs\":{d},\"games_per_run\":{d},\"entries\":[", .{ seed, runs, games_per_run });
     for (entries[0..selected.len], 0..) |e, i| {
         if (i > 0) try w.writeAll(",");
-        try w.print("{{\"policy\":\"{s}\",\"depth\":{d},\"games\":{d},\"avg_score\":{d:.1},\"avg_moves\":{d:.1},\"best_tile\":{d},\"reach_4096\":{d},\"reach_8192\":{d},\"reach_16384\":{d},\"dead_below_2048\":{d},\"latency_ms_per_move\":{d:.4},\"games_per_sec\":{d:.2},\"description\":\"{s}\"}}", .{
+        try w.print("{{\"policy\":\"{s}\",\"depth\":{d},\"games\":{d},\"avg_score\":{d:.1},\"avg_moves\":{d:.1},\"best_tile\":{d},\"reach_4096\":{d},\"reach_8192\":{d},\"reach_16384\":{d},\"dead_below_2048\":{d},\"latency_ms_per_move\":{d:.4},\"games_per_sec\":{d:.2},\"description\":\"{s}\",\"max_tiles\":[", .{
             @tagName(e.policy), e.depth, e.summary.games, e.summary.avg_score, e.summary.avg_moves, e.summary.best_tile, e.summary.reach_4096, e.summary.reach_8192, e.summary.reach_16384, e.summary.dead_below_2048, e.summary.latencyMsPerMove(), e.summary.gamesPerSec(), describe(e.policy),
         });
+        // How many games finished with each highest tile (`tile` is the final max tile of a game).
+        // Empty bins are left out; reach at any threshold is a suffix sum, so the page can show
+        // tiles this run does not count separately (#369).
+        var printed = false;
+        for (e.summary.max_tile_counts, 0..) |count, bin| {
+            if (count == 0) continue;
+            if (printed) try w.writeAll(",");
+            try w.print("{{\"tile\":{d},\"games\":{d}}}", .{ @as(u32, 1) << @intCast(bin + 1), count });
+            printed = true;
+        }
+        try w.writeAll("]}");
     }
     try w.writeAll("]}\n");
     try w.flush();
